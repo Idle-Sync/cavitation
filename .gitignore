@@ -1,3 +1,4 @@
 target/
 data/mnist/
 scripts/fixtures/.venv/
+book/book/

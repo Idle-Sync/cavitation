@@ -1,6 +1,9 @@
 //! Trains a small network on XOR with a hand-written training loop, then uses hooks to print
 //! what every layer saw and computed.
 //!
+//! The guide's chapter "Backprop by hand" walks through this file; the `ANCHOR` comments
+//! mark the parts it includes.
+//!
 //! Run it with `cargo run --release --example xor -p cavitation`.
 
 use std::cell::RefCell;
@@ -27,6 +30,7 @@ fn sci(values: &[f32]) -> String {
 
 /// Trains 2 -> 8 tanh -> 1 sigmoid on XOR, then reports every layer's z, a, f'(z) and gradients.
 fn main() -> Result<(), Error> {
+    // ANCHOR: network
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(1);
     let net = Sequential::new()
@@ -36,7 +40,9 @@ fn main() -> Result<(), Error> {
         .push(Sigmoid);
     let x = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], &[4, 2])?;
     let y = Tensor::from_vec(vec![0.0f32, 1.0, 1.0, 0.0], &[4, 1])?;
+    // ANCHOR_END: network
 
+    // ANCHOR: loop
     let names = net.parameter_names();
     let mut optimizer = Sgd::new(0.5);
     // Health checks stay on. Warnings (for example a gradient norm outside the bounds) are
@@ -74,10 +80,12 @@ fn main() -> Result<(), Error> {
             println!("epoch {epoch:4}: loss {value:.6}");
         }
     }
+    // ANCHOR_END: loop
 
     // One more pass, with a hook on every layer. Forward hooks see the layer's input (z for
     // an activation), its output (a) and the local derivative f'(z); backward hooks also see
     // the gradients of the loss with respect to the layer's output and input.
+    // ANCHOR: hooks
     let mut hooks = Hooks::new();
     for layer in 0..net.len() {
         hooks.on_forward(layer, move |e| {
@@ -105,6 +113,8 @@ fn main() -> Result<(), Error> {
             }
         });
     }
+    // ANCHOR_END: hooks
+    // ANCHOR: run
     let mut tape = graph.tape(&params.values);
     let input = tape.input(x.view());
     let target = tape.input(y.view());
@@ -114,6 +124,16 @@ fn main() -> Result<(), Error> {
     println!("\nHook output for the input (1, 1), after training:");
     hooks.run_forward(&tape, &trace, &net);
     hooks.run_backward(&tape, &trace, &net);
+    // ANCHOR_END: run
+
+    // The gradients of the parameters, summed over the four inputs, as `backward` left them
+    // in `params.grads`. The optimiser would subtract 0.5 times each of these.
+    // ANCHOR: grads
+    println!("\nParameter gradients over the whole batch:");
+    for (name, id) in &names {
+        println!("  {name:8}: {}", sci(params.grad(*id).data()));
+    }
+    // ANCHOR_END: grads
 
     println!("\nPredictions (targets 0, 1, 1, 0):");
     println!("  {}", row(tape.value(out).data()));

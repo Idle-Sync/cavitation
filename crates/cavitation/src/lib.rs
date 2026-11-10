@@ -5,7 +5,14 @@
 //! crates.
 //!
 //! Both crates are re-exported by name (`cavitation::cavitation_core`,
-//! `cavitation::cavitation_nn`), and [`prelude`] gathers the names most programs need. A
+//! `cavitation::cavitation_nn`), and [`prelude`] gathers the names most programs need.
+//!
+//! # Three levels of use
+//!
+//! The library can be used at three levels, and each one is built from the one below it.
+//!
+//! **1. [`fit`](cavitation_nn::fit).** Give it a network, its parameters, a [`Dataset`]
+//! and a [`FitConfig`]; it shuffles, batches, trains and checks the run's health. A
 //! complete, small training run:
 //!
 //! ```
@@ -29,6 +36,88 @@
 //! assert!(history.epochs[199].mean_loss < history.epochs[0].mean_loss);
 //! println!("cavitation {}", cavitation::VERSION);
 //! ```
+//!
+//! **2. A manual loop.** Each training step written out: open a [`Tape`] on the parameter
+//! values, record the inputs, run the network forward, record the loss, run `backward`
+//! into the gradients, drop the tape, step the optimiser and zero the gradients. Every
+//! value on the tape can be read between these lines. This one trains a network on XOR:
+//!
+//! ```
+//! use cavitation::prelude::*;
+//!
+//! let x = Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], &[4, 2]).unwrap();
+//! let y = Tensor::from_vec(vec![0.0f32, 1.0, 1.0, 0.0], &[4, 1]).unwrap();
+//! let mut params = ParamStore::new();
+//! let mut rng = Rng::seed(1);
+//! let net = Sequential::new()
+//!     .push(Linear::new(&mut params, 2, 8, &mut rng))
+//!     .push(Tanh)
+//!     .push(Linear::new(&mut params, 8, 1, &mut rng))
+//!     .push(Sigmoid);
+//! let mut optimizer = Sgd::new(0.5);
+//! let mut graph = Graph::new();
+//! let mut last = f32::INFINITY;
+//! for _ in 0..1000 {
+//!     // The tape reads `params.values`; `backward` writes `params.grads`.
+//!     let mut tape = graph.tape(&params.values);
+//!     let input = tape.input(x.view());
+//!     let target = tape.input(y.view());
+//!     let out = net.forward(&mut tape, input);
+//!     let loss = tape.mse(out, target, Reduction::Mean);
+//!     last = tape.value(loss).data()[0];
+//!     tape.backward(loss, &mut params.grads);
+//!     drop(tape); // releases `params.values` so the optimiser can change them
+//!     optimizer.step(&mut params);
+//!     params.zero_grad();
+//! }
+//! assert!(last < 0.01);
+//! ```
+//!
+//! [`Trainer`]'s documentation shows the same loop with the health checks that `fit`
+//! runs, and [`Hooks`] reads each layer's values and gradients from the tape.
+//!
+//! **3. Your own parts.** An [`Activation`] needs only its value and derivative; a
+//! [`Layer`] records its forward pass from tape operations; a
+//! [`CustomOp`](cavitation_core::CustomOp) is a new tape operation with its own forward
+//! and backward. Each is generic over the number type, so
+//! [`gradcheck`](cavitation_core::gradcheck) checks it in `f64`. A user-defined activation
+//! in a network:
+//!
+//! ```
+//! use cavitation::cavitation_nn::ActivationLayer;
+//! use cavitation::prelude::*;
+//! use cavitation::cavitation_core::Real;
+//!
+//! /// `x³`.
+//! struct Cube;
+//!
+//! impl<T: Real> Activation<T> for Cube {
+//!     fn name(&self) -> &str {
+//!         "cube"
+//!     }
+//!     fn f(&self, x: T) -> T {
+//!         x * x * x
+//!     }
+//!     // The derivative at x, given y = f(x).
+//!     fn df(&self, x: T, _y: T) -> T {
+//!         T::from_f64(3.0) * x * x
+//!     }
+//! }
+//!
+//! let mut params = ParamStore::new();
+//! let net = Sequential::new()
+//!     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+//!     .push(ActivationLayer::new(Cube));
+//! assert_eq!(net.layer(1).name(), "cube");
+//! ```
+//!
+//! [`Dataset`]: cavitation_nn::Dataset
+//! [`FitConfig`]: cavitation_nn::FitConfig
+//! [`Tape`]: cavitation_core::Tape
+//! [`Trainer`]: cavitation_nn::Trainer
+//! [`Hooks`]: cavitation_nn::Hooks
+//! [`Activation`]: cavitation_nn::Activation
+//! [`Layer`]: cavitation_nn::Layer
 
 pub use cavitation_core;
 pub use cavitation_nn;
@@ -68,3 +157,9 @@ pub mod prelude {
 /// assert_eq!(cavitation::VERSION, env!("CARGO_PKG_VERSION"));
 /// ```
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The repository README, compiled only by `cargo test --doc` so that its Rust examples run
+/// as tests and cannot drift from the library.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;

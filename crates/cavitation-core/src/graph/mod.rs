@@ -267,6 +267,10 @@ impl<T: Real> BackwardCtx<'_, T> {
 /// then record each step on a fresh [`Tape`] from [`Graph::tape`]; after the first steps,
 /// recording the same computation again allocates nothing.
 ///
+/// The `cavitation` crate's documentation shows a full training loop built on one graph:
+/// open a tape, run the network forward, record the loss, run `backward`, drop the tape,
+/// step the optimiser and zero the gradients.
+///
 /// # Examples
 ///
 /// ```
@@ -378,6 +382,9 @@ impl<T: Real> Graph<T> {
 ///
 /// Operations compute their value as they are recorded. Dropping the tape returns every
 /// buffer to the [`Graph`] that made it.
+///
+/// A training step records one tape; the `cavitation` crate's documentation shows the whole
+/// loop of steps (the manual training loop).
 ///
 /// # Examples
 ///

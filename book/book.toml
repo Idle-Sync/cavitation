@@ -1,0 +1,14 @@
+# mdBook configuration for the Cavitation guide. Build with `mdbook build book` from the
+# repository root; the HTML goes to book/book/.
+
+[book]
+title = "The Cavitation Guide"
+description = "How neural networks learn, worked through by hand with the cavitation library."
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/Lazy-Coder-03/cavitation"
+
+[output.html.playground]
+runnable = false
