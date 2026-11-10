@@ -483,7 +483,8 @@ impl HealthMonitor {
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
     /// let mut optimizer = Sgd::new(0.1);
-    /// optimizer.step(&mut params); // no backward pass: every gradient counts as 0
+    /// // No backward pass: nothing moves, and every gradient counts as 0 in the statistics.
+    /// optimizer.step(&mut params);
     /// // The sink is `'static`, so it shares the count through an `Rc`.
     /// let vanishing = Rc::new(Cell::new(0));
     /// let count = Rc::clone(&vanishing);

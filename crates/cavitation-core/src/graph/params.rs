@@ -393,23 +393,29 @@ impl<T: Real> ParamStore<T> {
     }
 
     /// Every parameter in the order it was added: its id, its value (mutable, for an
-    /// optimiser step) and its gradient (zeros when stale).
+    /// optimiser step) and its gradient, or `None` when the gradient is stale (nothing has
+    /// contributed to it since [`zero_grad`](Self::zero_grad)), as PyTorch's `grad` is
+    /// `None` for a parameter the backward pass did not reach. The optimisers skip such a
+    /// parameter.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
     /// let mut store = ParamStore::new();
     /// let p = store.add(Tensor::full(&[2], 1.0f32));
+    /// let q = store.add(Tensor::full(&[1], 1.0f32));
     /// store.grads.accumulate(p).0.data_mut().fill(0.5);
     /// for (_, value, grad) in store.iter_mut() {
+    ///     let Some(grad) = grad else { continue };
     ///     for (v, g) in value.data_mut().iter_mut().zip(grad.data()) {
     ///         *v -= 0.1 * *g;
     ///     }
     /// }
     /// assert_eq!(store.value(p).data(), &[0.95, 0.95]);
+    /// assert_eq!(store.value(q).data(), &[1.0]);
     /// ```
     pub fn iter_mut(
         &mut self,
-    ) -> impl Iterator<Item = (ParamId, &mut Tensor<T>, TensorView<'_, T>)> {
+    ) -> impl Iterator<Item = (ParamId, &mut Tensor<T>, Option<TensorView<'_, T>>)> {
         let grads = &self.grads;
         let store = self.values.store;
         self.values
@@ -418,7 +424,8 @@ impl<T: Real> ParamStore<T> {
             .enumerate()
             .map(move |(index, value)| {
                 let id = ParamId { index, store };
-                (id, value, grads.view(id))
+                let grad = (!grads.stale[index]).then(|| grads.view(id));
+                (id, value, grad)
             })
     }
 }
@@ -440,20 +447,29 @@ mod tests {
         assert_eq!(store.grad(large).data(), &[0.0; 6]);
     }
 
-    /// `iter_mut` visits every parameter with its gradient, so an optimiser can step.
+    /// `iter_mut` visits every parameter, with its gradient when it has one this step and
+    /// `None` when it is stale, so an optimiser can step the ones that have one.
     #[test]
     fn iter_mut_steps_every_parameter() {
         let mut store = ParamStore::new();
         let a = store.add(Tensor::full(&[1], 1.0f32));
         let b = store.add(Tensor::full(&[2], 2.0f32));
         store.grads.accumulate(a).0.data_mut()[0] = 0.5;
-        for (_, value, grad) in store.iter_mut() {
+        let mut stale = Vec::new();
+        for (id, value, grad) in store.iter_mut() {
+            let Some(grad) = grad else {
+                stale.push(id);
+                continue;
+            };
             for (v, g) in value.data_mut().iter_mut().zip(grad.data()) {
                 *v -= *g;
             }
         }
+        assert_eq!(stale, [b]);
         assert_eq!(store.value(a).data(), &[0.5]);
         assert_eq!(store.value(b).data(), &[2.0, 2.0]);
+        store.zero_grad();
+        assert!(store.iter_mut().all(|(_, _, g)| g.is_none()));
     }
 
     /// A `ParamId` from one store panics when used with another.

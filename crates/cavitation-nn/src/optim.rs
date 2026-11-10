@@ -160,8 +160,8 @@ fn chunked<T: Real, const M: usize>(
 /// squares of its gradient (in `f64`) and whether every value was finite.
 ///
 /// The optimiser fills it in the same pass that updates the parameters, so reading the
-/// gradients costs no extra pass. A stale gradient (no backward pass since
-/// [`ParamStore::zero_grad`]) counts as zeros. A `GradStats` can be reused from step to step;
+/// gradients costs no extra pass. A parameter whose gradient is stale (nothing contributed to
+/// it since [`ParamStore::zero_grad`]) is not updated and counts as zeros here. A `GradStats` can be reused from step to step;
 /// after the first step it allocates nothing.
 ///
 /// # Examples
@@ -278,7 +278,10 @@ impl GradStats {
 /// Changes parameters from their gradients.
 ///
 /// An optimiser keeps its state (momentum, moment estimates) in buffers it allocates on the
-/// first step and reuses afterwards. The parameter store must not change its number or the
+/// first step and reuses afterwards. A parameter whose gradient is stale (nothing has
+/// contributed to it since [`ParamStore::zero_grad`]) is skipped, as PyTorch skips a
+/// parameter whose `grad` is `None`: its value and its state stay as they are, and Adam's
+/// bias correction counts only the steps that updated it. The parameter store must not change its number or the
 /// sizes of its parameters after that: a later step panics if it does.
 ///
 /// # Examples
@@ -294,8 +297,9 @@ impl GradStats {
 /// assert_eq!(store.value(p).data(), &[0.95]);
 /// ```
 pub trait Optimizer<T: Real>: Send {
-    /// Updates every parameter from its gradient and fills `stats` with the gradients'
-    /// sums of squares and finiteness, in the same pass.
+    /// Updates every parameter that has a gradient (see [`Optimizer`] for those without one)
+    /// and fills `stats` with the gradients' sums of squares and finiteness, in the same
+    /// pass.
     ///
     /// # Panics
     ///
@@ -315,7 +319,8 @@ pub trait Optimizer<T: Real>: Send {
     /// ```
     fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats);
 
-    /// Updates every parameter from its gradient. The statistics go into a [`GradStats`] the
+    /// Updates every parameter that has a gradient, as
+    /// [`step_with_stats`](Optimizer::step_with_stats) does. The statistics go into a [`GradStats`] the
     /// optimiser owns, allocated on the first step and reused, so after the first step this
     /// allocates nothing; read them with [`last_stats`](Optimizer::last_stats).
     ///
@@ -467,6 +472,10 @@ pub struct Sgd<T: Real = f32> {
     sizes: Sizes,
     /// The momentum buffer of each parameter (empty without momentum).
     buffers: Vec<Vec<T>>,
+    /// Whether each parameter's momentum buffer holds a value: false until its first update,
+    /// which sets the buffer to that step's gradient, as PyTorch starts its buffer (empty
+    /// without momentum).
+    started: Vec<bool>,
     /// The statistics of the last `step`.
     stats: GradStats,
     /// One slot per chunk of the largest parameter, for the chunks' statistics.
@@ -487,6 +496,7 @@ impl<T: Real> Sgd<T> {
             weight_decay: 0.0,
             sizes: Sizes::default(),
             buffers: Vec::new(),
+            started: Vec::new(),
             stats: GradStats::new(),
             partials: Vec::new(),
         }
@@ -518,19 +528,25 @@ impl<T: Real> Sgd<T> {
 impl<T: Real> Sgd<T> {
     /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
     fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
-        let first = self.sizes.prepare("Sgd", params);
-        if first && self.momentum != 0.0 {
+        if self.sizes.prepare("Sgd", params) && self.momentum != 0.0 {
             self.buffers = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
+            self.started = vec![false; self.buffers.len()];
         }
         stats.reset(params.len());
         let (lr, mu, wd) = (self.lr, self.momentum, self.weight_decay);
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
+            let Some(grad) = grad else {
+                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
+                stats.push(id, 0.0, true);
+                continue;
+            };
             let values = value.data_mut();
             let grads = grad.data();
-            let buffer = if mu != 0.0 {
-                &mut self.buffers[k][..]
+            let (buffer, first) = if mu != 0.0 {
+                let first = !std::mem::replace(&mut self.started[k], true);
+                (&mut self.buffers[k][..], first)
             } else {
-                &mut []
+                (&mut [][..], false)
             };
             let (sum, finite) = match path {
                 Path::Reference => sgd_reference(lr, mu, wd, first, values, buffer, grads),
@@ -573,7 +589,7 @@ impl<T: Real> Sgd<T> {
 
 /// The plain SGD loop over one parameter, element by element on the calling thread: the
 /// reference for [`sgd_chunk`] and [`sgd_momentum_chunk`]. `buffer` is the momentum buffer
-/// (empty when `mu` is 0) and `first` whether this is the optimiser's first step. Returns the
+/// (empty when `mu` is 0) and `first` whether this is the parameter's first update. Returns the
 /// gradient's sum of squares and whether it was all finite.
 fn sgd_reference<T: Real>(
     lr: f64,
@@ -626,8 +642,8 @@ fn sgd_chunk<T: Real, const WD: bool>(
     })
 }
 
-/// One chunk of SGD with momentum, with weight decay when `WD`, on the optimiser's first
-/// step when `FIRST`: the arithmetic of [`sgd_reference`] per element.
+/// One chunk of SGD with momentum, with weight decay when `WD`, on the parameter's first
+/// update when `FIRST`: the arithmetic of [`sgd_reference`] per element.
 fn sgd_momentum_chunk<T: Real, const WD: bool, const FIRST: bool>(
     lr: f64,
     mu: f64,
@@ -689,8 +705,10 @@ struct AdamCore<T: Real> {
     eps: f64,
     /// The weight decay.
     weight_decay: f64,
-    /// The steps taken so far.
-    steps: i32,
+    /// The updates each parameter has had so far, for its bias corrections: a parameter
+    /// skipped for want of a gradient does not count the step, as in PyTorch's per-parameter
+    /// `state["step"]`.
+    steps: Vec<i32>,
     /// The sizes seen on the first step.
     sizes: Sizes,
     /// The first moment of each parameter.
@@ -712,7 +730,7 @@ impl<T: Real> AdamCore<T> {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay,
-            steps: 0,
+            steps: Vec::new(),
             sizes: Sizes::default(),
             m: Vec::new(),
             v: Vec::new(),
@@ -748,38 +766,45 @@ impl<T: Real> AdamCore<T> {
         if self.sizes.prepare(name, params) {
             self.m = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
             self.v = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
+            self.steps = vec![0; self.m.len()];
         }
-        self.steps += 1;
         stats.reset(params.len());
         let (lr, b1, b2, eps, wd) = (self.lr, self.beta1, self.beta2, self.eps, self.weight_decay);
-        let c = AdamStep {
-            lr,
-            b1,
-            b2,
-            eps,
-            wd,
-            correction1: 1.0 - b1.powi(self.steps),
-            correction2: 1.0 - b2.powi(self.steps),
-            shrink: 1.0 - lr * wd,
-        };
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
+            let Some(grad) = grad else {
+                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
+                stats.push(id, 0.0, true);
+                continue;
+            };
+            self.steps[k] += 1;
+            let c = AdamStep {
+                lr,
+                b1,
+                b2,
+                eps,
+                wd,
+                correction1: 1.0 - b1.powi(self.steps[k]),
+                correction2: 1.0 - b2.powi(self.steps[k]),
+                shrink: 1.0 - lr * wd,
+            };
+            let c = &c;
             let values = value.data_mut();
             let grads = grad.data();
             let (m, v) = (&mut self.m[k][..], &mut self.v[k][..]);
             let (sum, finite) = match path {
-                Path::Reference => adam_reference(&c, decoupled, values, m, v, grads),
+                Path::Reference => adam_reference(c, decoupled, values, m, v, grads),
                 Path::Chunked(threads) => {
                     let parts = &mut self.partials;
                     let muts = [values, m, v];
                     match (decoupled, wd != 0.0) {
                         (true, _) => chunked(threads, muts, grads, parts, &|[p, m, v], g| {
-                            adam_chunk::<T, true, false>(&c, p, m, v, g)
+                            adam_chunk::<T, true, false>(c, p, m, v, g)
                         }),
                         (false, true) => chunked(threads, muts, grads, parts, &|[p, m, v], g| {
-                            adam_chunk::<T, false, true>(&c, p, m, v, g)
+                            adam_chunk::<T, false, true>(c, p, m, v, g)
                         }),
                         (false, false) => chunked(threads, muts, grads, parts, &|[p, m, v], g| {
-                            adam_chunk::<T, false, false>(&c, p, m, v, g)
+                            adam_chunk::<T, false, false>(c, p, m, v, g)
                         }),
                     }
                 }
@@ -979,7 +1004,8 @@ impl<T: Real> Optimizer<T> for Adam<T> {
 /// use cavitation_nn::{AdamW, Optimizer};
 /// let mut store = ParamStore::new();
 /// let p = store.add(Tensor::full(&[1], 1.0f32));
-/// // No gradient: only the decay acts, 1 - 0.1 * 0.01 * 1.
+/// // A zero gradient: only the decay acts, 1 - 0.1 * 0.01 * 1.
+/// store.grads.accumulate(p).0.data_mut()[0] = 0.0;
 /// AdamW::new(0.1).step(&mut store);
 /// assert!((store.value(p).data()[0] - 0.999).abs() < 1e-6);
 /// ```
@@ -1178,7 +1204,8 @@ mod tests {
         let mut adamw = AdamW::new(0.1);
         Optimizer::<f32>::set_learning_rate(&mut adamw, 0.2);
         assert_eq!(Optimizer::<f32>::learning_rate(&adamw), 0.2);
-        // No gradient: only the decay acts, 1 − 0.2 · 0.01.
+        // A zero gradient: only the decay acts, 1 − 0.2 · 0.01.
+        set_grad(&mut store, p, &[0.0]);
         adamw.step(&mut store);
         assert!((store.value(p).data()[0] - 0.998).abs() < 1e-7);
     }
@@ -1286,6 +1313,15 @@ mod tests {
             match self {
                 Either::Sgd(o) => o.update(store, stats, path),
                 Either::Adam(o, decoupled) => o.step("Adam", *decoupled, store, stats, path),
+            }
+        }
+
+        /// The state buffers of parameter `k` (none for SGD without momentum), as bits.
+        fn state_of(&self, k: usize) -> Vec<Vec<u32>> {
+            let bits = |b: &Vec<f32>| -> Vec<u32> { b.iter().map(|x| x.to_bits()).collect() };
+            match self {
+                Either::Sgd(o) => o.buffers.get(k).map(bits).into_iter().collect(),
+                Either::Adam(o, _) => vec![bits(&o.m[k]), bits(&o.v[k])],
             }
         }
 
@@ -1453,6 +1489,57 @@ mod tests {
                 })
                 .collect();
             assert!(norms[0] == norms[1] && norms[0] == norms[2], "{name}");
+        }
+    }
+
+    /// A parameter that gets no gradient is skipped, as PyTorch skips `grad is None`, by
+    /// every optimiser setting on both paths: over three steps where only `a` gets a gradient,
+    /// `b`'s value and its optimiser state stay bit-identical, and the statistics count its
+    /// gradient as zeros. When `b` then gets its first gradient it moves exactly as a fresh
+    /// optimiser's first step would move it (its own step count, its momentum buffer started
+    /// from that gradient), while `a` keeps matching the reference.
+    #[test]
+    fn parameters_without_a_gradient_are_skipped() {
+        for (name, make) in chunk_configs() {
+            for path in [Path::Reference, Path::Chunked(2)] {
+                let at = format!("{name}, {path:?}");
+                let mut store = ParamStore::new();
+                let a = store.add(Tensor::from_vec(sequence(40, 1, &[]), &[40]).unwrap());
+                let b = store.add(Tensor::from_vec(sequence(30, 2, &[]), &[30]).unwrap());
+                let b_start = value_bits(&store, &[b]);
+                let mut opt = make();
+                let mut stats = GradStats::new();
+                for step in 1..=3 {
+                    store.zero_grad();
+                    set_grad(&mut store, a, &sequence(40, 10 + step, &[]));
+                    opt.step(&mut store, &mut stats, path);
+                    assert_eq!(
+                        value_bits(&store, &[b]),
+                        b_start,
+                        "{at}, step {step}: value"
+                    );
+                    assert!(
+                        opt.state_of(1).iter().flatten().all(|&x| x == 0),
+                        "{at}, step {step}: b's state was written"
+                    );
+                    assert_eq!(stats.norm(b), 0.0, "{at}");
+                }
+
+                let gb = sequence(30, 20, &[]);
+                store.zero_grad();
+                set_grad(&mut store, a, &sequence(40, 14, &[]));
+                set_grad(&mut store, b, &gb);
+                opt.step(&mut store, &mut stats, path);
+                let mut fresh = ParamStore::new();
+                let only_b = fresh.add(Tensor::from_vec(sequence(30, 2, &[]), &[30]).unwrap());
+                set_grad(&mut fresh, only_b, &gb);
+                make().step(&mut fresh, &mut GradStats::new(), path);
+                assert_eq!(
+                    value_bits(&store, &[b]),
+                    value_bits(&fresh, &[only_b]),
+                    "{at}: b's first update"
+                );
+            }
         }
     }
 
