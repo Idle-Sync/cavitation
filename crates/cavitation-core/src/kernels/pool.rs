@@ -14,6 +14,9 @@ use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
+/// The most threads, the caller included, that one call uses.
+const MAX_THREADS: usize = 256;
+
 /// How long a worker, or a caller waiting for workers, spins before it sleeps.
 const SPIN: Duration = Duration::from_micros(200);
 
@@ -35,9 +38,11 @@ const SPIN: Duration = Duration::from_micros(200);
 pub struct Task {
     /// The task's number, in `0..tasks`. Each number is run exactly once per call.
     pub index: usize,
-    /// The thread running the task, in `0..threads`; 0 is the calling thread. Two tasks
-    /// running at the same time never share a worker number, so it can pick per-thread
-    /// scratch space. Which worker runs which task varies from call to call.
+    /// The thread running the task, in `0..threads`; 0 is the calling thread. Within one
+    /// call, two tasks running at the same time never share a worker number; tasks of
+    /// different calls (concurrent or nested) can share one. Per-worker scratch space must
+    /// therefore belong to the call (or be thread-local), never be shared between calls.
+    /// Which worker runs which task varies from call to call.
     pub worker: usize,
 }
 
@@ -134,7 +139,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Tasks are handed out to threads in no fixed order. For results that are the same for any
 /// thread count and any schedule, each task's output must depend only on [`Task::index`]
 /// (for example, each task writes its own block of the output); use [`Task::worker`] only to
-/// choose per-thread scratch space.
+/// choose per-thread scratch space owned by this call. Worker numbers are unique only within
+/// one call: a concurrent or nested call also uses worker 0, so scratch indexed by worker
+/// number must not be shared between calls.
+///
+/// At most 256 threads take part, whatever `threads` asks for; results are unchanged, since
+/// each task's output depends only on its index.
 ///
 /// # Panics
 ///
@@ -152,7 +162,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// ```
 pub fn run(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
     assert!(threads >= 1, "pool::run: threads must be at least 1, got 0");
-    let wanted = threads.min(tasks);
+    let wanted = threads.min(tasks).min(MAX_THREADS);
     if wanted <= 1 || IS_WORKER.get() {
         return run_inline(tasks, job);
     }
@@ -195,6 +205,9 @@ fn run_on_pool(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
     let workers = lock(&POOL.workers);
     let started = grow(workers, threads - 1);
     if started.is_empty() {
+        // Unlock the worker list before running the tasks: a nested call from one of them
+        // would otherwise lock it again on this thread and deadlock.
+        drop(started);
         POOL.busy.store(false, Ordering::Release);
         return run_inline(tasks, job);
     }
@@ -253,10 +266,7 @@ fn grow(mut workers: MutexGuard<'static, Vec<&'static Worker>>, wanted: usize) -
             parked: AtomicBool::new(false),
             thread: OnceLock::new(),
         }));
-        let spawned = thread::Builder::new()
-            .name(format!("cavitation-pool-{}", worker.id))
-            .spawn(move || worker_main(worker, last_call));
-        match spawned {
+        match spawn_worker(worker, last_call) {
             Ok(handle) => {
                 let _ = worker.thread.set(handle.thread().clone());
                 workers.push(worker);
@@ -269,6 +279,25 @@ fn grow(mut workers: MutexGuard<'static, Vec<&'static Worker>>, wanted: usize) -
         guard: workers,
         len,
     }
+}
+
+/// Makes every later worker spawn fail, so tests can reach the path where the pool cannot
+/// start any thread. Set only from a test running alone in a child process.
+#[cfg(test)]
+static FAIL_SPAWN: AtomicBool = AtomicBool::new(false);
+
+/// Starts the thread for `worker`, created after call number `last_call`.
+fn spawn_worker(
+    worker: &'static Worker,
+    last_call: usize,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    #[cfg(test)]
+    if FAIL_SPAWN.load(Ordering::Relaxed) {
+        return Err(std::io::Error::other("worker spawn disabled for a test"));
+    }
+    thread::Builder::new()
+        .name(format!("cavitation-pool-{}", worker.id))
+        .spawn(move || worker_main(worker, last_call))
 }
 
 /// The first `len` workers, with the list kept locked.
@@ -320,9 +349,10 @@ fn work(tasks: usize, job: &(dyn Fn(Task) + Sync), worker: usize) {
                 *first = Some(payload);
             } else {
                 drop(first);
-                // A later payload is discarded; its destructor must not unwind out of here,
-                // or the caller could return while workers still use the job.
-                let _ = catch_unwind(AssertUnwindSafe(move || drop(payload)));
+                // A later payload is leaked, not dropped: its destructor could panic, and an
+                // unwind out of here could let the caller return while workers still use the
+                // job, or end a worker before it reports done. Leaks only on this path.
+                std::mem::forget(payload);
             }
         }
     }
@@ -418,6 +448,17 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Instant;
 
+    /// Held by every test that needs the pool to itself, so a call is not sent to the inline
+    /// path just because another test's call holds the pool.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Takes [`SERIAL`], ignoring poisoning from a failed test.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Runs `tasks` tasks on `threads` threads and returns how many times each index ran.
     fn counts(threads: usize, tasks: usize) -> Vec<usize> {
         let seen: Vec<AtomicUsize> = (0..tasks).map(|_| AtomicUsize::new(0)).collect();
@@ -435,6 +476,7 @@ mod tests {
     /// 10,000 tasks on 4 threads: every index runs exactly once.
     #[test]
     fn pool_runs_every_task_once() {
+        let _serial = serial();
         assert!(counts(4, 10_000).iter().all(|&c| c == 1));
         assert!(counts(1, 100).iter().all(|&c| c == 1));
         assert!(counts(4, 0).is_empty());
@@ -443,6 +485,7 @@ mod tests {
     /// 16 threads work whatever the number of cores.
     #[test]
     fn pool_more_threads_than_cores() {
+        let _serial = serial();
         for _ in 0..20 {
             assert!(counts(16, 1_000).iter().all(|&c| c == 1));
         }
@@ -452,6 +495,7 @@ mod tests {
     /// still works afterwards.
     #[test]
     fn pool_propagates_panic() {
+        let _serial = serial();
         let seen: Vec<AtomicUsize> = (0..100).map(|_| AtomicUsize::new(0)).collect();
         let result = catch_unwind(AssertUnwindSafe(|| {
             run(4, 100, &|t: Task| {
@@ -470,6 +514,7 @@ mod tests {
     /// 8 threads each call `run` 1,000 times at once: every task of every call runs once.
     #[test]
     fn pool_concurrent_callers() {
+        let _serial = serial();
         std::thread::scope(|s| {
             for caller in 0..8 {
                 s.spawn(move || {
@@ -488,6 +533,7 @@ mod tests {
     /// worker 0.
     #[test]
     fn pool_nested_call_runs_inline() {
+        let _serial = serial();
         let outer_seen: Vec<AtomicUsize> = (0..8).map(|_| AtomicUsize::new(0)).collect();
         run(4, 8, &|outer: Task| {
             let me = std::thread::current().id();
@@ -503,9 +549,62 @@ mod tests {
         assert!(outer_seen.iter().all(|c| c.load(Ordering::Relaxed) == 1));
     }
 
-    /// Prints the median time of an empty 4-task `run` on 4 threads, over 1,000 calls.
+    /// The pool cannot start any worker: `run`, and a `run` nested inside one of its
+    /// tasks, still finish with every task run once on the calling thread. Runs
+    /// `spawn_failure_child` in a fresh process (where no worker exists yet) and fails if it
+    /// fails or does not finish within 30 seconds.
+    #[test]
+    fn pool_spawn_failure_runs_inline() {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "--test-threads=1",
+                "kernels::pool::tests::spawn_failure_child",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the test binary runs");
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().expect("waiting for the child") {
+                assert!(status.success(), "the child failed: {status}");
+                return;
+            }
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child did not finish within 30 s: run deadlocked");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Helper for `pool_spawn_failure_runs_inline`; ignored by default and run in a child
+    /// process, since it disables worker spawning for the whole process.
+    #[test]
+    #[ignore = "run in a child process by pool_spawn_failure_runs_inline"]
+    fn spawn_failure_child() {
+        FAIL_SPAWN.store(true, Ordering::Relaxed);
+        let outer_seen: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
+        run(4, 4, &|outer: Task| {
+            assert_eq!(outer.worker, 0);
+            let inner = counts(4, 4);
+            assert!(inner.iter().all(|&c| c == 1));
+            outer_seen[outer.index].fetch_add(1, Ordering::Relaxed);
+        });
+        assert!(outer_seen.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+    }
+
+    /// Prints the median time of an empty 4-task `run` on 4 threads, over 1,000 calls. The
+    /// figure to quote comes from a run on its own, in release mode:
+    /// `cargo test -p cavitation-core --release --lib kernels::pool::tests::pool_round_trip_time -- --exact
+    /// --nocapture --test-threads=1`.
     #[test]
     fn pool_round_trip_time() {
+        let _serial = serial();
         let empty = |_: Task| {};
         for _ in 0..100 {
             run(4, 4, &empty);

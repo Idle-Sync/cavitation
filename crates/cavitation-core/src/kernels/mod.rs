@@ -299,6 +299,9 @@ pub fn threads() -> usize {
 /// Sets the number of threads the threaded kernels use, for the whole process. Results do
 /// not depend on it: each output element is computed by one thread in a fixed order.
 ///
+/// Any count is accepted, but one call into the thread pool uses at most 256 threads; a
+/// larger count runs on 256, with the same results.
+///
 /// # Panics
 ///
 /// Panics if `n` is 0.
