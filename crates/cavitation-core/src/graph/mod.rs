@@ -605,7 +605,11 @@ impl<T: Real> Tape<'_, T> {
                 pool,
                 params: grads,
             };
-            nodes[i].op.backward(out_grad, &mut ctx);
+            let this = Var {
+                index: i as u32,
+                tape: self.id,
+            };
+            nodes[i].op.backward(this, out_grad, &mut ctx);
         }
     }
 

@@ -1,7 +1,7 @@
 //! Gradient checks of the operations, through the numerical check harness.
 
 use cavitation_core::{
-    GradcheckReport, ParamStore, Tape, Tensor, Var, gradcheck, gradcheck_params,
+    GeluApprox, GradcheckReport, ParamStore, Rng, Tape, Tensor, Var, gradcheck, gradcheck_params,
 };
 
 fn t(data: &[f64]) -> Tensor<f64> {
@@ -125,5 +125,92 @@ fn gradcheck_matmul_shared_parameter() {
         tape.matmul_nt(h, wv)
     };
     let report = gradcheck_params(&mut params, &[filled(&[2, 3], 0.9)], build);
+    assert!(report.passed(), "{report:?}");
+}
+
+/// A `[4, 5]` input with entries drawn from `[-2, 2]` by a seeded generator, resampled until
+/// every entry is farther than `1e-3` from zero (ReLU and Leaky ReLU have a kink there).
+fn away_from_zero(seed: u64) -> Tensor<f64> {
+    let mut rng = Rng::seed(seed);
+    let data = (0..20)
+        .map(|_| {
+            loop {
+                let x = rng.range(-2.0, 2.0);
+                if x.abs() > 1e-3 {
+                    break x;
+                }
+            }
+        })
+        .collect();
+    Tensor::from_vec(data, &[4, 5]).unwrap()
+}
+
+/// `sum` and `mean` have the right gradient.
+#[test]
+fn gradcheck_full_reductions() {
+    let x = [away_from_zero(11)];
+    gradcheck(|t, v| t.sum(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.mean(v[0]), &x).assert_passed();
+}
+
+/// `sum_axis` and `mean_axis` have the right gradient along each axis, with and without
+/// `keep_dim`.
+#[test]
+fn gradcheck_axis_reductions() {
+    let x = [away_from_zero(12)];
+    for axis in 0..2 {
+        for keep_dim in [false, true] {
+            let report = gradcheck(|t, v| t.sum_axis(v[0], axis, keep_dim), &x);
+            assert!(report.passed(), "sum_axis {axis} {keep_dim}: {report:?}");
+            let report = gradcheck(|t, v| t.mean_axis(v[0], axis, keep_dim), &x);
+            assert!(report.passed(), "mean_axis {axis} {keep_dim}: {report:?}");
+        }
+    }
+}
+
+/// A reduction over the middle axis of a rank-3 value has the right gradient.
+#[test]
+fn gradcheck_reduction_middle_axis() {
+    let data = (0..24).map(|i| (i as f64 * 0.7).sin()).collect();
+    let x = [Tensor::from_vec(data, &[2, 3, 4]).unwrap()];
+    gradcheck(|t, v| t.sum_axis(v[0], 1, false), &x).assert_passed();
+    gradcheck(|t, v| t.mean_axis(v[0], 1, true), &x).assert_passed();
+}
+
+/// ReLU and Leaky ReLU have the right gradient away from the kink.
+#[test]
+fn gradcheck_relu_family() {
+    let x = [away_from_zero(13)];
+    gradcheck(|t, v| t.relu(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.leaky_relu(v[0], 0.01), &x).assert_passed();
+    gradcheck(|t, v| t.leaky_relu(v[0], 0.2), &x).assert_passed();
+}
+
+/// Tanh, sigmoid and both forms of GELU have the right gradient.
+#[test]
+fn gradcheck_smooth_activations() {
+    let mut rng = Rng::seed(14);
+    let data = (0..20).map(|_| rng.range(-3.0, 3.0)).collect();
+    let x = [Tensor::from_vec(data, &[4, 5]).unwrap()];
+    gradcheck(|t, v| t.tanh(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.sigmoid(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.gelu(v[0], GeluApprox::Exact), &x).assert_passed();
+    gradcheck(|t, v| t.gelu(v[0], GeluApprox::Tanh), &x).assert_passed();
+}
+
+/// A parameter used by two activations gets both contributions.
+#[test]
+fn gradcheck_activation_shared_parameter() {
+    let mut params = ParamStore::<f64>::new_generic();
+    let w = params.add(filled(&[4, 5], 0.2));
+    let build = |tape: &mut Tape<'_, f64>, v: &[Var]| {
+        let wv = tape.param(w);
+        let a = tape.mul(v[0], wv);
+        let b = tape.tanh(a);
+        let c = tape.sigmoid(wv);
+        let d = tape.add(b, c);
+        tape.mean_axis(d, 0, false)
+    };
+    let report = gradcheck_params(&mut params, &[filled(&[4, 5], 0.9)], build);
     assert!(report.passed(), "{report:?}");
 }

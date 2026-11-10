@@ -107,6 +107,15 @@ pub trait Real:
     /// assert_eq!(0.0f32.tanh(), 0.0);
     /// ```
     fn tanh(self) -> Self;
+    /// The error function, `2/√π` times the integral of `e^(-t²)` from 0 to `self`. Ported
+    /// from FreeBSD's msun; accurate to about 1 ulp.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// assert_eq!(0.0f64.erf(), 0.0);
+    /// assert!((1.0f64.erf() - 0.8427007929497149).abs() < 1e-15);
+    /// ```
+    fn erf(self) -> Self;
     /// The square root.
     ///
     /// ```
@@ -184,7 +193,7 @@ thread_local! {
 
 /// Implements `Real` for a primitive float type by forwarding to its inherent methods.
 macro_rules! impl_real {
-    ($t:ident) => {
+    ($t:ident, $erf:path) => {
         impl Real for $t {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
@@ -206,6 +215,9 @@ macro_rules! impl_real {
             }
             fn tanh(self) -> Self {
                 $t::tanh(self)
+            }
+            fn erf(self) -> Self {
+                $erf(self)
             }
             fn sqrt(self) -> Self {
                 $t::sqrt(self)
@@ -234,8 +246,8 @@ macro_rules! impl_real {
     };
 }
 
-impl_real!(f32);
-impl_real!(f64);
+impl_real!(f32, crate::ops::erf_f32);
+impl_real!(f64, crate::ops::erf_f64);
 
 /// Tests for `Real`.
 #[cfg(test)]

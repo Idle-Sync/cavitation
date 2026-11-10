@@ -141,12 +141,54 @@ fn tape_steady_state() -> usize {
     made
 }
 
+/// A `[8, 16] + [16]` bias add, ReLU and sum, forward and backward, 12 times: the bias
+/// gradient is reduced over the rows through a scratch buffer. Returns the allocations made
+/// during steps 3 to 12.
+fn bias_relu_sum_steady_state() -> usize {
+    let mut store = ParamStore::new();
+    let bias = store.add(Tensor::full(&[16], 0.1f32));
+    let weight = store.add(Tensor::full(&[8, 16], -0.3f32));
+    let x = Tensor::from_vec(
+        (0..128).map(|i| (i as f32 * 0.37).sin()).collect(),
+        &[8, 16],
+    )
+    .unwrap();
+    let mut graph = Graph::new();
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for step in 1..=12 {
+        if step == 3 {
+            before = allocations();
+        }
+        store.zero_grad();
+        {
+            let mut tape = graph.tape(&store.values);
+            let xi = tape.input(x.view());
+            let (b, w) = (tape.param(bias), tape.param(weight));
+            let h = tape.add(xi, b);
+            let h = tape.add(h, w);
+            let r = tape.relu(h);
+            let t = tape.tanh(r);
+            let loss = tape.sum(t);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0];
+        }
+        sink += store.grad(bias).data()[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// A named scenario: runs, and returns the allocations it made after warm-up.
 type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 1] = [("tape_steady_state", tape_steady_state)];
+    let scenarios: [Scenario; 2] = [
+        ("tape_steady_state", tape_steady_state),
+        ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
+    ];
     let mut failed = false;
     for (name, scenario) in scenarios {
         let made = scenario();

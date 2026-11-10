@@ -4,14 +4,19 @@
 //! Adding an operation means adding its variant to [`Op`], its arm to [`Op::backward`], and
 //! its file's forward and backward functions.
 
+mod activation;
 mod elementwise;
+mod erf;
 mod matmul;
+mod reduce;
 #[cfg(test)]
 mod wrong;
 
 use crate::Real;
 use crate::graph::{BackwardCtx, ParamId, Var};
+pub use activation::GeluApprox;
 use elementwise::Kind;
+pub(crate) use erf::{erf_f32, erf_f64};
 
 /// A recorded operation: what produced a node, with its inputs and anything its backward
 /// pass needs, stored inline so that recording never allocates.
@@ -33,6 +38,24 @@ pub(crate) enum Op {
     MatMulNt(Var, Var),
     /// Every element of the value times a scalar, kept as `f64` (exact for f32 and f64).
     Scale(Var, f64),
+    /// The sum of every element, a rank-0 value.
+    Sum(Var),
+    /// The mean of every element, a rank-0 value.
+    Mean(Var),
+    /// The sum along an axis.
+    SumAxis(Var, usize),
+    /// The mean along an axis.
+    MeanAxis(Var, usize),
+    /// `max(x, 0)`.
+    Relu(Var),
+    /// `x` where positive, slope times `x` elsewhere; the slope is kept as `f64`.
+    LeakyRelu(Var, f64),
+    /// The hyperbolic tangent.
+    Tanh(Var),
+    /// The logistic sigmoid.
+    Sigmoid(Var),
+    /// GELU in the given form.
+    Gelu(Var, GeluApprox),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -46,8 +69,9 @@ pub(crate) enum Op {
 
 impl Op {
     /// Passes `out_grad`, the gradient of the loss with respect to this node's value, back to
-    /// the node's inputs through `ctx`.
-    pub(crate) fn backward<T: Real>(&self, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
+    /// the node's inputs through `ctx`. `out` is the node itself, for operations whose
+    /// derivative is cheapest from their own output (`tanh`, `sigmoid`).
+    pub(crate) fn backward<T: Real>(&self, out: Var, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
         match *self {
             Op::Input | Op::Param(_) => {}
             Op::Add(a, b) => elementwise::binary_backward(Kind::Add, a, b, out_grad, ctx),
@@ -56,6 +80,15 @@ impl Op {
             Op::MatMul(a, b) => matmul::backward(false, a, b, out_grad, ctx),
             Op::MatMulNt(a, b) => matmul::backward(true, a, b, out_grad, ctx),
             Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
+            Op::Sum(a) => reduce::full_backward(a, false, out_grad, ctx),
+            Op::Mean(a) => reduce::full_backward(a, true, out_grad, ctx),
+            Op::SumAxis(a, axis) => reduce::axis_backward(a, axis, false, out_grad, ctx),
+            Op::MeanAxis(a, axis) => reduce::axis_backward(a, axis, true, out_grad, ctx),
+            Op::Relu(a) => activation::relu_backward(a, out_grad, ctx),
+            Op::LeakyRelu(a, slope) => activation::leaky_relu_backward(a, slope, out_grad, ctx),
+            Op::Tanh(a) => activation::tanh_backward(a, out, out_grad, ctx),
+            Op::Sigmoid(a) => activation::sigmoid_backward(a, out, out_grad, ctx),
+            Op::Gelu(a, approx) => activation::gelu_backward(a, approx, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]
