@@ -2,10 +2,12 @@
 
 mod error;
 mod real;
+mod rng;
 mod shape;
 mod tensor;
 
 pub use error::Error;
 pub use real::Real;
+pub use rng::{Rng, SplitMix64};
 pub use shape::Shape;
 pub use tensor::{Tensor, TensorView, TensorViewMut};
