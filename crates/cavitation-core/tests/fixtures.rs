@@ -12,7 +12,9 @@
 //!   order.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
+use cavitation_core::kernels::{Level, detected, level, set_level, supported};
 use cavitation_core::{Gate, GeluApprox, Graph, ParamStore, Reduction, Tape, Tensor, Var};
 use serde_json::Value;
 
@@ -717,9 +719,10 @@ fn compare(f: &Fixture, what: &str, ours: &[f32], torch32: &Tens, torch64: &Tens
         let diff = (f64::from(o) - t).abs();
         assert!(
             diff <= limit,
-            "{} ({}): {what}, element {i}: ours {o:e}, torch {t:e}, difference {diff:e} > {limit:e} ({label})",
+            "{} ({}) at level {}: {what}, element {i}: ours {o:e}, torch {t:e}, difference {diff:e} > {limit:e} ({label})",
             f.op,
-            f.name
+            f.name,
+            level()
         );
     }
 }
@@ -747,7 +750,99 @@ fn check(f: &Fixture) {
     }
 }
 
-/// Checks every fixture of the listed operations, and that each listed operation has one.
+/// The arithmetic operations.
+const ARITHMETIC: &[&str] = &["add", "sub", "mul", "scale"];
+/// The matrix products.
+const MATMUL: &[&str] = &["matmul", "matmul_nt"];
+/// The reductions.
+const REDUCTIONS: &[&str] = &["sum", "mean", "sum_axis", "mean_axis"];
+/// The activations, `prelu` and `glu`.
+const ACTIVATIONS: &[&str] = &[
+    "relu",
+    "leaky_relu",
+    "tanh",
+    "sigmoid",
+    "gelu",
+    "elu",
+    "selu",
+    "celu",
+    "silu",
+    "mish",
+    "softplus",
+    "softsign",
+    "hardtanh",
+    "relu6",
+    "hardsigmoid",
+    "hardswish",
+    "log_sigmoid",
+    "prelu",
+    "glu",
+];
+/// `softmax` and `log_softmax`.
+const SOFTMAX: &[&str] = &["softmax", "log_softmax"];
+/// The losses.
+const LOSSES: &[&str] = &[
+    "softmax_cross_entropy",
+    "mse",
+    "binary_cross_entropy",
+    "binary_cross_entropy_with_logits",
+    "nll",
+    "l1",
+    "huber",
+    "smooth_l1",
+    "kl_div",
+];
+
+/// Every operation list a comparison test checks.
+const OP_GROUPS: &[&[&str]] = &[ARITHMETIC, MATMUL, REDUCTIONS, ACTIVATIONS, SOFTMAX, LOSSES];
+
+/// Every level, in the order of their numbers.
+const ALL_LEVELS: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
+
+/// Serialises the tests that change the process-wide kernel level.
+static LEVEL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Restores the kernel level it was created under when dropped, even during a panic.
+struct RestoreLevel(Level);
+
+impl Drop for RestoreLevel {
+    /// Sets the saved level back.
+    fn drop(&mut self) {
+        set_level(self.0).expect("the original level is supported");
+    }
+}
+
+/// Every level this CPU can run, in the order of `Level`'s numbers.
+fn supported_levels() -> Vec<Level> {
+    ALL_LEVELS
+        .iter()
+        .copied()
+        .filter(|&l| supported(l))
+        .collect()
+}
+
+/// The levels this CPU cannot run.
+fn skipped_levels() -> Vec<Level> {
+    ALL_LEVELS
+        .iter()
+        .copied()
+        .filter(|&l| !supported(l))
+        .collect()
+}
+
+/// Runs `body` once on every supported level, holding the level lock for the whole call and
+/// restoring the original level afterwards, also when `body` panics.
+fn on_every_level(mut body: impl FnMut(Level)) {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = RestoreLevel(level());
+    for l in supported_levels() {
+        set_level(l).expect("a supported level can be set");
+        body(l);
+    }
+}
+
+/// Checks every fixture of the listed operations on every supported level, and that each
+/// listed operation has a fixture.
 fn check_ops(ops: &[&str]) {
     let all = load_all();
     for op in ops {
@@ -756,96 +851,104 @@ fn check_ops(ops: &[&str]) {
             "no fixture for operation {op:?}"
         );
     }
-    for f in all.iter().filter(|f| ops.contains(&f.op.as_str())) {
-        check(f);
-    }
+    on_every_level(|_| {
+        for f in all.iter().filter(|f| ops.contains(&f.op.as_str())) {
+            check(f);
+        }
+    });
 }
 
 /// `add`, `sub`, `mul` and `scale`, with broadcasting, match PyTorch.
 #[test]
 fn arithmetic_matches_torch() {
-    check_ops(&["add", "sub", "mul", "scale"]);
+    check_ops(ARITHMETIC);
 }
 
 /// `matmul` and `matmul_nt` match PyTorch's float64 result within the GEMM bound.
 #[test]
 fn matmul_matches_torch() {
-    check_ops(&["matmul", "matmul_nt"]);
+    check_ops(MATMUL);
 }
 
 /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
 #[test]
 fn reductions_match_torch() {
-    check_ops(&["sum", "mean", "sum_axis", "mean_axis"]);
+    check_ops(REDUCTIONS);
 }
 
 /// Every activation, `prelu` and `glu` match PyTorch.
 #[test]
 fn activations_match_torch() {
-    check_ops(&[
-        "relu",
-        "leaky_relu",
-        "tanh",
-        "sigmoid",
-        "gelu",
-        "elu",
-        "selu",
-        "celu",
-        "silu",
-        "mish",
-        "softplus",
-        "softsign",
-        "hardtanh",
-        "relu6",
-        "hardsigmoid",
-        "hardswish",
-        "log_sigmoid",
-        "prelu",
-        "glu",
-    ]);
+    check_ops(ACTIVATIONS);
 }
 
 /// `softmax` and `log_softmax` match PyTorch's float64 result.
 #[test]
 fn softmax_matches_torch() {
-    check_ops(&["softmax", "log_softmax"]);
+    check_ops(SOFTMAX);
 }
 
 /// Every loss, under every reduction, matches PyTorch's float64 result.
 #[test]
 fn losses_match_torch() {
-    check_ops(&[
-        "softmax_cross_entropy",
-        "mse",
-        "binary_cross_entropy",
-        "binary_cross_entropy_with_logits",
-        "nll",
-        "l1",
-        "huber",
-        "smooth_l1",
-        "kl_div",
-    ]);
+    check_ops(LOSSES);
+}
+
+/// Every fixture file's operation is covered by one of the comparison tests.
+#[test]
+fn every_fixture_op_is_checked() {
+    let unchecked: Vec<String> = load_all()
+        .iter()
+        .filter(|f| !OP_GROUPS.iter().any(|g| g.contains(&f.op.as_str())))
+        .map(|f| format!("{} (operation {:?})", f.name, f.op))
+        .collect();
+    assert!(
+        unchecked.is_empty(),
+        "fixtures whose operation no comparison covers: {}",
+        unchecked.join(", ")
+    );
+}
+
+/// Prints the levels the comparisons ran on and the ones this CPU cannot run, and checks
+/// that the reference level and the level the library chose by default are among them.
+#[test]
+fn levels_covered() {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let run = supported_levels();
+    let skipped = skipped_levels();
+    let names = |ls: &[Level]| {
+        ls.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    println!("fixture levels run: {}", names(&run));
+    println!(
+        "fixture levels skipped (unsupported on this CPU): {}",
+        if skipped.is_empty() {
+            "none".to_string()
+        } else {
+            names(&skipped)
+        }
+    );
+    assert!(run.contains(&Level::Reference), "reference always runs");
+    assert!(
+        run.contains(&detected()),
+        "the detected level {} is among the levels run",
+        detected()
+    );
+    assert_eq!(run.len() + skipped.len(), ALL_LEVELS.len());
 }
 
 /// Every loss has a fixture for each of the four reductions.
 #[test]
 fn every_loss_has_every_reduction() {
     let all = load_all();
-    for op in [
-        "softmax_cross_entropy",
-        "mse",
-        "binary_cross_entropy",
-        "binary_cross_entropy_with_logits",
-        "nll",
-        "l1",
-        "huber",
-        "smooth_l1",
-        "kl_div",
-    ] {
+    for op in LOSSES {
         for r in ["mean", "sum", "none", "batchmean"] {
             assert!(
                 all.iter()
-                    .any(|f| f.op == op && text(&f.params, "reduction") == r),
+                    .any(|f| f.op == *op && text(&f.params, "reduction") == r),
                 "no fixture for {op} with reduction {r}"
             );
         }
