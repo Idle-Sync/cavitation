@@ -97,8 +97,6 @@ The `xor` example is this loop with health checks and hooks added, and the guide
 **3. Your own parts.** An `Activation` needs only its value and its derivative. A `Layer` records its forward pass from tape operations. A `CustomOp` is a new tape operation with its own forward and backward. Each is generic over the number type, so `gradcheck` can check it in `f64`.
 
 ```rust
-use cavitation::cavitation_core::Real;
-use cavitation::cavitation_nn::ActivationLayer;
 use cavitation::prelude::*;
 
 /// `x³`.

@@ -84,9 +84,7 @@
 //! in a network:
 //!
 //! ```
-//! use cavitation::cavitation_nn::ActivationLayer;
 //! use cavitation::prelude::*;
-//! use cavitation::cavitation_core::Real;
 //!
 //! /// `x³`.
 //! struct Cube;
@@ -123,8 +121,9 @@ pub use cavitation_core;
 pub use cavitation_nn;
 
 /// The names most programs need, for `use cavitation::prelude::*;`: tensors and autograd,
-/// layers and activations, optimisers, the training loop, health checks, hooks, inference,
-/// saving and loading, the random generator and the gradient checks.
+/// layers and activations (with the settings their fields take), optimisers, the training
+/// loop and its batches, health checks, hooks, inference, saving and loading, the random
+/// generator, the gradient checks, and the traits for writing your own parts.
 ///
 /// ```
 /// use cavitation::prelude::*;
@@ -132,22 +131,32 @@ pub use cavitation_nn;
 /// let mut params = ParamStore::new();
 /// let net = Sequential::new()
 ///     .push(Linear::new(&mut params, 2, 4, &mut rng))
-///     .push(Relu)
-///     .push(Linear::new(&mut params, 4, 1, &mut rng))
-///     .push(Sigmoid);
+///     .push(Gelu { approx: GeluApprox::Tanh })
+///     .push(Linear::new(&mut params, 4, 2, &mut rng))
+///     .push(Glu { gate: Gate::Sigmoid });
 /// assert_eq!(net.len(), 4);
+///
+/// // One `Trainer` step on a `Batch`, stopping on a non-finite value.
+/// let data = Dataset { x: Tensor::zeros(&[2, 2]), targets: Targets::Values(Tensor::zeros(&[2, 1])) };
+/// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 2);
+/// trainer.set_health(Health { on_non_finite: OnNonFinite::Stop, ..Health::default() });
+/// let mut batch = Batch::new(&data, 2);
+/// let view: BatchView<'_, f32> = Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch);
+/// assert!(trainer.step(&net, &mut params, view).unwrap().is_finite());
 /// ```
 pub mod prelude {
     pub use cavitation_core::{
-        Error, Graph, ParamStore, Reduction, Rng, Tape, Tensor, Var, gradcheck, gradcheck_params,
+        CustomOp, Error, Gate, GeluApprox, Graph, ParamId, ParamStore, Real, Reduction, Rng, Tape,
+        Tensor, TensorView, Var, gradcheck, gradcheck_params,
     };
     pub use cavitation_nn::{
-        Activation, Adam, AdamW, Batcher, Celu, Dataset, Elu, EpochReport, FitConfig, Gelu, Glu,
-        Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, Hooks, InferenceModel, Init,
-        Layer, LeakyRelu, Linear, LogSigmoid, LogSoftmax, Loss, LrSchedule, Mish, NeuronMask,
-        Optimizer, OptimizerConfig, Prelu, Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu,
-        Softmax, Softplus, Softsign, Tanh, Targets, Trace, Trainer, Warning, accuracy, fit, load,
-        save,
+        Activation, ActivationLayer, Adam, AdamW, Batch, BatchView, Batcher, Celu, Dataset, Elu,
+        EpochReport, FitConfig, Gelu, Glu, GradStats, Hardsigmoid, Hardswish, Hardtanh, Health,
+        HealthMonitor, History, Hooks, InferenceModel, Init, Layer, LayerEvent, LeakyRelu, Linear,
+        LogSigmoid, LogSoftmax, Loss, LrSchedule, Mish, NeuronMask, OnNonFinite, Optimizer,
+        OptimizerConfig, Prelu, Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax,
+        Softplus, Softsign, Tanh, Targets, Trace, Trainer, Warning, accuracy, fit, fit_with_hooks,
+        load, load_lenient, save,
     };
 }
 
