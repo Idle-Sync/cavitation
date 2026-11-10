@@ -1,6 +1,7 @@
 //! Tensors, automatic differentiation and CPU kernels for the cavitation neural network library.
 
 mod error;
+pub mod kernels;
 mod real;
 mod rng;
 mod shape;

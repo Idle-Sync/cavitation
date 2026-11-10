@@ -7,3 +7,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - Cargo workspace with the core, nn, facade, datasets and bench crates, and shared lints.
 - `Real`, `Shape`, `Tensor` (with views) and `Error` in `cavitation-core`.
 - `SplitMix64` and `Rng` (xoshiro256++) in `cavitation-core`.
+- Strided matrix views (`MatRef`, `MatMut`) and reference `gemm` and `matvec` kernels in `cavitation-core`.
