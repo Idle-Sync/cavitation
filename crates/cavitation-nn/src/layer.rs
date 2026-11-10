@@ -2,6 +2,8 @@
 
 use cavitation_core::{ParamId, Real, Tape, Var};
 
+use crate::Activation;
+
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
 /// The trait is object safe, so a network can hold its layers as `Box<dyn Layer<T>>`.
@@ -18,6 +20,44 @@ use cavitation_core::{ParamId, Real, Tape, Var};
 /// ];
 /// let width = layers.iter().fold(4, |w, l| l.output_width(w));
 /// assert_eq!(width, 2);
+/// ```
+///
+/// A layer of your own implements the trait for every [`Real`] type, so that the same code
+/// trains in `f32` and runs through [`gradcheck_params`](cavitation_core::gradcheck_params)
+/// in `f64`. This one scales `tanh(x)` by a learnable `alpha`:
+///
+/// ```
+/// use cavitation_core::{ParamId, ParamStore, Real, Rng, Tape, Tensor, Var, gradcheck_params};
+/// use cavitation_nn::{Layer, Linear, Sequential};
+///
+/// struct ScaledTanh {
+///     alpha: ParamId,
+/// }
+///
+/// impl<T: Real> Layer<T> for ScaledTanh {
+///     fn name(&self) -> &str {
+///         "scaled_tanh"
+///     }
+///     fn output_width(&self, input_width: usize) -> usize {
+///         input_width
+///     }
+///     fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+///         let t = tape.tanh(x);
+///         let alpha = tape.param(self.alpha);
+///         tape.mul(t, alpha)
+///     }
+///     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+///         vec![("alpha", self.alpha)]
+///     }
+/// }
+///
+/// let mut params = ParamStore::<f64>::new_generic();
+/// let alpha = params.add(Tensor::from_vec(vec![1.5], &[1]).unwrap());
+/// let net = Sequential::new_generic()
+///     .push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0)))
+///     .push(ScaledTanh { alpha });
+/// let x = Tensor::from_vec(vec![0.1, -0.4, 0.8], &[1, 3]).unwrap();
+/// gradcheck_params(&mut params, &[x], |tape, v| net.forward(tape, v[0])).assert_passed();
 /// ```
 pub trait Layer<T: Real>: Send + Sync {
     /// The layer's kind, for example `"linear"`.
@@ -71,4 +111,33 @@ pub trait Layer<T: Real>: Send + Sync {
     /// assert_eq!(names, ["weight", "bias"]);
     /// ```
     fn parameters(&self) -> Vec<(&'static str, ParamId)>;
+
+    /// The width of input the layer requires, if it requires one. [`Sequential`](crate::Sequential)
+    /// checks it against the width of the previous layer's output. The default is `None`
+    /// (the layer accepts any width, or checks it itself).
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear, Relu};
+    /// let linear = Linear::new(&mut ParamStore::new(), 4, 2, &mut Rng::seed(0));
+    /// assert_eq!(Layer::<f32>::input_width(&linear), Some(4));
+    /// assert_eq!(Layer::<f32>::input_width(&Relu), None);
+    /// ```
+    fn input_width(&self) -> Option<usize> {
+        None
+    }
+
+    /// The element-wise [`Activation`] this layer applies, if it is one. Layers that are not
+    /// an element-wise function of one value (`Linear`, `Softmax`, `Glu`, `Prelu`) return
+    /// `None`, the default.
+    ///
+    /// ```
+    /// use cavitation_nn::{Activation, ActivationKind, Layer, Softmax, Tanh};
+    /// let act = Layer::<f32>::activation(&Tanh).unwrap();
+    /// assert_eq!(act.builtin(), Some(ActivationKind::Tanh));
+    /// assert!(Layer::<f32>::activation(&Softmax).is_none());
+    /// ```
+    fn activation(&self) -> Option<&dyn Activation<T>> {
+        None
+    }
 }

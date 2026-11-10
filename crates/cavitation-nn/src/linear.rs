@@ -185,6 +185,11 @@ impl<T: Real> Layer<T> for Linear {
         tape.add(y, b)
     }
 
+    /// Returns the number of inputs.
+    fn input_width(&self) -> Option<usize> {
+        Some(self.inputs)
+    }
+
     /// Returns `weight` and `bias`.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         vec![("weight", self.weight), ("bias", self.bias)]
