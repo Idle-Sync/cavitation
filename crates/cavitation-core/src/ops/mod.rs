@@ -56,6 +56,30 @@ pub(crate) enum Op {
     Sigmoid(Var),
     /// GELU in the given form.
     Gelu(Var, GeluApprox),
+    /// ELU with the given alpha (kept as `f64`).
+    Elu(Var, f64),
+    /// SELU.
+    Selu(Var),
+    /// CELU with the given alpha (kept as `f64`).
+    Celu(Var, f64),
+    /// SiLU, `x · σ(x)`.
+    Silu(Var),
+    /// Mish, `x · tanh(softplus(x))`.
+    Mish(Var),
+    /// Softplus with the given `beta` and threshold (kept as `f64`).
+    Softplus(Var, f64, f64),
+    /// Softsign, `x / (1 + |x|)`.
+    Softsign(Var),
+    /// Clamp to the given minimum and maximum (kept as `f64`); also ReLU6.
+    Hardtanh(Var, f64, f64),
+    /// Hard sigmoid.
+    HardSigmoid(Var),
+    /// Hard swish.
+    HardSwish(Var),
+    /// `log σ(x)`.
+    LogSigmoid(Var),
+    /// PReLU: the input, then the slope (shape `[1]` or `[C]`).
+    Prelu(Var, Var),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -89,6 +113,20 @@ impl Op {
             Op::Tanh(a) => activation::tanh_backward(a, out, out_grad, ctx),
             Op::Sigmoid(a) => activation::sigmoid_backward(a, out, out_grad, ctx),
             Op::Gelu(a, approx) => activation::gelu_backward(a, approx, out_grad, ctx),
+            Op::Elu(a, alpha) => activation::elu_backward(a, alpha, out_grad, ctx),
+            Op::Selu(a) => activation::selu_backward(a, out_grad, ctx),
+            Op::Celu(a, alpha) => activation::celu_backward(a, alpha, out_grad, ctx),
+            Op::Silu(a) => activation::silu_backward(a, out_grad, ctx),
+            Op::Mish(a) => activation::mish_backward(a, out_grad, ctx),
+            Op::Softplus(a, beta, threshold) => {
+                activation::softplus_backward(a, beta, threshold, out_grad, ctx)
+            }
+            Op::Softsign(a) => activation::softsign_backward(a, out_grad, ctx),
+            Op::Hardtanh(a, lo, hi) => activation::hardtanh_backward(a, lo, hi, out_grad, ctx),
+            Op::HardSigmoid(a) => activation::hardsigmoid_backward(a, out_grad, ctx),
+            Op::HardSwish(a) => activation::hardswish_backward(a, out_grad, ctx),
+            Op::LogSigmoid(a) => activation::log_sigmoid_backward(a, out_grad, ctx),
+            Op::Prelu(a, slope) => activation::prelu_backward(a, slope, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]

@@ -13,3 +13,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `sub`, `mul` and `scale` on the tape, and NumPy-style broadcasting for `add`, `sub` and `mul` (with a fast path for the bias add).
 - `matmul` and `matmul_nt` on the tape, with gradients computed on strided views, and `Real::gemm`.
 - `sum`, `sum_axis`, `mean`, `mean_axis`, `relu`, `leaky_relu`, `tanh`, `sigmoid` and `gelu` (exact and tanh forms, `GeluApprox`) on the tape, and `Real::erf` (ported from FreeBSD msun).
+- `elu`, `selu`, `celu`, `silu`, `mish`, `softplus`, `softsign`, `hardtanh`, `relu6`, `hardsigmoid`, `hardswish`, `log_sigmoid` and `prelu` on the tape, following PyTorch's definitions and boundary conventions; `relu` and the clamp family now pass NaN through instead of turning it into 0.

@@ -214,3 +214,75 @@ fn gradcheck_activation_shared_parameter() {
     let report = gradcheck_params(&mut params, &[filled(&[4, 5], 0.9)], build);
     assert!(report.passed(), "{report:?}");
 }
+
+/// A `[4, 5]` input with entries drawn from `[lo, hi]` by a seeded generator, resampled
+/// until every entry is farther than `1e-3` from each of the `kinks`.
+fn away_from(kinks: &[f64], lo: f64, hi: f64, seed: u64) -> Tensor<f64> {
+    let mut rng = Rng::seed(seed);
+    let data = (0..20)
+        .map(|_| {
+            loop {
+                let x = rng.range(lo, hi);
+                if kinks.iter().all(|k| (x - k).abs() > 1e-3) {
+                    break x;
+                }
+            }
+        })
+        .collect();
+    Tensor::from_vec(data, &[4, 5]).unwrap()
+}
+
+/// ELU, SELU and CELU have the right gradient away from zero.
+#[test]
+fn gradcheck_exponential_linear_units() {
+    let x = [away_from(&[0.0], -3.0, 3.0, 21)];
+    gradcheck(|t, v| t.elu(v[0], 1.0), &x).assert_passed();
+    gradcheck(|t, v| t.elu(v[0], 0.7), &x).assert_passed();
+    gradcheck(|t, v| t.selu(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.celu(v[0], 1.0), &x).assert_passed();
+    gradcheck(|t, v| t.celu(v[0], 2.0), &x).assert_passed();
+    gradcheck(|t, v| t.celu(v[0], 0.5), &x).assert_passed();
+}
+
+/// SiLU, Mish, softplus, softsign and log-sigmoid have the right gradient.
+#[test]
+fn gradcheck_smooth_extra_activations() {
+    let x = [away_from(&[], -4.0, 4.0, 22)];
+    gradcheck(|t, v| t.silu(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.mish(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.softplus(v[0], 1.0, 20.0), &x).assert_passed();
+    gradcheck(|t, v| t.softplus(v[0], 2.5, 20.0), &x).assert_passed();
+    gradcheck(|t, v| t.softsign(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.log_sigmoid(v[0]), &x).assert_passed();
+}
+
+/// Softplus has the right gradient on both sides of its threshold.
+#[test]
+fn gradcheck_softplus_threshold() {
+    let x = [away_from(&[20.0], 15.0, 25.0, 23)];
+    gradcheck(|t, v| t.softplus(v[0], 1.0, 20.0), &x).assert_passed();
+}
+
+/// The clamp family has the right gradient away from its kinks.
+#[test]
+fn gradcheck_clamp_family() {
+    let x = [away_from(&[-1.0, 1.0], -2.5, 2.5, 24)];
+    gradcheck(|t, v| t.hardtanh(v[0], -1.0, 1.0), &x).assert_passed();
+    let x = [away_from(&[0.0, 6.0], -2.0, 8.0, 25)];
+    gradcheck(|t, v| t.relu6(v[0]), &x).assert_passed();
+    let x = [away_from(&[-3.0, 3.0], -5.0, 5.0, 26)];
+    gradcheck(|t, v| t.hardsigmoid(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.hardswish(v[0]), &x).assert_passed();
+}
+
+/// PReLU has the right gradient for x and for the slope, with one slope and one per channel.
+#[test]
+fn gradcheck_prelu() {
+    let x = away_from(&[0.0], -2.0, 2.0, 27);
+    for dims in [&[1usize][..], &[5]] {
+        let n: usize = dims.iter().product();
+        let slope = Tensor::from_vec((0..n).map(|i| 0.1 + 0.2 * i as f64).collect(), dims).unwrap();
+        let report = gradcheck(|t, v| t.prelu(v[0], v[1]), &[x.clone(), slope]);
+        assert!(report.passed(), "prelu slope {dims:?}: {report:?}");
+    }
+}
