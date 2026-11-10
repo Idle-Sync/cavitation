@@ -56,8 +56,9 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
         .push(he(256, 10));
 
     // A dead-ReLU warning means a ReLU neuron output exactly 0 for every sample of an epoch,
-    // so it passed no signal forward and received no gradient. The warnings are counted and
-    // summarised at the end rather than printed every epoch.
+    // so it passed no signal forward and received no gradient. The warnings are counted, every
+    // epoch's, and summarised at the end; without a sink each layer's first report would be
+    // printed.
     let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let counter = std::rc::Rc::clone(&count);
     let health = Health {

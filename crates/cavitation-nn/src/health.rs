@@ -75,7 +75,8 @@ pub enum Warning {
         norm: f64,
     },
     /// Neurons of a ReLU or ReLU6 layer that output exactly 0 for every sample of the epoch.
-    /// Neurons turned off by a [`NeuronMask`](crate::NeuronMask) are not counted.
+    /// Neurons turned off by a [`NeuronMask`](crate::NeuronMask) are not counted. Sent to the
+    /// sink every epoch; without a sink, printed only the first time for each layer.
     DeadNeurons {
         /// The epoch, as passed to [`HealthMonitor::end_epoch`].
         epoch: usize,
@@ -129,8 +130,10 @@ impl fmt::Display for Warning {
 /// Which health checks run during training, and where their warnings go.
 ///
 /// The default stops on a non-finite loss or gradient, warns about gradient norms above
-/// 1e3 or below 1e-7, reports dead ReLU neurons, and prints every warning to standard error
-/// as `cavitation: warning: <the warning>`.
+/// 1e3 or below 1e-7, reports dead ReLU neurons, and prints the warnings to standard error
+/// as `cavitation: warning: <the warning>`. Printed, a layer's dead-neuron report appears
+/// only the first time, so a network with a dead layer does not print a line every epoch;
+/// a [`sink`](Health::sink) receives every epoch's report.
 ///
 /// # Examples
 ///
@@ -155,7 +158,7 @@ pub struct Health {
     /// each step).
     pub dead_relu: bool,
     /// Receives every warning; `None` prints them to standard error, prefixed
-    /// `cavitation: warning:`.
+    /// `cavitation: warning:`, each layer's [`Warning::DeadNeurons`] only the first time.
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
     pub sink: Option<Box<dyn FnMut(&Warning)>>,
@@ -276,6 +279,8 @@ pub struct HealthMonitor {
     alive: Vec<bool>,
     /// Whether `alive` holds at least one step of this epoch.
     tracked: bool,
+    /// The layers whose dead-neuron report was printed to standard error (with no sink).
+    dead_printed: Vec<usize>,
 }
 
 impl HealthMonitor {
@@ -295,14 +300,26 @@ impl HealthMonitor {
             relu_layers: Vec::new(),
             alive: Vec::new(),
             tracked: false,
+            dead_printed: Vec::new(),
         }
     }
 
-    /// Sends `warning` to the sink, or prints it to standard error when there is none.
+    /// Sends `warning` to the sink, or prints it to standard error when there is none: each
+    /// layer's dead-neuron report only the first time, saying that later epochs are not
+    /// printed.
     fn emit(&mut self, warning: Warning) {
-        match self.health.sink.as_mut() {
-            Some(sink) => sink(&warning),
-            None => eprintln!("cavitation: warning: {warning}"),
+        match (self.health.sink.as_mut(), &warning) {
+            (Some(sink), _) => sink(&warning),
+            (None, Warning::DeadNeurons { layer, .. }) => {
+                if !self.dead_printed.contains(layer) {
+                    self.dead_printed.push(*layer);
+                    eprintln!(
+                        "cavitation: warning: {warning}; later epochs' reports for layer {layer} \
+                         are not printed (a Health::sink receives every one)"
+                    );
+                }
+            }
+            (None, _) => eprintln!("cavitation: warning: {warning}"),
         }
     }
 
@@ -840,6 +857,86 @@ mod tests {
                 "masked {masked:?}"
             );
         }
+    }
+
+    /// Three epochs of `fit` on [`dead_network`] with `health`, using SGD and mean squared
+    /// error; the network stays dead every epoch.
+    fn fit_dead_network(health: Health) {
+        let mut params = ParamStore::new();
+        let (net, data) = dead_network(&mut params, &[]);
+        let config = FitConfig {
+            epochs: 3,
+            batch: 4,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.1,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            health,
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+    }
+
+    /// A sink receives the dead-neuron report of every epoch, not only the first.
+    #[test]
+    fn dead_relu_sink_receives_every_epoch() {
+        let (seen, sink) = collecting_sink();
+        fit_dead_network(health(OnNonFinite::Stop, sink));
+        let epochs: Vec<usize> = dead_reports(&seen)
+            .iter()
+            .map(|w| match w {
+                Warning::DeadNeurons { epoch, .. } => *epoch,
+                _ => unreachable!("dead_reports keeps only DeadNeurons"),
+            })
+            .collect();
+        assert_eq!(epochs, [1, 2, 3]);
+    }
+
+    /// Without a sink, a layer's dead neurons are printed to standard error once per run, with
+    /// their count, and not again every epoch: the test binary re-runs itself as a child that
+    /// trains the dead network for three epochs, and its standard error has one such line.
+    #[test]
+    fn dead_relu_prints_once_per_layer_without_a_sink() {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                "health::tests::dead_relu_printing_child",
+            ])
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "the child should run the helper and pass; stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        let dead: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("cavitation: warning:") && l.contains("dead ReLU"))
+            .collect();
+        assert_eq!(dead.len(), 1, "stderr:\n{stderr}");
+        assert!(
+            dead[0].starts_with(
+                "cavitation: warning: epoch 1: 4 neurons of layer 1 output 0 for every sample"
+            ) && dead[0].contains("later epochs"),
+            "{}",
+            dead[0]
+        );
+    }
+
+    /// Helper for `dead_relu_prints_once_per_layer_without_a_sink`: trains the dead network
+    /// with the default checks, which print to standard error. Ignored by default; it is run
+    /// in a child process.
+    #[test]
+    #[ignore = "run in a child process by dead_relu_prints_once_per_layer_without_a_sink"]
+    fn dead_relu_printing_child() {
+        fit_dead_network(Health::default());
     }
 
     /// Runs the manual loop over the first `steps` batches of 32 rows of `data` with a
