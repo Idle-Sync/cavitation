@@ -1,5 +1,5 @@
-//! `Mulberry32`: the standard mulberry32 32-bit generator, reproduced exactly from its
-//! common JavaScript form. It shuffles the scikit-learn digits deterministically.
+//! `Mulberry32`: the mulberry32 generator, reproduced exactly from its common JavaScript
+//! form, so a shuffle written in JavaScript gives the same order here.
 
 /// The mulberry32 generator. Its sequence matches the JavaScript function
 /// `rng(seed)` (which uses `|0` and `Math.imul`) value for value.

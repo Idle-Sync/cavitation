@@ -221,7 +221,7 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
-    //! Tests for the random number generators: known published values and determinism.
+    //! Tests for the random number generators: known published values and seeding.
 
     use super::*;
 

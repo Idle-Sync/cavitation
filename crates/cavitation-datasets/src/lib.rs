@@ -1,4 +1,5 @@
-//! Datasets used by the cavitation examples, tests and benchmark.
+//! Deterministic helpers for datasets, used by the cavitation examples, tests and
+//! benchmark. This crate is not published.
 
 pub mod mulberry32;
 
