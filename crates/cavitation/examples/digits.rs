@@ -53,13 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        schedule: LrSchedule::Constant,
         health,
-        on_epoch: Some(Box::new(|r: &EpochReport| {
-            println!(
-                "epoch {:2}: mean loss {:.6}, {:.3} s",
-                r.epoch, r.mean_loss, r.seconds
-            );
-        })),
+        on_epoch: Some(Box::new(
+            |r: &EpochReport, _: &Sequential, _: &ParamStore| {
+                println!(
+                    "epoch {:2}: mean loss {:.6}, {:.3} s",
+                    r.epoch, r.mean_loss, r.seconds
+                );
+            },
+        )),
     };
     fit(&net, &mut params, &train, config)?;
 

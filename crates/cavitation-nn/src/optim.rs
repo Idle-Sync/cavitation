@@ -794,6 +794,42 @@ mod tests {
         opt.step(&mut store);
     }
 
+    /// Each optimiser returns the rate it was given, and its next step uses it: SGD moves by
+    /// `lr·g`, Adam's first step moves by `lr`, and AdamW's decoupled decay shrinks by
+    /// `lr·wd` (PyTorch's `p ← p·(1 − lr·wd)` with the group's current rate).
+    #[test]
+    fn set_learning_rate_round_trips_and_applies() {
+        let one = || {
+            let mut store = ParamStore::new();
+            let p = store.add(Tensor::full(&[1], 1.0f32));
+            (store, p)
+        };
+
+        let (mut store, p) = one();
+        let mut sgd = Sgd::new(0.1);
+        Optimizer::<f32>::set_learning_rate(&mut sgd, 0.25);
+        assert_eq!(Optimizer::<f32>::learning_rate(&sgd), 0.25);
+        set_grad(&mut store, p, &[1.0]);
+        sgd.step(&mut store);
+        assert_eq!(store.value(p).data(), &[0.75]);
+
+        let (mut store, p) = one();
+        let mut adam = Adam::new(0.1);
+        Optimizer::<f32>::set_learning_rate(&mut adam, 0.03);
+        assert_eq!(Optimizer::<f32>::learning_rate(&adam), 0.03);
+        set_grad(&mut store, p, &[2.0]);
+        adam.step(&mut store);
+        assert!((store.value(p).data()[0] - 0.97).abs() < 1e-6);
+
+        let (mut store, p) = one();
+        let mut adamw = AdamW::new(0.1);
+        Optimizer::<f32>::set_learning_rate(&mut adamw, 0.2);
+        assert_eq!(Optimizer::<f32>::learning_rate(&adamw), 0.2);
+        // No gradient: only the decay acts, 1 − 0.2 · 0.01.
+        adamw.step(&mut store);
+        assert!((store.value(p).data()[0] - 0.998).abs() < 1e-7);
+    }
+
     /// A `Box<dyn Optimizer>` is an optimiser.
     #[test]
     fn boxed_optimizer_steps() {

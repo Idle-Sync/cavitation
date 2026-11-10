@@ -548,6 +548,59 @@ impl OptimizerConfig {
     }
 }
 
+/// How [`fit`] changes the learning rate from epoch to epoch. The rate the optimiser is
+/// configured with is the rate of the first epoch.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_nn::{FitConfig, LrSchedule};
+/// let config = FitConfig { schedule: LrSchedule::Cosine { min_lr: 0.0 }, ..FitConfig::default() };
+/// assert_ne!(config.schedule, LrSchedule::Constant);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum LrSchedule {
+    /// Every epoch trains at the configured rate.
+    #[default]
+    Constant,
+    /// Cosine annealing from the configured rate down towards `min_lr`, set once at the
+    /// start of each epoch, as PyTorch's `CosineAnnealingLR(optimizer, T_max=epochs,
+    /// eta_min=min_lr)` stepped once per epoch: epoch `e` (counting from 0) of `epochs`
+    /// trains at `min_lr + (lr − min_lr)·(1 + cos(π·e/epochs))/2`.
+    Cosine {
+        /// The rate the schedule approaches; the last epoch trains a little above it.
+        min_lr: f64,
+    },
+}
+
+impl LrSchedule {
+    /// The learning rate of epoch `epoch` (counting from 0, the number of epochs already
+    /// trained) of a run of `epochs` epochs whose first epoch trains at `initial`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `epochs` is 0.
+    ///
+    /// ```
+    /// use cavitation_nn::LrSchedule;
+    /// let cosine = LrSchedule::Cosine { min_lr: 0.0 };
+    /// assert_eq!(cosine.learning_rate(1e-3, 0, 4), 1e-3);
+    /// assert_eq!(cosine.learning_rate(1e-3, 2, 4), 5e-4);
+    /// assert_eq!(LrSchedule::Constant.learning_rate(1e-3, 3, 4), 1e-3);
+    /// ```
+    pub fn learning_rate(&self, initial: f64, epoch: usize, epochs: usize) -> f64 {
+        assert!(epochs > 0, "LrSchedule: a run needs at least one epoch");
+        match *self {
+            LrSchedule::Constant => initial,
+            LrSchedule::Cosine { min_lr } => {
+                // PyTorch's order of operations: π·e first, then the division.
+                let angle = std::f64::consts::PI * epoch as f64 / epochs as f64;
+                min_lr + (initial - min_lr) * (1.0 + angle.cos()) / 2.0
+            }
+        }
+    }
+}
+
 /// What one epoch of [`fit`] did.
 ///
 /// # Examples
@@ -583,9 +636,9 @@ pub struct History {
 
 /// How [`fit`] trains. Taken by value, because it holds the `on_epoch` callback.
 ///
-/// The default is 10 epochs in batches of 32, Adam at learning rate 1e-3 without weight
-/// decay, cross-entropy, shuffled with seed 0, the default [`Health`] checks, and no
-/// callback.
+/// The default is 10 epochs in batches of 32, Adam at a constant learning rate of 1e-3
+/// without weight decay, cross-entropy, shuffled with seed 0, the default [`Health`] checks,
+/// and no callback.
 ///
 /// # Examples
 ///
@@ -605,17 +658,21 @@ pub struct FitConfig {
     pub loss: Loss,
     /// The seed that shuffles the rows each epoch; `None` keeps the data's order.
     pub shuffle_seed: Option<u64>,
+    /// How the learning rate changes from epoch to epoch, starting from the optimiser's.
+    pub schedule: LrSchedule,
     /// The health checks run on every step and at the end of every epoch.
     pub health: Health,
-    /// Called with each epoch's report as soon as the epoch ends.
+    /// Called as soon as each epoch ends with its report, the model and the parameters as
+    /// they are after the epoch, so a held-out metric such as [`accuracy`] can be measured
+    /// every epoch.
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
-    pub on_epoch: Option<Box<dyn FnMut(&EpochReport) + 'static>>,
+    pub on_epoch: Option<Box<dyn FnMut(&EpochReport, &Sequential, &ParamStore) + 'static>>,
 }
 
 impl Default for FitConfig {
-    /// 10 epochs, batch 32, Adam at 1e-3, cross-entropy, shuffle seed 0, the default health
-    /// checks, no callback.
+    /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, the
+    /// default health checks, no callback.
     fn default() -> FitConfig {
         FitConfig {
             epochs: 10,
@@ -626,6 +683,7 @@ impl Default for FitConfig {
             },
             loss: Loss::CrossEntropy,
             shuffle_seed: Some(0),
+            schedule: LrSchedule::Constant,
             health: Health::default(),
             on_epoch: None,
         }
@@ -641,6 +699,7 @@ impl fmt::Debug for FitConfig {
             .field("optimizer", &self.optimizer)
             .field("loss", &self.loss)
             .field("shuffle_seed", &self.shuffle_seed)
+            .field("schedule", &self.schedule)
             .field("health", &self.health)
             .field("on_epoch", &self.on_epoch.as_ref().map(|_| "FnMut"))
             .finish()
@@ -680,9 +739,9 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 
 /// Trains `model` on `train` as `config` says and returns each epoch's report.
 ///
-/// Each epoch reshuffles the rows (with `config.shuffle_seed`), takes one [`Trainer::step`]
-/// per batch, ends the epoch of the health checks ([`Trainer::end_epoch`]) and then calls
-/// `config.on_epoch`. The same seeds give bit-identical parameters on every run on the same
+/// Each epoch sets the optimiser's learning rate from `config.schedule`, reshuffles the rows
+/// (with `config.shuffle_seed`), takes one [`Trainer::step`] per batch, ends the epoch of the
+/// health checks ([`Trainer::end_epoch`]) and then calls `config.on_epoch`. The same seeds give bit-identical parameters on every run on the same
 /// machine and kernel level, for any thread count.
 ///
 /// # Errors
@@ -775,7 +834,12 @@ pub fn fit_with_hooks(
         epochs: Vec::with_capacity(config.epochs),
     };
     params.zero_grad();
+    let initial_lr = trainer.optimizer.learning_rate();
     for epoch in 1..=config.epochs {
+        let lr = config
+            .schedule
+            .learning_rate(initial_lr, epoch - 1, config.epochs);
+        trainer.optimizer.set_learning_rate(lr);
         let start = Instant::now();
         let mean_loss = trainer.run_epoch(model, params, train, &mut batcher, hooks)?;
         trainer.end_epoch(epoch)?;
@@ -785,7 +849,7 @@ pub fn fit_with_hooks(
             seconds: start.elapsed().as_secs_f64(),
         };
         if let Some(on_epoch) = config.on_epoch.as_mut() {
-            on_epoch(&report);
+            on_epoch(&report, model, params);
         }
         history.epochs.push(report);
     }
@@ -977,6 +1041,7 @@ mod tests {
             },
             loss: Loss::Mse,
             shuffle_seed: None,
+            schedule: LrSchedule::Constant,
             health: Health::default(),
             on_epoch: None,
         };
@@ -1233,9 +1298,11 @@ mod tests {
         let sink = Arc::clone(&seen);
         let config = FitConfig {
             epochs: 3,
-            on_epoch: Some(Box::new(move |r: &EpochReport| {
-                sink.lock().unwrap().push(*r)
-            })),
+            on_epoch: Some(Box::new(
+                move |r: &EpochReport, _: &Sequential, _: &ParamStore| {
+                    sink.lock().unwrap().push(*r)
+                },
+            )),
             ..FitConfig::default()
         };
         let history = fit(&net, &mut params, &data, config).unwrap();
@@ -1264,7 +1331,110 @@ mod tests {
         );
         assert_eq!(config.loss, Loss::CrossEntropy);
         assert_eq!(config.shuffle_seed, Some(0));
+        assert_eq!(config.schedule, LrSchedule::Constant);
         assert!(config.on_epoch.is_none());
+    }
+
+    /// The cosine rates for 4 epochs equal PyTorch's `CosineAnnealingLR(T_max=4)` stepped
+    /// once per epoch (values printed by PyTorch 2.15.0), with and without a floor; the
+    /// constant schedule returns the initial rate for every epoch.
+    #[test]
+    fn lr_schedule_rates() {
+        let cosine = LrSchedule::Cosine { min_lr: 0.0 };
+        let rates: Vec<f64> = (0..4).map(|e| cosine.learning_rate(1e-3, e, 4)).collect();
+        assert_eq!(
+            rates,
+            [1e-3, 8.535533905932737e-4, 5e-4, 1.4644660940672628e-4]
+        );
+        let floored = LrSchedule::Cosine { min_lr: 0.01 };
+        let rates: Vec<f64> = (0..4).map(|e| floored.learning_rate(0.1, e, 4)).collect();
+        assert_eq!(
+            rates,
+            [
+                0.1,
+                0.08681980515339464,
+                0.05500000000000001,
+                0.023180194846605363
+            ]
+        );
+        for e in 0..4 {
+            assert_eq!(LrSchedule::Constant.learning_rate(0.1, e, 4), 0.1);
+        }
+        assert_eq!(LrSchedule::default(), LrSchedule::Constant);
+    }
+
+    /// The learning rate each epoch of `fit` trains at under `schedule`, starting from SGD at
+    /// 0.1 over 4 epochs, read back from the parameters in `on_epoch`.
+    ///
+    /// The network is one `Linear` from a zero input to a target of 1 under mean squared
+    /// error, one row per epoch, so the output is the bias `b` and one step multiplies the
+    /// distance `1 − b` by `1 − 2·lr`: `lr = (1 − d_new / d_old) / 2`.
+    fn rates_fit_trains_at(schedule: LrSchedule) -> Vec<f64> {
+        use std::sync::{Arc, Mutex};
+        let data = Dataset {
+            x: Tensor::zeros(&[1, 1]),
+            targets: Targets::Values(Tensor::full(&[1, 1], 1.0f32)),
+        };
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
+        let bias = layer.bias();
+        let net = Sequential::new().push(layer);
+        let distances = Arc::new(Mutex::new(vec![1.0f64]));
+        let sink = Arc::clone(&distances);
+        let config = FitConfig {
+            epochs: 4,
+            batch: 1,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.1,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            schedule,
+            // The weight's gradient is exactly 0 (the input is 0); its warning is expected.
+            health: Health {
+                sink: Some(Box::new(|_: &crate::Warning| {})),
+                ..Health::default()
+            },
+            on_epoch: Some(Box::new(
+                move |_: &EpochReport, _: &Sequential, params: &ParamStore| {
+                    let b = f64::from(params.value(bias).data()[0]);
+                    sink.lock().unwrap().push(1.0 - b);
+                },
+            )),
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+        let d = distances.lock().unwrap();
+        d.windows(2).map(|w| (1.0 - w[1] / w[0]) / 2.0).collect()
+    }
+
+    /// `fit` sets each epoch's rate from the cosine schedule before the epoch trains, and
+    /// `on_epoch` sees the parameters after the epoch.
+    #[test]
+    fn fit_follows_the_cosine_schedule() {
+        let rates = rates_fit_trains_at(LrSchedule::Cosine { min_lr: 0.01 });
+        let expected = [
+            0.1,
+            0.08681980515339464,
+            0.05500000000000001,
+            0.023180194846605363,
+        ];
+        assert_eq!(rates.len(), 4);
+        for (e, (got, want)) in rates.iter().zip(expected).enumerate() {
+            // The bias is f32, so the recovered rate carries its rounding.
+            assert!((got - want).abs() < 1e-6, "epoch {e}: {got} vs {want}");
+        }
+    }
+
+    /// With the constant schedule every epoch of `fit` trains at the configured rate.
+    #[test]
+    fn fit_constant_schedule_keeps_the_rate() {
+        let rates = rates_fit_trains_at(LrSchedule::Constant);
+        assert_eq!(rates.len(), 4);
+        for (e, got) in rates.iter().enumerate() {
+            assert!((got - 0.1).abs() < 1e-6, "epoch {e}: {got}");
+        }
     }
 
     /// Every loss trains a step on matching targets and returns the loss the tape computes

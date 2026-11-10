@@ -6,7 +6,8 @@ use cavitation_core::kernels::gemm::threads_used;
 use cavitation_core::kernels::{Level, level, set_threads};
 use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_nn::{
-    Dataset, FitConfig, Health, Init, Linear, Loss, OptimizerConfig, Relu, Sequential, Targets, fit,
+    Dataset, FitConfig, Health, Init, Linear, Loss, LrSchedule, OptimizerConfig, Relu, Sequential,
+    Targets, fit,
 };
 
 /// The batch size of the run: large enough that every product of the step is split.
@@ -59,6 +60,7 @@ fn train() -> Vec<u32> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(5),
+        schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: None,
     };

@@ -55,9 +55,10 @@ pub mod prelude {
     pub use cavitation_nn::{
         Activation, Adam, AdamW, Batcher, Celu, Dataset, Elu, EpochReport, FitConfig, Gelu, Glu,
         Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, Hooks, InferenceModel, Init,
-        Layer, LeakyRelu, Linear, LogSigmoid, LogSoftmax, Loss, Mish, NeuronMask, Optimizer,
-        OptimizerConfig, Prelu, Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax,
-        Softplus, Softsign, Tanh, Targets, Trace, Trainer, Warning, accuracy, fit, load, save,
+        Layer, LeakyRelu, Linear, LogSigmoid, LogSoftmax, Loss, LrSchedule, Mish, NeuronMask,
+        Optimizer, OptimizerConfig, Prelu, Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu,
+        Softmax, Softplus, Softsign, Tanh, Targets, Trace, Trainer, Warning, accuracy, fit, load,
+        save,
     };
 }
 

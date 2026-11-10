@@ -7,8 +7,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use cavitation_nn::{
-    Adam, Batch, Batcher, EpochReport, FitConfig, Health, Init, Linear, Loss, OptimizerConfig,
-    Relu, Sequential, Trainer, Warning, accuracy, fit,
+    Adam, Batch, Batcher, EpochReport, FitConfig, Health, Init, Linear, Loss, LrSchedule,
+    OptimizerConfig, Relu, Sequential, Trainer, Warning, accuracy, fit,
 };
 
 /// The 64 → 256 → 128 → 10 ReLU network (He uniform weights, zero biases, `Rng::seed(1)`),
@@ -44,13 +44,16 @@ fn digits_known_result() {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        schedule: LrSchedule::Constant,
         health: Health::default(),
-        on_epoch: Some(Box::new(|r: &EpochReport| {
-            println!(
-                "epoch {:2}: mean loss {:.6}, {:.3} s",
-                r.epoch, r.mean_loss, r.seconds
-            );
-        })),
+        on_epoch: Some(Box::new(
+            |r: &EpochReport, _: &Sequential, _: &ParamStore| {
+                println!(
+                    "epoch {:2}: mean loss {:.6}, {:.3} s",
+                    r.epoch, r.mean_loss, r.seconds
+                );
+            },
+        )),
     };
     let history = fit(&net, &mut params, &train, config).unwrap();
     assert_eq!(history.epochs.len(), 20);
