@@ -9,8 +9,8 @@
 use std::path::PathBuf;
 
 use cavitation_core::kernels::{Level, level, set_level, supported};
-use cavitation_core::{Graph, ParamStore, Rng, Tensor};
-use cavitation_nn::{Layer, Linear};
+use cavitation_core::{Graph, ParamId, ParamStore, Rng, Tensor};
+use cavitation_nn::{Adam, AdamW, Layer, Linear, Optimizer, Sgd};
 use serde_json::Value;
 
 /// A tensor read from a fixture: its shape and its values as f64.
@@ -173,5 +173,111 @@ fn linear_matches_pytorch() {
     for l in ALL_LEVELS.into_iter().filter(|&l| supported(l)) {
         set_level(l).expect("a supported level can be set");
         check_at_current_level();
+    }
+}
+
+/// Copies a fixture tensor's values over the parameter `id`.
+fn set_value(params: &mut ParamStore, id: ParamId, t: &Tens) {
+    params
+        .value_mut(id)
+        .data_mut()
+        .copy_from_slice(to_tensor(t).data());
+}
+
+/// Checks `got` against PyTorch's `want` within `1e-6 + 1e-5 * |torch|`.
+fn within(case: &str, step: usize, what: &str, got: &[f32], want: &Tens) {
+    assert_eq!(got.len(), want.data.len(), "{case}: {what} length");
+    for (i, (&g, &w)) in got.iter().zip(&want.data).enumerate() {
+        let limit = 1e-6 + 1e-5 * w.abs();
+        assert!(
+            (f64::from(g) - w).abs() <= limit,
+            "{case}, step {}: {what}[{i}] is {g:e}, torch has {w:e} (limit {limit:e})",
+            step + 1
+        );
+    }
+}
+
+/// Builds the optimiser a fixture's `params` describe.
+fn optimizer_for(v: &Value) -> Box<dyn Optimizer<f32>> {
+    let p = &v["params"];
+    let get = |key: &str| p[key].as_f64();
+    let lr = get("lr").expect("lr");
+    let wd = get("weight_decay");
+    match v["optimizer"].as_str().expect("optimizer name") {
+        "SGD" => {
+            let mut o = Sgd::new(lr);
+            if let Some(m) = get("momentum") {
+                o = o.with_momentum(m);
+            }
+            if let Some(w) = wd {
+                o = o.with_weight_decay(w);
+            }
+            Box::new(o)
+        }
+        "Adam" => {
+            let o = Adam::new(lr);
+            Box::new(match wd {
+                Some(w) => o.with_weight_decay(w),
+                None => o,
+            })
+        }
+        "AdamW" => {
+            let o = AdamW::new(lr);
+            Box::new(match wd {
+                Some(w) => o.with_weight_decay(w),
+                None => o,
+            })
+        }
+        other => panic!("unknown optimiser {other}"),
+    }
+}
+
+/// Every optimiser fixture: ten steps on a weight and a bias, with the fixture's gradients,
+/// agree with `torch.optim` after every step.
+#[test]
+fn optimizers_match_pytorch() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/optim");
+    let mut names: Vec<_> = std::fs::read_dir(&dir)
+        .expect("fixture directory")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 5, "expected five optimiser fixtures");
+    for path in names {
+        let case = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let mut opt = optimizer_for(&v);
+        let mut params = ParamStore::new();
+        let w = params.add(Tensor::zeros(&[4, 3]));
+        let b = params.add(Tensor::zeros(&[3]));
+        set_value(&mut params, w, &parse_tensor(&v["initial"]["weight"]));
+        set_value(&mut params, b, &parse_tensor(&v["initial"]["bias"]));
+        let grads = v["grads"].as_array().unwrap();
+        let after = v["after"].as_array().unwrap();
+        assert_eq!(grads.len(), 10);
+        for (step, (g, a)) in grads.iter().zip(after).enumerate() {
+            params.zero_grad();
+            for (id, key) in [(w, "weight"), (b, "bias")] {
+                let (mut buf, stale) = params.grads.accumulate(id);
+                assert!(stale);
+                buf.data_mut()
+                    .copy_from_slice(to_tensor(&parse_tensor(&g[key])).data());
+            }
+            opt.step(&mut params);
+            within(
+                &case,
+                step,
+                "weight",
+                params.value(w).data(),
+                &parse_tensor(&a["weight"]),
+            );
+            within(
+                &case,
+                step,
+                "bias",
+                params.value(b).data(),
+                &parse_tensor(&a["bias"]),
+            );
+        }
     }
 }

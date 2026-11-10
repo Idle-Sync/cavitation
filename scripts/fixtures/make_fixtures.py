@@ -54,6 +54,7 @@ torch.manual_seed(0)
 TORCH_VERSION = torch.__version__.split("+")[0]
 CASES = []
 LAYER_CASES = []
+OPTIM_CASES = []
 
 
 def rnd(*shape, scale=1.0):
@@ -413,6 +414,53 @@ def make_layers():
     )
 
 
+def make_optimizers():
+    """Ten steps of each optimiser on a [4, 3] weight and a [3] bias.
+
+    The gradients are fixed per step (drawn from a generator seeded 0, independent of the
+    cases above) and set directly, so the fixture holds exactly the numbers `torch.optim`
+    was given: the starting values, the ten gradients and the parameters after each step.
+    """
+    configs = [
+        ("sgd", torch.optim.SGD, {"lr": 0.1}),
+        ("sgd-momentum", torch.optim.SGD, {"lr": 0.1, "momentum": 0.9}),
+        ("adam", torch.optim.Adam, {"lr": 0.01}),
+        ("adamw", torch.optim.AdamW, {"lr": 0.01, "weight_decay": 0.01}),
+        ("adam-weight-decay", torch.optim.Adam, {"lr": 0.01, "weight_decay": 0.1}),
+    ]
+    steps = 10
+    for name, cls, kwargs in configs:
+        gen = torch.Generator().manual_seed(0)
+        weight = torch.nn.Parameter(torch.randn(4, 3, generator=gen))
+        bias = torch.nn.Parameter(torch.randn(3, generator=gen))
+        init = {"weight": tensor_json(weight, F32_DIGITS), "bias": tensor_json(bias, F32_DIGITS)}
+        opt = cls([weight, bias], **kwargs)
+        grads, after = [], []
+        for _ in range(steps):
+            gw = torch.randn(4, 3, generator=gen)
+            gb = torch.randn(3, generator=gen)
+            # The fixture stores the rounded gradients, so torch must use the same values.
+            gw = torch.tensor(tensor_json(gw, F32_DIGITS)["data"], dtype=torch.float32).reshape(4, 3)
+            gb = torch.tensor(tensor_json(gb, F32_DIGITS)["data"], dtype=torch.float32)
+            weight.grad, bias.grad = gw.clone(), gb.clone()
+            opt.step()
+            grads.append({"weight": tensor_json(gw, F32_DIGITS), "bias": tensor_json(gb, F32_DIGITS)})
+            after.append({"weight": tensor_json(weight, F32_DIGITS), "bias": tensor_json(bias, F32_DIGITS)})
+        OPTIM_CASES.append(
+            (
+                name,
+                {
+                    "torch_version": TORCH_VERSION,
+                    "optimizer": cls.__name__,
+                    "params": kwargs,
+                    "initial": init,
+                    "grads": grads,
+                    "after": after,
+                },
+            )
+        )
+
+
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
@@ -425,6 +473,7 @@ def main():
     make_softmax()
     make_losses()
     make_layers()
+    make_optimizers()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):
@@ -447,6 +496,13 @@ def main():
             json.dump(body, f, separators=(",", ":"))
             f.write("\n")
     print(f"wrote {len(LAYER_CASES)} fixtures to {layer_dir} with torch {TORCH_VERSION}", file=sys.stderr)
+    optim_dir = os.path.join(args.out, "cavitation-nn", "tests", "fixtures", "optim")
+    os.makedirs(optim_dir, exist_ok=True)
+    for name, body in OPTIM_CASES:
+        with open(os.path.join(optim_dir, name + ".json"), "w") as f:
+            json.dump(body, f, separators=(",", ":"))
+            f.write("\n")
+    print(f"wrote {len(OPTIM_CASES)} fixtures to {optim_dir} with torch {TORCH_VERSION}", file=sys.stderr)
 
 
 if __name__ == "__main__":

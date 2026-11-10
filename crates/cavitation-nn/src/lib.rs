@@ -4,6 +4,7 @@ mod activation;
 mod init;
 mod layer;
 mod linear;
+mod optim;
 mod sequential;
 
 pub use activation::{
@@ -14,4 +15,5 @@ pub use activation::{
 pub use init::Init;
 pub use layer::Layer;
 pub use linear::Linear;
+pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
