@@ -25,7 +25,7 @@ pub use custom::CustomOp;
 use elementwise::Kind;
 pub(crate) use erf::{erf_f32, erf_f64};
 pub use glu::Gate;
-pub use loss::Reduction;
+pub use loss::{Reduction, log_softmax_row, softmax_row};
 
 /// A recorded operation: what produced a node, with its inputs and anything its backward
 /// pass needs, stored inline so that recording never allocates.

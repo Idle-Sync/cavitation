@@ -12,7 +12,7 @@ use std::sync::Arc;
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
-use cavitation_core::{Error, Gate, ParamStore, TensorView};
+use cavitation_core::{Error, Gate, ParamStore, TensorView, log_softmax_row, softmax_row};
 
 use crate::{Activation, ActivationKind, Sequential};
 
@@ -474,6 +474,30 @@ impl Run {
                     );
                     cur = Some(to);
                 }
+                InferenceLayer::Softmax | InferenceLayer::LogSoftmax => {
+                    let to = cur.map_or(0, |c| 1 - c);
+                    let [b0, b1] = bufs;
+                    let (src, dst): (&[f32], &mut [f32]) = match cur {
+                        None => (input, if to == 0 { b0 } else { b1 }),
+                        Some(0) => (b0, b1),
+                        Some(_) => (b1, b0),
+                    };
+                    let row = if matches!(step.form, InferenceLayer::Softmax) {
+                        softmax_row::<f32>
+                    } else {
+                        log_softmax_row::<f32>
+                    };
+                    let width = step.inputs;
+                    if width > 0 {
+                        for (x, y) in src[..n_in]
+                            .chunks_exact(width)
+                            .zip(dst[..n_out].chunks_exact_mut(width))
+                        {
+                            row(x, y);
+                        }
+                    }
+                    cur = Some(to);
+                }
                 InferenceLayer::Glu(gate) => {
                     let (width, half) = (step.inputs, step.outputs);
                     let c = cur.unwrap_or(0);
@@ -578,32 +602,6 @@ fn element_wise(form: &InferenceLayer, data: &mut [f32], width: usize) {
                 }
             }
         }
-        InferenceLayer::Softmax => {
-            for row in data.chunks_exact_mut(width) {
-                let m = row_max(row);
-                let mut sum = 0.0f32;
-                for v in row.iter_mut() {
-                    *v = (*v - m).exp();
-                    sum += *v;
-                }
-                for v in row.iter_mut() {
-                    *v /= sum;
-                }
-            }
-        }
-        InferenceLayer::LogSoftmax => {
-            for row in data.chunks_exact_mut(width) {
-                let m = row_max(row);
-                let mut sum = 0.0f32;
-                for &v in row.iter() {
-                    sum += (v - m).exp();
-                }
-                let lse = sum.ln();
-                for v in row.iter_mut() {
-                    *v = *v - m - lse;
-                }
-            }
-        }
         InferenceLayer::Mask(keep) => {
             for row in data.chunks_exact_mut(width) {
                 for (v, &k) in row.iter_mut().zip(keep) {
@@ -613,25 +611,13 @@ fn element_wise(form: &InferenceLayer, data: &mut [f32], width: usize) {
                 }
             }
         }
-        InferenceLayer::Linear { .. } | InferenceLayer::Glu(_) => {
-            unreachable!("Linear and Glu steps change the width and run on their own")
+        InferenceLayer::Linear { .. }
+        | InferenceLayer::Glu(_)
+        | InferenceLayer::Softmax
+        | InferenceLayer::LogSoftmax => {
+            unreachable!("Linear, Glu, Softmax and LogSoftmax steps run on their own")
         }
     }
-}
-
-/// The largest value of a non-empty row, or the first NaN after the first value; the same
-/// maximum the tape's softmax subtracts.
-fn row_max(row: &[f32]) -> f32 {
-    let mut m = row[0];
-    for &v in &row[1..] {
-        if v.is_nan() {
-            return v;
-        }
-        if v > m {
-            m = v;
-        }
-    }
-    m
 }
 
 #[cfg(test)]

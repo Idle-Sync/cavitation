@@ -13,7 +13,7 @@ mod tensor;
 pub use check::{GradcheckFailure, GradcheckReport, gradcheck, gradcheck_params};
 pub use error::Error;
 pub use graph::{Graph, ParamGrads, ParamId, ParamStore, ParamValues, Tape, Var};
-pub use ops::{CustomOp, Gate, GeluApprox, Reduction};
+pub use ops::{CustomOp, Gate, GeluApprox, Reduction, log_softmax_row, softmax_row};
 pub use real::Real;
 pub use rng::{Rng, SplitMix64};
 pub use shape::Shape;

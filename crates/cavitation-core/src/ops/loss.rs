@@ -156,6 +156,76 @@ fn log_sum_exp<T: Real>(row: &[T]) -> (T, T) {
     (m, s.ln())
 }
 
+/// The softmax of one row, `out[i] = e^(input[i] - max) / Σ e^(input - max)`, with the row's
+/// maximum subtracted so that large values do not overflow. NaN anywhere in the row makes
+/// the whole row NaN. This is the computation [`Tape::softmax`] records for each row of its
+/// last axis, so the two give the same bits. An empty row writes nothing.
+///
+/// # Panics
+///
+/// Panics, naming both lengths, if `out.len() != input.len()`.
+///
+/// # Examples
+///
+/// ```
+/// let mut out = [0.0f32; 3];
+/// cavitation_core::softmax_row(&[1e4, 0.0, -1e4], &mut out);
+/// assert_eq!(out, [1.0, 0.0, 0.0]);
+/// ```
+pub fn softmax_row<T: Real>(input: &[T], out: &mut [T]) {
+    assert!(
+        out.len() == input.len(),
+        "softmax_row: the output has {} values but the input has {}",
+        out.len(),
+        input.len()
+    );
+    if input.is_empty() {
+        return;
+    }
+    let m = row_max(input);
+    let mut sum = T::ZERO;
+    for (o, &z) in out.iter_mut().zip(input) {
+        let e = (z - m).exp();
+        *o = e;
+        sum += e;
+    }
+    for o in out.iter_mut() {
+        *o = *o / sum;
+    }
+}
+
+/// The log-softmax of one row, `out[i] = input[i] - max - ln Σ e^(input - max)`, which never
+/// overflows. NaN anywhere in the row makes the whole row NaN. This is the computation
+/// [`Tape::log_softmax`] records for each row of its last axis, so the two give the same
+/// bits. An empty row writes nothing.
+///
+/// # Panics
+///
+/// Panics, naming both lengths, if `out.len() != input.len()`.
+///
+/// # Examples
+///
+/// ```
+/// let mut out = [0.0f32; 2];
+/// cavitation_core::log_softmax_row(&[1e4, 0.0], &mut out);
+/// assert_eq!(out, [0.0, -1e4]);
+/// ```
+pub fn log_softmax_row<T: Real>(input: &[T], out: &mut [T]) {
+    assert!(
+        out.len() == input.len(),
+        "log_softmax_row: the output has {} values but the input has {}",
+        out.len(),
+        input.len()
+    );
+    if input.is_empty() {
+        return;
+    }
+    let (m, lse) = log_sum_exp(input);
+    for (o, &z) in out.iter_mut().zip(input) {
+        *o = z - m - lse;
+    }
+}
+
 /// Checks that `shape` is `[batch, classes]` with one label per row, each below `classes`,
 /// and returns `(batch, classes)`.
 ///
@@ -218,16 +288,7 @@ impl<T: Real> Tape<'_, T> {
                 .chunks_exact_mut(width)
                 .zip(self.data(x).chunks_exact(width))
             {
-                let m = row_max(row);
-                let mut sum = T::ZERO;
-                for (o, &z) in o.iter_mut().zip(row) {
-                    let e = (z - m).exp();
-                    *o = e;
-                    sum += e;
-                }
-                for o in o.iter_mut() {
-                    *o = *o / sum;
-                }
+                softmax_row(row, o);
             }
         }
         self.push(Op::Softmax(x), shape, out)
@@ -259,10 +320,7 @@ impl<T: Real> Tape<'_, T> {
                 .chunks_exact_mut(width)
                 .zip(self.data(x).chunks_exact(width))
             {
-                let (m, lse) = log_sum_exp(row);
-                for (o, &z) in o.iter_mut().zip(row) {
-                    *o = z - m - lse;
-                }
+                log_softmax_row(row, o);
             }
         }
         self.push(Op::LogSoftmax(x), shape, out)
