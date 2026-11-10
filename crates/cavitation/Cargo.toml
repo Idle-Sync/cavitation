@@ -6,6 +6,9 @@ description = "A fast, glass-box neural network library for the CPU."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
 
 [lints]
 workspace = true
