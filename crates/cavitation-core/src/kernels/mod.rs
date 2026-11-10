@@ -1,5 +1,26 @@
 //! CPU kernels: strided matrix views, the plain reference implementations, the kernel level
 //! (which instruction set the fast kernels use) and the thread count.
+//!
+//! The tape's matrix products and the optimisers run on these kernels; most programs never
+//! call them directly. [`MatRef`] and [`MatMut`] describe a matrix inside a slice by its
+//! strides, so a transposed or column-major matrix needs no copy. [`gemm`] and [`matvec`]
+//! hold the fast kernels, [`reference`](mod@reference) the plain loops they are tested against, and
+//! [`pool`] the thread pool the threaded kernels share. [`level`] and [`threads`] report
+//! what the fast kernels use, and `CAVITATION_KERNEL` and `CAVITATION_THREADS` override them.
+//!
+//! # Examples
+//!
+//! ```
+//! use cavitation_core::kernels::{MatRef, level, supported, threads};
+//! // The current level is always one this CPU can run, and there is at least one thread.
+//! assert!(supported(level()));
+//! assert!(threads() >= 1);
+//! // A 2 x 3 row-major matrix, and its transpose read through the same storage.
+//! let a = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+//! let m = MatRef::new(&a, 2, 3, 3, 1).unwrap();
+//! let t = MatRef::new(&a, 3, 2, 1, 3).unwrap();
+//! assert_eq!((m.get(0, 2), t.get(2, 0)), (3.0, 3.0));
+//! ```
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;

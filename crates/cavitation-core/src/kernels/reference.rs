@@ -1,4 +1,25 @@
 //! Plain reference GEMM and matvec: the simple loops that fast kernels are tested against.
+//!
+//! They are generic over [`Real`], so they also give the `f64` products the
+//! gradient checks use.
+//!
+//! # Examples
+//!
+//! ```
+//! use cavitation_core::kernels::{MatMut, MatRef, reference};
+//! let a = [1.0f64, 2.0, 3.0];
+//! let b = [4.0f64, 5.0, 6.0];
+//! let mut c = [0.0f64; 1];
+//! // A 1 x 3 row times a 3 x 1 column: the dot product.
+//! reference::gemm(
+//!     1.0,
+//!     MatRef::new(&a, 1, 3, 3, 1).unwrap(),
+//!     MatRef::new(&b, 3, 1, 1, 1).unwrap(),
+//!     0.0,
+//!     MatMut::new(&mut c, 1, 1, 1, 1).unwrap(),
+//! );
+//! assert_eq!(c, [32.0]);
+//! ```
 
 use super::{MatMut, MatRef};
 use crate::Real;

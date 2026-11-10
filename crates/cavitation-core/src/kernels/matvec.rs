@@ -7,6 +7,25 @@
 //! partial sums in the output between groups. The SSE4.2 kernel multiplies and adds separately,
 //! exactly as the reference loop does; the AVX2 and NEON kernels fuse each step into one
 //! multiply-add (one rounding instead of two).
+//!
+//! # Examples
+//!
+//! One input through a 3-input, 2-output layer, against the reference twin
+//! [`reference::matvec`]:
+//!
+//! ```
+//! use cavitation_core::kernels::matvec::matvec_f32;
+//! use cavitation_core::kernels::{MatRef, reference};
+//! // The weights stored transposed: row i holds input i's weight to each output.
+//! let w_t = [0.5f32, -1.0, 0.25, 2.0, -0.75, 0.5];
+//! let w = MatRef::new(&w_t, 3, 2, 2, 1).unwrap();
+//! let (x, bias) = ([1.0f32, 2.0, 4.0], [0.125f32, -0.5]);
+//! let (mut fast, mut slow) = ([0.0f32; 2], [0.0f32; 2]);
+//! matvec_f32(w, &x, Some(&bias), false, &mut fast);
+//! reference::matvec(w, &x, Some(&bias), &mut slow);
+//! assert_eq!(fast, slow); // small integers and halves: every level is exact here
+//! assert_eq!(fast, [-1.875, 4.5]);
+//! ```
 
 use super::{Level, MatRef, detected_features, reference, supported};
 

@@ -4,6 +4,23 @@
 //! worker spins for about 200 microseconds, so the next job in a burst (the matrix products
 //! of one training step) starts without a wake-up, then parks. Running a job allocates
 //! nothing once the pool has as many workers as the job asks for.
+//!
+//! # Examples
+//!
+//! Squares of 0 to 99, each task writing its own block, so the result is the same for any
+//! thread count:
+//!
+//! ```
+//! use cavitation_core::kernels::pool::{Task, run};
+//! use std::sync::atomic::{AtomicU64, Ordering};
+//! let out: Vec<AtomicU64> = (0..100).map(|_| AtomicU64::new(0)).collect();
+//! run(4, 10, &|t: Task| {
+//!     for i in t.index * 10..(t.index + 1) * 10 {
+//!         out[i].store((i * i) as u64, Ordering::Relaxed);
+//!     }
+//! });
+//! assert_eq!(out[99].load(Ordering::Relaxed), 9801);
+//! ```
 
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};

@@ -12,6 +12,27 @@
 //! each block summed in order inside the microkernel. The blocking depends only on the
 //! shape, never on the thread count, and `k` is never split between threads, so any thread
 //! count (and the single-thread path for small products) gives bit-identical results.
+//!
+//! # Examples
+//!
+//! The packed product agrees with its reference twin, [`reference::gemm`], here on a
+//! product with `B` transposed:
+//!
+//! ```
+//! use cavitation_core::kernels::gemm::gemm_f32;
+//! use cavitation_core::kernels::{MatMut, MatRef, reference};
+//! let (m, n, k) = (5, 7, 9);
+//! let a: Vec<f32> = (0..m * k).map(|i| (i % 7) as f32 * 0.25 - 0.75).collect();
+//! let bt: Vec<f32> = (0..n * k).map(|i| (i % 5) as f32 * 0.5 - 1.0).collect();
+//! let a_view = MatRef::new(&a, m, k, k, 1).unwrap();
+//! let b_view = MatRef::new(&bt, k, n, 1, k).unwrap(); // B stored as its transpose
+//! let (mut fast, mut slow) = (vec![0.0f32; m * n], vec![0.0f32; m * n]);
+//! gemm_f32(1.0, a_view, b_view, 0.0, MatMut::new(&mut fast, m, n, n, 1).unwrap());
+//! reference::gemm(1.0, a_view, b_view, 0.0, MatMut::new(&mut slow, m, n, n, 1).unwrap());
+//! for (f, s) in fast.iter().zip(&slow) {
+//!     assert!((f - s).abs() <= 1e-5 * (1.0 + s.abs()));
+//! }
+//! ```
 
 use std::cell::RefCell;
 
