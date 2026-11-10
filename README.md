@@ -167,7 +167,7 @@ The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH
 Two environment variables change how the library runs, for the benchmark and for your own programs:
 
 - `CAVITATION_KERNEL` forces a kernel level: `reference`, `sse4.2`, `avx2` or `neon`. The default is the best level the CPU supports.
-- `CAVITATION_THREADS` sets the number of threads for matrix products. The default is the number of logical cores.
+- `CAVITATION_THREADS` sets the number of threads the threaded kernels use: the matrix products (in training and in `infer_batch`) and the optimiser update. The default is the number of logical cores; `infer` always runs on the calling thread.
 
 ## Tests
 
