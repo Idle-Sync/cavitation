@@ -1,8 +1,15 @@
 //! CPU kernels: strided matrix views, the plain reference implementations, the kernel level
 //! (which instruction set the fast kernels use) and the thread count.
 
+pub mod gemm;
 pub mod pool;
 pub mod reference;
+#[cfg(target_arch = "x86_64")]
+mod x86;
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod twin_tests;
 
 use crate::Real;
 use crate::error::Error;
@@ -630,6 +637,17 @@ impl<'a, T: Real> MatMut<'a, T> {
             self.cols
         );
         self.data[i * self.row_stride + j * self.col_stride]
+    }
+
+    /// The same data seen as the transpose: rows and columns swap, and so do the strides.
+    pub(crate) fn transpose(self) -> Self {
+        Self {
+            data: self.data,
+            rows: self.cols,
+            cols: self.rows,
+            row_stride: self.col_stride,
+            col_stride: self.row_stride,
+        }
     }
 
     /// A mutable reference to the element at row `i`, column `j`.

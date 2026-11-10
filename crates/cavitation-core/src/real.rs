@@ -158,7 +158,9 @@ pub trait Real:
     /// assert!(!f32::NAN.is_finite());
     /// ```
     fn is_finite(self) -> bool;
-    /// General matrix multiply, `C = alpha * A * B + beta * C`, with the kernel for this type.
+    /// General matrix multiply, `C = alpha * A * B + beta * C`, with the kernel for this type:
+    /// [`kernels::gemm::gemm_f32`](crate::kernels::gemm::gemm_f32) for f32 (the current kernel
+    /// level and thread count), the reference loops for f64.
     /// Results match [`kernels::reference::gemm`](crate::kernels::reference::gemm) within the
     /// rounding of a different summation order; when `beta` is zero the old contents of `C`
     /// are never read.
@@ -193,7 +195,7 @@ thread_local! {
 
 /// Implements `Real` for a primitive float type by forwarding to its inherent methods.
 macro_rules! impl_real {
-    ($t:ident, $erf:path) => {
+    ($t:ident, $erf:path, $gemm:path) => {
         impl Real for $t {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
@@ -240,14 +242,14 @@ macro_rules! impl_real {
             fn gemm(alpha: Self, a: MatRef<Self>, b: MatRef<Self>, beta: Self, c: MatMut<Self>) {
                 #[cfg(test)]
                 GEMM_CALLS.with(|n| n.set(n.get() + 1));
-                crate::kernels::reference::gemm(alpha, a, b, beta, c);
+                $gemm(alpha, a, b, beta, c);
             }
         }
     };
 }
 
-impl_real!(f32, crate::ops::erf_f32);
-impl_real!(f64, crate::ops::erf_f64);
+impl_real!(f32, crate::ops::erf_f32, crate::kernels::gemm::gemm_f32);
+impl_real!(f64, crate::ops::erf_f64, crate::kernels::reference::gemm);
 
 /// Tests for `Real`.
 #[cfg(test)]

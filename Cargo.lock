@@ -15,6 +15,7 @@ dependencies = [
 name = "cavitation-bench"
 version = "0.1.0"
 dependencies = [
+ "cavitation-core",
  "cavitation-datasets",
 ]
 

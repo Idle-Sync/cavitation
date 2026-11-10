@@ -7,7 +7,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::pool::{self, Task};
+use cavitation_core::kernels::{MatMut, MatRef, level};
 
 use std::sync::Arc;
 
@@ -349,18 +351,63 @@ fn pool_steady_state() -> usize {
     made
 }
 
+/// The f32 GEMM on 4 threads at the current kernel level, alternating a large forward-pass
+/// product (128 x 1024 x 784, B transposed) and a small one (32 x 10 x 256): 3 warm-up rounds
+/// (which size the packing buffers), then 10 counted rounds. Returns the allocations made
+/// during the counted rounds, on any thread.
+fn gemm_steady_state() -> usize {
+    let a1 = vec![0.25f32; 128 * 784];
+    let w1 = vec![0.5f32; 1024 * 784];
+    let mut c1 = vec![0.0f32; 128 * 1024];
+    let a2 = vec![0.5f32; 32 * 256];
+    let b2 = vec![0.25f32; 256 * 10];
+    let mut c2 = vec![0.0f32; 32 * 10];
+    let level = level();
+    let mut round = |beta: f32| {
+        gemm_f32_with(
+            level,
+            4,
+            1.0,
+            MatRef::new(&a1, 128, 784, 784, 1).unwrap(),
+            MatRef::new(&w1, 1024, 784, 784, 1).unwrap().transpose(),
+            beta,
+            MatMut::new(&mut c1, 128, 1024, 1024, 1).unwrap(),
+        );
+        gemm_f32_with(
+            level,
+            4,
+            1.0,
+            MatRef::new(&a2, 32, 256, 256, 1).unwrap(),
+            MatRef::new(&b2, 256, 10, 10, 1).unwrap(),
+            beta,
+            MatMut::new(&mut c2, 32, 10, 10, 1).unwrap(),
+        );
+    };
+    for _ in 0..3 {
+        round(0.0);
+    }
+    let before = allocations();
+    for i in 0..10 {
+        round(if i % 2 == 0 { 0.0 } else { 1.0 });
+    }
+    let made = allocations() - before;
+    assert!(c1[0].is_finite() && c2[0].is_finite());
+    made
+}
+
 /// A named scenario: runs, and returns the allocations it made after warm-up.
 type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 6] = [
+    let scenarios: [Scenario; 7] = [
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
         ("cross_entropy_steady_state", cross_entropy_steady_state),
         ("bce_and_nll_steady_state", bce_and_nll_steady_state),
         ("custom_op_steady_state", custom_op_steady_state),
         ("pool_steady_state", pool_steady_state),
+        ("gemm_steady_state", gemm_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

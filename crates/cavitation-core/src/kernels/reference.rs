@@ -39,6 +39,25 @@ use crate::Real;
 /// assert_eq!(c, [19.0, 22.0, 43.0, 50.0]);
 /// ```
 pub fn gemm<T: Real>(alpha: T, a: MatRef<T>, b: MatRef<T>, beta: T, mut c: MatMut<T>) {
+    check_gemm_shapes(&a, &b, &c);
+    for i in 0..a.rows() {
+        for j in 0..b.cols() {
+            let mut acc = T::ZERO;
+            for p in 0..a.cols() {
+                acc += a.get(i, p) * b.get(p, j);
+            }
+            let out = c.get_mut(i, j);
+            *out = if beta == T::ZERO {
+                alpha * acc
+            } else {
+                beta * *out + alpha * acc
+            };
+        }
+    }
+}
+
+/// Panics, naming the shapes, unless `A · B` is defined and has `C`'s shape.
+pub(super) fn check_gemm_shapes<T: Real>(a: &MatRef<T>, b: &MatRef<T>, c: &MatMut<T>) {
     assert!(
         a.cols() == b.rows(),
         "gemm: inner dimensions differ: A is {} x {}, B is {} x {}",
@@ -59,20 +78,6 @@ pub fn gemm<T: Real>(alpha: T, a: MatRef<T>, b: MatRef<T>, beta: T, mut c: MatMu
         a.rows(),
         b.cols()
     );
-    for i in 0..a.rows() {
-        for j in 0..b.cols() {
-            let mut acc = T::ZERO;
-            for p in 0..a.cols() {
-                acc += a.get(i, p) * b.get(p, j);
-            }
-            let out = c.get_mut(i, j);
-            *out = if beta == T::ZERO {
-                alpha * acc
-            } else {
-                beta * *out + alpha * acc
-            };
-        }
-    }
 }
 
 /// One input vector times a weight matrix stored transposed: `out[j] = bias[j] + sum_i x[i] * w_t[i][j]`.
