@@ -1,8 +1,10 @@
 //! Gradient checks of the operations, through the numerical check harness.
 
+use std::sync::Arc;
+
 use cavitation_core::{
-    Gate, GeluApprox, GradcheckReport, ParamStore, Reduction, Rng, Tape, Tensor, Var, gradcheck,
-    gradcheck_params,
+    CustomOp, Gate, GeluApprox, GradcheckReport, Graph, ParamStore, Real, Reduction, Rng, Shape,
+    Tape, Tensor, TensorView, TensorViewMut, Var, gradcheck, gradcheck_params,
 };
 
 fn t(data: &[f64]) -> Tensor<f64> {
@@ -497,4 +499,108 @@ fn gradcheck_kl_div() {
         let report = gradcheck(|t, v| t.kl_div(v[0], v[1], r), &x);
         assert!(report.passed(), "kl_div {r:?}: {report:?}");
     }
+}
+
+/// A user-defined cube, `x³`, whose backward pass wrongly uses the derivative `2x`.
+struct WrongCube;
+
+impl<T: Real> CustomOp<T> for WrongCube {
+    fn name(&self) -> &str {
+        "wrong_cube"
+    }
+
+    fn output_shape(&self, inputs: &[Shape]) -> Shape {
+        inputs[0]
+    }
+
+    fn forward(&self, inputs: &[TensorView<T>], mut output: TensorViewMut<T>) {
+        for (o, &x) in output.data_mut().iter_mut().zip(inputs[0].data()) {
+            *o = x * x * x;
+        }
+    }
+
+    fn backward(
+        &self,
+        inputs: &[TensorView<T>],
+        _output: TensorView<T>,
+        grad_output: TensorView<T>,
+        grad_inputs: &mut [TensorViewMut<T>],
+    ) {
+        let x = inputs[0].data();
+        for (i, g) in grad_inputs[0].data_mut().iter_mut().enumerate() {
+            *g = (x[i] + x[i]) * grad_output.data()[i];
+        }
+    }
+}
+
+/// The gradient check catches a user-defined operation with a wrong backward pass.
+#[test]
+fn custom_op_wrong_backward_is_caught() {
+    let op: Arc<dyn CustomOp<f64> + Send + Sync> = Arc::new(WrongCube);
+    let report = gradcheck(|t, v| t.custom(&op, &[v[0]]), &[t(&[0.5, -1.5, 2.0])]);
+    assert!(!report.passed());
+    assert_eq!(report.failures.len(), 3);
+}
+
+/// A user-defined two-input multiply, `a · b`.
+struct CustomMul;
+
+impl<T: Real> CustomOp<T> for CustomMul {
+    fn name(&self) -> &str {
+        "custom_mul"
+    }
+
+    fn output_shape(&self, inputs: &[Shape]) -> Shape {
+        assert_eq!(inputs[0], inputs[1], "custom_mul: shapes differ");
+        inputs[0]
+    }
+
+    fn forward(&self, inputs: &[TensorView<T>], mut output: TensorViewMut<T>) {
+        let (a, b) = (inputs[0].data(), inputs[1].data());
+        for (i, o) in output.data_mut().iter_mut().enumerate() {
+            *o = a[i] * b[i];
+        }
+    }
+
+    fn backward(
+        &self,
+        inputs: &[TensorView<T>],
+        _output: TensorView<T>,
+        grad_output: TensorView<T>,
+        grad_inputs: &mut [TensorViewMut<T>],
+    ) {
+        let (a, b, g) = (inputs[0].data(), inputs[1].data(), grad_output.data());
+        let [ga, gb] = grad_inputs else {
+            panic!("custom_mul takes two inputs")
+        };
+        for i in 0..g.len() {
+            ga.data_mut()[i] += b[i] * g[i];
+            gb.data_mut()[i] += a[i] * g[i];
+        }
+    }
+}
+
+/// `x · x` written as a two-input custom multiply gets the gradient `2x`: each input slot
+/// gets its own scratch buffer and both are added into `x`'s gradient.
+#[test]
+fn custom_op_same_var_twice() {
+    let op: Arc<dyn CustomOp<f64> + Send + Sync> = Arc::new(CustomMul);
+    let x = t(&[0.5, -1.5, 2.0]);
+    gradcheck(
+        |t, v| t.custom(&op, &[v[0], v[0]]),
+        std::slice::from_ref(&x),
+    )
+    .assert_passed();
+
+    let mut store = ParamStore::<f64>::new_generic();
+    let p = store.add(x);
+    let mut graph = Graph::<f64>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let v = tape.param(p);
+    let sq = tape.custom(&op, &[v, v]);
+    assert_eq!(tape.value(sq).data(), &[0.25, 2.25, 4.0]);
+    let loss = tape.sum(sq);
+    tape.backward(loss, &mut store.grads);
+    drop(tape);
+    assert_eq!(store.grad(p).data(), &[1.0, -3.0, 4.0]);
 }

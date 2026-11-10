@@ -2,9 +2,11 @@
 //!
 //! Each operation's forward pass is a [`Tape`](crate::Tape) method in the operation's file.
 //! Adding an operation means adding its variant to [`Op`], its arm to [`Op::backward`], and
-//! its file's forward and backward functions.
+//! its file's forward and backward functions. Operations defined outside the crate go
+//! through [`CustomOp`] instead.
 
 mod activation;
+mod custom;
 mod elementwise;
 mod erf;
 mod glu;
@@ -14,9 +16,12 @@ mod reduce;
 #[cfg(test)]
 mod wrong;
 
+use std::sync::Arc;
+
 use crate::Real;
 use crate::graph::{BackwardCtx, ParamId, Var};
 pub use activation::GeluApprox;
+pub use custom::CustomOp;
 use elementwise::Kind;
 pub(crate) use erf::{erf_f32, erf_f64};
 pub use glu::Gate;
@@ -25,7 +30,7 @@ pub use loss::Reduction;
 /// A recorded operation: what produced a node, with its inputs and anything its backward
 /// pass needs, stored inline so that recording never allocates.
 #[derive(Debug)]
-pub(crate) enum Op {
+pub(crate) enum Op<T: Real> {
     /// A value copied in from outside; takes no gradient.
     Input,
     /// A parameter read in place from the borrowed parameter values.
@@ -110,6 +115,13 @@ pub(crate) enum Op {
     SmoothL1(Var, Var, f64, Reduction),
     /// KL divergence of log-probabilities from target probabilities: the reduction.
     KlDiv(Var, Var, Reduction),
+    /// A user-defined operation: the operation, its inputs (slots from the count on are
+    /// unused) and the input count.
+    Custom(
+        Arc<dyn CustomOp<T> + Send + Sync>,
+        [Var; custom::MAX_INPUTS],
+        u8,
+    ),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -121,11 +133,11 @@ pub(crate) enum Op {
     BlowUp(Var),
 }
 
-impl Op {
+impl<T: Real> Op<T> {
     /// Passes `out_grad`, the gradient of the loss with respect to this node's value, back to
     /// the node's inputs through `ctx`. `out` is the node itself, for operations whose
     /// derivative is cheapest from their own output (`tanh`, `sigmoid`).
-    pub(crate) fn backward<T: Real>(&self, out: Var, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
+    pub(crate) fn backward(&self, out: Var, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
         match *self {
             Op::Input | Op::Param(_) => {}
             Op::Add(a, b) => elementwise::binary_backward(Kind::Add, a, b, out_grad, ctx),
@@ -173,6 +185,9 @@ impl Op {
             Op::Huber(p, t, delta, r) => loss::huber_backward(p, t, delta, r, out_grad, ctx),
             Op::SmoothL1(p, t, beta, r) => loss::smooth_l1_backward(p, t, beta, r, out_grad, ctx),
             Op::KlDiv(x, t, r) => loss::kl_div_backward(x, t, r, out_grad, ctx),
+            Op::Custom(ref op, ref inputs, count) => {
+                custom::backward(&**op, &inputs[..usize::from(count)], out, out_grad, ctx)
+            }
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]

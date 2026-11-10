@@ -54,13 +54,19 @@ impl Var {
         );
         self.index as usize
     }
+
+    /// Fills the unused input slots of a custom operation; never read.
+    pub(crate) const UNUSED: Var = Var {
+        index: u32::MAX,
+        tape: u32::MAX,
+    };
 }
 
 /// One recorded value: the operation that made it, its shape and its elements.
 #[derive(Debug)]
-pub(crate) struct Node<T> {
+pub(crate) struct Node<T: Real> {
     /// The operation and the inputs it read.
-    op: Op,
+    op: Op<T>,
     /// The shape of the value.
     shape: Shape,
     /// The elements, taken from the pool; empty for a parameter, whose value stays in the
@@ -687,7 +693,7 @@ impl<T: Real> Tape<'_, T> {
     }
 
     /// Appends a node and returns its variable.
-    pub(crate) fn push(&mut self, op: Op, shape: Shape, value: Vec<T>) -> Var {
+    pub(crate) fn push(&mut self, op: Op<T>, shape: Shape, value: Vec<T>) -> Var {
         debug_assert!(matches!(op, Op::Param(_)) || value.len() == shape.len());
         let index = u32::try_from(self.graph.nodes.len()).expect("a tape holds at most 2^32 nodes");
         self.graph.nodes.push(Node { op, shape, value });

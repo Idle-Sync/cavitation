@@ -640,7 +640,7 @@ impl<T: Real> Tape<'_, T> {
     }
 
     /// Records `op` with the value `f` applied to every element of `x`.
-    fn map(&mut self, op: Op, x: Var, f: impl Fn(T) -> T) -> Var {
+    fn map(&mut self, op: Op<T>, x: Var, f: impl Fn(T) -> T) -> Var {
         let shape = self.shape(x);
         let mut out = self.take_buffer(shape.len());
         debug_assert_eq!(out.len(), self.data(x).len());

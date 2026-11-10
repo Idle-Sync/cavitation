@@ -297,6 +297,14 @@ pub struct TensorViewMut<'a, T: Real = f32> {
     shape: Shape,
 }
 
+impl<'a, T: Real> TensorViewMut<'a, T> {
+    /// Wraps a slice that holds exactly `shape.len()` elements.
+    pub(crate) fn from_parts(data: &'a mut [T], shape: Shape) -> TensorViewMut<'a, T> {
+        debug_assert_eq!(data.len(), shape.len(), "view length must match its shape");
+        TensorViewMut { data, shape }
+    }
+}
+
 impl<T: Real> TensorViewMut<'_, T> {
     /// The shape.
     ///

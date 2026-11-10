@@ -26,7 +26,7 @@ impl Kind {
     }
 
     /// The recorded operation for inputs `a` and `b`.
-    fn op(self, a: Var, b: Var) -> Op {
+    fn op<T: Real>(self, a: Var, b: Var) -> Op<T> {
         match self {
             Kind::Add => Op::Add(a, b),
             Kind::Sub => Op::Sub(a, b),

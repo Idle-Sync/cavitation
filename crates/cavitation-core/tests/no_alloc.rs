@@ -7,7 +7,11 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cavitation_core::{Graph, ParamStore, Reduction, Tensor};
+use std::sync::Arc;
+
+use cavitation_core::{
+    CustomOp, Graph, ParamStore, Real, Reduction, Shape, Tensor, TensorView, TensorViewMut,
+};
 
 /// The number of allocations (including reallocations) made so far, from every thread.
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -257,16 +261,84 @@ fn bce_and_nll_steady_state() -> usize {
     made
 }
 
+/// A user-defined elementwise multiply, `a · b`, for the custom-operation scenario.
+struct CustomMul;
+
+impl<T: Real> CustomOp<T> for CustomMul {
+    fn name(&self) -> &str {
+        "custom_mul"
+    }
+
+    fn output_shape(&self, inputs: &[Shape]) -> Shape {
+        inputs[0]
+    }
+
+    fn forward(&self, inputs: &[TensorView<T>], mut output: TensorViewMut<T>) {
+        let (a, b) = (inputs[0].data(), inputs[1].data());
+        for (i, o) in output.data_mut().iter_mut().enumerate() {
+            *o = a[i] * b[i];
+        }
+    }
+
+    fn backward(
+        &self,
+        inputs: &[TensorView<T>],
+        _output: TensorView<T>,
+        grad_output: TensorView<T>,
+        grad_inputs: &mut [TensorViewMut<T>],
+    ) {
+        let (a, b, g) = (inputs[0].data(), inputs[1].data(), grad_output.data());
+        for i in 0..g.len() {
+            grad_inputs[0].data_mut()[i] = b[i] * g[i];
+            grad_inputs[1].data_mut()[i] = a[i] * g[i];
+        }
+    }
+}
+
+/// A custom two-input multiply, forward and backward, 12 times: once with a parameter and
+/// an input, once with the same parameter in both slots. Returns the allocations made during
+/// steps 3 to 12.
+fn custom_op_steady_state() -> usize {
+    let mut store = ParamStore::new();
+    let weight = store.add(Tensor::full(&[4, 3], 0.5f32));
+    let x = Tensor::from_vec((0..12).map(|i| (i as f32 * 0.3).sin()).collect(), &[4, 3]).unwrap();
+    let op: Arc<dyn CustomOp<f32> + Send + Sync> = Arc::new(CustomMul);
+    let mut graph = Graph::new();
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for step in 1..=12 {
+        if step == 3 {
+            before = allocations();
+        }
+        store.zero_grad();
+        {
+            let mut tape = graph.tape(&store.values);
+            let xi = tape.input(x.view());
+            let w = tape.param(weight);
+            let h = tape.custom(&op, &[xi, w]);
+            let sq = tape.custom(&op, &[h, h]);
+            let loss = tape.sum(sq);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0];
+        }
+        sink += store.grad(weight).data()[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// A named scenario: runs, and returns the allocations it made after warm-up.
 type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 4] = [
+    let scenarios: [Scenario; 5] = [
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
         ("cross_entropy_steady_state", cross_entropy_steady_state),
         ("bce_and_nll_steady_state", bce_and_nll_steady_state),
+        ("custom_op_steady_state", custom_op_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

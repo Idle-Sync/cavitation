@@ -17,3 +17,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `glu` on the tape with `Gate`: GLU (sigmoid, as PyTorch `F.glu`), GeGLU, ReGLU and SwiGLU, splitting the last axis; NaN passes through every gate.
 - `softmax`, `log_softmax`, `softmax_cross_entropy` and `mse` on the tape, with `Reduction` (`Mean`, `Sum`, `None`, `BatchMean`); cross-entropy is fused, uses the log-sum-exp form and gives a NaN loss for NaN logits.
 - `binary_cross_entropy` (with a count of clamped logarithms, `Tape::clamped_logs`), `binary_cross_entropy_with_logits`, `nll`, `l1`, `huber`, `smooth_l1` and `kl_div` on the tape, following PyTorch's definitions, each taking a `Reduction`; NaN input gives a NaN loss.
+- User-defined operations: the `CustomOp` trait (forward, backward and output shape, generic over `Real` so `gradcheck` runs on it in `f64`) and `Tape::custom`, taking up to 4 inputs and allocating nothing after warm-up.
