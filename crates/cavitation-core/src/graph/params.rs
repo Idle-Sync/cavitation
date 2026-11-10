@@ -1,11 +1,16 @@
 //! `ParamStore`: parameter values and their gradients, kept apart from any model.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::{Real, Shape, Tensor, TensorView, TensorViewMut};
+
+/// The id the next [`ParamStore`] gets, so ids from one store are recognised in another.
+static NEXT_STORE_ID: AtomicU32 = AtomicU32::new(0);
 
 /// Names one parameter in the [`ParamStore`] that created it.
 ///
-/// An id is only meaningful for the store that returned it; using it with another store
-/// reads a different parameter or panics.
+/// An id is only meaningful for the store that returned it (or a clone of that store);
+/// using it with another store panics.
 ///
 /// # Examples
 ///
@@ -17,7 +22,26 @@ use crate::{Real, Shape, Tensor, TensorView, TensorViewMut};
 /// assert_ne!(a, b);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct ParamId(usize);
+pub struct ParamId {
+    /// The parameter's position in its store.
+    index: usize,
+    /// The id of the store that created it.
+    store: u32,
+}
+
+/// The position of `id` in the store with id `store`.
+///
+/// # Panics
+///
+/// Panics if `id` was created by another store.
+fn index_in(store: u32, id: ParamId) -> usize {
+    assert!(
+        id.store == store,
+        "ParamId belongs to another ParamStore (its store is {}, this store is {store})",
+        id.store
+    );
+    id.index
+}
 
 /// The values of every parameter in a [`ParamStore`], indexed by [`ParamId`].
 ///
@@ -35,6 +59,8 @@ pub struct ParamId(usize);
 /// ```
 #[derive(Clone, Debug)]
 pub struct ParamValues<T: Real = f32> {
+    /// The id of the store these values belong to.
+    store: u32,
     /// One tensor per parameter, in the order they were added.
     tensors: Vec<Tensor<T>>,
 }
@@ -44,7 +70,7 @@ impl<T: Real> ParamValues<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -53,7 +79,7 @@ impl<T: Real> ParamValues<T> {
     /// assert_eq!(store.values.get(p).data(), &[2.0]);
     /// ```
     pub fn get(&self, id: ParamId) -> &Tensor<T> {
-        &self.tensors[id.0]
+        &self.tensors[index_in(self.store, id)]
     }
 
     /// The value of parameter `id`, mutably. Change its elements, never its shape: the
@@ -61,7 +87,7 @@ impl<T: Real> ParamValues<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -71,7 +97,12 @@ impl<T: Real> ParamValues<T> {
     /// assert_eq!(store.values.get(p).data(), &[5.0]);
     /// ```
     pub fn get_mut(&mut self, id: ParamId) -> &mut Tensor<T> {
-        &mut self.tensors[id.0]
+        &mut self.tensors[index_in(self.store, id)]
+    }
+
+    /// The id of the store these values belong to.
+    pub(crate) fn store_id(&self) -> u32 {
+        self.store
     }
 }
 
@@ -97,6 +128,8 @@ impl<T: Real> ParamValues<T> {
 /// ```
 #[derive(Clone, Debug)]
 pub struct ParamGrads<T: Real = f32> {
+    /// The id of the store these gradients belong to.
+    store: u32,
     /// One gradient buffer per parameter, shaped like its value.
     tensors: Vec<Tensor<T>>,
     /// Whether each gradient is stale: its buffer holds old data and it reads as zeros.
@@ -111,7 +144,7 @@ impl<T: Real> ParamGrads<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -120,16 +153,16 @@ impl<T: Real> ParamGrads<T> {
     /// assert!(store.grads.is_stale(p));
     /// ```
     pub fn is_stale(&self, id: ParamId) -> bool {
-        self.stale[id.0]
+        self.stale[index_in(self.store, id)]
     }
 
     /// The gradient buffer of `id` for writing, and whether it was stale. The writer must
     /// overwrite every element when it was stale and add to the buffer otherwise. The
-    /// gradient is current from then on.
+    /// gradient is current from then on, even if the write never happens.
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -142,20 +175,28 @@ impl<T: Real> ParamGrads<T> {
     /// assert_eq!(store.grad(p).data(), &[2.0]);
     /// ```
     pub fn accumulate(&mut self, id: ParamId) -> (TensorViewMut<'_, T>, bool) {
-        let stale = std::mem::replace(&mut self.stale[id.0], false);
-        (self.tensors[id.0].view_mut(), stale)
+        let i = index_in(self.store, id);
+        let stale = std::mem::replace(&mut self.stale[i], false);
+        (self.tensors[i].view_mut(), stale)
     }
 
-    /// Like [`ParamGrads::accumulate`], returning the bare slice.
-    pub(crate) fn accumulate_slice(&mut self, id: ParamId) -> (&mut [T], bool) {
-        let stale = std::mem::replace(&mut self.stale[id.0], false);
-        (self.tensors[id.0].data_mut(), stale)
+    /// The gradient buffer of `id` and its stale flag, left unchanged, for a writer that
+    /// clears the flag only once its write has succeeded.
+    pub(crate) fn buffer_and_flag(&mut self, id: ParamId) -> (&mut [T], &mut bool) {
+        let i = index_in(self.store, id);
+        (self.tensors[i].data_mut(), &mut self.stale[i])
+    }
+
+    /// The id of the store these gradients belong to.
+    pub(crate) fn store_id(&self) -> u32 {
+        self.store
     }
 
     /// The gradient of `id`: a view of zeros when it is stale.
     fn view(&self, id: ParamId) -> TensorView<'_, T> {
-        let t = &self.tensors[id.0];
-        if self.stale[id.0] {
+        let i = index_in(self.store, id);
+        let t = &self.tensors[i];
+        if self.stale[i] {
             let shape: Shape = *t.shape();
             TensorView::from_parts(&self.zeros[..shape.len()], shape)
         } else {
@@ -216,11 +257,14 @@ impl<T: Real> ParamStore<T> {
     /// assert!(store.is_empty());
     /// ```
     pub fn new_generic() -> ParamStore<T> {
+        let store = NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed);
         ParamStore {
             values: ParamValues {
+                store,
                 tensors: Vec::new(),
             },
             grads: ParamGrads {
+                store,
                 tensors: Vec::new(),
                 stale: Vec::new(),
                 zeros: Vec::new(),
@@ -239,7 +283,10 @@ impl<T: Real> ParamStore<T> {
     /// assert_eq!(store.grad(p).data(), &[0.0, 0.0]);
     /// ```
     pub fn add(&mut self, value: Tensor<T>) -> ParamId {
-        let id = ParamId(self.values.tensors.len());
+        let id = ParamId {
+            index: self.values.tensors.len(),
+            store: self.values.store,
+        };
         let len = value.data().len();
         if self.grads.zeros.len() < len {
             self.grads.zeros.resize(len, T::ZERO);
@@ -292,7 +339,7 @@ impl<T: Real> ParamStore<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -308,7 +355,7 @@ impl<T: Real> ParamStore<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -325,7 +372,7 @@ impl<T: Real> ParamStore<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` does not belong to this store.
+    /// Panics if `id` was created by another store.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -356,11 +403,15 @@ impl<T: Real> ParamStore<T> {
         &mut self,
     ) -> impl Iterator<Item = (ParamId, &mut Tensor<T>, TensorView<'_, T>)> {
         let grads = &self.grads;
+        let store = self.values.store;
         self.values
             .tensors
             .iter_mut()
             .enumerate()
-            .map(move |(i, value)| (ParamId(i), value, grads.view(ParamId(i))))
+            .map(move |(index, value)| {
+                let id = ParamId { index, store };
+                (id, value, grads.view(id))
+            })
     }
 }
 
@@ -395,5 +446,16 @@ mod tests {
         }
         assert_eq!(store.value(a).data(), &[0.5]);
         assert_eq!(store.value(b).data(), &[2.0, 2.0]);
+    }
+
+    /// A `ParamId` from one store panics when used with another.
+    #[test]
+    #[should_panic(expected = "ParamId belongs to another ParamStore")]
+    fn param_id_from_other_store_panics() {
+        let mut s1 = ParamStore::new();
+        let mut s2 = ParamStore::new();
+        let p = s1.add(Tensor::full(&[1], 1.0f32));
+        s2.add(Tensor::full(&[1], 2.0f32));
+        s2.value(p);
     }
 }

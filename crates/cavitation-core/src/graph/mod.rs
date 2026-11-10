@@ -5,14 +5,19 @@ mod pool;
 
 pub use params::{ParamGrads, ParamId, ParamStore, ParamValues};
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use crate::ops::Op;
 use crate::{Real, Shape, TensorView};
 use pool::Pool;
 
+/// The id the next [`Tape`] gets, so variables from one tape are recognised on another.
+static NEXT_TAPE_ID: AtomicU32 = AtomicU32::new(0);
+
 /// A value recorded on a [`Tape`]: an index into that tape's nodes.
 ///
-/// A `Var` is only meaningful on the tape that returned it; using it on another tape reads
-/// a different node or panics.
+/// A `Var` is only meaningful on the tape that returned it; using it on another tape,
+/// including a later tape of the same [`Graph`], panics.
 ///
 /// # Examples
 ///
@@ -28,7 +33,28 @@ use pool::Pool;
 /// assert_eq!(tape.value(s).data(), &[2.0, 2.0]);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Var(usize);
+pub struct Var {
+    /// The node's position on its tape.
+    index: u32,
+    /// The id of the tape that recorded it.
+    tape: u32,
+}
+
+impl Var {
+    /// The node position of `self` on the tape with id `tape`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `self` was recorded on another tape.
+    fn index_on(self, tape: u32) -> usize {
+        assert!(
+            self.tape == tape,
+            "Var belongs to another tape (its tape is {}, this tape is {tape})",
+            self.tape
+        );
+        self.index as usize
+    }
+}
 
 /// One recorded value: the operation that made it, its shape and its elements.
 #[derive(Debug)]
@@ -45,6 +71,8 @@ pub(crate) struct Node<T> {
 /// Reads recorded values: node buffers, and parameter values for parameter nodes.
 #[derive(Clone, Copy)]
 pub(crate) struct Values<'a, T: Real> {
+    /// The id of the tape the nodes belong to.
+    tape: u32,
     /// The tape's nodes.
     nodes: &'a [Node<T>],
     /// The parameter values the tape borrows.
@@ -54,7 +82,7 @@ pub(crate) struct Values<'a, T: Real> {
 impl<'a, T: Real> Values<'a, T> {
     /// The elements of `v`.
     fn get(self, v: Var) -> &'a [T] {
-        let node = &self.nodes[v.0];
+        let node = &self.nodes[v.index_on(self.tape)];
         match node.op {
             Op::Param(id) => self.params.get(id).data(),
             _ => &node.value,
@@ -66,25 +94,37 @@ impl<'a, T: Real> Values<'a, T> {
 /// backward pass (overwrite) or a later one (add).
 pub(crate) struct GradSlot<'s, T> {
     /// The gradient buffer, as long as the value it belongs to.
-    pub(crate) buf: &'s mut [T],
+    buf: &'s mut [T],
     /// Whether to overwrite `buf` instead of adding to it.
-    pub(crate) overwrite: bool,
+    overwrite: bool,
+    /// A parameter's stale flag, cleared once the contribution has been written.
+    stale: Option<&'s mut bool>,
 }
 
 impl<T: Real> GradSlot<'_, T> {
-    /// Contributes `src`: copies it when overwriting, adds it otherwise.
+    /// Contributes `src`: copies it when overwriting, adds it otherwise. A parameter's
+    /// gradient becomes current only after the write.
     ///
     /// # Panics
     ///
-    /// Panics if `src` and the buffer differ in length.
+    /// Panics if `src` and the buffer differ in length, before writing anything.
     pub(crate) fn add_from(self, src: &[T]) {
+        assert_eq!(
+            self.buf.len(),
+            src.len(),
+            "gradient length {} does not match the value's length {}",
+            src.len(),
+            self.buf.len()
+        );
         if self.overwrite {
             self.buf.copy_from_slice(src);
         } else {
-            assert_eq!(self.buf.len(), src.len(), "gradient length mismatch");
             for (d, &s) in self.buf.iter_mut().zip(src) {
                 *d += s;
             }
+        }
+        if let Some(stale) = self.stale {
+            *stale = false;
         }
     }
 }
@@ -108,18 +148,27 @@ impl<T: Real> BackwardCtx<'_, T> {
     /// gradient). A node's first contribution gets a fresh pool buffer to overwrite; a
     /// parameter's slot follows its stale flag.
     pub(crate) fn slot(&mut self, v: Var) -> Option<GradSlot<'_, T>> {
-        let node = &self.values.nodes[v.0];
+        let index = v.index_on(self.values.tape);
+        let node = &self.values.nodes[index];
         match node.op {
             Op::Input => None,
             Op::Param(id) => {
-                let (buf, overwrite) = self.params.accumulate_slice(id);
-                Some(GradSlot { buf, overwrite })
+                let (buf, stale) = self.params.buffer_and_flag(id);
+                Some(GradSlot {
+                    buf,
+                    overwrite: *stale,
+                    stale: Some(stale),
+                })
             }
             _ => {
-                let entry = &mut self.grads[v.0];
+                let entry = &mut self.grads[index];
                 let overwrite = entry.is_none();
                 let buf = entry.get_or_insert_with(|| self.pool.take(node.shape.len()));
-                Some(GradSlot { buf, overwrite })
+                Some(GradSlot {
+                    buf,
+                    overwrite,
+                    stale: None,
+                })
             }
         }
     }
@@ -208,6 +257,7 @@ impl<T: Real> Graph<T> {
         Tape {
             graph: self,
             params,
+            id: NEXT_TAPE_ID.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -256,6 +306,8 @@ pub struct Tape<'g, T: Real = f32> {
     graph: &'g mut Graph<T>,
     /// The parameter values, read in place.
     params: &'g ParamValues<T>,
+    /// This tape's id, carried by every [`Var`] it records.
+    id: u32,
 }
 
 impl<T: Real> Tape<'_, T> {
@@ -313,7 +365,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(v).data(), &[7.0]);
     /// ```
     pub fn value(&self, v: Var) -> TensorView<'_, T> {
-        TensorView::from_parts(self.values().get(v), self.graph.nodes[v.0].shape)
+        TensorView::from_parts(self.values().get(v), self.shape(v))
     }
 
     /// The gradient of the loss with respect to `v`, after [`Tape::backward`]. `None` for
@@ -338,11 +390,12 @@ impl<T: Real> Tape<'_, T> {
     /// assert!(tape.grad(v).is_none());
     /// ```
     pub fn grad(&self, v: Var) -> Option<TensorView<'_, T>> {
-        let node = &self.graph.nodes[v.0];
+        let index = v.index_on(self.id);
+        let node = &self.graph.nodes[index];
         match node.op {
             Op::Input | Op::Param(_) => None,
             _ => {
-                let buf = self.graph.grads.get(v.0)?.as_deref()?;
+                let buf = self.graph.grads.get(index)?.as_deref()?;
                 Some(TensorView::from_parts(buf, node.shape))
             }
         }
@@ -364,7 +417,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.shape(v).dims(), &[2, 3]);
     /// ```
     pub fn shape(&self, v: Var) -> Shape {
-        self.graph.nodes[v.0].shape
+        self.graph.nodes[v.index_on(self.id)].shape
     }
 
     /// The number of nodes recorded so far (inputs, parameters and operation results).
@@ -393,7 +446,8 @@ impl<T: Real> Tape<'_, T> {
     /// # Panics
     ///
     /// Panics if `loss` does not have exactly one element (the message names the loss and its
-    /// shape), or if `loss` was not recorded on this tape.
+    /// shape), if `loss` was not recorded on this tape, or if `grads` belongs to another
+    /// [`ParamStore`] than the values this tape reads.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -410,7 +464,15 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(store.grad(b).data(), &[1.0]);
     /// ```
     pub fn backward(&mut self, loss: Var, grads: &mut ParamGrads<T>) {
-        let shape = self.graph.nodes[loss.0].shape;
+        assert!(
+            grads.store_id() == self.params.store_id(),
+            "backward: the grads belong to another ParamStore than the values this tape reads \
+             (grads of store {}, values of store {})",
+            grads.store_id(),
+            self.params.store_id()
+        );
+        let loss_index = loss.index_on(self.id);
+        let shape = self.graph.nodes[loss_index].shape;
         assert!(
             shape.len() == 1,
             "backward: the loss must have one element, but its shape is {:?}",
@@ -424,6 +486,7 @@ impl<T: Real> Tape<'_, T> {
         } = &mut *self.graph;
         node_grads.resize_with(nodes.len(), || None);
         let values = Values {
+            tape: self.id,
             nodes,
             params: self.params,
         };
@@ -436,7 +499,7 @@ impl<T: Real> Tape<'_, T> {
         if let Some(slot) = seed_ctx.slot(loss) {
             slot.add_from(&[T::ONE]);
         }
-        for i in (0..=loss.0).rev() {
+        for i in (0..=loss_index).rev() {
             let (before, rest) = node_grads.split_at_mut(i);
             let Some(out_grad) = rest[0].as_deref() else {
                 continue;
@@ -454,6 +517,7 @@ impl<T: Real> Tape<'_, T> {
     /// Reads recorded values.
     fn values(&self) -> Values<'_, T> {
         Values {
+            tape: self.id,
             nodes: &self.graph.nodes,
             params: self.params,
         }
@@ -472,8 +536,12 @@ impl<T: Real> Tape<'_, T> {
     /// Appends a node and returns its variable.
     pub(crate) fn push(&mut self, op: Op, shape: Shape, value: Vec<T>) -> Var {
         debug_assert!(matches!(op, Op::Param(_)) || value.len() == shape.len());
+        let index = u32::try_from(self.graph.nodes.len()).expect("a tape holds at most 2^32 nodes");
         self.graph.nodes.push(Node { op, shape, value });
-        Var(self.graph.nodes.len() - 1)
+        Var {
+            index,
+            tape: self.id,
+        }
     }
 }
 
@@ -542,5 +610,75 @@ mod tests {
         let v = tape.param(p);
         let loss = tape.add(v, v);
         tape.backward(loss, &mut store.grads);
+    }
+
+    /// A `Var` kept from a dropped tape panics instead of reading the node now at its index.
+    #[test]
+    #[should_panic(expected = "Var belongs to another tape")]
+    fn stale_var_from_dropped_tape_panics() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[1], 1.0f32));
+        let q = store.add(Tensor::full(&[1], 3.0f32));
+        let x = Tensor::full(&[1], 2.0f32);
+        let mut graph = Graph::new();
+        let old = {
+            let mut tape = graph.tape(&store.values);
+            let v = tape.param(p);
+            tape.add(v, v)
+        };
+        let mut tape = graph.tape(&store.values);
+        tape.input(x.view());
+        tape.param(q);
+        tape.value(old);
+    }
+
+    /// A `Var` from a tape of another graph panics when used.
+    #[test]
+    #[should_panic(expected = "Var belongs to another tape")]
+    fn var_from_other_graph_panics() {
+        let store = ParamStore::new();
+        let x = Tensor::full(&[1], 2.0f32);
+        let (mut g1, mut g2) = (Graph::new(), Graph::new());
+        let mut t1 = g1.tape(&store.values);
+        let mut t2 = g2.tape(&store.values);
+        let a = t1.input(x.view());
+        t2.input(x.view());
+        t2.add(a, a);
+    }
+
+    /// Gradients of one store cannot receive a backward pass over another store's values.
+    #[test]
+    #[should_panic(expected = "grads belong to another ParamStore")]
+    fn backward_with_other_stores_grads_panics() {
+        let mut s1 = ParamStore::new();
+        let mut s2 = ParamStore::new();
+        let p = s1.add(Tensor::full(&[1], 1.0f32));
+        s2.add(Tensor::full(&[1], 1.0f32));
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&s1.values);
+        let v = tape.param(p);
+        let loss = tape.add(v, v);
+        tape.backward(loss, &mut s2.grads);
+    }
+
+    /// A gradient write that panics on a length mismatch leaves the parameter stale.
+    #[test]
+    fn failed_gradient_write_leaves_param_stale() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[2], 1.0f32));
+        // Shrinking the value breaks the documented rule on purpose: the gradient buffer
+        // keeps two elements while the loss below sends back one.
+        *store.value_mut(p) = Tensor::full(&[1], 1.0f32);
+        let mut graph = Graph::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut tape = graph.tape(&store.values);
+            let v = tape.param(p);
+            let loss = tape.add(v, v);
+            tape.backward(loss, &mut store.grads);
+        }));
+        let message = result.unwrap_err();
+        let message = message.downcast_ref::<String>().unwrap();
+        assert!(message.contains("gradient length 1"), "{message}");
+        assert!(store.grads.is_stale(p));
     }
 }
