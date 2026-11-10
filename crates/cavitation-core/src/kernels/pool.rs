@@ -366,6 +366,14 @@ fn wait_for_workers() {
     while POOL.remaining.load(Ordering::Acquire) != 0 {
         std::hint::spin_loop();
         spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(64) {
+            // Give the core away now and then. When other processes keep a core busy, a
+            // pool thread that has been preempted otherwise waits for a pure spinner to
+            // reach its time limit: about 210 us per round trip, against 0.5 to 1 us with
+            // these yields under light load and 11 to 24 us under heavy load (empty 4-thread
+            // job on a 4-core machine, measured with `pool_round_trip_time`).
+            thread::yield_now();
+        }
         if spins.is_multiple_of(64) && start.elapsed() >= SPIN {
             let mut guard = lock(&POOL.done_lock);
             // SeqCst pairs with the worker's decrement and load of `caller_waiting`: either
@@ -423,6 +431,14 @@ fn wait_for_job(me: &Worker, seen: usize) -> usize {
         }
         std::hint::spin_loop();
         spins = spins.wrapping_add(1);
+        if spins.is_multiple_of(64) {
+            // Give the core away now and then. When other processes keep a core busy, a
+            // pool thread that has been preempted otherwise waits for a pure spinner to
+            // reach its time limit: about 210 us per round trip, against 0.5 to 1 us with
+            // these yields under light load and 11 to 24 us under heavy load (empty 4-thread
+            // job on a 4-core machine, measured with `pool_round_trip_time`).
+            thread::yield_now();
+        }
         if spins.is_multiple_of(64) && start.elapsed() >= SPIN {
             break;
         }
