@@ -163,10 +163,9 @@ pub trait Optimizer<T: Real>: Send {
     /// ```
     fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats);
 
-    /// Updates every parameter from its gradient and discards the statistics. This builds a
-    /// fresh [`GradStats`], so it allocates on every call; use
-    /// [`step_with_stats`](Optimizer::step_with_stats) with a reused `GradStats` in a loop
-    /// that must not allocate.
+    /// Updates every parameter from its gradient. The statistics go into a [`GradStats`] the
+    /// optimiser owns, allocated on the first step and reused, so after the first step this
+    /// allocates nothing; read them with [`last_stats`](Optimizer::last_stats).
     ///
     /// # Panics
     ///
@@ -178,12 +177,28 @@ pub trait Optimizer<T: Real>: Send {
     /// let mut store = ParamStore::new();
     /// let p = store.add(Tensor::full(&[1], 1.0f32));
     /// store.grads.accumulate(p).0.data_mut()[0] = 1.0;
-    /// Sgd::new(0.5).step(&mut store);
+    /// let mut opt = Sgd::new(0.5);
+    /// opt.step(&mut store);
     /// assert_eq!(store.value(p).data(), &[0.5]);
+    /// assert_eq!(opt.last_stats().norm(p), 1.0);
     /// ```
-    fn step(&mut self, params: &mut ParamStore<T>) {
-        self.step_with_stats(params, &mut GradStats::new());
-    }
+    fn step(&mut self, params: &mut ParamStore<T>);
+
+    /// The statistics of the last [`step`](Optimizer::step) (empty before the first). A step
+    /// taken with [`step_with_stats`](Optimizer::step_with_stats) fills the caller's
+    /// `GradStats` instead and leaves this one unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Adam, Optimizer};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::zeros(&[2]));
+    /// store.grads.accumulate(p).0.data_mut().copy_from_slice(&[3.0, 4.0]);
+    /// let mut opt = Adam::new(0.01);
+    /// opt.step(&mut store);
+    /// assert_eq!(opt.last_stats().norm(p), 5.0);
+    /// ```
+    fn last_stats(&self) -> &GradStats;
 
     /// The current learning rate.
     ///
@@ -211,6 +226,10 @@ impl<T: Real, O: Optimizer<T> + ?Sized> Optimizer<T> for Box<O> {
 
     fn step(&mut self, params: &mut ParamStore<T>) {
         (**self).step(params);
+    }
+
+    fn last_stats(&self) -> &GradStats {
+        (**self).last_stats()
     }
 
     fn learning_rate(&self) -> f64 {
@@ -296,6 +315,8 @@ pub struct Sgd<T: Real = f32> {
     sizes: Sizes,
     /// The momentum buffer of each parameter (empty without momentum).
     buffers: Vec<Vec<T>>,
+    /// The statistics of the last `step`.
+    stats: GradStats,
 }
 
 impl<T: Real> Sgd<T> {
@@ -312,6 +333,7 @@ impl<T: Real> Sgd<T> {
             weight_decay: 0.0,
             sizes: Sizes::default(),
             buffers: Vec::new(),
+            stats: GradStats::new(),
         }
     }
 
@@ -374,6 +396,16 @@ impl<T: Real> Optimizer<T> for Sgd<T> {
         }
     }
 
+    fn step(&mut self, params: &mut ParamStore<T>) {
+        let mut stats = std::mem::take(&mut self.stats);
+        self.step_with_stats(params, &mut stats);
+        self.stats = stats;
+    }
+
+    fn last_stats(&self) -> &GradStats {
+        &self.stats
+    }
+
     fn learning_rate(&self) -> f64 {
         self.lr
     }
@@ -404,6 +436,8 @@ struct AdamCore<T: Real> {
     m: Vec<Vec<T>>,
     /// The second moment of each parameter.
     v: Vec<Vec<T>>,
+    /// The statistics of the last `step`.
+    stats: GradStats,
 }
 
 impl<T: Real> AdamCore<T> {
@@ -419,6 +453,7 @@ impl<T: Real> AdamCore<T> {
             sizes: Sizes::default(),
             m: Vec::new(),
             v: Vec::new(),
+            stats: GradStats::new(),
         }
     }
 
@@ -562,6 +597,16 @@ impl<T: Real> Optimizer<T> for Adam<T> {
         self.core.step("Adam", false, params, stats);
     }
 
+    fn step(&mut self, params: &mut ParamStore<T>) {
+        let mut stats = std::mem::take(&mut self.core.stats);
+        self.step_with_stats(params, &mut stats);
+        self.core.stats = stats;
+    }
+
+    fn last_stats(&self) -> &GradStats {
+        &self.core.stats
+    }
+
     fn learning_rate(&self) -> f64 {
         self.core.lr
     }
@@ -646,6 +691,16 @@ impl<T: Real> AdamW<T> {
 impl<T: Real> Optimizer<T> for AdamW<T> {
     fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats) {
         self.core.step("AdamW", true, params, stats);
+    }
+
+    fn step(&mut self, params: &mut ParamStore<T>) {
+        let mut stats = std::mem::take(&mut self.core.stats);
+        self.step_with_stats(params, &mut stats);
+        self.core.stats = stats;
+    }
+
+    fn last_stats(&self) -> &GradStats {
+        &self.core.stats
     }
 
     fn learning_rate(&self) -> f64 {

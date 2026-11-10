@@ -89,9 +89,45 @@ fn optimizers_steady_state() -> usize {
     allocations() - before
 }
 
+/// Steps each of the four optimisers with `step` (the path a training loop uses) 12 times,
+/// alternating fresh gradients with `zero_grad` and no backward pass (stale gradients), and
+/// reads `last_stats` each time. Returns the allocations made during steps 2 to 12.
+fn optimizers_step_steady_state() -> usize {
+    let mut optimizers: Vec<Box<dyn Optimizer<f32>>> = vec![
+        Box::new(Sgd::new(0.1)),
+        Box::new(Sgd::new(0.1).with_momentum(0.9).with_weight_decay(0.01)),
+        Box::new(Adam::new(0.01).with_weight_decay(0.1)),
+        Box::new(AdamW::new(0.01)),
+    ];
+    let mut store = ParamStore::new();
+    let w = store.add(Tensor::full(&[4, 3], 0.5f32));
+    let b = store.add(Tensor::full(&[3], -0.5f32));
+    let mut before = 0;
+    let mut sink = 0.0;
+    for step in 1..=12 {
+        if step == 2 {
+            before = allocations();
+        }
+        for opt in &mut optimizers {
+            store.zero_grad();
+            if step % 2 == 1 {
+                store.grads.accumulate(w).0.data_mut().fill(0.25);
+                store.grads.accumulate(b).0.data_mut().fill(-0.125);
+            }
+            opt.step(&mut store);
+            sink += opt.last_stats().norm(w);
+        }
+    }
+    assert!(sink > 0.0);
+    allocations() - before
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 1] = [("optimizers_steady_state", optimizers_steady_state)];
+    let scenarios: [Scenario; 2] = [
+        ("optimizers_steady_state", optimizers_steady_state),
+        ("optimizers_step_steady_state", optimizers_step_steady_state),
+    ];
     let mut failed = false;
     for (name, scenario) in scenarios {
         let made = scenario();
