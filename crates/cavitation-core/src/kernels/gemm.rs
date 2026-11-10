@@ -87,13 +87,14 @@ pub(super) struct Dest {
 }
 
 /// Products of fewer floating-point operations than this (`2 · m · n · k`) run on the
-/// calling thread alone, with the same blocking. Not tuned: a guess at the size below which
-/// two thread-pool round trips per block cost more than splitting the work saves.
+/// calling thread alone, with the same blocking: about the size below which two thread-pool
+/// round trips per block cost more than splitting the work saves. Timing whole training
+/// steps on an idle 4-core Intel Celeron N5105 with 2¹⁵, 2¹⁹ and 2²⁰ found none faster.
 const SINGLE_THREAD_FLOPS: usize = 1 << 17;
 
 /// Compute tasks per thread the driver aims for. More tasks balance uneven work better but
-/// pack each row of `A` more often. One was chosen with `cavitation-bench gemm`; provisional,
-/// tuned on a loaded machine (see the SSE kernel's notes in `x86.rs`).
+/// pack each row of `A` more often. One was chosen with `cavitation-bench gemm` and
+/// re-checked by timing whole training steps (see the SSE kernel's notes in `x86.rs`).
 const TASKS_PER_THREAD: usize = 1;
 
 /// General matrix multiply in f32, `C = alpha · A · B + beta · C`, with the kernel for the
@@ -363,6 +364,14 @@ impl Plan {
     }
 }
 
+/// The greatest common divisor of `a` and `b` (Euclid's algorithm); `gcd(a, 0)` is `a`.
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
+
 /// One cache line of floats: the unit the packing buffers are allocated in, so every
 /// buffer, and every per-task slot in one, starts on a 64-byte boundary.
 #[derive(Clone, Copy)]
@@ -415,7 +424,7 @@ impl Shared {
 
 /// How one `kc` by `nc` block of the product is split into compute tasks.
 #[derive(Clone, Copy)]
-struct Grid {
+pub(super) struct Grid {
     /// `mr`-row panels of `A` per task.
     m_panels: usize,
     /// Number of task rows.
@@ -429,10 +438,12 @@ struct Grid {
 impl Grid {
     /// Splits `m` rows and `n` columns into tasks of whole `mr` by `nr` panels, at most
     /// `mc` rows each, aiming for [`TASKS_PER_THREAD`] tasks per thread when `threads > 1`
-    /// (splitting columns first, then rows) and one column of tasks on one thread. Which
-    /// task computes a tile never changes the tile's value, so the split may depend on the
-    /// thread count.
-    fn new(m: usize, n: usize, mr: usize, nr: usize, mc: usize, threads: usize) -> Grid {
+    /// (splitting columns first, then rows) and one column of tasks on one thread. When the
+    /// `mc` limit leaves more tasks than threads, the rows are cut into more tasks, to a
+    /// whole number per thread where the panels allow it, so that no thread runs a last task
+    /// alone while the others wait. Which task computes a tile never changes the tile's
+    /// value, so the split may depend on the thread count.
+    pub(super) fn new(m: usize, n: usize, mr: usize, nr: usize, mc: usize, threads: usize) -> Grid {
         let rows = m.div_ceil(mr);
         let cols = n.div_ceil(nr);
         let mut m_tasks = rows.div_ceil(mc / mr);
@@ -445,6 +456,20 @@ impl Grid {
         if m_tasks * n_tasks < want {
             m_tasks = want.div_ceil(n_tasks).min(rows).max(m_tasks);
         }
+        if threads > 1 && m_tasks * n_tasks > threads {
+            // The fewest task rows at or above `m_tasks` that, once the rows are shared out
+            // in whole panels, make the count a multiple of `threads`; none if the rows do
+            // not allow it.
+            let step = threads / gcd(n_tasks, threads);
+            let mut rows_tasks = m_tasks.next_multiple_of(step);
+            while rows_tasks <= rows {
+                if (rows.div_ceil(rows.div_ceil(rows_tasks)) * n_tasks).is_multiple_of(threads) {
+                    m_tasks = rows_tasks;
+                    break;
+                }
+                rows_tasks += step;
+            }
+        }
         let m_panels = rows.div_ceil(m_tasks);
         let n_panels = cols.div_ceil(n_tasks);
         Grid {
@@ -456,7 +481,7 @@ impl Grid {
     }
 
     /// The number of tasks.
-    fn tasks(&self) -> usize {
+    pub(super) fn tasks(&self) -> usize {
         self.m_tasks * self.n_tasks
     }
 }

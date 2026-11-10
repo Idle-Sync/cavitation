@@ -24,8 +24,10 @@ use super::matvec::Job;
 /// Block sizes `kc = 256`, `mc = 96`, `nc = 2048`, with one compute task per thread (set in
 /// the driver), were chosen by running `cavitation-bench gemm --shapes mnist128` and
 /// `--shapes digits128` with each candidate (`kc` 128 to 384, `mc` 48 to 144, 1 to 3 tasks
-/// per thread). They are provisional: they were tuned on a loaded machine and are to be
-/// re-checked on a quiet one.
+/// per thread), then re-checked on an idle 4-core Intel Celeron N5105 by timing whole
+/// training steps of the 784 → 1024 → 256 → 10 network at batch 32 and 128 and the
+/// 64 → 256 → 128 → 10 network at batch 128: `kc` 384 and 512, `mc` 48, 144 and 192, `nc`
+/// 512 and 1024 and 2 or 3 tasks per thread were each as fast or slower on all three.
 pub(super) struct Sse;
 
 // SAFETY: `tile` reads `24·kc` values from `a` and `8·kc` from `b` (aligned loads at multiples
@@ -50,6 +52,9 @@ unsafe impl Kernel for Sse {
     }
 
     unsafe fn tile(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f32, dest: &Dest) {
+        // `tile_6x8` makes aligned loads from the A panel, which the driver aligns to 16
+        // bytes only when `MR · A_REP` is a multiple of 4.
+        const { assert!((Self::MR * Self::A_REP) % 4 == 0) };
         // SAFETY: the caller upholds this function's contract, which is `tile_6x8`'s, and
         // runs this kernel only on CPUs with SSE4.2.
         unsafe { tile_6x8(kc, a, b, alpha, beta, dest) }

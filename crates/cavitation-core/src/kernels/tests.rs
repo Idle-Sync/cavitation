@@ -1,7 +1,7 @@
 //! Fast kernels against their reference twins. Each test names the kernel level directly,
 //! so tests never depend on, or race on, the process-wide level setting.
 
-use super::gemm::{gemm_f32, gemm_f32_with, threads_used};
+use super::gemm::{Grid, gemm_f32, gemm_f32_with, threads_used};
 use super::matvec::{matvec_f32, matvec_f32_with};
 use super::{Level, MatMut, MatRef, reference, supported};
 use crate::Rng;
@@ -467,6 +467,36 @@ fn threads_used_matches_the_work() {
             threads_used(level, 1000, 1024, 1024, 1024) <= 256,
             "{level}"
         );
+    }
+}
+
+/// When a block of the product has more tasks than threads, the compute grid has a whole
+/// number of tasks per thread (checked on 2, 3, 4 and 8 threads), so no thread runs a last
+/// task alone while the others wait.
+/// The shapes are the products of the 784 → 1024 → 256 → 10 and 64 → 256 → 128 → 10
+/// networks at batch 32 and 128 (each after the driver's swap), in 6 by 8 tiles with
+/// 96-row tasks, as the SSE4.2 kernel blocks them.
+#[test]
+fn grid_gives_every_thread_the_same_number_of_tasks() {
+    let shapes = [
+        (1024, 784),
+        (256, 1024),
+        (1024, 256),
+        (10, 256),
+        (128, 1024),
+        (32, 1024),
+        (256, 64),
+        (128, 256),
+        (128, 128),
+    ];
+    for threads in [2, 3, 4, 8] {
+        for (m, n) in shapes {
+            let tasks = Grid::new(m, n, 6, 8, 96, threads).tasks();
+            assert!(
+                tasks <= threads || tasks.is_multiple_of(threads),
+                "{m} by {n} on {threads} threads: {tasks} tasks"
+            );
+        }
     }
 }
 
