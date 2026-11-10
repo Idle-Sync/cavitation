@@ -22,21 +22,16 @@ fn required_len(rows: usize, cols: usize, row_stride: usize, col_stride: usize) 
 /// least 1. Two need, with the smaller stride `s` and its extent `e`, `s >= 1` and
 /// `e * s <= ` the larger stride. This is sufficient, not necessary.
 fn is_non_aliasing(rows: usize, cols: usize, row_stride: usize, col_stride: usize) -> bool {
-    let mut dims: Vec<(usize, usize)> = Vec::with_capacity(2);
-    if rows > 1 {
-        dims.push((rows, row_stride));
-    }
-    if cols > 1 {
-        dims.push((cols, col_stride));
-    }
-    match dims.as_slice() {
-        [] => true,
-        [(_, stride)] => *stride >= 1,
-        [a, b] => {
+    // (extent, stride) of each dimension longer than 1, without allocating.
+    let row = (rows > 1).then_some((rows, row_stride));
+    let col = (cols > 1).then_some((cols, col_stride));
+    match (row, col) {
+        (None, None) => true,
+        (Some((_, stride)), None) | (None, Some((_, stride))) => stride >= 1,
+        (Some(a), Some(b)) => {
             let (small, large) = if a.1 <= b.1 { (a, b) } else { (b, a) };
             small.1 >= 1 && small.0.checked_mul(small.1).is_some_and(|v| v <= large.1)
         }
-        _ => unreachable!("a matrix has two dimensions"),
     }
 }
 
