@@ -18,4 +18,7 @@ pub use layer::Layer;
 pub use linear::Linear;
 pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
-pub use train::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
+pub use train::{
+    Batch, BatchView, Batcher, Dataset, EpochReport, FitConfig, History, Loss, OptimizerConfig,
+    Targets, TargetsView, Trainer, accuracy, fit,
+};

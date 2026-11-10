@@ -7,9 +7,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cavitation_core::{ParamStore, Tensor};
+use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Optimizer, Sgd, Targets, TargetsView,
+    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Init, Linear, Loss, Optimizer, Relu,
+    Sequential, Sgd, Targets, TargetsView, Trainer,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -165,12 +166,127 @@ fn gather_steady_state() -> usize {
     allocations() - before
 }
 
+/// The 50k network, 64 → 256 → 128 → 10 with ReLU and He uniform weights, from `Rng::seed(1)`.
+fn network_50k(params: &mut ParamStore) -> Sequential {
+    let mut rng = Rng::seed(1);
+    let mut he = |inputs, outputs| {
+        Linear::with_init(
+            params,
+            inputs,
+            outputs,
+            Init::HeUniform,
+            Init::Zeros,
+            &mut rng,
+        )
+    };
+    Sequential::new()
+        .push(he(64, 256))
+        .push(Relu)
+        .push(he(256, 128))
+        .push(Relu)
+        .push(he(128, 10))
+}
+
+/// 1,437 rows of 64 features in `[0, 1)` with class labels 0 to 9, from `Rng::seed(2)`: the
+/// size of the digits training set, so batch 128 leaves a last batch of 29.
+fn synthetic_1437() -> Dataset {
+    let n = 1437;
+    let mut rng = Rng::seed(2);
+    let x: Vec<f32> = (0..n * 64).map(|_| rng.uniform_f32()).collect();
+    Dataset {
+        x: Tensor::from_vec(x, &[n, 64]).unwrap(),
+        targets: Targets::Classes((0..n).map(|_| rng.below(10) as usize).collect()),
+    }
+}
+
+/// The two optimisers the training scenarios run: SGD with momentum and Adam.
+fn training_optimizers() -> [Box<dyn Optimizer<f32>>; 2] {
+    [
+        Box::new(Sgd::new(0.05).with_momentum(0.9)),
+        Box::new(Adam::new(1e-3)),
+    ]
+}
+
+/// Trains the 50k network with `Trainer::step` on the 1,437-row set at batch 128, with SGD
+/// and with Adam: one whole warm-up epoch (including the 29-row last batch), then counts
+/// the allocations of a second whole epoch.
+fn training_step() -> usize {
+    let data = synthetic_1437();
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let net = network_50k(&mut params);
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+        let mut before = 0;
+        for epoch in 0..2 {
+            if epoch == 1 {
+                before = allocations();
+            }
+            batcher.epoch();
+            for range in batcher.batches() {
+                let view = batcher.gather(&data, range, &mut batch);
+                sink += trainer.step(&net, &mut params, view);
+            }
+        }
+        made += allocations() - before;
+        assert!(sink.is_finite() && sink > 0.0);
+    }
+    made
+}
+
+/// The manual training loop on the 50k network and the 1,437-row set at batch 128, with SGD
+/// and with Adam: a tape on the parameter values, the batch as an input, the forward pass,
+/// cross-entropy, `backward` into the gradients, the optimiser step and `zero_grad`. One
+/// whole warm-up epoch, then counts the allocations of a second whole epoch.
+fn manual_loop() -> usize {
+    let data = synthetic_1437();
+    let mut made = 0;
+    for mut optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let net = network_50k(&mut params);
+        let mut graph = Graph::new();
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+        let mut before = 0;
+        for epoch in 0..2 {
+            if epoch == 1 {
+                before = allocations();
+            }
+            batcher.epoch();
+            for range in batcher.batches() {
+                let view = batcher.gather(&data, range, &mut batch);
+                let TargetsView::Classes(labels) = view.targets else {
+                    unreachable!("the set has class labels")
+                };
+                let mut tape = graph.tape(&params.values);
+                let x = tape.input(view.x);
+                let logits = net.forward(&mut tape, x);
+                let loss = tape.softmax_cross_entropy(logits, labels, Reduction::Mean);
+                sink += tape.value(loss).data()[0];
+                tape.backward(loss, &mut params.grads);
+                drop(tape);
+                optimizer.step(&mut params);
+                params.zero_grad();
+            }
+        }
+        made += allocations() - before;
+        assert!(sink.is_finite() && sink > 0.0);
+    }
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 3] = [
+    let scenarios: [Scenario; 5] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
+        ("training_step", training_step),
+        ("manual_loop", manual_loop),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

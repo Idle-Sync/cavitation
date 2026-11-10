@@ -46,6 +46,15 @@ impl Trace {
         Trace::default()
     }
 
+    /// An empty trace with room for `layers` layers, so tracing a network of that many layers
+    /// allocates nothing.
+    pub(crate) fn with_capacity(layers: usize) -> Trace {
+        Trace {
+            inputs: Vec::with_capacity(layers),
+            outputs: Vec::with_capacity(layers),
+        }
+    }
+
     /// The number of layers recorded.
     ///
     /// ```
