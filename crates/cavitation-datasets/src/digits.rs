@@ -129,7 +129,7 @@ mod tests {
     /// The shuffle reproduces the reference split: the first rows of each side come from
     /// the pinned source rows, and the pinned indices sum to the pinned total.
     #[test]
-    fn digits_split_matches_mockup() {
+    fn digits_split_matches_reference() {
         let order = split_order(1797);
         assert_eq!(order[..5], [1784, 96, 434, 1205, 1703]);
         assert_eq!(order[1437..1442], [1231, 388, 1595, 389, 1767]);
