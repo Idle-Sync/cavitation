@@ -36,6 +36,10 @@ pub(super) unsafe trait Kernel {
     const NC: usize;
     /// How many times each packed value of `A` is repeated (4 to store it broadcast to a
     /// four-wide vector, 1 to store it once).
+    ///
+    /// The driver starts every `A` panel on a 16-byte boundary only when `MR · A_REP` is a
+    /// multiple of 4; otherwise a panel is aligned to f32 alone, and the kernel must not
+    /// make aligned vector loads from it.
     const A_REP: usize;
 
     /// Packs rows `rows.0..rows.1` of `A`, columns `ks.0..ks.0 + ks.1`, into `dst` in the
@@ -50,15 +54,17 @@ pub(super) unsafe trait Kernel {
 
     /// Computes one tile: `C = alpha · Ã · B̃ + beta · C` for the valid `dest.rows` by
     /// `dest.cols` corner of an `MR` by `NR` tile, where `Ã` is the packed `A` panel (`kc`
-    /// groups of `MR` values, each repeated `A_REP` times) and `B̃` the packed `B` panel (`kc` groups of `NR`
-    /// values). Each element's sum runs over `p` in order from zero, with a separate multiply
-    /// and add, and is then stored as `alpha · sum` when `beta` is 0 (C is not read) or
-    /// `alpha · sum + beta · c` otherwise.
+    /// groups of `MR` values, each repeated `A_REP` times) and `B̃` the packed `B` panel (`kc`
+    /// groups of `NR` values). Each element's sum runs over `p` in order from zero, each
+    /// step a multiply and an add (fused into one rounding by kernels with fused
+    /// multiply-add), and is then stored as `alpha · sum` when `beta` is 0 (C is not read) or
+    /// `alpha · sum + beta · c` otherwise, the same way for edge tiles as for full ones.
     ///
     /// # Safety
     ///
     /// `a` must be valid for reading `MR · A_REP · kc` values and `b` for reading `NR · kc`
-    /// values, both aligned to 16 bytes. `dest.rows <= MR`, `dest.cols <= NR`, and for every
+    /// values. `b` is aligned to 16 bytes; `a` is aligned to 16 bytes when `MR · A_REP` is a
+    /// multiple of 4, and to 4 bytes otherwise. `dest.rows <= MR`, `dest.cols <= NR`, and for every
     /// `r < dest.rows` and `j < dest.cols` the element at `dest.ptr + r · dest.rs + j · dest.cs`
     /// must be valid for reading and writing, and not accessed by any other thread during
     /// the call. The CPU must support the kernel's instruction set.
@@ -134,10 +140,13 @@ pub fn gemm_f32(alpha: f32, a: MatRef<f32>, b: MatRef<f32>, beta: f32, c: MatMut
 /// [`gemm_f32`] with the kernel level and the thread count given explicitly, instead of
 /// the process-wide settings.
 ///
-/// [`Level::Sse42`] runs the packed SSE4.2 kernel. [`Level::Avx2Fma`] runs the same SSE4.2
-/// kernel for now (every CPU with AVX2 has SSE4.2), and [`Level::Neon`] the reference loops.
-/// [`Level::Reference`] runs [`reference::gemm`] on one thread. Products too small to be
-/// worth splitting run on one thread; [`threads_used`] tells how many a call uses.
+/// [`Level::Sse42`] runs the packed SSE4.2 kernel (6 by 8 tiles), [`Level::Avx2Fma`] the
+/// packed AVX2 kernel (6 by 16 tiles, fused multiply-add) and [`Level::Neon`] the packed
+/// NEON kernel (8 by 12 tiles, fused multiply-add). [`Level::Reference`] runs
+/// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one
+/// thread; [`threads_used`] tells how many a call uses. Each level rounds differently (fused
+/// multiply-add rounds once per step, and each kernel blocks the sum differently), so
+/// results are bit-identical across thread counts within one level, not across levels.
 ///
 /// # Panics
 ///
@@ -188,31 +197,58 @@ pub fn gemm_f32_with(
         // Nothing to multiply: C is untouched (m or n is 0) or becomes beta · C (k is 0).
         return reference::gemm(alpha, a, b, beta, c);
     }
+    // Each arm runs a kernel only after checking that this CPU supports it.
     match level {
-        // AVX2 CPUs run the SSE4.2 kernel until there is an AVX2 one; the check keeps that
-        // sound even on a CPU that reported AVX2 without SSE4.2.
         #[cfg(target_arch = "x86_64")]
-        Level::Sse42 | Level::Avx2Fma if supported(Level::Sse42) => {
-            if swaps(m, n) {
-                // Cᵀ = Bᵀ · Aᵀ: the same sums of the same products in the same order (a
-                // product of two floats does not depend on their order), so the same bits.
-                // SAFETY: this CPU supports SSE4.2 (checked just above).
-                unsafe {
-                    packed::<super::x86::Sse>(
-                        threads,
-                        alpha,
-                        b.transpose(),
-                        a.transpose(),
-                        beta,
-                        c.transpose(),
-                    );
-                }
-            } else {
-                // SAFETY: this CPU supports SSE4.2 (checked just above).
-                unsafe { packed::<super::x86::Sse>(threads, alpha, a, b, beta, c) }
-            }
-        }
+        // SAFETY: this CPU supports AVX2 and FMA (the guard).
+        Level::Avx2Fma if supported(Level::Avx2Fma) => unsafe {
+            dispatch::<super::x86::Avx2>(threads, alpha, a, b, beta, c)
+        },
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: this CPU supports SSE4.2 (the guard).
+        Level::Sse42 if supported(Level::Sse42) => unsafe {
+            dispatch::<super::x86::Sse>(threads, alpha, a, b, beta, c)
+        },
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: this CPU supports NEON (the guard).
+        Level::Neon if supported(Level::Neon) => unsafe {
+            dispatch::<super::aarch64::Neon>(threads, alpha, a, b, beta, c)
+        },
         _ => reference::gemm(alpha, a, b, beta, c),
+    }
+}
+
+/// The packed product with kernel `K`, swapping to `Cᵀ = Bᵀ · Aᵀ` when [`swaps`] says so.
+///
+/// # Safety
+///
+/// As [`packed`]: the CPU must support `K`'s instruction set.
+unsafe fn dispatch<K: Kernel>(
+    threads: usize,
+    alpha: f32,
+    a: MatRef<f32>,
+    b: MatRef<f32>,
+    beta: f32,
+    c: MatMut<f32>,
+) {
+    let (m, n) = (a.rows(), b.cols());
+    if swaps(m, n) {
+        // Cᵀ = Bᵀ · Aᵀ: the same sums of the same products in the same order (a product of
+        // two floats does not depend on their order), so the same bits.
+        // SAFETY: the caller guarantees the CPU supports `K`.
+        unsafe {
+            packed::<K>(
+                threads,
+                alpha,
+                b.transpose(),
+                a.transpose(),
+                beta,
+                c.transpose(),
+            );
+        }
+    } else {
+        // SAFETY: the caller guarantees the CPU supports `K`.
+        unsafe { packed::<K>(threads, alpha, a, b, beta, c) }
     }
 }
 
@@ -235,18 +271,32 @@ pub fn threads_used(level: Level, threads: usize, m: usize, n: usize, k: usize) 
     }
     match level {
         #[cfg(target_arch = "x86_64")]
-        Level::Sse42 | Level::Avx2Fma if supported(Level::Sse42) => {
-            type K = super::x86::Sse;
-            let (m, n) = if swaps(m, n) { (n, m) } else { (m, n) };
-            Plan::new::<K>(m, n, k, threads).threads_used::<K>(n)
+        Level::Avx2Fma if supported(Level::Avx2Fma) => {
+            plan_threads::<super::x86::Avx2>(threads, m, n, k)
+        }
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse42 if supported(Level::Sse42) => {
+            plan_threads::<super::x86::Sse>(threads, m, n, k)
+        }
+        #[cfg(target_arch = "aarch64")]
+        Level::Neon if supported(Level::Neon) => {
+            plan_threads::<super::aarch64::Neon>(threads, m, n, k)
         }
         _ => 1,
     }
 }
 
+/// [`threads_used`] for kernel `K`, with `m`, `n` and `k` all non-zero: the threads
+/// [`dispatch`] uses for this shape.
+fn plan_threads<K: Kernel>(threads: usize, m: usize, n: usize, k: usize) -> usize {
+    let (m, n) = if swaps(m, n) { (n, m) } else { (m, n) };
+    Plan::new::<K>(m, n, k, threads).threads_used::<K>(n)
+}
+
 /// Whether the packed driver computes `Cᵀ = Bᵀ · Aᵀ` instead: when `C` is much taller than
-/// wide. The kernel stores each value of `A` four times over, so packing costs most when `A`
-/// is the large operand and every packed row serves only a few columns.
+/// wide. Every task packs its own rows of `A` (the SSE4.2 kernel stores each value four times
+/// over), so packing costs most when `A` is the large operand and every packed row serves
+/// only a few columns.
 fn swaps(m: usize, n: usize) -> bool {
     n.saturating_mul(4) <= m
 }
@@ -529,7 +579,7 @@ unsafe fn packed<K: Kernel>(
     const {
         assert!(
             K::NR % 4 == 0
-                && (K::MR * K::A_REP) % 4 == 0
+                && K::A_REP >= 1
                 && K::MR <= MAX_MR
                 && K::MC % K::MR == 0
                 && K::MC >= K::MR
@@ -624,10 +674,11 @@ unsafe fn packed<K: Kernel>(
                                     cols,
                                 };
                                 // SAFETY: the A panel holds `mr·A_REP·kcur` floats, the B panel
-                                // `nr·kcur`, both 16-byte aligned (the slots and the B buffer
-                                // start on 64-byte boundaries, and panels at multiples of
-                                // `nr·kcur` and `mr·A_REP·kcur` floats, multiples of 4 since
-                                // `nr` and `A_REP` are checked or set to be).
+                                // `nr·kcur`. The slots and the B buffer start on 64-byte
+                                // boundaries and panels at multiples of `nr·kcur` and
+                                // `mr·A_REP·kcur` floats, so B panels are 16-byte aligned
+                                // (`nr` is a multiple of 4, checked above) and A panels are
+                                // when `mr·A_REP` is a multiple of 4, as `Kernel::tile` states.
                                 // The tile's valid elements lie in C (rows and cols are clipped
                                 // to m and n), and this task is the only one writing rows
                                 // i0..i1 of columns of panels first..last; `MatMut` guarantees

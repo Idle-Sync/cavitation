@@ -1,9 +1,11 @@
 //! x86_64 microkernels: the SSE4.2 GEMM tile (6 by 8, multiply then add; SSE has no fused
-//! multiply-add) and its packing routines.
+//! multiply-add) with its packing routines, and the AVX2 tile (6 by 16, fused multiply-add).
 
 use std::arch::x86_64::{
-    __m128, _mm_add_ps, _mm_load_ps, _mm_loadu_ps, _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps,
-    _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_storeu_ps, _mm_unpackhi_ps, _mm_unpacklo_ps,
+    __m128, __m256, _mm_add_ps, _mm_load_ps, _mm_loadu_ps, _mm_movehl_ps, _mm_movelh_ps,
+    _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_storeu_ps, _mm_unpackhi_ps,
+    _mm_unpacklo_ps, _mm256_add_ps, _mm256_broadcast_ss, _mm256_fmadd_ps, _mm256_loadu_ps,
+    _mm256_mul_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
 };
 
 use super::MatRef;
@@ -258,6 +260,125 @@ unsafe fn tile_6x8(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f3
                         t[8 * r + j]
                     } else {
                         t[8 * r + j] + beta * *p
+                    };
+                }
+            }
+        }
+    }
+}
+
+/// The AVX2 GEMM kernel: 6 by 16 tiles held in 12 eight-wide accumulators, updated with
+/// fused multiply-add (with the two `B` vectors and one broadcast value of `A`, 15 of the
+/// 16 AVX registers in use, nothing spilled).
+///
+/// Packed `A` holds each value once (`A_REP = 1`): AVX2's broadcast from memory
+/// (`vbroadcastss`) loads one float into all eight lanes in a single load, without a
+/// shuffle, so storing each value eight times over would only make the packed `A` panel
+/// eight times larger. Both panels use the general packing routines.
+///
+/// Block sizes `kc = 256`, `mc = 96`, `nc = 2048` are estimates, not tuned: with `kc = 256`
+/// one `A` panel (6 KB) and one `B` panel (16 KB) fit in a 32 KB L1 data cache, and one
+/// task's packed rows of `A` (96 KB) in L2.
+pub(super) struct Avx2;
+
+// SAFETY: `tile` reads `6·kc` values from `a` and `16·kc` from `b`, with unaligned loads and
+// one-float broadcasts (so it needs only the 4-byte alignment of f32), and reads and writes C
+// only at the `dest.rows` by `dest.cols` elements its contract names.
+unsafe impl Kernel for Avx2 {
+    const MR: usize = 6;
+    const NR: usize = 16;
+    const KC: usize = 256;
+    const MC: usize = 96;
+    const NC: usize = 2048;
+    const A_REP: usize = 1;
+
+    fn pack_a(a: &MatRef<f32>, rows: (usize, usize), ks: (usize, usize), dst: &mut [f32]) {
+        pack_a::<1>(a, rows, ks, 6, dst, |_, _, _, _| false);
+    }
+
+    fn pack_b(b: &MatRef<f32>, cols: (usize, usize), ks: (usize, usize), dst: &mut [f32]) {
+        pack_b(b, cols, ks, 16, dst);
+    }
+
+    unsafe fn tile(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f32, dest: &Dest) {
+        // SAFETY: the caller upholds this function's contract, which is `tile_6x16`'s, and
+        // runs this kernel only on CPUs with AVX2 and FMA.
+        unsafe { tile_6x16(kc, a, b, alpha, beta, dest) }
+    }
+}
+
+/// The 6 by 16 AVX2 tile; see [`Kernel::tile`] for the contract. Each step of the sum is one
+/// fused multiply-add (one rounding instead of two).
+///
+/// # Safety
+///
+/// As [`Kernel::tile`] with `MR = 6`, `NR = 16` and `A_REP = 1`, on a CPU with AVX2 and FMA;
+/// `a` and `b` need only the alignment of f32.
+#[target_feature(enable = "avx2,fma")]
+unsafe fn tile_6x16(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f32, dest: &Dest) {
+    let mut acc: [[__m256; 2]; 6] = [[_mm256_setzero_ps(); 2]; 6];
+    for p in 0..kc {
+        // SAFETY: `p < kc`, so floats `16p..16p + 16` of the B panel are inside it; the
+        // loads are unaligned.
+        let (b0, b1) = unsafe {
+            (
+                _mm256_loadu_ps(b.add(16 * p)),
+                _mm256_loadu_ps(b.add(16 * p + 8)),
+            )
+        };
+        for (r, row) in acc.iter_mut().enumerate() {
+            // SAFETY: `6p + r < 6·kc`, inside the A panel; a one-float load.
+            let x = unsafe { _mm256_broadcast_ss(&*a.add(6 * p + r)) };
+            row[0] = _mm256_fmadd_ps(x, b0, row[0]);
+            row[1] = _mm256_fmadd_ps(x, b1, row[1]);
+        }
+    }
+    let va = _mm256_set1_ps(alpha);
+    for row in &mut acc {
+        row[0] = _mm256_mul_ps(va, row[0]);
+        row[1] = _mm256_mul_ps(va, row[1]);
+    }
+    if dest.rows == 6 && dest.cols == 16 && dest.cs == 1 {
+        let vb = _mm256_set1_ps(beta);
+        for (r, row) in acc.iter().enumerate() {
+            // SAFETY: row `r < 6 = dest.rows` and its 16 columns are elements of C, contiguous
+            // since `cs = 1`; the caller gives this call sole access to them.
+            unsafe {
+                let p = dest.ptr.add(r * dest.rs);
+                if beta == 0.0 {
+                    _mm256_storeu_ps(p, row[0]);
+                    _mm256_storeu_ps(p.add(8), row[1]);
+                } else {
+                    // A separate multiply and add, as the edge path below does, so a value
+                    // does not depend on whether its tile lies on an edge.
+                    let c0 = _mm256_mul_ps(vb, _mm256_loadu_ps(p));
+                    let c1 = _mm256_mul_ps(vb, _mm256_loadu_ps(p.add(8)));
+                    _mm256_storeu_ps(p, _mm256_add_ps(row[0], c0));
+                    _mm256_storeu_ps(p.add(8), _mm256_add_ps(row[1], c1));
+                }
+            }
+        }
+    } else {
+        // An edge tile, or C with non-unit column stride: the same arithmetic, one element
+        // at a time, storing only the valid part.
+        let mut t = [0.0f32; 96];
+        for (r, row) in acc.iter().enumerate() {
+            // SAFETY: `t` has room for 16 floats at `16r` (r < 6).
+            unsafe {
+                _mm256_storeu_ps(t.as_mut_ptr().add(16 * r), row[0]);
+                _mm256_storeu_ps(t.as_mut_ptr().add(16 * r + 8), row[1]);
+            }
+        }
+        for r in 0..dest.rows {
+            for j in 0..dest.cols {
+                // SAFETY: `r < dest.rows` and `j < dest.cols`, so this is an element of C
+                // the caller gives this call sole access to.
+                unsafe {
+                    let p = dest.ptr.add(r * dest.rs + j * dest.cs);
+                    *p = if beta == 0.0 {
+                        t[16 * r + j]
+                    } else {
+                        t[16 * r + j] + beta * *p
                     };
                 }
             }

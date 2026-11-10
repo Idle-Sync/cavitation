@@ -1,6 +1,8 @@
 //! CPU kernels: strided matrix views, the plain reference implementations, the kernel level
 //! (which instruction set the fast kernels use) and the thread count.
 
+#[cfg(target_arch = "aarch64")]
+mod aarch64;
 pub mod gemm;
 pub mod pool;
 pub mod reference;
@@ -733,6 +735,11 @@ mod tests {
 
     /// Re-runs this test binary with `name` (an ignored helper test) and one environment
     /// variable set, and returns whether it succeeded and what it wrote to stderr.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the child did not run the helper: a filter that matches no test also exits
+    /// successfully, so the child's summary must report the one test passed or failed.
     fn run_child(name: &str, var: &str, value: &str) -> (bool, String) {
         let exe = std::env::current_exe().expect("the test binary's path");
         let out = Command::new(exe)
@@ -748,10 +755,14 @@ mod tests {
             .env(var, value)
             .output()
             .expect("the test binary runs");
-        (
-            out.status.success(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let ok = out.status.success();
+        let summary = if ok { "1 passed" } else { "1 failed" };
+        assert!(
+            stdout.contains(summary),
+            "the child did not run `{name}`; stdout:\n{stdout}"
+        );
+        (ok, String::from_utf8_lossy(&out.stderr).into_owned())
     }
 
     /// `CAVITATION_THREADS=abc` makes `threads()` panic, naming the variable and the value.

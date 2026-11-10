@@ -236,16 +236,34 @@ fn check_case(
     }
 }
 
-/// The SSE4.2 GEMM matches the reference within the GEMM tolerance on 400 shapes sampled
+/// Every level with a packed kernel, and the `MR` by `NR` tile its kernel computes.
+const FAST: [(Level, usize, usize); 3] = [
+    (Level::Sse42, 6, 8),
+    (Level::Avx2Fma, 6, 16),
+    (Level::Neon, 8, 12),
+];
+
+/// The fast levels this CPU runs, with their tiles. Prints each level it skips, so the test
+/// output shows which kernels were not tested here.
+fn fast_levels(test: &str) -> Vec<(Level, usize, usize)> {
+    FAST.into_iter()
+        .filter(|&(level, ..)| {
+            let ok = supported(level);
+            if !ok {
+                println!("{test}: skipped kernel level {level}, not supported by this CPU");
+            }
+            ok
+        })
+        .collect()
+}
+
+/// Every fast kernel matches the reference within the GEMM tolerance on 400 shapes sampled
 /// (seed 3) from every combination of sizes around the tile edges, for all four transpose
 /// combinations, alpha in {1, -0.5} and beta in {0, 1, 0.25}.
 #[test]
-fn sse_matches_reference() {
-    if !supported(Level::Sse42) {
-        return;
-    }
+fn fast_matches_reference() {
     let sizes = [
-        1usize, 2, 3, 5, 7, 8, 9, 15, 16, 17, 31, 33, 64, 65, 127, 129, 255, 257,
+        1usize, 2, 3, 5, 7, 8, 9, 11, 12, 13, 15, 16, 17, 31, 33, 64, 65, 127, 129, 255, 257,
     ];
     let mut cases = Vec::new();
     for &m in &sizes {
@@ -255,49 +273,48 @@ fn sse_matches_reference() {
             }
         }
     }
-    let mut rng = Rng::seed(3);
-    rng.shuffle(&mut cases);
-    for (i, &shape) in cases[..400].iter().enumerate() {
+    for (level, ..) in fast_levels("fast_matches_reference") {
+        let mut cases = cases.clone();
+        let mut rng = Rng::seed(3);
+        rng.shuffle(&mut cases);
+        for (i, &shape) in cases[..400].iter().enumerate() {
+            check_case(
+                &mut rng,
+                level,
+                1 + i % 4,
+                shape,
+                &[1.0, -0.5],
+                &[0.0, 1.0, 0.25],
+                i % 3,
+                i % 2 == 1,
+            );
+        }
+    }
+}
+
+/// A 512 x 512 x 512 product on 4 threads matches the reference within the tolerance, at
+/// every fast level.
+#[test]
+fn fast_large_square() {
+    for (level, ..) in fast_levels("fast_large_square") {
+        let mut rng = Rng::seed(5);
         check_case(
             &mut rng,
-            Level::Sse42,
-            1 + i % 4,
-            shape,
-            &[1.0, -0.5],
-            &[0.0, 1.0, 0.25],
-            i % 3,
-            i % 2 == 1,
+            level,
+            4,
+            (512, 512, 512),
+            &[1.0],
+            &[0.0, 0.25],
+            0,
+            false,
         );
     }
 }
 
-/// A 512 x 512 x 512 product on 4 threads matches the reference within the tolerance.
-#[test]
-fn sse_large_square() {
-    if !supported(Level::Sse42) {
-        return;
-    }
-    let mut rng = Rng::seed(5);
-    check_case(
-        &mut rng,
-        Level::Sse42,
-        4,
-        (512, 512, 512),
-        &[1.0],
-        &[0.0, 0.25],
-        0,
-        false,
-    );
-}
-
 /// Shapes with one dimension of 1 (a row, a column, an outer product) and 1 x 1 x 1 match
-/// the reference.
+/// the reference, at every fast level.
 #[test]
-fn sse_vector_shapes() {
-    if !supported(Level::Sse42) {
-        return;
-    }
-    let mut rng = Rng::seed(7);
+fn fast_vector_shapes() {
     let shapes = [
         (1, 1, 1),
         (1, 300, 77),
@@ -306,77 +323,65 @@ fn sse_vector_shapes() {
         (1, 1, 500),
         (1, 9, 1),
         (9, 1, 1),
+        (1, 13, 1),
+        (13, 1, 1),
     ];
-    for (i, &shape) in shapes.iter().enumerate() {
-        check_case(
-            &mut rng,
-            Level::Sse42,
-            1 + i % 4,
-            shape,
-            &[1.0, -0.5],
-            &[0.0, 1.0],
-            i % 2,
-            i % 2 == 0,
-        );
+    for (level, ..) in fast_levels("fast_vector_shapes") {
+        let mut rng = Rng::seed(7);
+        for (i, &shape) in shapes.iter().enumerate() {
+            check_case(
+                &mut rng,
+                level,
+                1 + i % 4,
+                shape,
+                &[1.0, -0.5],
+                &[0.0, 1.0],
+                i % 2,
+                i % 2 == 0,
+            );
+        }
     }
 }
 
 /// With m or n zero nothing is written; with k zero, C becomes beta·C (zeros for beta 0,
-/// even over NaN).
+/// even over NaN). At every fast level.
 #[test]
-fn sse_empty_dims() {
-    if !supported(Level::Sse42) {
-        return;
+fn fast_empty_dims() {
+    for (level, ..) in fast_levels("fast_empty_dims") {
+        let a = [1.0f32; 12];
+        let b = [1.0f32; 12];
+        // m = 0 and n = 0: C's storage is untouched.
+        let mut c = [3.0f32; 6];
+        let empty_c = MatMut::new(&mut c, 0, 3, 3, 1).unwrap();
+        gemm_f32_with(level, 4, 1.0, rm(&a, 0, 4), rm(&b, 4, 3), 0.0, empty_c);
+        assert_eq!(c, [3.0; 6], "{level}");
+        let empty_c = MatMut::new(&mut c, 2, 0, 3, 1).unwrap();
+        gemm_f32_with(level, 4, 1.0, rm(&a, 2, 4), rm(&b, 4, 0), 0.0, empty_c);
+        assert_eq!(c, [3.0; 6], "{level}");
+        // k = 0: C = beta·C.
+        let mut c = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        gemm_f32_with(
+            level,
+            4,
+            1.0,
+            MatRef::new(&[], 2, 0, 0, 1).unwrap(),
+            MatRef::new(&[], 0, 3, 3, 1).unwrap(),
+            2.0,
+            rm_mut(&mut c, 2, 3),
+        );
+        assert_eq!(c, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0], "{level}");
+        let mut c = [f32::NAN; 6];
+        gemm_f32_with(
+            level,
+            1,
+            1.0,
+            MatRef::new(&[], 2, 0, 0, 1).unwrap(),
+            MatRef::new(&[], 0, 3, 3, 1).unwrap(),
+            0.0,
+            rm_mut(&mut c, 2, 3),
+        );
+        assert_eq!(c, [0.0; 6], "{level}");
     }
-    let a = [1.0f32; 12];
-    let b = [1.0f32; 12];
-    // m = 0 and n = 0: C's storage is untouched.
-    let mut c = [3.0f32; 6];
-    let empty_c = MatMut::new(&mut c, 0, 3, 3, 1).unwrap();
-    gemm_f32_with(
-        Level::Sse42,
-        4,
-        1.0,
-        rm(&a, 0, 4),
-        rm(&b, 4, 3),
-        0.0,
-        empty_c,
-    );
-    assert_eq!(c, [3.0; 6]);
-    let empty_c = MatMut::new(&mut c, 2, 0, 3, 1).unwrap();
-    gemm_f32_with(
-        Level::Sse42,
-        4,
-        1.0,
-        rm(&a, 2, 4),
-        rm(&b, 4, 0),
-        0.0,
-        empty_c,
-    );
-    assert_eq!(c, [3.0; 6]);
-    // k = 0: C = beta·C.
-    let mut c = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-    gemm_f32_with(
-        Level::Sse42,
-        4,
-        1.0,
-        MatRef::new(&[], 2, 0, 0, 1).unwrap(),
-        MatRef::new(&[], 0, 3, 3, 1).unwrap(),
-        2.0,
-        rm_mut(&mut c, 2, 3),
-    );
-    assert_eq!(c, [2.0, 4.0, 6.0, 8.0, 10.0, 12.0]);
-    let mut c = [f32::NAN; 6];
-    gemm_f32_with(
-        Level::Sse42,
-        1,
-        1.0,
-        MatRef::new(&[], 2, 0, 0, 1).unwrap(),
-        MatRef::new(&[], 0, 3, 3, 1).unwrap(),
-        0.0,
-        rm_mut(&mut c, 2, 3),
-    );
-    assert_eq!(c, [0.0; 6]);
 }
 
 /// The bits of `alpha·A·B + beta·C` for one product at `threads` threads.
@@ -397,63 +402,117 @@ fn product_bits(
 
 /// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the
 /// training shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and
-/// 32 x 256 x 1024.
+/// 32 x 256 x 1024, at every fast level.
 #[test]
 fn threads_bit_identical() {
-    if !supported(Level::Sse42) {
-        return;
-    }
-    let mut rng = Rng::seed(11);
-    for (m, n, k, b_transposed) in [
-        (300, 700, 500, false),
-        (128, 1024, 784, true),
-        (32, 256, 1024, false),
-    ] {
-        let a = random(&mut rng, m * k);
-        let b = Stored::new(&random(&mut rng, k * n), k, n, b_transposed, 0);
-        let c0 = random(&mut rng, m * n);
-        for beta in [0.0, 1.0] {
-            let one = product_bits(Level::Sse42, 1, rm(&a, m, k), b.view(), beta, &c0);
-            for threads in [2, 3, 4, 7] {
-                let many = product_bits(Level::Sse42, threads, rm(&a, m, k), b.view(), beta, &c0);
-                assert!(
-                    one == many,
-                    "{m}x{n}x{k}, beta {beta}: {threads} threads differ from 1 thread"
-                );
+    for (level, ..) in fast_levels("threads_bit_identical") {
+        let mut rng = Rng::seed(11);
+        for (m, n, k, b_transposed) in [
+            (300, 700, 500, false),
+            (128, 1024, 784, true),
+            (32, 256, 1024, false),
+        ] {
+            let a = random(&mut rng, m * k);
+            let b = Stored::new(&random(&mut rng, k * n), k, n, b_transposed, 0);
+            let c0 = random(&mut rng, m * n);
+            for beta in [0.0, 1.0] {
+                let one = product_bits(level, 1, rm(&a, m, k), b.view(), beta, &c0);
+                for threads in [2, 3, 4, 7] {
+                    let many = product_bits(level, threads, rm(&a, m, k), b.view(), beta, &c0);
+                    assert!(
+                        one == many,
+                        "{level}, {m}x{n}x{k}, beta {beta}: {threads} threads differ from 1"
+                    );
+                }
             }
         }
     }
 }
 
-/// The same call twice gives the same bits.
+/// The same call twice gives the same bits, at every fast level.
 #[test]
 fn run_to_run_identical() {
-    if !supported(Level::Sse42) {
-        return;
-    }
-    let mut rng = Rng::seed(13);
-    let (m, n, k) = (200, 300, 400);
-    let a = random(&mut rng, m * k);
-    let b = random(&mut rng, k * n);
-    let c0 = random(&mut rng, m * n);
-    let first = product_bits(Level::Sse42, 4, rm(&a, m, k), rm(&b, k, n), 0.5, &c0);
-    for _ in 0..3 {
-        let again = product_bits(Level::Sse42, 4, rm(&a, m, k), rm(&b, k, n), 0.5, &c0);
-        assert!(first == again, "a repeated call gave different bits");
+    for (level, ..) in fast_levels("run_to_run_identical") {
+        let mut rng = Rng::seed(13);
+        let (m, n, k) = (200, 300, 400);
+        let a = random(&mut rng, m * k);
+        let b = random(&mut rng, k * n);
+        let c0 = random(&mut rng, m * n);
+        let first = product_bits(level, 4, rm(&a, m, k), rm(&b, k, n), 0.5, &c0);
+        for _ in 0..3 {
+            let again = product_bits(level, 4, rm(&a, m, k), rm(&b, k, n), 0.5, &c0);
+            assert!(
+                first == again,
+                "{level}: a repeated call gave different bits"
+            );
+        }
     }
 }
 
-/// The reported thread count is the one the call runs on: never more than its tasks.
+/// The reported thread count is the one the call runs on: never more than its tasks. Each
+/// level runs its own kernel: one of its tiles is one task, two side by side are two.
 #[test]
 fn threads_used_matches_the_work() {
-    if !supported(Level::Sse42) {
+    for (level, mr, nr) in fast_levels("threads_used_matches_the_work") {
+        assert_eq!(threads_used(level, 4, mr, nr, 4096), 1, "{level}: one tile");
+        assert_eq!(
+            threads_used(level, 4, mr, 2 * nr, 4096),
+            2,
+            "{level}: two tiles"
+        );
+        assert_eq!(threads_used(level, 4, 128, 1024, 784), 4, "{level}");
+        assert_eq!(threads_used(level, 4, 0, 1024, 784), 1, "{level}");
+        assert!(
+            threads_used(level, 1000, 1024, 1024, 1024) <= 256,
+            "{level}"
+        );
+    }
+}
+
+/// On a CPU without AVX2, `CAVITATION_KERNEL=avx2` makes the first kernel call panic: the
+/// test binary re-runs itself as a child with the variable set, and the child fails with a
+/// message naming `avx2` and the detected features.
+#[test]
+fn forced_unsupported_level_panics_cleanly() {
+    if supported(Level::Avx2Fma) {
+        println!("forced_unsupported_level_panics_cleanly: skipped, this CPU supports avx2");
         return;
     }
-    // One 6 by 8 tile: one task, so one thread, however many are offered.
-    assert_eq!(threads_used(Level::Sse42, 4, 6, 8, 4096), 1);
-    assert_eq!(threads_used(Level::Sse42, 4, 128, 1024, 784), 4);
-    assert_eq!(threads_used(Level::Sse42, 4, 0, 1024, 784), 1);
-    assert!(threads_used(Level::Sse42, 1000, 1024, 1024, 1024) <= 256);
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "kernels::twin_tests::forced_level_child",
+        ])
+        .env_remove("CAVITATION_THREADS")
+        .env("CAVITATION_KERNEL", "avx2")
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // A filter that matches nothing also exits 0; "1 failed" shows the helper ran.
+    assert!(
+        !out.status.success() && stdout.contains("1 failed"),
+        "the child should run the helper and fail; stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let features = format!("detected features: {}", super::detected_features());
+    assert!(
+        stderr.contains("cannot run kernel level avx2") && stderr.contains(&features),
+        "stderr:\n{stderr}"
+    );
+}
+
+/// Helper for `forced_unsupported_level_panics_cleanly`: one product at the level the
+/// environment gives. Ignored by default; it is run in a child process.
+#[test]
+#[ignore = "run in a child process by forced_unsupported_level_panics_cleanly"]
+fn forced_level_child() {
+    let (a, b, mut c) = ([1.0f32; 4], [1.0f32; 4], [0.0f32; 4]);
+    gemm_f32(1.0, rm(&a, 2, 2), rm(&b, 2, 2), 0.0, rm_mut(&mut c, 2, 2));
+    assert_eq!(c, [2.0; 4]);
 }
 
 /// Asking for a level this CPU cannot run panics, naming the level, before any kernel runs.
