@@ -1,5 +1,6 @@
-//! Trains a 784 -> 256 -> 128 -> 10 ReLU network on MNIST with `fit` and prints the test
-//! accuracy. It needs the data files; run `scripts/data/get-mnist.sh` once to fetch them.
+//! Trains a 784 -> 256 -> 128 -> 10 ReLU network on MNIST with `fit`, Adam and a cosine
+//! learning-rate schedule, and prints the test accuracy. It needs the data files; run
+//! `scripts/data/get-mnist.sh` once to fetch them.
 //!
 //! Run it with `cargo run --release --example mnist -p cavitation`.
 
@@ -8,7 +9,8 @@ use std::process::ExitCode;
 
 use cavitation::prelude::*;
 
-/// Loads MNIST from `data/mnist/`, trains with Adam, prints the test accuracy.
+/// Loads MNIST from `data/mnist/`, trains with Adam and cosine decay, prints the test
+/// accuracy.
 fn main() -> ExitCode {
     // `data/mnist/` at the repository root, wherever the example is started from.
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/mnist");
@@ -29,7 +31,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Trains for 10 epochs and prints the test accuracy.
+/// Trains for 10 epochs with the learning rate decayed by a cosine and prints the test
+/// accuracy.
 fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>> {
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(1);
@@ -68,7 +71,8 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
-        schedule: LrSchedule::Constant,
+        // The rate starts at 1e-3 and falls along a cosine towards 0 over the 10 epochs.
+        schedule: LrSchedule::Cosine { min_lr: 0.0 },
         health,
         on_epoch: Some(Box::new(
             |r: &EpochReport, _: &Sequential, _: &ParamStore| {
