@@ -1,4 +1,5 @@
-//! Elementwise operations with broadcasting: `add`, `sub`, `mul` and `scale`.
+//! Elementwise operations with broadcasting: `add`, `sub`, `mul`, `scale` and the select
+//! `keep_where`.
 
 use crate::graph::{BackwardCtx, Var};
 use crate::ops::Op;
@@ -240,6 +241,44 @@ impl<T: Real> Tape<'_, T> {
         self.push(Op::Scale(a, s.to_f64()), shape, out)
     }
 
+    /// Records `x` where `keep` is non-zero and exactly 0 where `keep` is 0, with `keep`
+    /// broadcast to the shape of `x` (NumPy rules; see [`add`](Tape::add)). A `[N]` row
+    /// against a `[B, N]` input selects columns, as a neuron mask does.
+    ///
+    /// It selects rather than multiplies, so an infinite or NaN element of `x` where `keep`
+    /// is 0 still gives 0 (a multiply by 0 would give NaN). A NaN in `keep` counts as
+    /// non-zero. The gradient of `x` is the output gradient where `keep` is non-zero and 0
+    /// elsewhere; `keep` is a condition and gets no gradient. This matches PyTorch's
+    /// `torch.where(keep != 0, x, 0)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `keep` does not broadcast to the shape of `x` (the message names both
+    /// shapes, for example `keep_where: cannot broadcast keep [4] to the input's shape
+    /// [2, 3]`), including a `keep` that would stretch `x`, or if either value was not
+    /// recorded on this tape.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let x = vec![1.0f32, f32::INFINITY, 3.0, 4.0, f32::NAN, 6.0];
+    /// let x = Tensor::from_vec(x, &[2, 3]).unwrap();
+    /// let keep = Tensor::from_vec(vec![1.0f32, 0.0, 1.0], &[3]).unwrap();
+    /// let (x, keep) = (tape.input(x.view()), tape.input(keep.view()));
+    /// let y = tape.keep_where(x, keep);
+    /// assert_eq!(tape.value(y).data(), &[1.0, 0.0, 3.0, 4.0, 0.0, 6.0]);
+    /// ```
+    pub fn keep_where(&mut self, x: Var, keep: Var) -> Var {
+        let (sx, sk) = (self.shape(x), self.shape(keep));
+        check_keep(&sx, &sk);
+        let mut out = self.take_buffer(sx.len());
+        let (xd, kd) = (self.data(x), self.data(keep));
+        apply(select, xd, kd, (&sx, &sk, &sx), &mut out);
+        self.push(Op::KeepWhere(x, keep), sx, out)
+    }
+
     /// Records `a kind b`.
     fn binary(&mut self, kind: Kind, a: Var, b: Var) -> Var {
         let (sa, sb) = (self.shape(a), self.shape(b));
@@ -348,6 +387,41 @@ pub(super) fn binary_backward<T: Real>(
             ctx.release(dst);
         }
     }
+}
+
+/// `v` where `keep` is non-zero, exactly 0 where it is 0.
+fn select<T: Real>(v: T, keep: T) -> T {
+    if keep == T::ZERO { T::ZERO } else { v }
+}
+
+/// Panics, naming both shapes, unless a `keep` of shape `sk` broadcasts to `sx` exactly.
+fn check_keep(sx: &Shape, sk: &Shape) {
+    assert!(
+        Shape::broadcast(sx, sk).as_ref() == Some(sx),
+        "keep_where: cannot broadcast keep {:?} to the input's shape {:?}",
+        sk.dims(),
+        sx.dims()
+    );
+}
+
+/// Backward of `keep_where`: `x` gets the output gradient where `keep` is non-zero and 0
+/// elsewhere; `keep` gets nothing.
+pub(super) fn keep_where_backward<T: Real>(
+    x: Var,
+    keep: Var,
+    out_grad: &[T],
+    ctx: &mut BackwardCtx<'_, T>,
+) {
+    if !ctx.takes_grad(x) {
+        return;
+    }
+    let (sx, sk) = (ctx.shape(x), ctx.shape(keep));
+    let mut dst = ctx.scratch(sx.len());
+    apply(select, out_grad, ctx.value(keep), (&sx, &sk, &sx), &mut dst);
+    if let Some(slot) = ctx.slot(x) {
+        slot.add_from(&dst);
+    }
+    ctx.release(dst);
 }
 
 /// Backward of `a * s`: the output gradient times `s`.
@@ -536,6 +610,91 @@ mod tests {
         tape.backward_seeded(out, &[1.0, 2.0, 3.0], &mut store.grads);
         drop(tape);
         assert_eq!(store.grad(p).data(), &[2.5, 5.0, 7.5]);
+    }
+
+    /// `keep_where` gives exactly 0 where `keep` is 0, even for an infinite or NaN input, and
+    /// the input unchanged elsewhere.
+    #[test]
+    fn keep_where_zeroes_dropped_positions_even_inf_and_nan() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = Tensor::from_vec(
+            vec![
+                1.0f32,
+                f32::INFINITY,
+                -3.0,
+                4.0,
+                f32::NAN,
+                f32::NEG_INFINITY,
+            ],
+            &[2, 3],
+        )
+        .unwrap();
+        let keep = Tensor::from_vec(vec![1.0f32, 0.0, 1.0], &[3]).unwrap();
+        let (x, keep) = (tape.input(x.view()), tape.input(keep.view()));
+        let out = tape.keep_where(x, keep);
+        assert_eq!(tape.shape(out).dims(), &[2, 3]);
+        let bits: Vec<u32> = tape.value(out).data().iter().map(|v| v.to_bits()).collect();
+        let want: Vec<u32> = [1.0f32, 0.0, -3.0, 4.0, 0.0, f32::NEG_INFINITY]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(bits, want);
+    }
+
+    /// The input's gradient is the output gradient where `keep` is non-zero and 0 elsewhere;
+    /// `keep` itself gets no gradient. A same-shape `keep` works too.
+    #[test]
+    fn keep_where_grad_is_zero_where_dropped() {
+        let mut store = ParamStore::new();
+        let px = store.add(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap());
+        let pk = store.add(Tensor::from_vec(vec![0.0f32, 2.0], &[2]).unwrap());
+        let full = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], &[2, 2]).unwrap();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let (x, k) = (tape.param(px), tape.param(pk));
+        let out = tape.keep_where(x, k);
+        assert_eq!(tape.value(out).data(), &[0.0, 2.0, 0.0, 4.0]);
+        tape.backward_seeded(out, &[5.0, 6.0, 7.0, 8.0], &mut store.grads);
+        drop(tape);
+        assert_eq!(store.grad(px).data(), &[0.0, 6.0, 0.0, 8.0]);
+        assert_eq!(store.grad(pk).data(), &[0.0, 0.0]);
+
+        store.zero_grad();
+        let mut tape = graph.tape(&store.values);
+        let (x, k) = (tape.param(px), tape.input(full.view()));
+        let out = tape.keep_where(x, k);
+        assert_eq!(tape.value(out).data(), &[1.0, 0.0, 0.0, 4.0]);
+        tape.backward_seeded(out, &[5.0, 6.0, 7.0, 8.0], &mut store.grads);
+        drop(tape);
+        assert_eq!(store.grad(px).data(), &[5.0, 0.0, 0.0, 8.0]);
+    }
+
+    /// A `keep` that does not broadcast to the input's shape panics naming both shapes.
+    #[test]
+    #[should_panic(expected = "keep_where: cannot broadcast keep [4] to the input's shape [2, 3]")]
+    fn keep_where_mismatch_panics() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = Tensor::zeros(&[2, 3]);
+        let keep = Tensor::zeros(&[4]);
+        let (x, keep) = (tape.input(x.view()), tape.input(keep.view()));
+        tape.keep_where(x, keep);
+    }
+
+    /// A `keep` larger than the input (which would stretch the input) panics too.
+    #[test]
+    #[should_panic(expected = "keep_where: cannot broadcast keep [2, 3] to the input's shape [3]")]
+    fn keep_where_larger_keep_panics() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = Tensor::zeros(&[3]);
+        let keep = Tensor::zeros(&[2, 3]);
+        let (x, keep) = (tape.input(x.view()), tape.input(keep.view()));
+        tape.keep_where(x, keep);
     }
 
     /// A pooled buffer holding old data is fully overwritten: the second step gives the same

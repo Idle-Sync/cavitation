@@ -270,8 +270,8 @@ impl Trainer {
     /// # Panics
     ///
     /// Panics as [`step`](Self::step) does, and as [`Hooks::run_forward`] does when a hook is
-    /// registered on a layer `model` does not have (after the forward pass, before any hook
-    /// runs or any parameter changes).
+    /// registered on a layer `model` does not have (before the forward pass, so nothing runs
+    /// and no parameter changes).
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng, Tensor};
@@ -303,6 +303,7 @@ impl Trainer {
         hooks: &mut Hooks<'_>,
     ) -> f32 {
         self.loss.check_targets(batch.targets);
+        hooks.check_layers(model);
         let value = {
             let mut tape = self.graph.tape(&params.values);
             let x = tape.input(batch.x);
@@ -730,10 +731,14 @@ fn argmax(row: &[f32]) -> Option<usize> {
 mod tests {
     //! Tests for the training step, `fit`, the losses and `accuracy`.
 
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::train::data::tests::classes_dataset;
-    use crate::{Linear, Sigmoid, Tanh};
-    use cavitation_core::{Rng, Tensor};
+    use crate::{Layer, Linear, Sigmoid, Tanh};
+    use cavitation_core::{ParamId, Rng, Tensor};
 
     /// `n` rows of `features` uniform values in `[-1, 1)` from `Rng::seed(seed)`, labelled
     /// by which of `classes` equal slices of the features has the largest sum.
@@ -980,6 +985,63 @@ mod tests {
         let mut batch = Batch::new(&data, 2);
         let view = batcher.gather(&data, 0..2, &mut batch);
         trainer.step(&net, &mut params, view);
+    }
+
+    /// A layer that passes its input through and counts its forward passes.
+    struct CountForwards {
+        /// The number of forward passes so far.
+        count: Arc<AtomicUsize>,
+    }
+
+    impl Layer<f32> for CountForwards {
+        fn name(&self) -> &str {
+            "count_forwards"
+        }
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        fn forward(&self, _tape: &mut Tape<'_, f32>, x: Var) -> Var {
+            self.count.fetch_add(1, Ordering::SeqCst);
+            x
+        }
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+    }
+
+    /// A hook on a layer the model does not have panics, naming the index and the range,
+    /// before the forward pass runs and before any parameter changes.
+    #[test]
+    fn bad_hook_index_panics_before_forward() {
+        let data = classes_dataset(4);
+        let mut params = ParamStore::new();
+        let forwards = Arc::new(AtomicUsize::new(0));
+        let net = Sequential::new()
+            .push(CountForwards {
+                count: Arc::clone(&forwards),
+            })
+            .push(Linear::new(&mut params, 3, 4, &mut Rng::seed(0)));
+        let before = parameter_bits(&net, &params);
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 4);
+        let batcher = Batcher::new(4, 4, None);
+        let mut batch = Batch::new(&data, 4);
+        let view = batcher.gather(&data, 0..4, &mut batch);
+        let mut hooks = Hooks::new();
+        hooks.on_forward(7, |_| {});
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            trainer.step_with_hooks(&net, &mut params, view, &mut hooks)
+        }));
+        let message = result.expect_err("a hook on layer 7 of 2 panics");
+        let message = message
+            .downcast_ref::<String>()
+            .expect("the panic message is a String");
+        assert!(
+            message.contains("layer 7, but the model has 2 layers (valid indices 0..2)"),
+            "{message}"
+        );
+        assert_eq!(forwards.load(Ordering::SeqCst), 0, "the forward pass ran");
+        assert_eq!(parameter_bits(&net, &params), before);
+        assert_eq!(trainer.steps(), 0);
     }
 
     /// `fit` returns an error, before training, when the targets do not have one entry per

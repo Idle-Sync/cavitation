@@ -45,6 +45,9 @@ pub(crate) enum Op<T: Real> {
     MatMul(Var, Var),
     /// Matrix product `a · bᵀ` of `[m, k]` and `[n, k]`.
     MatMulNt(Var, Var),
+    /// The input where the condition (broadcast to the input's shape) is non-zero, 0
+    /// elsewhere.
+    KeepWhere(Var, Var),
     /// Every element of the value times a scalar, kept as `f64` (exact for f32 and f64).
     Scale(Var, f64),
     /// The sum of every element, a rank-0 value.
@@ -146,6 +149,7 @@ impl<T: Real> Op<T> {
             Op::MatMul(a, b) => matmul::backward(false, a, b, out_grad, ctx),
             Op::MatMulNt(a, b) => matmul::backward(true, a, b, out_grad, ctx),
             Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
+            Op::KeepWhere(x, keep) => elementwise::keep_where_backward(x, keep, out_grad, ctx),
             Op::Sum(a) => reduce::full_backward(a, false, out_grad, ctx),
             Op::Mean(a) => reduce::full_backward(a, true, out_grad, ctx),
             Op::SumAxis(a, axis) => reduce::axis_backward(a, axis, false, out_grad, ctx),

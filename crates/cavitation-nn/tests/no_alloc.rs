@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Hooks, Init, Linear, Loss, Optimizer, Relu,
-    Sequential, Sgd, Targets, TargetsView, Trainer,
+    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Hooks, Init, Linear, Loss, NeuronMask,
+    Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trainer,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -351,15 +351,54 @@ fn no_hooks_no_cost() -> usize {
     made
 }
 
+/// Trains the 50k network with neuron masks on both ReLU layers (every third neuron of the
+/// first off, every fifth of the second) with `Trainer::step` on the 1,437-row set at batch
+/// 128, with SGD and with Adam: one whole warm-up epoch, then counts the allocations of a
+/// second whole epoch.
+fn masked_training_step() -> usize {
+    let data = synthetic_1437();
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let mut net = network_50k(&mut params);
+        for (layer, width, every) in [(1, 256, 3), (3, 128, 5)] {
+            let mut mask = NeuronMask::all_on(width);
+            for neuron in (0..width).step_by(every) {
+                mask.set(neuron, false);
+            }
+            net.set_mask(layer, mask);
+        }
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+        let mut before = 0;
+        for epoch in 0..2 {
+            if epoch == 1 {
+                before = allocations();
+            }
+            batcher.epoch();
+            for range in batcher.batches() {
+                let view = batcher.gather(&data, range, &mut batch);
+                sink += trainer.step(&net, &mut params, view);
+            }
+        }
+        made += allocations() - before;
+        assert!(sink.is_finite() && sink > 0.0);
+    }
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 6] = [
+    let scenarios: [Scenario; 7] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
         ("training_step", training_step),
         ("manual_loop", manual_loop),
         ("no_hooks_no_cost", no_hooks_no_cost),
+        ("masked_training_step", masked_training_step),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

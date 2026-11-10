@@ -187,6 +187,7 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
         "sub" => tape.sub(v[0], v[1]),
         "mul" => tape.mul(v[0], v[1]),
         "scale" => tape.scale(v[0], f32_of("s")),
+        "keep_where" => tape.keep_where(v[0], v[1]),
         "matmul" => tape.matmul(v[0], v[1]),
         "matmul_nt" => tape.matmul_nt(v[0], v[1]),
         "sum" => tape.sum(v[0]),
@@ -655,7 +656,7 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
     match f.op.as_str() {
         "scale" | "relu" | "leaky_relu" | "tanh" | "sigmoid" | "gelu" | "elu" | "selu" | "celu"
         | "silu" | "mish" | "softplus" | "softsign" | "hardtanh" | "relu6" | "hardsigmoid"
-        | "hardswish" | "log_sigmoid" | "glu" => all_elementwise(),
+        | "hardswish" | "log_sigmoid" | "glu" | "keep_where" => all_elementwise(),
         "prelu" => {
             // The slope's gradient sums over every position of its channel.
             let (x, slope) = (&f.inputs[0], &f.inputs[1]);
@@ -752,6 +753,8 @@ fn check(f: &Fixture) {
 
 /// The arithmetic operations.
 const ARITHMETIC: &[&str] = &["add", "sub", "mul", "scale"];
+/// The select operation.
+const SELECT: &[&str] = &["keep_where"];
 /// The matrix products.
 const MATMUL: &[&str] = &["matmul", "matmul_nt"];
 /// The reductions.
@@ -794,7 +797,15 @@ const LOSSES: &[&str] = &[
 ];
 
 /// Every operation list a comparison test checks.
-const OP_GROUPS: &[&[&str]] = &[ARITHMETIC, MATMUL, REDUCTIONS, ACTIVATIONS, SOFTMAX, LOSSES];
+const OP_GROUPS: &[&[&str]] = &[
+    ARITHMETIC,
+    SELECT,
+    MATMUL,
+    REDUCTIONS,
+    ACTIVATIONS,
+    SOFTMAX,
+    LOSSES,
+];
 
 /// Every level, in the order of their numbers.
 const ALL_LEVELS: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
@@ -862,6 +873,13 @@ fn check_ops(ops: &[&str]) {
 #[test]
 fn arithmetic_matches_torch() {
     check_ops(ARITHMETIC);
+}
+
+/// `keep_where` matches `torch.where(keep != 0, x, 0)`, including its zero gradient for
+/// `keep`.
+#[test]
+fn keep_where_matches_torch() {
+    check_ops(SELECT);
 }
 
 /// `matmul` and `matmul_nt` match PyTorch's float64 result within the GEMM bound.

@@ -5,6 +5,7 @@ mod hooks;
 mod init;
 mod layer;
 mod linear;
+mod mask;
 mod optim;
 mod sequential;
 mod train;
@@ -18,6 +19,7 @@ pub use hooks::{HookId, Hooks, LayerEvent};
 pub use init::Init;
 pub use layer::Layer;
 pub use linear::Linear;
+pub use mask::NeuronMask;
 pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{

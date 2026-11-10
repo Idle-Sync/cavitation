@@ -461,6 +461,23 @@ def make_optimizers():
         )
 
 
+def make_select():
+    """keep_where: the input where `keep` is non-zero and 0 elsewhere, with `keep` a row
+    broadcast over the rows, a value of the input's shape, and a scalar.
+
+    Built last, so its random draws do not shift the inputs of the cases before it.
+    """
+
+    def keep_where(x, keep):
+        return torch.where(keep != 0, x, torch.zeros((), dtype=x.dtype))
+
+    row = torch.tensor([1.0, 0.0, 1.0, 1.0, 0.0])
+    add_case("keep-where-3x5-with-5", "keep_where", {}, [rnd(3, 5), row], keep_where)
+    full = (torch.rand(16, 33) < 0.5).float()
+    add_case("keep-where-16x33", "keep_where", {}, [rnd(16, 33), full], keep_where)
+    add_case("keep-where-7x1-with-scalar", "keep_where", {}, [rnd(7, 1), torch.tensor(0.0)], keep_where)
+
+
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
@@ -474,6 +491,7 @@ def main():
     make_losses()
     make_layers()
     make_optimizers()
+    make_select()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):

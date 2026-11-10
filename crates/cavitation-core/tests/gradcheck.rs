@@ -99,6 +99,30 @@ fn gradcheck_scale() {
     report.assert_passed();
 }
 
+/// `keep_where` has the right gradient for its input, with `keep` a row broadcast over the
+/// rows, a value of the input's own shape, and a scalar; `keep` is a constant input.
+#[test]
+fn gradcheck_keep_where() {
+    let cases: [(&[usize], Tensor<f64>); 3] = [
+        (&[3, 4], t(&[1.0, 0.0, 1.0, 0.0])),
+        (
+            &[2, 3],
+            Tensor::from_vec(vec![0.0, 1.0, 1.0, 1.0, 0.0, 1.0], &[2, 3]).unwrap(),
+        ),
+        (&[5], Tensor::from_vec(vec![1.0], &[]).unwrap()),
+    ];
+    for (dims, keep) in cases {
+        let report = gradcheck(
+            |t, v| {
+                let k = t.input(keep.view());
+                t.keep_where(v[0], k)
+            },
+            &[filled(dims, 0.4)],
+        );
+        assert!(report.passed(), "keep_where {dims:?}: {report:?}");
+    }
+}
+
 /// `matmul` has the right gradient for both inputs, including a 1 x 1 result.
 #[test]
 fn gradcheck_matmul() {

@@ -5,7 +5,7 @@ use std::fmt;
 
 use cavitation_core::{Real, Tape, TensorView};
 
-use crate::{Sequential, Trace};
+use crate::{NeuronMask, Sequential, Trace};
 
 /// What a hook sees of one layer in one step.
 ///
@@ -38,11 +38,14 @@ pub struct LayerEvent<'a, T: Real = f32> {
     pub name: &'a str,
     /// The layer's input.
     pub input: TensorView<'a, T>,
-    /// The layer's output, as the next layer receives it.
+    /// The layer's output, as the next layer receives it: with a
+    /// [`NeuronMask`](crate::NeuronMask) on the layer, the masked output (0 for each off
+    /// neuron).
     pub output: TensorView<'a, T>,
     /// The derivative of each output value with respect to the input value at the same
     /// position, from [`Layer::local_derivative`](crate::Layer::local_derivative): `f′(z)`
-    /// for an activation, 1 or the slope for `Prelu`. `None` for layers whose derivative is
+    /// for an activation, 1 or the slope for `Prelu`, and 0 for each neuron a mask turns off
+    /// (its output no longer depends on its input). `None` for layers whose derivative is
     /// not element-wise (`Linear`, `Softmax`, `LogSoftmax`, `Glu`).
     pub local_derivative: Option<TensorView<'a, T>>,
     /// The gradient of the loss with respect to the output. `None` in a forward event, and
@@ -334,6 +337,21 @@ impl<'h, T: Real> Hooks<'h, T> {
         }
     }
 
+    /// Panics, naming the index and the valid range, if a hook (forward or backward) watches
+    /// a layer `model` does not have. Needs no tape, so a training step can call it before
+    /// any kernel runs.
+    pub(crate) fn check_layers(&self, model: &Sequential<T>) {
+        let layers = model.len();
+        for entry in self.forward.iter().chain(&self.backward) {
+            assert!(
+                entry.layer < layers,
+                "hooks: a hook is registered on layer {}, but the model has {layers} layers \
+                 (valid indices 0..{layers})",
+                entry.layer
+            );
+        }
+    }
+
     /// A fresh id.
     fn next_id(&mut self) -> HookId {
         let id = HookId(self.next_id);
@@ -344,15 +362,8 @@ impl<'h, T: Real> Hooks<'h, T> {
     /// Panics if a hook watches a layer `model` does not have, or `trace` does not match
     /// `model`.
     fn check(&self, trace: &Trace, model: &Sequential<T>) {
+        self.check_layers(model);
         let layers = model.len();
-        for entry in self.forward.iter().chain(&self.backward) {
-            assert!(
-                entry.layer < layers,
-                "hooks: a hook is registered on layer {}, but the model has {layers} layers \
-                 (valid indices 0..{layers})",
-                entry.layer
-            );
-        }
         assert!(
             trace.len() == layers,
             "hooks: the trace records {} layers, but the model has {layers}",
@@ -362,8 +373,9 @@ impl<'h, T: Real> Hooks<'h, T> {
 }
 
 /// Runs every hook in `entries` that watches `layer`, with that layer's event; the local
-/// derivative is computed into `derivative` only if there is such a hook. With `backward`
-/// the event carries the tape's gradients.
+/// derivative is computed into `derivative` only if there is such a hook, and set to 0 for
+/// the neurons the layer's mask turns off. With `backward` the event carries the tape's
+/// gradients.
 fn run_layer<T: Real>(
     entries: &mut [Entry<'_, T>],
     derivative: &mut Vec<T>,
@@ -381,6 +393,9 @@ fn run_layer<T: Real>(
     let input = tape.value(x);
     derivative.resize(input.data().len(), T::ZERO);
     let local_derivative = if l.local_derivative(tape, x, derivative) {
+        if let Some(mask) = model.mask(layer) {
+            zero_masked(derivative, mask);
+        }
         let view = TensorView::from_slice(&derivative[..], input.shape().dims());
         Some(view.expect("the derivative buffer has the input's length"))
     } else {
@@ -397,6 +412,23 @@ fn run_layer<T: Real>(
     };
     for entry in entries.iter_mut().filter(|e| e.layer == layer) {
         (entry.f)(&event);
+    }
+}
+
+/// Sets to 0 every value of `values` (rows of `mask.width()` values each, as an element-wise
+/// layer's output is laid out) in a column `mask` turns off.
+fn zero_masked<T: Real>(values: &mut [T], mask: &NeuronMask) {
+    let width = mask.width();
+    if width == 0 {
+        return;
+    }
+    debug_assert_eq!(values.len() % width, 0);
+    for row in values.chunks_exact_mut(width) {
+        for (neuron, v) in row.iter_mut().enumerate() {
+            if !mask.is_on(neuron) {
+                *v = T::ZERO;
+            }
+        }
     }
 }
 

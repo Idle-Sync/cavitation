@@ -1,12 +1,14 @@
-//! `Sequential` and `Trace`: layers run one after another, and a record of each layer's input
-//! and output.
+//! `Sequential` and `Trace`: layers run one after another, with optional neuron masks on
+//! their outputs, and a record of each layer's input and output.
 
 use cavitation_core::{ParamId, Real, Tape, Var};
 
-use crate::Layer;
 use crate::activation::last_dim;
+use crate::mask::LayerMask;
+use crate::{Layer, NeuronMask};
 
-/// Each layer's input and output [`Var`] from one forward pass.
+/// Each layer's input and output [`Var`] from one forward pass. A masked layer's output is
+/// the masked value.
 ///
 /// Fill it with [`Sequential::forward_traced`]. Reuse one trace for every step: it keeps its
 /// capacity, so tracing allocates nothing after the first step.
@@ -143,6 +145,9 @@ impl Trace {
 /// Its parameters are named `"{index}.{local name}"`, so layer 0's weight is `0.weight`, as
 /// in a PyTorch `nn.Sequential`. A `Sequential` is not itself a layer, so they do not nest.
 ///
+/// Any layer can carry a [`NeuronMask`] ([`set_mask`](Self::set_mask)): the forward pass sets
+/// the off neurons of that layer's output to exactly 0, and they pass no gradient back.
+///
 /// ```
 /// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
 /// use cavitation_nn::{Linear, Relu, Sequential};
@@ -161,6 +166,8 @@ impl Trace {
 pub struct Sequential<T: Real = f32> {
     /// The layers, in order.
     layers: Vec<Box<dyn Layer<T>>>,
+    /// The neuron mask on each layer's output, if any; one entry per layer.
+    masks: Vec<Option<LayerMask<T>>>,
 }
 
 impl Sequential<f32> {
@@ -190,7 +197,10 @@ impl<T: Real> Sequential<T> {
     /// assert_eq!(Sequential::<f64>::new_generic().len(), 0);
     /// ```
     pub fn new_generic() -> Sequential<T> {
-        Sequential { layers: Vec::new() }
+        Sequential {
+            layers: Vec::new(),
+            masks: Vec::new(),
+        }
     }
 
     /// Adds `layer` at the end and returns the network.
@@ -202,6 +212,7 @@ impl<T: Real> Sequential<T> {
     /// ```
     pub fn push(mut self, layer: impl Layer<T> + 'static) -> Sequential<T> {
         self.layers.push(Box::new(layer));
+        self.masks.push(None);
         self
     }
 
@@ -245,15 +256,98 @@ impl<T: Real> Sequential<T> {
         &*self.layers[i]
     }
 
+    /// Puts `mask` on layer `layer`'s output, replacing any mask already there. From the next
+    /// forward pass on, each off neuron's output (its position on the output's last axis) is
+    /// exactly 0, even where the layer gives infinity or NaN, and its gradient is 0, so
+    /// nothing flows back through it. To turn off a hidden neuron, mask the activation layer
+    /// that follows its `Linear`.
+    ///
+    /// The mask's width is checked against the layer's output at the next forward pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layer >= len()`; the message names the index and the valid range.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Linear, NeuronMask, Sequential, Sigmoid};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Sigmoid);
+    /// let mut mask = NeuronMask::all_on(3);
+    /// mask.set(1, false);
+    /// net.set_mask(1, mask);
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&params.values);
+    /// let x = tape.input(Tensor::full(&[1, 2], 1.0f32).view());
+    /// let y = net.forward(&mut tape, x);
+    /// assert_eq!(tape.value(y).data()[1], 0.0);
+    /// ```
+    pub fn set_mask(&mut self, layer: usize, mask: NeuronMask) {
+        self.check_layer(layer, "mask");
+        self.masks[layer] = Some(LayerMask::new(mask));
+    }
+
+    /// Removes the mask from layer `layer`, if it has one; the layer's output is used as it
+    /// is again, and the forward pass records nothing extra for it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layer >= len()`; the message names the index and the valid range.
+    ///
+    /// ```
+    /// use cavitation_nn::{NeuronMask, Relu, Sequential};
+    /// let mut net = Sequential::new().push(Relu);
+    /// net.set_mask(0, NeuronMask::all_on(4));
+    /// net.clear_mask(0);
+    /// assert!(net.mask(0).is_none());
+    /// ```
+    pub fn clear_mask(&mut self, layer: usize) {
+        self.check_layer(layer, "clear the mask of");
+        self.masks[layer] = None;
+    }
+
+    /// The mask on layer `layer`, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `layer >= len()`; the message names the index and the valid range.
+    ///
+    /// ```
+    /// use cavitation_nn::{NeuronMask, Relu, Sequential};
+    /// let mut net = Sequential::new().push(Relu);
+    /// assert!(net.mask(0).is_none());
+    /// net.set_mask(0, NeuronMask::all_on(4));
+    /// assert_eq!(net.mask(0).unwrap().width(), 4);
+    /// ```
+    pub fn mask(&self, layer: usize) -> Option<&NeuronMask> {
+        self.check_layer(layer, "read the mask of");
+        self.masks[layer].as_ref().map(|m| &m.mask)
+    }
+
+    /// Panics, naming `action`, the index and the valid range, if `layer` is not a layer.
+    fn check_layer(&self, layer: usize, action: &str) {
+        let layers = self.layers.len();
+        assert!(
+            layer < layers,
+            "sequential: cannot {action} layer {layer}, the model has {layers} layers \
+             (valid indices 0..{layers})"
+        );
+    }
+
     /// Records every layer's forward pass on `tape`, each taking the previous output, and
-    /// returns the last output (`x` itself for an empty network).
+    /// returns the last output (`x` itself for an empty network). A masked layer's output is
+    /// recorded through [`Tape::keep_where`] with the mask as the condition; an unmasked
+    /// layer records nothing extra.
     ///
     /// # Panics
     ///
     /// Panics if a layer's required input width differs from the width of the previous
     /// output, or a layer produces a width other than the one it reports; the message names
-    /// the layer's index and name and both widths. A layer may also panic on a shape it
-    /// rejects.
+    /// the layer's index and name and both widths. Panics, after that layer's forward pass,
+    /// if a layer's mask is not as wide as its output; the message names the layer and both
+    /// widths. A layer may also panic on a shape it rejects.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
@@ -321,7 +415,7 @@ impl<T: Real> Sequential<T> {
                     self.layers[i - 1].name()
                 );
             }
-            let y = layer.forward(tape, x);
+            let mut y = layer.forward(tape, x);
             let produced = last_dim(tape.shape(y));
             let reported = layer.output_width(width);
             assert!(
@@ -329,6 +423,16 @@ impl<T: Real> Sequential<T> {
                 "sequential: layer {i} ({}) produced output width {produced}, but reports {reported} for input width {width}",
                 layer.name()
             );
+            if let Some(mask) = &self.masks[i] {
+                let masked = mask.mask.width();
+                assert!(
+                    masked == produced,
+                    "sequential: the mask on layer {i} ({}) has width {masked}, but the layer outputs width {produced}",
+                    layer.name()
+                );
+                let keep = tape.input(mask.keep.view());
+                y = tape.keep_where(y, keep);
+            }
             if let Some(trace) = trace.as_deref_mut() {
                 trace.inputs.push(x);
                 trace.outputs.push(y);

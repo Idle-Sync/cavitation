@@ -7,8 +7,8 @@ use cavitation_core::{
     TensorViewMut, Var, gradcheck_params,
 };
 use cavitation_nn::{
-    Activation, ActivationLayer, Gelu, Glu, Init, Layer, Linear, LogSoftmax, Prelu, Sequential,
-    Sigmoid, Softmax, Tanh,
+    Activation, ActivationLayer, Gelu, Glu, Init, Layer, Linear, LogSoftmax, NeuronMask, Prelu,
+    Sequential, Sigmoid, Softmax, Tanh,
 };
 
 /// A `Linear` layer's forward pass has the right gradient for its input, weight and bias.
@@ -173,6 +173,42 @@ fn gradcheck_three_layer_sequential() {
             &mut rng,
         ));
     let x = Tensor::from_vec(vec![0.3, -0.7, 1.1, 0.2, -0.4, 0.9], &[3, 2]).unwrap();
+    gradcheck_params(&mut params, &[x], |tape, v| net.forward(tape, v[0])).assert_passed();
+}
+
+/// A 3 -> 5 -> 2 tanh network with two hidden neurons and one output neuron masked off
+/// passes the gradient check for every parameter and the input.
+#[test]
+fn gradcheck_masked_tanh_network() {
+    let mut params = ParamStore::<f64>::new_generic();
+    let mut rng = Rng::seed(13);
+    let mut net = Sequential::new_generic()
+        .push(Linear::with_init(
+            &mut params,
+            3,
+            5,
+            Init::XavierNormal,
+            Init::XavierUniform,
+            &mut rng,
+        ))
+        .push(Tanh)
+        .push(Linear::with_init(
+            &mut params,
+            5,
+            2,
+            Init::XavierNormal,
+            Init::XavierUniform,
+            &mut rng,
+        ))
+        .push(Tanh);
+    let mut hidden = NeuronMask::all_on(5);
+    hidden.set(0, false);
+    hidden.set(3, false);
+    net.set_mask(1, hidden);
+    let mut out = NeuronMask::all_on(2);
+    out.set(1, false);
+    net.set_mask(3, out);
+    let x = Tensor::from_vec(vec![0.3, -0.7, 1.1, 0.2, -0.4, 0.9], &[2, 3]).unwrap();
     gradcheck_params(&mut params, &[x], |tape, v| net.forward(tape, v[0])).assert_passed();
 }
 
