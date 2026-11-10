@@ -15,7 +15,7 @@ use std::thread::{self, Thread};
 use std::time::{Duration, Instant};
 
 /// The most threads, the caller included, that one call uses.
-const MAX_THREADS: usize = 256;
+pub(super) const MAX_THREADS: usize = 256;
 
 /// How long a worker, or a caller waiting for workers, spins before it sleeps.
 const SPIN: Duration = Duration::from_micros(200);

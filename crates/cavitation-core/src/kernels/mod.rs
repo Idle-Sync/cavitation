@@ -342,10 +342,14 @@ fn required_len(rows: usize, cols: usize, row_stride: usize, col_stride: usize) 
 
 /// Whether no two distinct elements of a `rows` by `cols` view can share an offset.
 ///
-/// Only dimensions with extent above 1 count. A single such dimension needs a stride of at
-/// least 1. Two need, with the smaller stride `s` and its extent `e`, `s >= 1` and
+/// An empty view (no rows or no columns) always passes. Otherwise only dimensions with
+/// extent above 1 count. A single such dimension needs a stride of at least 1. Two need, with the smaller stride `s` and its extent `e`, `s >= 1` and
 /// `e * s <= ` the larger stride. This is sufficient, not necessary.
 fn is_non_aliasing(rows: usize, cols: usize, row_stride: usize, col_stride: usize) -> bool {
+    if rows == 0 || cols == 0 {
+        // No elements, so none can share an offset.
+        return true;
+    }
     // (extent, stride) of each dimension longer than 1, without allocating.
     let row = (rows > 1).then_some((rows, row_stride));
     let col = (cols > 1).then_some((cols, col_stride));
@@ -511,7 +515,8 @@ impl<'a, T: Real> MatRef<'a, T> {
 ///
 /// A `MatMut` never aliases: `new` returns `None` unless distinct elements map to distinct
 /// positions in the slice, so writing different elements can never touch the same value.
-/// Only dimensions longer than 1 count (a single row or column may have any stride). For
+/// An empty view (no rows or no columns) is always accepted. Otherwise only dimensions
+/// longer than 1 count (a single row or column may have any stride). For
 /// two such dimensions the rule is conservative: with the smaller stride `s` and its extent
 /// `e`, it needs `s >= 1` and `e * s <=` the larger stride. A few non-aliasing layouts, such
 /// as strides `(3, 2)` on a 2 x 2 view, are rejected too. A row-major, column-major or

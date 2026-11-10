@@ -242,6 +242,14 @@ mod tests {
         assert!(MatMut::new(&mut d, 2, 3, 1, 2).is_some());
     }
 
+    /// Empty views have no elements to alias, whatever their strides.
+    #[test]
+    fn matmut_accepts_empty_views() {
+        assert!(MatMut::<f32>::new(&mut [], 5, 0, 0, 1).is_some());
+        assert!(MatMut::<f32>::new(&mut [], 0, 96, 1, 0).is_some());
+        assert!(MatMut::<f32>::new(&mut [], 0, 0, 0, 0).is_some());
+    }
+
     /// Shape mismatches panic with a message naming both shapes.
     #[test]
     #[should_panic(expected = "A is 2 x 3, B is 2 x 2")]

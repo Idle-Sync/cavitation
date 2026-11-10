@@ -1,7 +1,7 @@
 //! Fast kernels against their reference twins. Each test names the kernel level directly,
 //! so tests never depend on, or race on, the process-wide level setting.
 
-use super::gemm::{gemm_f32, gemm_f32_with};
+use super::gemm::{gemm_f32, gemm_f32_with, threads_used};
 use super::{Level, MatMut, MatRef, reference, supported};
 use crate::Rng;
 
@@ -42,6 +42,25 @@ impl Stored {
             }
         }
         let (row_stride, col_stride) = if transposed { (1, lead) } else { (lead, 1) };
+        Stored {
+            data,
+            rows,
+            cols,
+            row_stride,
+            col_stride,
+        }
+    }
+
+    /// Stores the row-major `rows` by `cols` values `logical` with neither stride 1: column
+    /// stride 2 and row stride `2·cols + 1`, the gaps holding NaN.
+    fn strided(logical: &[f32], rows: usize, cols: usize) -> Stored {
+        let (row_stride, col_stride) = (2 * cols + 1, 2);
+        let mut data = vec![f32::NAN; rows * row_stride];
+        for i in 0..rows {
+            for j in 0..cols {
+                data[i * row_stride + j * col_stride] = logical[i * cols + j];
+            }
+        }
         Stored {
             data,
             rows,
@@ -171,15 +190,32 @@ fn check_case(
                 rm_mut(&mut want, m, n),
             );
             let bound = bounds(&a, &b, &c0, (m, n, k), alpha, beta);
-            for (ta, tb) in [(false, false), (true, false), (false, true), (true, true)] {
-                let sa = Stored::new(&a, m, k, ta, pad);
-                let sb = Stored::new(&b, k, n, tb, pad);
+            // The four transpose combinations, then A, B and C all with general strides.
+            for (ta, tb, general) in [
+                (false, false, false),
+                (true, false, false),
+                (false, true, false),
+                (true, true, false),
+                (false, false, true),
+            ] {
                 let start = if beta == 0.0 {
                     vec![f32::NAN; m * n]
                 } else {
                     c0.clone()
                 };
-                let mut sc = Stored::new(&start, m, n, c_transposed, pad);
+                let (sa, sb, mut sc) = if general {
+                    (
+                        Stored::strided(&a, m, k),
+                        Stored::strided(&b, k, n),
+                        Stored::strided(&start, m, n),
+                    )
+                } else {
+                    (
+                        Stored::new(&a, m, k, ta, pad),
+                        Stored::new(&b, k, n, tb, pad),
+                        Stored::new(&start, m, n, c_transposed, pad),
+                    )
+                };
                 gemm_f32_with(
                     level,
                     threads,
@@ -191,7 +227,8 @@ fn check_case(
                 );
                 let what = format!(
                     "{m}x{n}x{k}, A transposed {ta}, B transposed {tb}, C transposed \
-                     {c_transposed}, alpha {alpha}, beta {beta}, {threads} threads"
+                     {c_transposed}, general strides {general}, alpha {alpha}, beta {beta}, \
+                     {threads} threads"
                 );
                 assert_within(&sc.logical(), &want, &bound, n, &what);
             }
@@ -404,6 +441,19 @@ fn run_to_run_identical() {
         let again = product_bits(Level::Sse42, 4, rm(&a, m, k), rm(&b, k, n), 0.5, &c0);
         assert!(first == again, "a repeated call gave different bits");
     }
+}
+
+/// The reported thread count is the one the call runs on: never more than its tasks.
+#[test]
+fn threads_used_matches_the_work() {
+    if !supported(Level::Sse42) {
+        return;
+    }
+    // One 6 by 8 tile: one task, so one thread, however many are offered.
+    assert_eq!(threads_used(Level::Sse42, 4, 6, 8, 4096), 1);
+    assert_eq!(threads_used(Level::Sse42, 4, 128, 1024, 784), 4);
+    assert_eq!(threads_used(Level::Sse42, 4, 0, 1024, 784), 1);
+    assert!(threads_used(Level::Sse42, 1000, 1024, 1024, 1024) <= 256);
 }
 
 /// Asking for a level this CPU cannot run panics, naming the level, before any kernel runs.

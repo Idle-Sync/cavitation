@@ -81,13 +81,13 @@ pub(super) struct Dest {
 }
 
 /// Products of fewer floating-point operations than this (`2 · m · n · k`) run on the
-/// calling thread alone, with the same blocking. An estimate, not tuned: about 6 µs of work
-/// on one core, against two thread-pool round trips of about 0.5 µs each.
+/// calling thread alone, with the same blocking. Not tuned: a guess at the size below which
+/// two thread-pool round trips per block cost more than splitting the work saves.
 const SINGLE_THREAD_FLOPS: usize = 1 << 17;
 
 /// Compute tasks per thread the driver aims for. More tasks balance uneven work better but
-/// pack each row of `A` more often; one was fastest when measured (see the SSE kernel's
-/// notes in `x86.rs`).
+/// pack each row of `A` more often. One was chosen with `cavitation-bench gemm`; provisional,
+/// tuned on a loaded machine (see the SSE kernel's notes in `x86.rs`).
 const TASKS_PER_THREAD: usize = 1;
 
 /// General matrix multiply in f32, `C = alpha · A · B + beta · C`, with the kernel for the
@@ -97,6 +97,12 @@ const TASKS_PER_THREAD: usize = 1;
 /// (the sum over `k` runs in blocks), are bit-identical for any thread count, and are the
 /// same from run to run at the same level. When `beta` is zero the old contents of `C` are
 /// never read, so NaN in `C` does not leak into the result.
+///
+/// Bit-identical results across thread count assume the default floating-point mode. The
+/// pool's worker threads always run in it; a caller that turns on flush-to-zero or
+/// denormals-are-zero (the x86 MXCSR flags) on its own thread computes its share of the
+/// tiles in that mode, so results that involve subnormal values can then depend on the
+/// thread count.
 ///
 /// # Panics
 ///
@@ -187,7 +193,6 @@ pub fn gemm_f32_with(
         // sound even on a CPU that reported AVX2 without SSE4.2.
         #[cfg(target_arch = "x86_64")]
         Level::Sse42 | Level::Avx2Fma if supported(Level::Sse42) => {
-            let threads = threads_for(m, n, k, threads);
             if swaps(m, n) {
                 // Cᵀ = Bᵀ · Aᵀ: the same sums of the same products in the same order (a
                 // product of two floats does not depend on their order), so the same bits.
@@ -212,8 +217,9 @@ pub fn gemm_f32_with(
 }
 
 /// The number of threads [`gemm_f32_with`] uses for an `m` by `k` times `k` by `n` product
-/// at `level` when given `threads`: 1 for the reference loops and for products too small to
-/// be worth splitting, else `threads`.
+/// at `level` when given `threads`: 1 for the reference loops, for empty products and for
+/// products too small to be worth splitting, else the most threads any step of the product
+/// runs on (never more than its number of tasks, nor more than the pool's maximum of 256).
 ///
 /// # Examples
 ///
@@ -224,11 +230,15 @@ pub fn gemm_f32_with(
 /// assert_eq!(threads_used(Level::Sse42, 4, 2, 2, 2), 1);
 /// ```
 pub fn threads_used(level: Level, threads: usize, m: usize, n: usize, k: usize) -> usize {
+    if m == 0 || n == 0 || k == 0 {
+        return 1;
+    }
     match level {
-        Level::Sse42 | Level::Avx2Fma
-            if cfg!(target_arch = "x86_64") && supported(Level::Sse42) =>
-        {
-            threads_for(m, n, k, threads)
+        #[cfg(target_arch = "x86_64")]
+        Level::Sse42 | Level::Avx2Fma if supported(Level::Sse42) => {
+            type K = super::x86::Sse;
+            let (m, n) = if swaps(m, n) { (n, m) } else { (m, n) };
+            Plan::new::<K>(m, n, k, threads).threads_used::<K>(n)
         }
         _ => 1,
     }
@@ -248,6 +258,58 @@ fn threads_for(m: usize, n: usize, k: usize, threads: usize) -> usize {
         1
     } else {
         threads
+    }
+}
+
+/// The threads one `pool::run` of `tasks` tasks uses when given `threads`: the pool never
+/// runs more threads than tasks, nor more than its maximum.
+fn launch(threads: usize, tasks: usize) -> usize {
+    threads.min(tasks).clamp(1, pool::MAX_THREADS)
+}
+
+/// How the packed driver splits an `m` by `n` by `k` product (after any swap), from the
+/// shape and the thread count alone. The driver and [`threads_used`] both read it, so the
+/// reported thread count is the one the driver uses.
+#[derive(Clone, Copy)]
+struct Plan {
+    /// The thread count passed to the pool: 1 below [`SINGLE_THREAD_FLOPS`].
+    threads: usize,
+    /// The length of every block of the sum but the last, which may be shorter. Blocks are
+    /// of equal size and do not depend on the thread count.
+    kc: usize,
+    /// The width of every block of columns but the last, a multiple of `NR`.
+    nc: usize,
+    /// The compute grid of a full-width block of columns.
+    full: Grid,
+    /// The compute grid of the last block of columns.
+    last: Grid,
+}
+
+impl Plan {
+    /// The plan for kernel `K`; `m`, `n` and `k` are all non-zero.
+    fn new<K: Kernel>(m: usize, n: usize, k: usize, threads: usize) -> Plan {
+        let threads = threads_for(m, n, k, threads);
+        let kc = k.div_ceil(k.div_ceil(K::KC));
+        let nc = n.div_ceil(n.div_ceil(K::NC)).next_multiple_of(K::NR);
+        let grid = |width| Grid::new(m, width, K::MR, K::NR, K::MC, threads);
+        Plan {
+            threads,
+            kc,
+            nc,
+            full: grid(nc.min(n)),
+            last: grid(n - (n - 1) / nc * nc),
+        }
+    }
+
+    /// The most threads any `pool::run` of the call uses: packing runs one task per `NR`
+    /// columns of a block, computing runs the block's grid.
+    fn threads_used<K: Kernel>(&self, n: usize) -> usize {
+        let last_width = n - (n - 1) / self.nc * self.nc;
+        [(self.full, self.nc.min(n)), (self.last, last_width)]
+            .into_iter()
+            .map(|(grid, width)| launch(self.threads, grid.tasks().max(width.div_ceil(K::NR))))
+            .max()
+            .unwrap_or(1)
     }
 }
 
@@ -475,21 +537,22 @@ unsafe fn packed<K: Kernel>(
     };
     let (m, n, k) = (a.rows(), b.cols(), a.cols());
     let (mr, nr) = (K::MR, K::NR);
-    // Blocks of equal size (the last may be shorter by less than one step): the same for any
-    // thread count.
-    let kc = k.div_ceil(k.div_ceil(K::KC));
-    let nc = n.div_ceil(n.div_ceil(K::NC)).next_multiple_of(nr);
+    let plan = Plan::new::<K>(m, n, k, threads);
+    let Plan {
+        threads,
+        kc,
+        nc,
+        full,
+        last,
+    } = plan;
     let (crs, ccs) = (c.row_stride, c.col_stride);
     // The one raw pointer to C, taken from the `MatMut` borrowed for the whole call.
     let c_ptr = Shared(c.data.as_mut_ptr());
     SCRATCH.with_borrow_mut(|scratch| {
         // Sizes depend only on the shape and the thread count, so a warmed-up caller never
-        // grows them again.
-        // Every block of columns is `nc` wide except perhaps the last, so these two grids
-        // bound the tasks and rows of every block.
-        let full = Grid::new(m, nc.min(n), mr, nr, K::MC, threads);
-        let last = Grid::new(m, n - (n - 1) / nc * nc, mr, nr, K::MC, threads);
-        let slots = threads.min(full.tasks().max(last.tasks()));
+        // grows them again. `full` and `last` bound the tasks and rows of every block, and
+        // no compute task runs on a worker numbered `slots` or above.
+        let slots = launch(threads, full.tasks().max(last.tasks()));
         let a_slot = (full.m_panels.max(last.m_panels) * mr * kc * K::A_REP).div_ceil(16);
         reserve(&mut scratch.b, (kc * nc).div_ceil(16));
         reserve(&mut scratch.a, slots * a_slot);
@@ -502,7 +565,7 @@ unsafe fn packed<K: Kernel>(
             for p0 in (0..k).step_by(kc) {
                 let kcur = kc.min(k - p0);
                 let beta = if p0 == 0 { beta } else { 1.0 };
-                pool::run(threads, panels, &|t: pool::Task| {
+                pool::run(launch(threads, panels), panels, &|t: pool::Task| {
                     let j = t.index * nr;
                     // SAFETY: panel `t.index` occupies floats `t.index·kcur·nr` up to
                     // `(t.index + 1)·kcur·nr` of the B buffer, which holds `kc·nc` floats
@@ -516,69 +579,74 @@ unsafe fn packed<K: Kernel>(
                     };
                     K::pack_b(&b, (j0 + j, nr.min(ncur - j)), (p0, kcur), dst);
                 });
-                pool::run(threads, grid.tasks(), &|t: pool::Task| {
-                    assert!(t.worker < slots, "gemm: worker {} of {slots}", t.worker);
-                    let (ti, tj) = (t.index / grid.n_tasks, t.index % grid.n_tasks);
-                    let i0 = ti * grid.m_panels * mr;
-                    let i1 = m.min(i0 + grid.m_panels * mr);
-                    let a_panels = (i1 - i0).div_ceil(mr);
-                    // SAFETY: slot `t.worker` is floats `t.worker·a_slot·16` onward, `a_slot`
-                    // lines long, inside the A buffer (`t.worker < slots`); it holds
-                    // `a_panels·mr·kcur <= grid.m_panels·mr·kc` floats, at most `a_slot`
-                    // lines. Two tasks
-                    // running at the same time have different worker numbers, and the
-                    // buffer outlives this `run`.
-                    let a_pack = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            a_buf.ptr().add(t.worker * a_slot * 16),
-                            a_panels * mr * kcur * K::A_REP,
-                        )
-                    };
-                    K::pack_a(&a, (i0, i1), (p0, kcur), a_pack);
-                    let first = tj * grid.n_panels;
-                    let last = panels.min(first + grid.n_panels);
-                    // One A panel stays in L1 while the task's B panels stream past it.
-                    for ip in 0..a_panels {
-                        let i = i0 + ip * mr;
-                        let rows = mr.min(m - i);
-                        for jp in first..last {
-                            let j = jp * nr;
-                            let cols = nr.min(ncur - j);
-                            // SAFETY: inside the B buffer, packed by the previous `run`, which
-                            // finished before this one started; only read from now on.
-                            let b_panel = unsafe { b_buf.ptr().add(jp * kcur * nr).cast_const() };
-                            let dest = Dest {
-                                // SAFETY: (i, j0 + j) is an element of C (i < m,
-                                // j0 + j < n), so its offset is inside C's slice.
-                                ptr: unsafe { c_ptr.ptr().add(i * crs + (j0 + j) * ccs) },
-                                rs: crs,
-                                cs: ccs,
-                                rows,
-                                cols,
-                            };
-                            // SAFETY: the A panel holds `mr·A_REP·kcur` floats, the B panel
-                            // `nr·kcur`, both 16-byte aligned (the slots and the B buffer
-                            // start on 64-byte boundaries, and panels at multiples of
-                            // `nr·kcur` and `mr·A_REP·kcur` floats, multiples of 4 since
-                            // `nr` and `A_REP` are checked or set to be).
-                            // The tile's valid elements lie in C (rows and cols are clipped
-                            // to m and n), and this task is the only one writing rows
-                            // i0..i1 of columns of panels first..last; `MatMut` guarantees
-                            // distinct elements do not alias. The CPU supports `K` (this
-                            // function's contract).
-                            unsafe {
-                                K::tile(
-                                    kcur,
-                                    a_pack.as_ptr().add(ip * mr * kcur * K::A_REP),
-                                    b_panel,
-                                    alpha,
-                                    beta,
-                                    &dest,
-                                );
+                pool::run(
+                    launch(threads, grid.tasks()),
+                    grid.tasks(),
+                    &|t: pool::Task| {
+                        assert!(t.worker < slots, "gemm: worker {} of {slots}", t.worker);
+                        let (ti, tj) = (t.index / grid.n_tasks, t.index % grid.n_tasks);
+                        let i0 = ti * grid.m_panels * mr;
+                        let i1 = m.min(i0 + grid.m_panels * mr);
+                        let a_panels = (i1 - i0).div_ceil(mr);
+                        // SAFETY: slot `t.worker` is floats `t.worker·a_slot·16` onward, `a_slot`
+                        // lines long, inside the A buffer (`t.worker < slots`); it holds
+                        // `a_panels·mr·kcur <= grid.m_panels·mr·kc` floats, at most `a_slot`
+                        // lines. Two tasks
+                        // running at the same time have different worker numbers, and the
+                        // buffer outlives this `run`.
+                        let a_pack = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                a_buf.ptr().add(t.worker * a_slot * 16),
+                                a_panels * mr * kcur * K::A_REP,
+                            )
+                        };
+                        K::pack_a(&a, (i0, i1), (p0, kcur), a_pack);
+                        let first = tj * grid.n_panels;
+                        let last = panels.min(first + grid.n_panels);
+                        // One A panel stays in L1 while the task's B panels stream past it.
+                        for ip in 0..a_panels {
+                            let i = i0 + ip * mr;
+                            let rows = mr.min(m - i);
+                            for jp in first..last {
+                                let j = jp * nr;
+                                let cols = nr.min(ncur - j);
+                                // SAFETY: inside the B buffer, packed by the previous `run`, which
+                                // finished before this one started; only read from now on.
+                                let b_panel =
+                                    unsafe { b_buf.ptr().add(jp * kcur * nr).cast_const() };
+                                let dest = Dest {
+                                    // SAFETY: (i, j0 + j) is an element of C (i < m,
+                                    // j0 + j < n), so its offset is inside C's slice.
+                                    ptr: unsafe { c_ptr.ptr().add(i * crs + (j0 + j) * ccs) },
+                                    rs: crs,
+                                    cs: ccs,
+                                    rows,
+                                    cols,
+                                };
+                                // SAFETY: the A panel holds `mr·A_REP·kcur` floats, the B panel
+                                // `nr·kcur`, both 16-byte aligned (the slots and the B buffer
+                                // start on 64-byte boundaries, and panels at multiples of
+                                // `nr·kcur` and `mr·A_REP·kcur` floats, multiples of 4 since
+                                // `nr` and `A_REP` are checked or set to be).
+                                // The tile's valid elements lie in C (rows and cols are clipped
+                                // to m and n), and this task is the only one writing rows
+                                // i0..i1 of columns of panels first..last; `MatMut` guarantees
+                                // distinct elements do not alias. The CPU supports `K` (this
+                                // function's contract).
+                                unsafe {
+                                    K::tile(
+                                        kcur,
+                                        a_pack.as_ptr().add(ip * mr * kcur * K::A_REP),
+                                        b_panel,
+                                        alpha,
+                                        beta,
+                                        &dest,
+                                    );
+                                }
                             }
                         }
-                    }
-                });
+                    },
+                );
             }
         }
     });

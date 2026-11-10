@@ -9,20 +9,18 @@ use std::arch::x86_64::{
 use super::MatRef;
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
 
-/// The SSE4.2 GEMM kernel: 6 by 8 tiles held in 12 four-wide accumulators. Packed `A` holds
-/// each value four times over, so the kernel loads it already broadcast instead of
-/// shuffling: on cores with one vector multiply per cycle the shuffles (and register copies)
-/// compete with the multiplies. With this layout the tile runs at 22.2 GFLOPS on one core of
-/// an Intel Celeron N5105 with its data in L1, against 22.4 for back-to-back multiplies and
-/// adds alone (measured, `kc` 64 to 256).
+/// The SSE4.2 GEMM kernel: 6 by 8 tiles held in 12 four-wide accumulators (with the two
+/// `B` vectors, all 16 SSE registers in use, nothing spilled).
+///
+/// Packed `A` holds each value four times over (`A_REP = 4`), so the kernel loads it already
+/// broadcast: on cores with one four-wide multiply per cycle, a shuffle or a register copy
+/// in the inner loop costs as much as a multiply.
 ///
 /// Block sizes `kc = 256`, `mc = 96`, `nc = 2048`, with one compute task per thread (set in
-/// the driver), chosen by measurement on the eight products of a batch-128 training step of
-/// a 784-1024-256-10 and a 64-256-128-10 network, 4 threads, Intel Celeron N5105, best of 3
-/// runs (GFLOPS over all eight): `kc` 256 gave 55.6 and 41.9, 192 gave 57.3 and 37.3, 384
-/// gave 51.2 and 42.1; `mc` 72 gave 56.7 and 41.5, 144 gave 49.4 and 28.6; 1 task per thread
-/// gave 56.5 and 49.5, against 55.6 and 41.9 for 2 and 53.6 and 35.0 for 3. Other work ran
-/// during the sweep (load average 0.9 to 2.7), so differences of a few percent are noise.
+/// the driver), were chosen by running `cavitation-bench gemm --shapes mnist128` and
+/// `--shapes digits128` with each candidate (`kc` 128 to 384, `mc` 48 to 144, 1 to 3 tasks
+/// per thread). They are provisional: they were tuned on a loaded machine and are to be
+/// re-checked on a quiet one.
 pub(super) struct Sse;
 
 // SAFETY: `tile` reads `24·kc` values from `a` and `8·kc` from `b` (aligned loads at multiples
@@ -207,8 +205,7 @@ unsafe fn tile_6x8(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f3
             // times), and a multiple of 4 floats from a 16-byte aligned start, so `pa` is
             // aligned for `__m128`. The value is loaded twice, once per multiply: volatile
             // keeps the two loads from being merged into one load and a register copy, and
-            // the copy would take a slot from the multiplies (measured: 17.3 against 22.2
-            // GFLOPS for the tile in L1).
+            // the copy would take a slot from the multiplies.
             let (x0, x1) = unsafe {
                 let pa = a.add(24 * p + 4 * r).cast::<__m128>();
                 (std::ptr::read_volatile(pa), std::ptr::read_volatile(pa))
