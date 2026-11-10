@@ -4,10 +4,10 @@
 use std::fmt;
 use std::time::Instant;
 
-use cavitation_core::{Error, Graph, ParamStore, Reduction, Tape, TensorView, Var};
+use cavitation_core::{Error, Graph, ParamId, ParamStore, Reduction, Tape, TensorView, Var};
 
 use super::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
-use crate::{Adam, AdamW, Hooks, Optimizer, Sequential, Sgd, Trace};
+use crate::{Adam, AdamW, Health, HealthMonitor, Hooks, Optimizer, Sequential, Sgd, Trace};
 
 /// The loss [`Trainer`] and [`fit`] minimise, always averaged over the batch.
 ///
@@ -115,8 +115,10 @@ impl Loss {
 /// A trainer owns everything a step needs besides the model and its parameters: the
 /// [`Graph`] the steps record on, the [`Trace`] of each layer's input and output, the
 /// optimiser (which keeps the gradient statistics of its last step, see
-/// [`Optimizer::last_stats`]) and the batch buffers [`fit`] gathers into. After a warm-up
-/// epoch, including the smaller last batch, a step allocates nothing.
+/// [`Optimizer::last_stats`]), the [`HealthMonitor`] that checks every step (the default
+/// [`Health`] unless [`set_health`](Self::set_health) changes it) and the batch buffers
+/// [`fit`] gathers into. After a warm-up epoch, including the smaller last batch, a healthy
+/// step allocates nothing. Call [`end_epoch`](Self::end_epoch) after each epoch.
 ///
 /// # Examples
 ///
@@ -141,31 +143,46 @@ impl Loss {
 /// ```
 ///
 /// The same step written out by hand, the way to train with a loss [`Loss`] does not list:
-/// open a tape on the parameter values, add the batch as an input, run the model, record
-/// the loss, run `backward` into the gradients, drop the tape, step the optimiser and mark
-/// the gradients stale. The tape borrows `params.values` while `backward` writes
-/// `params.grads`; borrowing the two fields separately is what lets this compile.
+/// open a tape on the parameter values, add the batch as an input, run the model (traced,
+/// for the health checks), record the loss, run `backward` into the gradients, run the
+/// [`HealthMonitor`]'s tape checks, drop the tape, step the optimiser, run the monitor's
+/// gradient checks on the optimiser's statistics and mark the gradients stale; at the end
+/// of each epoch, end the monitor's epoch. The tape borrows `params.values` while
+/// `backward` writes `params.grads`; borrowing the two fields separately is what lets this
+/// compile.
 ///
 /// ```
-/// use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
-/// use cavitation_nn::{Linear, Optimizer, Sequential, Sgd};
+/// use cavitation_core::{Error, Graph, ParamStore, Reduction, Rng, Tensor};
+/// use cavitation_nn::{Health, HealthMonitor, Linear, Optimizer, Sequential, Sgd, Trace};
 /// let x = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap();
 /// let y = Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap();
 /// let mut params = ParamStore::new();
 /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+/// let names = net.parameter_names();
 /// let mut optimizer = Sgd::new(0.05);
+/// let mut monitor = HealthMonitor::new(Health::default());
 /// let mut graph = Graph::new();
-/// for _ in 0..200 {
-///     let mut tape = graph.tape(&params.values);
-///     let input = tape.input(x.view());
-///     let target = tape.input(y.view());
-///     let out = net.forward(&mut tape, input);
-///     let loss = tape.l1(out, target, Reduction::Sum);
-///     tape.backward(loss, &mut params.grads);
-///     drop(tape);
-///     optimizer.step(&mut params);
-///     params.zero_grad();
-/// }
+/// let mut trace = Trace::new();
+/// let mut train = || -> Result<(), Error> {
+///     for epoch in 1..=200 {
+///         let step = epoch as u64; // one step per epoch here
+///         let mut tape = graph.tape(&params.values);
+///         let input = tape.input(x.view());
+///         let target = tape.input(y.view());
+///         let out = net.forward_traced(&mut tape, input, &mut trace);
+///         let loss = tape.l1(out, target, Reduction::Sum);
+///         let value = tape.value(loss).data()[0];
+///         tape.backward(loss, &mut params.grads);
+///         monitor.after_backward(step, value, &tape, &trace, &net)?;
+///         drop(tape);
+///         optimizer.step(&mut params);
+///         monitor.after_update(step, optimizer.last_stats(), &names)?;
+///         params.zero_grad();
+///         monitor.end_epoch(epoch)?;
+///     }
+///     Ok(())
+/// };
+/// train().unwrap();
 /// ```
 pub struct Trainer {
     /// The storage every step records on.
@@ -182,6 +199,13 @@ pub struct Trainer {
     batch: Option<Batch<f32>>,
     /// The number of steps taken.
     steps: u64,
+    /// The health checks run on every step.
+    health: HealthMonitor,
+    /// The model's parameter names, for the health checks' messages.
+    names: Vec<(String, ParamId)>,
+    /// The first error a public step met under [`OnNonFinite::Stop`](crate::OnNonFinite)
+    /// since the last [`end_epoch`](Trainer::end_epoch).
+    stopped: Option<Error>,
 }
 
 impl Trainer {
@@ -225,7 +249,58 @@ impl Trainer {
             batch_size: batch,
             batch: None,
             steps: 0,
+            health: HealthMonitor::new(Health::default()),
+            names: model.parameter_names(),
+            stopped: None,
         }
+    }
+
+    /// Replaces the health checks run on every step with `health`, starting afresh (nothing
+    /// of the current epoch is carried over).
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Health, Linear, Loss, OnNonFinite, Sequential, Sgd, Trainer};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 8);
+    /// trainer.set_health(Health { on_non_finite: OnNonFinite::Warn, ..Health::default() });
+    /// assert!(trainer.end_epoch(1).is_ok());
+    /// ```
+    pub fn set_health(&mut self, health: Health) {
+        self.health = HealthMonitor::new(health);
+    }
+
+    /// Ends epoch `epoch` of the health checks ([`HealthMonitor::end_epoch`]: the dead-neuron
+    /// report, and a new epoch for the once-per-epoch warnings). Call it after the last step
+    /// of each epoch; [`fit`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first [`Error::NonFinite`] that [`step`](Self::step) or
+    /// [`step_with_hooks`](Self::step_with_hooks) met under
+    /// [`OnNonFinite::Stop`](crate::OnNonFinite) since the last `end_epoch`, once.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
+    /// let data = Dataset {
+    ///     x: Tensor::full(&[2, 1], f32::NAN),
+    ///     targets: Targets::Values(Tensor::zeros(&[2, 1])),
+    /// };
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 2);
+    /// let mut batch = Batch::new(&data, 2);
+    /// let loss = trainer.step(&net, &mut params, Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch));
+    /// assert!(loss.is_nan());
+    /// let err = trainer.end_epoch(1).unwrap_err();
+    /// assert_eq!(err.to_string(), "non-finite value at step 1 in loss");
+    /// ```
+    pub fn end_epoch(&mut self, epoch: usize) -> Result<(), Error> {
+        let stopped = self.stopped.take();
+        self.health.end_epoch(epoch)?;
+        stopped.map_or(Ok(()), Err)
     }
 
     /// Trains on one batch: the forward pass of `model` on `batch.x`, the loss against
@@ -233,6 +308,13 @@ impl Trainer {
     /// [`ParamStore::zero_grad`]. Returns the batch's loss (its mean over the batch).
     ///
     /// The gradients must be stale when it starts, as the previous step leaves them.
+    ///
+    /// Every step runs the health checks (see [`HealthMonitor`]). Under
+    /// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), a NaN or infinite loss skips
+    /// the optimiser step, so the parameters stay as they were, and the step returns the
+    /// loss as it is; a NaN or infinite gradient is found after the update. Either way the
+    /// first such error is kept and returned by [`end_epoch`](Self::end_epoch). [`fit`]
+    /// stops at it instead.
     ///
     /// # Panics
     ///
@@ -302,9 +384,29 @@ impl Trainer {
         batch: BatchView<'_, f32>,
         hooks: &mut Hooks<'_>,
     ) -> f32 {
+        let (value, checked) = self.checked_step(model, params, batch, hooks);
+        if let Err(err) = checked
+            && self.stopped.is_none()
+        {
+            self.stopped = Some(err);
+        }
+        value
+    }
+
+    /// The step behind [`step_with_hooks`](Self::step_with_hooks): returns the batch's loss
+    /// and the health checks' verdict. When the tape checks fail the optimiser step is
+    /// skipped; the gradients are marked stale and the step is counted either way.
+    fn checked_step(
+        &mut self,
+        model: &Sequential,
+        params: &mut ParamStore,
+        batch: BatchView<'_, f32>,
+        hooks: &mut Hooks<'_>,
+    ) -> (f32, Result<(), Error>) {
         self.loss.check_targets(batch.targets);
         hooks.check_layers(model);
-        let value = {
+        let step = self.steps + 1;
+        let (value, mut checked) = {
             let mut tape = self.graph.tape(&params.values);
             let x = tape.input(batch.x);
             let out = model.forward_traced(&mut tape, x, &mut self.trace);
@@ -313,12 +415,20 @@ impl Trainer {
             let value = tape.value(loss).data()[0];
             tape.backward(loss, &mut params.grads);
             hooks.run_backward(&tape, &self.trace, model);
-            value
+            let checked = self
+                .health
+                .after_backward(step, value, &tape, &self.trace, model);
+            (value, checked)
         };
-        self.optimizer.step(params);
+        if checked.is_ok() {
+            self.optimizer.step(params);
+            checked = self
+                .health
+                .after_update(step, self.optimizer.last_stats(), &self.names);
+        }
         params.zero_grad();
-        self.steps += 1;
-        value
+        self.steps = step;
+        (value, checked)
     }
 
     /// The number of steps taken so far.
@@ -335,8 +445,12 @@ impl Trainer {
     }
 
     /// Runs one epoch over `data` in the batches of `batcher` (reshuffled first), running
-    /// `hooks` on every step, and returns the mean loss over the epoch's rows: each batch's
-    /// loss weighted by its row count.
+    /// `hooks` and the health checks on every step, and returns the mean loss over the
+    /// epoch's rows: each batch's loss weighted by its row count.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error of the health checks, at the step that met it.
     fn run_epoch(
         &mut self,
         model: &Sequential,
@@ -344,21 +458,26 @@ impl Trainer {
         data: &Dataset,
         batcher: &mut Batcher,
         hooks: &mut Hooks<'_>,
-    ) -> f64 {
+    ) -> Result<f64, Error> {
         let mut batch = self
             .batch
             .take()
             .unwrap_or_else(|| Batch::new(data, self.batch_size));
         batcher.epoch();
         let mut total = 0.0f64;
+        let mut checked = Ok(());
         for range in batcher.batches() {
             let rows = range.len() as f64;
             let view = batcher.gather(data, range, &mut batch);
-            let loss = self.step_with_hooks(model, params, view, hooks);
+            let (loss, step_checked) = self.checked_step(model, params, view, hooks);
             total += f64::from(loss) * rows;
+            if step_checked.is_err() {
+                checked = step_checked;
+                break;
+            }
         }
         self.batch = Some(batch);
-        total / data.len() as f64
+        checked.map(|()| total / data.len() as f64)
     }
 }
 
@@ -463,7 +582,8 @@ pub struct History {
 /// How [`fit`] trains. Taken by value, because it holds the `on_epoch` callback.
 ///
 /// The default is 10 epochs in batches of 32, Adam at learning rate 1e-3 without weight
-/// decay, cross-entropy, shuffled with seed 0, and no callback.
+/// decay, cross-entropy, shuffled with seed 0, the default [`Health`] checks, and no
+/// callback.
 ///
 /// # Examples
 ///
@@ -483,6 +603,8 @@ pub struct FitConfig {
     pub loss: Loss,
     /// The seed that shuffles the rows each epoch; `None` keeps the data's order.
     pub shuffle_seed: Option<u64>,
+    /// The health checks run on every step and at the end of every epoch.
+    pub health: Health,
     /// Called with each epoch's report as soon as the epoch ends.
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
@@ -490,7 +612,8 @@ pub struct FitConfig {
 }
 
 impl Default for FitConfig {
-    /// 10 epochs, batch 32, Adam at 1e-3, cross-entropy, shuffle seed 0, no callback.
+    /// 10 epochs, batch 32, Adam at 1e-3, cross-entropy, shuffle seed 0, the default health
+    /// checks, no callback.
     fn default() -> FitConfig {
         FitConfig {
             epochs: 10,
@@ -501,6 +624,7 @@ impl Default for FitConfig {
             },
             loss: Loss::CrossEntropy,
             shuffle_seed: Some(0),
+            health: Health::default(),
             on_epoch: None,
         }
     }
@@ -515,6 +639,7 @@ impl fmt::Debug for FitConfig {
             .field("optimizer", &self.optimizer)
             .field("loss", &self.loss)
             .field("shuffle_seed", &self.shuffle_seed)
+            .field("health", &self.health)
             .field("on_epoch", &self.on_epoch.as_ref().map(|_| "FnMut"))
             .finish()
     }
@@ -554,14 +679,19 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 /// Trains `model` on `train` as `config` says and returns each epoch's report.
 ///
 /// Each epoch reshuffles the rows (with `config.shuffle_seed`), takes one [`Trainer::step`]
-/// per batch and then calls `config.on_epoch`. The same seeds give bit-identical parameters
-/// on every run on the same machine and kernel level, for any thread count.
+/// per batch, ends the epoch of the health checks ([`Trainer::end_epoch`]) and then calls
+/// `config.on_epoch`. The same seeds give bit-identical parameters on every run on the same
+/// machine and kernel level, for any thread count.
 ///
 /// # Errors
 ///
 /// Returns, before training, [`Error::Format`] if `train.x` is not a matrix or has no rows
 /// (or value targets are not a matrix), and [`Error::ShapeMismatch`] if the targets do not
-/// have one entry per row.
+/// have one entry per row. During training, with `config.health.on_non_finite` set to
+/// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`] at
+/// the first step whose loss or gradient is NaN or infinite, naming the step and `"loss"` or
+/// the parameter (for example `"0.weight"`). A non-finite loss stops before the optimiser
+/// step; a non-finite gradient with a finite loss is found after the update applied it.
 ///
 /// # Panics
 ///
@@ -603,7 +733,7 @@ pub fn fit(
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`fit`], before training.
+/// Returns the same errors as [`fit`].
 ///
 /// # Panics
 ///
@@ -637,6 +767,7 @@ pub fn fit_with_hooks(
     check_dataset(train)?;
     let mut trainer =
         Trainer::with_boxed(model, config.optimizer.build(), config.loss, config.batch);
+    trainer.set_health(config.health);
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut history = History {
         epochs: Vec::with_capacity(config.epochs),
@@ -644,7 +775,8 @@ pub fn fit_with_hooks(
     params.zero_grad();
     for epoch in 1..=config.epochs {
         let start = Instant::now();
-        let mean_loss = trainer.run_epoch(model, params, train, &mut batcher, hooks);
+        let mean_loss = trainer.run_epoch(model, params, train, &mut batcher, hooks)?;
+        trainer.end_epoch(epoch)?;
         let report = EpochReport {
             epoch,
             mean_loss,
@@ -830,6 +962,7 @@ mod tests {
             },
             loss: Loss::Mse,
             shuffle_seed: None,
+            health: Health::default(),
             on_epoch: None,
         };
         let history = fit(&net, &mut params, &data, config).unwrap();

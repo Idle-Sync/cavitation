@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Hooks, Init, Linear, Loss, NeuronMask,
-    Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trainer,
+    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Health, Hooks, Init, Linear, Loss, NeuronMask,
+    Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -193,6 +193,19 @@ fn synthetic_1437() -> Dataset {
     let n = 1437;
     let mut rng = Rng::seed(2);
     let x: Vec<f32> = (0..n * 64).map(|_| rng.uniform_f32()).collect();
+    Dataset {
+        x: Tensor::from_vec(x, &[n, 64]).unwrap(),
+        targets: Targets::Classes((0..n).map(|_| rng.below(10) as usize).collect()),
+    }
+}
+
+/// 1,437 rows of 64 features in `[-1, 1)` with class labels 0 to 9, from `Rng::seed(2)`.
+/// Centred inputs keep every ReLU neuron of the 50k network active on some row, so a run on
+/// them is healthy (the `[0, 1)` set leaves a few neurons dead from the start).
+fn synthetic_centred_1437() -> Dataset {
+    let n = 1437;
+    let mut rng = Rng::seed(2);
+    let x: Vec<f32> = (0..n * 64).map(|_| rng.range(-1.0, 1.0) as f32).collect();
     Dataset {
         x: Tensor::from_vec(x, &[n, 64]).unwrap(),
         targets: Targets::Classes((0..n).map(|_| rng.below(10) as usize).collect()),
@@ -389,9 +402,52 @@ fn masked_training_step() -> usize {
     made
 }
 
+/// Trains the 50k network with `Trainer::step` on the centred 1,437-row set at batch 128,
+/// with SGD and with Adam, with every health check on (non-finite values, gradient norms, dead ReLU
+/// neurons) and a sink that counts warnings, calling `Trainer::end_epoch` after each epoch:
+/// one whole warm-up epoch, then counts the allocations of a second whole epoch and its end.
+/// The run is healthy, so the sink receives nothing.
+fn health_steady_state() -> usize {
+    let data = synthetic_centred_1437();
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let net = network_50k(&mut params);
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let warnings = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = std::rc::Rc::clone(&warnings);
+        trainer.set_health(Health {
+            sink: Some(Box::new(move |w: &Warning| {
+                eprintln!("health_steady_state: {w}");
+                counter.set(counter.get() + 1);
+            })),
+            ..Health::default()
+        });
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+        let mut before = 0;
+        for epoch in 1..=2 {
+            if epoch == 2 {
+                before = allocations();
+            }
+            batcher.epoch();
+            for range in batcher.batches() {
+                let view = batcher.gather(&data, range, &mut batch);
+                sink += trainer.step(&net, &mut params, view);
+            }
+            trainer.end_epoch(epoch).unwrap();
+        }
+        made += allocations() - before;
+        assert!(sink.is_finite() && sink > 0.0);
+        assert_eq!(warnings.get(), 0, "the healthy run produced warnings");
+    }
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 7] = [
+    let scenarios: [Scenario; 8] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -399,6 +455,7 @@ fn main() -> ExitCode {
         ("manual_loop", manual_loop),
         ("no_hooks_no_cost", no_hooks_no_cost),
         ("masked_training_step", masked_training_step),
+        ("health_steady_state", health_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

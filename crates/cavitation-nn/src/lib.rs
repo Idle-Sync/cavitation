@@ -1,6 +1,7 @@
 //! Layers, optimisers and training for the cavitation neural network library.
 
 mod activation;
+mod health;
 mod hooks;
 mod init;
 mod layer;
@@ -15,6 +16,7 @@ pub use activation::{
     Hardtanh, LeakyRelu, LogSigmoid, LogSoftmax, Mish, Prelu, Relu, Relu6, Selu, Sigmoid, Silu,
     Softmax, Softplus, Softsign, Tanh,
 };
+pub use health::{Health, HealthMonitor, OnNonFinite, Warning};
 pub use hooks::{HookId, Hooks, LayerEvent};
 pub use init::Init;
 pub use layer::Layer;

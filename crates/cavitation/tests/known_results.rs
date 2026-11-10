@@ -2,7 +2,8 @@
 
 use cavitation_core::{ParamStore, Rng};
 use cavitation_nn::{
-    EpochReport, FitConfig, Init, Linear, Loss, OptimizerConfig, Relu, Sequential, accuracy, fit,
+    EpochReport, FitConfig, Health, Init, Linear, Loss, OptimizerConfig, Relu, Sequential,
+    accuracy, fit,
 };
 
 /// The 64 → 256 → 128 → 10 ReLU network (He uniform weights, zero biases, `Rng::seed(1)`),
@@ -38,6 +39,7 @@ fn digits_known_result() {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        health: Health::default(),
         on_epoch: Some(Box::new(|r: &EpochReport| {
             println!(
                 "epoch {:2}: mean loss {:.6}, {:.3} s",
