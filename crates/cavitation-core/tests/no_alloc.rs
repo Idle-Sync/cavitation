@@ -7,6 +7,8 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use cavitation_core::kernels::pool::{self, Task};
+
 use std::sync::Arc;
 
 use cavitation_core::{
@@ -328,17 +330,37 @@ fn custom_op_steady_state() -> usize {
     made
 }
 
+/// The thread pool on 4 threads: 100 warm-up runs (which start the workers), then 1,000
+/// runs of 64 tasks each. Returns the allocations made during those 1,000 runs, on any thread.
+fn pool_steady_state() -> usize {
+    let sum = AtomicUsize::new(0);
+    let job = |t: Task| {
+        sum.fetch_add(t.index + t.worker, Ordering::Relaxed);
+    };
+    for _ in 0..100 {
+        pool::run(4, 64, &job);
+    }
+    let before = allocations();
+    for _ in 0..1_000 {
+        pool::run(4, 64, &job);
+    }
+    let made = allocations() - before;
+    assert!(sum.load(Ordering::Relaxed) > 0);
+    made
+}
+
 /// A named scenario: runs, and returns the allocations it made after warm-up.
 type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 5] = [
+    let scenarios: [Scenario; 6] = [
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
         ("cross_entropy_steady_state", cross_entropy_steady_state),
         ("bce_and_nll_steady_state", bce_and_nll_steady_state),
         ("custom_op_steady_state", custom_op_steady_state),
+        ("pool_steady_state", pool_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {
