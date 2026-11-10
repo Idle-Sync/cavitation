@@ -1,6 +1,7 @@
 //! Layers, optimisers and training for the cavitation neural network library.
 
 mod activation;
+mod hooks;
 mod init;
 mod layer;
 mod linear;
@@ -13,6 +14,7 @@ pub use activation::{
     Hardtanh, LeakyRelu, LogSigmoid, LogSoftmax, Mish, Prelu, Relu, Relu6, Selu, Sigmoid, Silu,
     Softmax, Softplus, Softsign, Tanh,
 };
+pub use hooks::{HookId, Hooks, LayerEvent};
 pub use init::Init;
 pub use layer::Layer;
 pub use linear::Linear;
@@ -20,5 +22,5 @@ pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
     Batch, BatchView, Batcher, Dataset, EpochReport, FitConfig, History, Loss, OptimizerConfig,
-    Targets, TargetsView, Trainer, accuracy, fit,
+    Targets, TargetsView, Trainer, accuracy, fit, fit_with_hooks,
 };

@@ -5,4 +5,6 @@ mod data;
 mod fit;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
-pub use fit::{EpochReport, FitConfig, History, Loss, OptimizerConfig, Trainer, accuracy, fit};
+pub use fit::{
+    EpochReport, FitConfig, History, Loss, OptimizerConfig, Trainer, accuracy, fit, fit_with_hooks,
+};

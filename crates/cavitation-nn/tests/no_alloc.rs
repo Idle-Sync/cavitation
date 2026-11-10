@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Init, Linear, Loss, Optimizer, Relu,
+    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Hooks, Init, Linear, Loss, Optimizer, Relu,
     Sequential, Sgd, Targets, TargetsView, Trainer,
 };
 
@@ -279,14 +279,87 @@ fn manual_loop() -> usize {
     made
 }
 
+/// Runs one epoch of `Trainer::step_with_hooks` over `data` at batch 128 and returns the
+/// sum of the batch losses.
+fn hooked_epoch(
+    trainer: &mut Trainer,
+    net: &Sequential,
+    params: &mut ParamStore,
+    data: &Dataset,
+    batcher: &mut Batcher,
+    batch: &mut Batch,
+    hooks: &mut Hooks<'_>,
+) -> f32 {
+    let mut sum = 0.0;
+    batcher.epoch();
+    for range in batcher.batches() {
+        let view = batcher.gather(data, range, batch);
+        sum += trainer.step_with_hooks(net, params, view, hooks);
+    }
+    sum
+}
+
+/// Trains the 50k network with `Trainer::step_with_hooks` on the 1,437-row set at batch
+/// 128, with SGD and with Adam. With an empty `Hooks`: one warm-up epoch, then counts a
+/// second epoch. Then with one forward and one backward hook on the first ReLU layer (whose
+/// local derivative is computed into the hooks' own buffer): one warm-up epoch, then counts
+/// another. Returns the allocations of both counted epochs.
+fn no_hooks_no_cost() -> usize {
+    let data = synthetic_1437();
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let net = network_50k(&mut params);
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+
+        let mut empty = Hooks::new();
+        let mut run = |hooks: &mut Hooks<'_>, sink: &mut f32| {
+            *sink += hooked_epoch(
+                &mut trainer,
+                &net,
+                &mut params,
+                &data,
+                &mut batcher,
+                &mut batch,
+                hooks,
+            );
+        };
+        run(&mut empty, &mut sink);
+        let before = allocations();
+        run(&mut empty, &mut sink);
+        made += allocations() - before;
+
+        let mut seen = 0.0f32;
+        let mut grads = 0.0f32;
+        {
+            let mut hooks = Hooks::new();
+            hooks.on_forward(1, |e| {
+                seen += e.output.data()[0] + e.local_derivative.unwrap().data()[0];
+            });
+            hooks.on_backward(1, |e| grads += e.grad_output.unwrap().data()[0]);
+            run(&mut hooks, &mut sink);
+            let before = allocations();
+            run(&mut hooks, &mut sink);
+            made += allocations() - before;
+        }
+        assert!(sink.is_finite() && sink > 0.0);
+        assert!(seen.is_finite() && seen > 0.0 && grads.is_finite());
+    }
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 5] = [
+    let scenarios: [Scenario; 6] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
         ("training_step", training_step),
         ("manual_loop", manual_loop),
+        ("no_hooks_no_cost", no_hooks_no_cost),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

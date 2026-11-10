@@ -1022,6 +1022,25 @@ impl<T: Real> Layer<T> for Prelu {
         tape.prelu(x, slope)
     }
 
+    /// 1 where `x` is above 0 and the value's slope elsewhere (at 0 and for NaN too), as the
+    /// tape's PReLU gradient uses.
+    fn local_derivative(&self, tape: &Tape<'_, T>, x: Var, out: &mut [T]) -> bool {
+        let slopes = tape.param_value(self.weight);
+        let slopes = slopes.data();
+        for (i, (d, &v)) in out.iter_mut().zip(tape.value(x).data()).enumerate() {
+            *d = if v > T::ZERO {
+                T::ONE
+            } else {
+                slopes[if slopes.len() == 1 {
+                    0
+                } else {
+                    i % slopes.len()
+                }]
+            };
+        }
+        true
+    }
+
     /// Returns `weight`.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         vec![("weight", self.weight)]

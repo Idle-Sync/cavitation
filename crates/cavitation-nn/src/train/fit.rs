@@ -1,4 +1,5 @@
-//! The training step ([`Trainer`]), the losses it minimises, [`fit`] and [`accuracy`].
+//! The training step ([`Trainer`]), the losses it minimises, [`fit`] (with and without
+//! hooks) and [`accuracy`].
 
 use std::fmt;
 use std::time::Instant;
@@ -6,7 +7,7 @@ use std::time::Instant;
 use cavitation_core::{Error, Graph, ParamStore, Reduction, Tape, TensorView, Var};
 
 use super::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
-use crate::{Adam, AdamW, Optimizer, Sequential, Sgd, Trace};
+use crate::{Adam, AdamW, Hooks, Optimizer, Sequential, Sgd, Trace};
 
 /// The loss [`Trainer`] and [`fit`] minimise, always averaged over the batch.
 ///
@@ -258,14 +259,59 @@ impl Trainer {
         params: &mut ParamStore,
         batch: BatchView<'_, f32>,
     ) -> f32 {
+        self.step_with_hooks(model, params, batch, &mut Hooks::new())
+    }
+
+    /// Like [`step`](Self::step), and runs `hooks`: the forward hooks right after the forward
+    /// pass, the backward hooks right after the backward pass, both before the optimiser
+    /// updates the parameters (so every event shows the values and gradients of this step).
+    /// With no hooks registered it does exactly what `step` does.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`step`](Self::step) does, and as [`Hooks::run_forward`] does when a hook is
+    /// registered on a layer `model` does not have (after the forward pass, before any hook
+    /// runs or any parameter changes).
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{
+    ///     Batch, Batcher, Dataset, Hooks, Linear, Loss, Sequential, Sgd, Targets, Tanh, Trainer,
+    /// };
+    /// let data = Dataset { x: Tensor::full(&[2, 2], 0.5f32), targets: Targets::Classes(vec![0, 1]) };
+    /// let mut params = ParamStore::new();
+    /// let mut rng = Rng::seed(0);
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut rng))
+    ///     .push(Tanh)
+    ///     .push(Linear::new(&mut params, 3, 2, &mut rng));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 2);
+    /// let mut batch = Batch::new(&data, 2);
+    /// let mut widths = Vec::new();
+    /// let mut hooks = Hooks::new();
+    /// hooks.on_forward(1, |e| widths.push(e.output.shape().dims().to_vec()));
+    /// let view = Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch);
+    /// trainer.step_with_hooks(&net, &mut params, view, &mut hooks);
+    /// drop(hooks);
+    /// assert_eq!(widths, [vec![2, 3]]);
+    /// ```
+    pub fn step_with_hooks(
+        &mut self,
+        model: &Sequential,
+        params: &mut ParamStore,
+        batch: BatchView<'_, f32>,
+        hooks: &mut Hooks<'_>,
+    ) -> f32 {
         self.loss.check_targets(batch.targets);
         let value = {
             let mut tape = self.graph.tape(&params.values);
             let x = tape.input(batch.x);
             let out = model.forward_traced(&mut tape, x, &mut self.trace);
+            hooks.run_forward(&tape, &self.trace, model);
             let loss = self.loss.record(&mut tape, out, batch.targets);
             let value = tape.value(loss).data()[0];
             tape.backward(loss, &mut params.grads);
+            hooks.run_backward(&tape, &self.trace, model);
             value
         };
         self.optimizer.step(params);
@@ -287,14 +333,16 @@ impl Trainer {
         self.steps
     }
 
-    /// Runs one epoch over `data` in the batches of `batcher` (reshuffled first) and returns
-    /// the mean loss over the epoch's rows: each batch's loss weighted by its row count.
+    /// Runs one epoch over `data` in the batches of `batcher` (reshuffled first), running
+    /// `hooks` on every step, and returns the mean loss over the epoch's rows: each batch's
+    /// loss weighted by its row count.
     fn run_epoch(
         &mut self,
         model: &Sequential,
         params: &mut ParamStore,
         data: &Dataset,
         batcher: &mut Batcher,
+        hooks: &mut Hooks<'_>,
     ) -> f64 {
         let mut batch = self
             .batch
@@ -304,7 +352,8 @@ impl Trainer {
         let mut total = 0.0f64;
         for range in batcher.batches() {
             let rows = range.len() as f64;
-            let loss = self.step(model, params, batcher.gather(data, range, &mut batch));
+            let view = batcher.gather(data, range, &mut batch);
+            let loss = self.step_with_hooks(model, params, view, hooks);
             total += f64::from(loss) * rows;
         }
         self.batch = Some(batch);
@@ -543,7 +592,46 @@ pub fn fit(
     model: &Sequential,
     params: &mut ParamStore,
     train: &Dataset,
+    config: FitConfig,
+) -> Result<History, Error> {
+    fit_with_hooks(model, params, train, config, &mut Hooks::new())
+}
+
+/// Like [`fit`], and runs `hooks` on every step as [`Trainer::step_with_hooks`] does. Hooks
+/// only read, so the same seeds train to the same parameters as `fit`.
+///
+/// # Errors
+///
+/// Returns the same errors as [`fit`], before training.
+///
+/// # Panics
+///
+/// Panics as [`fit`] does, and on the first step if a hook is registered on a layer `model`
+/// does not have.
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::{Dataset, FitConfig, Hooks, Linear, Loss, Sequential, Targets, fit_with_hooks};
+/// let data = Dataset {
+///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
+///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
+/// };
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+/// let mut steps = 0;
+/// let mut hooks = Hooks::new();
+/// hooks.on_backward(0, |_| steps += 1);
+/// let config = FitConfig { epochs: 5, batch: 2, loss: Loss::Mse, ..FitConfig::default() };
+/// fit_with_hooks(&net, &mut params, &data, config, &mut hooks).unwrap();
+/// drop(hooks);
+/// assert_eq!(steps, 10);
+/// ```
+pub fn fit_with_hooks(
+    model: &Sequential,
+    params: &mut ParamStore,
+    train: &Dataset,
     mut config: FitConfig,
+    hooks: &mut Hooks<'_>,
 ) -> Result<History, Error> {
     check_dataset(train)?;
     let mut trainer =
@@ -555,7 +643,7 @@ pub fn fit(
     params.zero_grad();
     for epoch in 1..=config.epochs {
         let start = Instant::now();
-        let mean_loss = trainer.run_epoch(model, params, train, &mut batcher);
+        let mean_loss = trainer.run_epoch(model, params, train, &mut batcher, hooks);
         let report = EpochReport {
             epoch,
             mean_loss,

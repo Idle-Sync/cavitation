@@ -140,4 +140,39 @@ pub trait Layer<T: Real>: Send + Sync {
     fn activation(&self) -> Option<&dyn Activation<T>> {
         None
     }
+
+    /// Writes the layer's local derivative at the input `x` into `out` and returns `true`,
+    /// for a layer whose every output value depends only on the input value at the same
+    /// position: `out[i]` is the derivative of output `i` with respect to input `i`.
+    /// [`Hooks`](crate::Hooks) show it as [`LayerEvent::local_derivative`](crate::LayerEvent).
+    ///
+    /// The default computes `df(x, f(x))` with the layer's [`activation`](Self::activation)
+    /// when it has one, and otherwise writes nothing and returns `false` (a layer such as
+    /// `Linear` or `Softmax`, whose derivative is not element-wise). `out` holds as many
+    /// values as `x`.
+    ///
+    /// # Panics
+    ///
+    /// May panic if `x` was not recorded on `tape`.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{Layer, Linear, Relu};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let x = tape.input(Tensor::from_vec(vec![-1.0f32, 2.0], &[1, 2]).unwrap().view());
+    /// let mut out = [9.0f32; 2];
+    /// assert!(Layer::<f32>::local_derivative(&Relu, &tape, x, &mut out));
+    /// assert_eq!(out, [0.0, 1.0]);
+    /// ```
+    fn local_derivative(&self, tape: &Tape<'_, T>, x: Var, out: &mut [T]) -> bool {
+        let Some(act) = self.activation() else {
+            return false;
+        };
+        for (d, &v) in out.iter_mut().zip(tape.value(x).data()) {
+            *d = act.df(v, act.f(v));
+        }
+        true
+    }
 }

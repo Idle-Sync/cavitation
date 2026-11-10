@@ -465,6 +465,25 @@ impl<T: Real> Tape<'_, T> {
         TensorView::from_parts(self.values().get(v), self.shape(v))
     }
 
+    /// The value of parameter `id`, read from the [`ParamValues`] this tape borrows, whether
+    /// or not the tape has recorded it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` does not belong to the store whose values this tape borrows.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[2], 0.25f32));
+    /// let mut graph = Graph::new();
+    /// let tape = graph.tape(&store.values);
+    /// assert_eq!(tape.param_value(p).data(), &[0.25, 0.25]);
+    /// ```
+    pub fn param_value(&self, id: ParamId) -> TensorView<'_, T> {
+        self.params.get(id).view()
+    }
+
     /// The gradient of the loss with respect to `v`, after [`Tape::backward`]. `None` for
     /// inputs, for parameters (their gradients are in [`ParamGrads`]), for values the loss
     /// does not depend on, and before any backward pass.
