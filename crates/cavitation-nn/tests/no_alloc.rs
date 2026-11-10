@@ -8,7 +8,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{ParamStore, Tensor};
-use cavitation_nn::{Adam, AdamW, GradStats, Optimizer, Sgd};
+use cavitation_nn::{
+    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Optimizer, Sgd, Targets, TargetsView,
+};
 
 /// The number of allocations (including reallocations) made so far, from every thread.
 static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
@@ -122,11 +124,53 @@ fn optimizers_step_steady_state() -> usize {
     allocations() - before
 }
 
+/// Runs the batcher over 1,437 rows at batch 128 (12 batches, the last of 29), for class
+/// labels and for value targets: one warm-up epoch, then three epochs of `epoch`, `batches`
+/// and `gather`. Returns the allocations made after the warm-up epoch.
+fn gather_steady_state() -> usize {
+    let n = 1437;
+    let x: Vec<f32> = (0..n * 64).map(|i| i as f32).collect();
+    let classes = Dataset {
+        x: Tensor::from_vec(x.clone(), &[n, 64]).unwrap(),
+        targets: Targets::Classes((0..n).map(|i| i % 10).collect()),
+    };
+    let values = Dataset {
+        x: Tensor::from_vec(x, &[n, 64]).unwrap(),
+        targets: Targets::Values(Tensor::full(&[n, 3], 0.5f32)),
+    };
+    let mut sets = [
+        (Batch::new(&classes, 128), classes),
+        (Batch::new(&values, 128), values),
+    ];
+    let mut batchers = [Batcher::new(n, 128, Some(5)), Batcher::new(n, 128, None)];
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for epoch in 0..4 {
+        if epoch == 1 {
+            before = allocations();
+        }
+        for ((out, data), batcher) in sets.iter_mut().zip(&mut batchers) {
+            batcher.epoch();
+            for range in batcher.batches() {
+                let view = batcher.gather(data, range, out);
+                sink += view.x.data()[0];
+                match view.targets {
+                    TargetsView::Classes(c) => sink += c[0] as f32,
+                    TargetsView::Values(v) => sink += v.data()[0],
+                }
+            }
+        }
+    }
+    assert!(sink > 0.0);
+    allocations() - before
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 2] = [
+    let scenarios: [Scenario; 3] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
+        ("gather_steady_state", gather_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

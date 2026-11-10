@@ -6,6 +6,7 @@ mod layer;
 mod linear;
 mod optim;
 mod sequential;
+mod train;
 
 pub use activation::{
     Activation, ActivationKind, ActivationLayer, Celu, Elu, Gelu, Glu, Hardsigmoid, Hardswish,
@@ -17,3 +18,4 @@ pub use layer::Layer;
 pub use linear::Linear;
 pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
+pub use train::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};

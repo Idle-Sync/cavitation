@@ -29,6 +29,10 @@ dependencies = [
 [[package]]
 name = "cavitation-datasets"
 version = "0.1.0"
+dependencies = [
+ "cavitation-core",
+ "cavitation-nn",
+]
 
 [[package]]
 name = "cavitation-nn"

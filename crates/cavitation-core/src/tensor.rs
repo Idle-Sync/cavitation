@@ -245,6 +245,34 @@ impl<'a, T: Real> TensorView<'a, T> {
         TensorView { data, shape }
     }
 
+    /// Views `data` (row-major) as a tensor of the given shape without copying it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::ShapeMismatch`] if `data.len()` is not the product of `shape`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `shape` has more than [`Shape::MAX_RANK`] dimensions.
+    ///
+    /// ```
+    /// use cavitation_core::TensorView;
+    /// let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+    /// let v = TensorView::from_slice(&data[..4], &[2, 2]).unwrap();
+    /// assert_eq!(v.data(), &[1.0, 2.0, 3.0, 4.0]);
+    /// assert!(TensorView::from_slice(&data, &[2, 2]).is_err());
+    /// ```
+    pub fn from_slice(data: &'a [T], shape: &[usize]) -> Result<TensorView<'a, T>, Error> {
+        let s = Shape::new(shape);
+        if data.len() != s.len() {
+            return Err(Error::ShapeMismatch {
+                expected: shape.to_vec(),
+                found: vec![data.len()],
+            });
+        }
+        Ok(TensorView { data, shape: s })
+    }
+
     /// The shape.
     ///
     /// ```

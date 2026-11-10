@@ -1,5 +1,7 @@
 //! `Mulberry32`: the mulberry32 generator, reproduced exactly from its common JavaScript
-//! form, so a shuffle written in JavaScript gives the same order here.
+//! form, so a shuffle written in JavaScript gives the same order here. It is the generator
+//! that shuffles the digits data set into its train and test split
+//! ([`digits::load`](crate::digits::load)).
 
 /// The mulberry32 generator. Its sequence matches the JavaScript function
 /// `rng(seed)` (which uses `|0` and `Math.imul`) value for value.
