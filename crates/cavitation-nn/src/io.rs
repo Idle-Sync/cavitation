@@ -280,8 +280,10 @@ mod tests {
     }
 
     /// PyTorch's saved MLP loads by name and gives PyTorch's outputs on the fixture inputs,
-    /// within the layer-fixture bound `2 * (k + 2) * 1.19e-7 * sum|terms|` (each layer's
-    /// bound plus the first layer's bound carried through the second layer's weights).
+    /// within the layer-fixture bound `2 * (k + 2) * 1.19e-7 * sum|terms|`, where a layer's
+    /// sum has `k = inputs + 1` terms (the bias is one), so `2 * (inputs + 3) * 1.19e-7 *
+    /// sum|terms|`: each layer's bound, plus the first layer's bound carried through the
+    /// second layer's weights.
     #[test]
     fn pytorch_state_dict_loads_and_predicts() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
@@ -320,7 +322,7 @@ mod tests {
                 .map(|&w| f64::from(w))
                 .collect()
         };
-        let (w1, b1, w2) = (get(0), get(1), get(2));
+        let (w1, b1, w2, b2) = (get(0), get(1), get(2), get(3));
         let eps = 1.19e-7;
         for r in 0..rows {
             let mut hidden_err = vec![0.0; hidden];
@@ -333,7 +335,7 @@ mod tests {
             }
             for j in 0..n_out {
                 let mut limit = 1e-30;
-                let mut sum = get(3)[j].abs();
+                let mut sum = b2[j].abs();
                 for p in 0..hidden {
                     let pre: f64 = b1[p]
                         + (0..n_in)
@@ -472,5 +474,194 @@ mod tests {
         assert!(load(&path, &net, &mut params).is_err());
         assert_eq!(bits(&net, &params), before);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Writes `bytes` as a file and loads it into the MLP, failing the test if `load` panics
+    /// or if it returns an error after changing a parameter.
+    fn load_bytes(name: &str, bytes: &[u8]) -> Result<(), Error> {
+        let path = temp_path(name);
+        std::fs::write(&path, bytes).unwrap();
+        let (net, mut params) = mlp(1);
+        let before = bits(&net, &params);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load(&path, &net, &mut params)
+        }));
+        std::fs::remove_file(&path).unwrap();
+        let result = result.unwrap_or_else(|_| panic!("{name}: load panicked"));
+        if result.is_err() {
+            assert_eq!(bits(&net, &params), before, "{name}: a failed load wrote");
+        }
+        result
+    }
+
+    /// A file made of an 8-byte little-endian header length, the header and `data`.
+    fn with_header(header: &str, data: &[u8]) -> Vec<u8> {
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(data);
+        bytes
+    }
+
+    /// The header of `good_entries` with `first` as the entry for `0.weight`.
+    fn header_with(first: &str) -> String {
+        format!(
+            r#"{{"0.weight":{first},"0.bias":{{"dtype":"F32","shape":[8],"data_offsets":[128,160]}},"2.weight":{{"dtype":"F32","shape":[3,8],"data_offsets":[160,256]}},"2.bias":{{"dtype":"F32","shape":[3],"data_offsets":[256,268]}}}}"#
+        )
+    }
+
+    /// Malformed files are format errors, never panics, and change nothing: a length prefix
+    /// cut short, a header length past the end of the file (or near `u64::MAX`), a header
+    /// that is not JSON, an element type that does not exist, and data offsets out of range
+    /// or not matching the shape. The well-formed header these are made from loads.
+    #[test]
+    fn malformed_headers_are_format_errors() {
+        let good = r#"{"dtype":"F32","shape":[8,4],"data_offsets":[0,128]}"#;
+        let data = vec![0u8; 268];
+        load_bytes("good-header", &with_header(&header_with(good), &data)).unwrap();
+
+        let mut past_end = with_header(&header_with(good), &data);
+        past_end[..8].copy_from_slice(&10_000u64.to_le_bytes());
+        let mut huge = past_end.clone();
+        huge[..8].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", Vec::new()),
+            ("short-length", vec![12, 0, 0]),
+            ("past-end", past_end),
+            ("huge-length", huge),
+            ("not-json", with_header("{not json", &data)),
+            (
+                "unknown-dtype",
+                with_header(
+                    &header_with(r#"{"dtype":"Q7","shape":[8,4],"data_offsets":[0,128]}"#),
+                    &data,
+                ),
+            ),
+            (
+                "offsets-past-data",
+                with_header(
+                    &header_with(r#"{"dtype":"F32","shape":[8,4],"data_offsets":[0,99999]}"#),
+                    &data,
+                ),
+            ),
+            (
+                "offsets-reversed",
+                with_header(
+                    &header_with(r#"{"dtype":"F32","shape":[8,4],"data_offsets":[128,0]}"#),
+                    &data,
+                ),
+            ),
+            (
+                "offsets-not-the-shape",
+                with_header(
+                    &header_with(r#"{"dtype":"F32","shape":[8,4],"data_offsets":[0,4]}"#),
+                    &data,
+                ),
+            ),
+        ];
+        for (name, bytes) in cases {
+            let err = load_bytes(name, &bytes).unwrap_err();
+            assert!(matches!(err, Error::Format(_)), "{name}: {err:?}");
+        }
+    }
+
+    /// The model behind `from-rust.safetensors`: the fixture's MLP with every parameter set
+    /// from its position `k` (counting through the parameters in order) to
+    /// `(k * 7919 mod 199) * 0.01 - 1` in f32, so its values come from neither initialiser.
+    fn rust_fixture_model() -> (Sequential<f32>, ParamStore<f32>) {
+        let (net, mut params) = mlp(0);
+        let mut k = 0u32;
+        for (_, id) in net.parameter_names() {
+            for v in params.value_mut(id).data_mut() {
+                *v = (k * 7919 % 199) as f32 * 0.01 - 1.0;
+                k += 1;
+            }
+        }
+        (net, params)
+    }
+
+    /// A tensor as the fixture JSON writes it: `{"shape": [...], "data": [...]}`.
+    fn tensor_json(shape: &[usize], data: &[f32]) -> Value {
+        serde_json::json!({ "shape": shape, "data": data })
+    }
+
+    /// `save` writes `tests/fixtures/state-dict/from-rust.safetensors` byte for byte, and
+    /// `from-rust-io.json` holds the same parameter values, so the PyTorch check of
+    /// `scripts/fixtures/make_fixtures.py --check-rust-save` (which loads that file with
+    /// `safetensors.torch.load_file`, runs it in PyTorch and compares) covers what `save`
+    /// writes today. With `CAVITATION_WRITE_FIXTURES` set, the test writes both files instead
+    /// (the JSON with the inputs of `mlp-io.json` and this model's outputs on them); rerun
+    /// the PyTorch check after that.
+    #[test]
+    fn save_writes_the_file_pytorch_was_checked_against() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+        let (net, params) = rust_fixture_model();
+        let path = temp_path("from-rust");
+        save(&path, &net, &params).unwrap();
+        let written = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let names = net.parameter_names();
+
+        if std::env::var_os("CAVITATION_WRITE_FIXTURES").is_some() {
+            let io: Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("mlp-io.json")).unwrap())
+                    .unwrap();
+            let input: Vec<f32> = io["input"]["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_f64().unwrap() as f32)
+                .collect();
+            let rows = input.len() / 4;
+            let mut graph = Graph::new();
+            let output: Vec<f32> = {
+                let mut tape = graph.tape(&params.values);
+                let x = tape.input(Tensor::from_vec(input.clone(), &[rows, 4]).unwrap().view());
+                let y = net.forward(&mut tape, x);
+                tape.value(y).data().to_vec()
+            };
+            let mut parameters = serde_json::Map::new();
+            for (name, id) in &names {
+                let value = params.value(*id);
+                parameters.insert(
+                    name.clone(),
+                    tensor_json(value.shape().dims(), value.data()),
+                );
+            }
+            let body = serde_json::json!({
+                "keys": names.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+                "params": parameters,
+                "input": tensor_json(&[rows, 4], &input),
+                "output": tensor_json(&[rows, 3], &output),
+            });
+            std::fs::write(dir.join("from-rust.safetensors"), &written).unwrap();
+            std::fs::write(dir.join("from-rust-io.json"), format!("{body}\n")).unwrap();
+            return;
+        }
+
+        let committed = std::fs::read(dir.join("from-rust.safetensors")).unwrap();
+        assert!(
+            written == committed,
+            "save no longer writes tests/fixtures/state-dict/from-rust.safetensors; if the \
+             change is meant, rewrite it with CAVITATION_WRITE_FIXTURES=1 and rerun \
+             make_fixtures.py --check-rust-save"
+        );
+        let io: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("from-rust-io.json")).unwrap())
+                .unwrap();
+        for (name, id) in &names {
+            let stored: Vec<u32> = io["params"][name.as_str()]["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| (x.as_f64().unwrap() as f32).to_bits())
+                .collect();
+            let ours: Vec<u32> = params
+                .value(*id)
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect();
+            assert_eq!(stored, ours, "{name}");
+        }
     }
 }

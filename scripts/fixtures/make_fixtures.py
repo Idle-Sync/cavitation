@@ -16,6 +16,22 @@ The state-dict fixture goes under `crates/cavitation-nn/tests/fixtures/state-dic
 `safetensors.torch.save_file` as `mlp.safetensors`, and `mlp-io.json` with five inputs and the
 network's outputs in f32 and float64. `--only state-dict` writes just these two files.
 
+`--check-rust-save` writes nothing. It checks the other direction: that a file written by the
+library's `save` loads in PyTorch. The Rust test `save_writes_the_file_pytorch_was_checked_against`
+(in `crates/cavitation-nn/src/io.rs`) keeps `from-rust.safetensors` in the same folder equal,
+byte for byte, to what `save` writes today, and `from-rust-io.json` beside it holds that model's
+parameter values, five inputs and the library's outputs on them. The check loads the file with
+`safetensors.torch.load_file`, loads it into `nn.Sequential(Linear(4, 8), ReLU(), Linear(8, 3))`
+with `load_state_dict(strict=True)`, requires every tensor to be F32 and bit-for-bit the stored
+values, runs the network and requires both PyTorch's f32 outputs and the library's to be within
+`2 * (k + 2) * 1.19e-7 * sum|terms|` of the float64 result (`k` terms per layer, the bias
+included, and the first layer's bound carried through the second layer's weights). To rewrite
+the two files after a deliberate change to `save`, run
+`CAVITATION_WRITE_FIXTURES=1 cargo test --release -p cavitation-nn --lib save_writes_the_file`,
+then this check:
+
+    scripts/fixtures/.venv/bin/python -I scripts/fixtures/make_fixtures.py --out crates --check-rust-save
+
 Inputs come from `torch.manual_seed(0)` with one thread, in a fixed order, so a rerun writes
 identical files. Inputs are kept away from kinks (zero for ReLU, the clamp edges, the points
 where Huber and smooth L1 change branch) so both sides take the same branch.
@@ -43,7 +59,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 
 F32_DIGITS = 9
 F64_DIGITS = 17
@@ -508,12 +524,72 @@ def write_state_dict(crates_dir):
     print(f"wrote the state-dict fixture to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
 
 
+def mlp_bound(model, x):
+    """Per-output bound on the distance of an f32 forward pass of `model` (Linear, ReLU, Linear)
+    on `x` from the float64 result: `2 * (k + 2) * 1.19e-7 * sum|terms|` for each layer, with
+    `k` its terms (inputs plus the bias), and the first layer's bound carried through the
+    second layer's absolute weights."""
+    eps = 1.19e-7
+    w1, b1 = model[0].weight.double(), model[0].bias.double()
+    w2, b2 = model[2].weight.double(), model[2].bias.double()
+    x = x.double()
+    hidden_terms = (x.abs() @ w1.abs().T) + b1.abs()
+    hidden_err = 2 * (w1.shape[1] + 3) * eps * hidden_terms
+    h = torch.relu(x @ w1.T + b1)
+    out_terms = (h.abs() @ w2.abs().T) + b2.abs()
+    return 2 * (w2.shape[1] + 3) * eps * out_terms + hidden_err @ w2.abs().T + 1e-30
+
+
+def check_rust_save(crates_dir):
+    """Loads the library-written `from-rust.safetensors` into the PyTorch network and checks its
+    values and outputs against `from-rust-io.json`; raises on any difference."""
+    in_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
+    state = load_file(os.path.join(in_dir, "from-rust.safetensors"))
+    with open(os.path.join(in_dir, "from-rust-io.json")) as f:
+        io = json.load(f)
+
+    def tensor(t):
+        return torch.tensor(t["data"], dtype=torch.float32).reshape(t["shape"])
+
+    assert sorted(state) == sorted(io["keys"]), f"keys {sorted(state)} != {sorted(io['keys'])}"
+    for key in io["keys"]:
+        assert state[key].dtype == torch.float32, f"{key}: {state[key].dtype}"
+        assert torch.equal(state[key], tensor(io["params"][key])), f"{key}: values differ"
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 3))
+    model.load_state_dict(state, strict=True)
+    x = tensor(io["input"])
+    ours = tensor(io["output"])
+    with torch.no_grad():
+        theirs = model(x)
+        bound = mlp_bound(model, x)
+        exact = model.double()(x.double())
+    for name, out in (("PyTorch", theirs), ("the library", ours)):
+        diff = (out.double() - exact).abs()
+        worst = (diff / bound).max().item()
+        assert bool((diff <= bound).all()), f"{name}'s outputs are outside the bound (worst {worst:.3g} of it)"
+        print(f"{name}: every output within the bound (worst {worst:.3g} of it)", file=sys.stderr)
+    largest = (theirs - ours).abs().max().item()
+    print(
+        f"from-rust.safetensors loads in torch {TORCH_VERSION} with strict keys, F32 values equal "
+        f"to the library's; largest output difference {largest:.3g}",
+        file=sys.stderr,
+    )
+
+
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
     parser.add_argument("--out", required=True, help="the crates directory (files go under cavitation-core/tests/fixtures/ops)")
     parser.add_argument("--only", choices=["state-dict"], help="write only this fixture family")
+    parser.add_argument(
+        "--check-rust-save",
+        action="store_true",
+        help="write nothing; check that the library-written state-dict file loads and predicts in PyTorch",
+    )
     args = parser.parse_args()
+    if args.check_rust_save:
+        check_rust_save(args.out)
+        return
     if args.only == "state-dict":
         write_state_dict(args.out)
         return
