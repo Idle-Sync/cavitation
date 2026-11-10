@@ -5,6 +5,8 @@
 //! its file's forward and backward functions.
 
 mod elementwise;
+#[cfg(test)]
+mod wrong;
 
 use crate::Real;
 use crate::graph::{BackwardCtx, ParamId, Var};
@@ -19,6 +21,9 @@ pub(crate) enum Op {
     Param(ParamId),
     /// Elementwise `a + b` of two values of the same shape.
     Add(Var, Var),
+    /// Test only: the identity, whose backward pass returns twice the true gradient.
+    #[cfg(test)]
+    WrongIdentity(Var),
 }
 
 impl Op {
@@ -28,6 +33,8 @@ impl Op {
         match *self {
             Op::Input | Op::Param(_) => {}
             Op::Add(a, b) => elementwise::add_backward(a, b, out_grad, ctx),
+            #[cfg(test)]
+            Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
         }
     }
 }

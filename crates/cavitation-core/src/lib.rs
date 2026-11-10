@@ -1,5 +1,6 @@
 //! Tensors, automatic differentiation and CPU kernels for the cavitation neural network library.
 
+mod check;
 mod error;
 mod graph;
 pub mod kernels;
@@ -9,6 +10,7 @@ mod rng;
 mod shape;
 mod tensor;
 
+pub use check::{GradcheckFailure, GradcheckReport, gradcheck, gradcheck_params};
 pub use error::Error;
 pub use graph::{Graph, ParamGrads, ParamId, ParamStore, ParamValues, Tape, Var};
 pub use real::Real;

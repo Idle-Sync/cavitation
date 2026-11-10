@@ -464,6 +464,25 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(store.grad(b).data(), &[1.0]);
     /// ```
     pub fn backward(&mut self, loss: Var, grads: &mut ParamGrads<T>) {
+        let shape = self.shape(loss);
+        assert!(
+            shape.len() == 1,
+            "backward: the loss must have one element, but its shape is {:?}",
+            shape.dims()
+        );
+        self.backward_seeded(loss, &[T::ONE], grads);
+    }
+
+    /// Like [`backward`](Tape::backward) for an output of any size: seeds the gradient of
+    /// `out` with `seed` (the gradient of the loss with respect to each element of `out`)
+    /// and runs the same reverse pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `seed` does not have as many elements as `out`, if `out` was not recorded
+    /// on this tape, or if `grads` belongs to another [`ParamStore`] than the values this
+    /// tape reads.
+    pub(crate) fn backward_seeded(&mut self, out: Var, seed: &[T], grads: &mut ParamGrads<T>) {
         assert!(
             grads.store_id() == self.params.store_id(),
             "backward: the grads belong to another ParamStore than the values this tape reads \
@@ -471,11 +490,12 @@ impl<T: Real> Tape<'_, T> {
             grads.store_id(),
             self.params.store_id()
         );
-        let loss_index = loss.index_on(self.id);
+        let loss_index = out.index_on(self.id);
         let shape = self.graph.nodes[loss_index].shape;
         assert!(
-            shape.len() == 1,
-            "backward: the loss must have one element, but its shape is {:?}",
+            shape.len() == seed.len(),
+            "backward: the seed has {} elements, but the output's shape is {:?}",
+            seed.len(),
             shape.dims()
         );
         self.graph.reclaim_grads();
@@ -496,8 +516,8 @@ impl<T: Real> Tape<'_, T> {
             pool,
             params: grads,
         };
-        if let Some(slot) = seed_ctx.slot(loss) {
-            slot.add_from(&[T::ONE]);
+        if let Some(slot) = seed_ctx.slot(out) {
+            slot.add_from(seed);
         }
         for i in (0..=loss_index).rev() {
             let (before, rest) = node_grads.split_at_mut(i);
