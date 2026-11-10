@@ -35,3 +35,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `save`, `load` and `load_lenient`: weights in the safetensors format, named as a PyTorch `state_dict` (`0.weight`, `2.bias`); loading checks every key, shape and the F32 type before writing anything. New `Error::WrongShape`; `Error::Dtype` now says F32 was expected.
 - `cavitation::prelude`, the top-level re-exports of the core and nn crates, and the `xor`, `digits` and `mnist` examples (`cargo run --release --example digits -p cavitation`; MNIST needs `scripts/data/get-mnist.sh` first).
 - A known-result test for MNIST (784 → 1024 → 256 → 10, ignored by default: it needs the data files), which prints the test accuracy after every epoch.
+- `cavitation-bench` command (`all`, `mnist`, `digits`, `latency`, `gemm`, `info`) that times training and inference against an in-run numpy baseline (`scripts/bench/numpy_mlp.py`) and writes `target/bench/results.json`.

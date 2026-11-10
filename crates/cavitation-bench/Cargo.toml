@@ -13,3 +13,4 @@ workspace = true
 [dependencies]
 cavitation-core = { path = "../cavitation-core" }
 cavitation-datasets = { path = "../cavitation-datasets" }
+cavitation-nn = { path = "../cavitation-nn" }
