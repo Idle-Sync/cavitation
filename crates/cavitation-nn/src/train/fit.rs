@@ -120,12 +120,13 @@ impl Loss {
 /// [`Optimizer::last_stats`]), the [`HealthMonitor`] that checks every step (the default
 /// [`Health`] unless [`set_health`](Self::set_health) changes it) and the batch buffers
 /// [`fit`] gathers into. After a warm-up epoch, including the smaller last batch, a healthy
-/// step allocates nothing. Call [`end_epoch`](Self::end_epoch) after each epoch.
+/// step allocates nothing. Each step returns its loss, or the health checks' error at the
+/// step that met it; call [`end_epoch`](Self::end_epoch) after each epoch.
 ///
 /// # Examples
 ///
 /// ```
-/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_core::{Error, ParamStore, Rng, Tensor};
 /// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
@@ -136,11 +137,16 @@ impl Loss {
 /// let mut trainer = Trainer::new(&net, Sgd::new(0.05), Loss::Mse, 4);
 /// let batcher = Batcher::new(4, 4, None);
 /// let mut batch = Batch::new(&data, 4);
-/// let first = trainer.step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch));
-/// let mut last = first;
-/// for _ in 0..200 {
-///     last = trainer.step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch));
-/// }
+/// let mut train = || -> Result<(f32, f32), Error> {
+///     let first = trainer.step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch))?;
+///     let mut last = first;
+///     for epoch in 1..=200 {
+///         last = trainer.step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch))?;
+///         trainer.end_epoch(epoch)?;
+///     }
+///     Ok((first, last))
+/// };
+/// let (first, last) = train().unwrap();
 /// assert!(last < first * 0.01);
 /// ```
 ///
@@ -205,9 +211,6 @@ pub struct Trainer {
     health: HealthMonitor,
     /// The model's parameter names, for the health checks' messages.
     names: Vec<(String, ParamId)>,
-    /// The first error a public step met under [`OnNonFinite::Stop`](crate::OnNonFinite)
-    /// since the last [`end_epoch`](Trainer::end_epoch).
-    stopped: Option<Error>,
 }
 
 impl Trainer {
@@ -253,7 +256,6 @@ impl Trainer {
             steps: 0,
             health: HealthMonitor::new(Health::default()),
             names: model.parameter_names(),
-            stopped: None,
         }
     }
 
@@ -279,30 +281,19 @@ impl Trainer {
     ///
     /// # Errors
     ///
-    /// Returns the first [`Error::NonFinite`] that [`step`](Self::step) or
-    /// [`step_with_hooks`](Self::step_with_hooks) met under
-    /// [`OnNonFinite::Stop`](crate::OnNonFinite) since the last `end_epoch`, once.
+    /// None of the end-of-epoch checks stops training, so this returns `Ok`; it returns a
+    /// `Result` so that a loop can use `?` on it and on [`step`](Self::step) alike.
     ///
     /// ```
-    /// use cavitation_core::{ParamStore, Rng, Tensor};
-    /// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
-    /// let data = Dataset {
-    ///     x: Tensor::full(&[2, 1], f32::NAN),
-    ///     targets: Targets::Values(Tensor::zeros(&[2, 1])),
-    /// };
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer};
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 2);
-    /// let mut batch = Batch::new(&data, 2);
-    /// let loss = trainer.step(&net, &mut params, Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch));
-    /// assert!(loss.is_nan());
-    /// let err = trainer.end_epoch(1).unwrap_err();
-    /// assert_eq!(err.to_string(), "non-finite value at step 1 in loss");
+    /// assert!(trainer.end_epoch(1).is_ok());
     /// ```
     pub fn end_epoch(&mut self, epoch: usize) -> Result<(), Error> {
-        let stopped = self.stopped.take();
-        self.health.end_epoch(epoch)?;
-        stopped.map_or(Ok(()), Err)
+        self.health.end_epoch(epoch)
     }
 
     /// Trains on one batch: the forward pass of `model` on `batch.x`, the loss against
@@ -311,12 +302,20 @@ impl Trainer {
     ///
     /// The gradients must be stale when it starts, as the previous step leaves them.
     ///
-    /// Every step runs the health checks (see [`HealthMonitor`]). Under
-    /// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), a NaN or infinite loss skips
-    /// the optimiser step, so the parameters stay as they were, and the step returns the
-    /// loss as it is; a NaN or infinite gradient is found after the update. Either way the
-    /// first such error is kept and returned by [`end_epoch`](Self::end_epoch). [`fit`]
-    /// stops at it instead.
+    /// Every step runs the health checks (see [`HealthMonitor`]).
+    ///
+    /// # Errors
+    ///
+    /// Under [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns
+    /// [`Error::NonFinite`] when the loss or a gradient is NaN or infinite, naming the step
+    /// and `"loss"` or the parameter, and sends the matching [`Warning::NonFinite`] to the
+    /// health sink. A NaN or infinite loss skips the optimiser step, so the parameters stay
+    /// as they were; a NaN or infinite gradient with a finite loss is found after the update
+    /// has applied it. The step is counted and the gradients are marked stale either way.
+    /// [`fit`] stops at this error. Under [`OnNonFinite::Warn`](crate::OnNonFinite) the step
+    /// returns its loss, NaN or not.
+    ///
+    /// [`Warning::NonFinite`]: crate::Warning::NonFinite
     ///
     /// # Panics
     ///
@@ -333,7 +332,8 @@ impl Trainer {
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 3);
     /// let mut batch = Batch::new(&data, 3);
-    /// let loss = trainer.step(&net, &mut params, Batcher::new(3, 3, None).gather(&data, 0..3, &mut batch));
+    /// let view = Batcher::new(3, 3, None).gather(&data, 0..3, &mut batch);
+    /// let loss = trainer.step(&net, &mut params, view).unwrap();
     /// // All-zero inputs and a zero bias give equal scores: the loss is ln 2.
     /// assert!((loss - 2f32.ln()).abs() < 1e-6);
     /// ```
@@ -342,7 +342,7 @@ impl Trainer {
         model: &Sequential,
         params: &mut ParamStore,
         batch: BatchView<'_, f32>,
-    ) -> f32 {
+    ) -> Result<f32, Error> {
         self.step_with_hooks(model, params, batch, &mut Hooks::new())
     }
 
@@ -350,6 +350,10 @@ impl Trainer {
     /// pass, the backward hooks right after the backward pass, both before the optimiser
     /// updates the parameters (so every event shows the values and gradients of this step).
     /// With no hooks registered it does exactly what `step` does.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`step`](Self::step) returns, after the hooks have run.
     ///
     /// # Panics
     ///
@@ -375,7 +379,7 @@ impl Trainer {
     /// let mut hooks = Hooks::new();
     /// hooks.on_forward(1, |e| widths.push(e.output.shape().dims().to_vec()));
     /// let view = Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch);
-    /// trainer.step_with_hooks(&net, &mut params, view, &mut hooks);
+    /// trainer.step_with_hooks(&net, &mut params, view, &mut hooks).unwrap();
     /// drop(hooks);
     /// assert_eq!(widths, [vec![2, 3]]);
     /// ```
@@ -385,14 +389,9 @@ impl Trainer {
         params: &mut ParamStore,
         batch: BatchView<'_, f32>,
         hooks: &mut Hooks<'_>,
-    ) -> f32 {
+    ) -> Result<f32, Error> {
         let (value, checked) = self.checked_step(model, params, batch, hooks);
-        if let Err(err) = checked
-            && self.stopped.is_none()
-        {
-            self.stopped = Some(err);
-        }
-        value
+        checked.map(|()| value)
     }
 
     /// The step behind [`step_with_hooks`](Self::step_with_hooks): returns the batch's loss
@@ -751,7 +750,8 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 /// have one entry per row. During training, with `config.health.on_non_finite` set to
 /// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`] at
 /// the first step whose loss or gradient is NaN or infinite, naming the step and `"loss"` or
-/// the parameter (for example `"0.weight"`). A non-finite loss stops before the optimiser
+/// the parameter (for example `"0.weight"`), after sending the matching warning to the
+/// health sink. A non-finite loss stops before the optimiser
 /// step; a non-finite gradient with a finite loss is found after the update applied it.
 ///
 /// # Panics
@@ -1105,7 +1105,9 @@ mod tests {
         );
         for range in ranges {
             let before = parameter_bits(&net, &params);
-            let loss = trainer.step(&net, &mut params, batcher.gather(&data, range, &mut batch));
+            let loss = trainer
+                .step(&net, &mut params, batcher.gather(&data, range, &mut batch))
+                .unwrap();
             assert!(loss.is_finite() && loss > 0.0);
             assert_ne!(parameter_bits(&net, &params), before);
         }
@@ -1144,7 +1146,7 @@ mod tests {
         for range in batcher.batches() {
             let view = batcher.gather(&data, range, &mut batch);
             assert_eq!(view.x.shape().dims(), &[1, 2]);
-            assert!(trainer.step(&net, &mut params, view).is_finite());
+            assert!(trainer.step(&net, &mut params, view).unwrap().is_finite());
         }
         assert_eq!(trainer.steps(), 20);
         let config = FitConfig {
@@ -1178,7 +1180,7 @@ mod tests {
         let batcher = Batcher::new(4, 4, None);
         let mut batch = Batch::new(&data, 4);
         let view = batcher.gather(&data, 0..4, &mut batch);
-        trainer.step(&net, &mut params, view);
+        let _ = trainer.step(&net, &mut params, view);
     }
 
     /// Value targets with cross-entropy panic, naming the loss and the kind of targets.
@@ -1197,7 +1199,7 @@ mod tests {
         let batcher = Batcher::new(2, 2, None);
         let mut batch = Batch::new(&data, 2);
         let view = batcher.gather(&data, 0..2, &mut batch);
-        trainer.step(&net, &mut params, view);
+        let _ = trainer.step(&net, &mut params, view);
     }
 
     /// A layer that passes its input through and counts its forward passes.
@@ -1242,7 +1244,7 @@ mod tests {
         let mut hooks = Hooks::new();
         hooks.on_forward(7, |_| {});
         let result = catch_unwind(AssertUnwindSafe(|| {
-            trainer.step_with_hooks(&net, &mut params, view, &mut hooks)
+            let _ = trainer.step_with_hooks(&net, &mut params, view, &mut hooks);
         }));
         let message = result.expect_err("a hook on layer 7 of 2 panics");
         let message = message
@@ -1484,7 +1486,9 @@ mod tests {
                 tape.value(l).data()[0]
             };
             let before = parameter_bits(&net, &params);
-            let got = trainer.step(&net, &mut params, batcher.gather(data, 0..2, &mut batch));
+            let got = trainer
+                .step(&net, &mut params, batcher.gather(data, 0..2, &mut batch))
+                .unwrap();
             assert_eq!(got.to_bits(), expected.to_bits(), "{loss:?}");
             assert!(got.is_finite() && got > 0.0, "{loss:?}: {got}");
             assert_ne!(parameter_bits(&net, &params), before, "{loss:?}");

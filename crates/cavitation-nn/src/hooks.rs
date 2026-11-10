@@ -694,7 +694,9 @@ mod tests {
             let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 3);
             let mut batch = Batch::new(&data, 3);
             let view = Batcher::new(3, 3, None).gather(&data, 0..3, &mut batch);
-            trainer.step_with_hooks(&net, &mut params, view, &mut hooks);
+            trainer
+                .step_with_hooks(&net, &mut params, view, &mut hooks)
+                .unwrap();
         }
 
         let got = got.into_inner();

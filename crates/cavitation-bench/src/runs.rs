@@ -316,7 +316,11 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
     let ranges: Vec<_> = batcher.batches().collect();
     for k in 0..TRAIN_WARMUP {
         let view = batcher.gather(data, ranges[k % ranges.len()].clone(), &mut buffer);
-        black_box(trainer.step(&net, &mut params, view));
+        black_box(
+            trainer
+                .step(&net, &mut params, view)
+                .map_err(|e| e.to_string())?,
+        );
     }
     let mut seconds = Vec::with_capacity(spec.epochs);
     for epoch in 1..=spec.epochs {
@@ -324,7 +328,11 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
         batcher.epoch();
         for range in &ranges {
             let view = batcher.gather(data, range.clone(), &mut buffer);
-            black_box(trainer.step(&net, &mut params, view));
+            black_box(
+                trainer
+                    .step(&net, &mut params, view)
+                    .map_err(|e| e.to_string())?,
+            );
         }
         trainer.end_epoch(epoch).map_err(|e| e.to_string())?;
         seconds.push(start.elapsed().as_secs_f64());

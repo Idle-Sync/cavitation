@@ -18,7 +18,8 @@ use crate::{ActivationKind, GradStats, Sequential, Trace};
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OnNonFinite {
-    /// Stop training with [`Error::NonFinite`], naming the step and where the value was.
+    /// Stop training with [`Error::NonFinite`], naming the step and where the value was,
+    /// after sending the matching [`Warning::NonFinite`] to the sink.
     Stop,
     /// Send a [`Warning::NonFinite`] to the sink and keep training.
     Warn,
@@ -44,8 +45,9 @@ pub enum Warning {
         /// How many logarithms that step clamped.
         count: usize,
     },
-    /// The loss or a gradient held a NaN or an infinity (with [`OnNonFinite::Warn`]). Sent
-    /// at most once per epoch for each location.
+    /// The loss or a gradient held a NaN or an infinity. With [`OnNonFinite::Warn`] it is
+    /// sent at most once per epoch for each location; with [`OnNonFinite::Stop`] it is sent
+    /// once, just before the step returns [`Error::NonFinite`] for the same location.
     NonFinite {
         /// The step, counting from 1.
         step: u64,
@@ -304,6 +306,16 @@ impl HealthMonitor {
         }
     }
 
+    /// Sends [`Warning::NonFinite`] for `location` at `step` to the sink and returns the
+    /// matching [`Error::NonFinite`], for [`OnNonFinite::Stop`].
+    fn stop(&mut self, step: u64, location: String) -> Error {
+        self.emit(Warning::NonFinite {
+            step,
+            location: location.clone(),
+        });
+        Error::NonFinite { step, location }
+    }
+
     /// The checks that need the tape, run after the backward pass of step `step` (counting
     /// from 1) and before the tape is dropped: `loss` must be finite, binary cross-entropy
     /// clamps send [`Warning::ClampedLogs`] (at most once per epoch), and, with
@@ -314,8 +326,9 @@ impl HealthMonitor {
     /// # Errors
     ///
     /// With [`OnNonFinite::Stop`], returns [`Error::NonFinite`] with location `"loss"` if
-    /// `loss` is NaN or infinite. With [`OnNonFinite::Warn`] it sends
-    /// [`Warning::NonFinite`] instead (at most once per epoch) and returns `Ok`.
+    /// `loss` is NaN or infinite, after sending [`Warning::NonFinite`] to the sink. With
+    /// [`OnNonFinite::Warn`] it only sends the warning (at most once per epoch) and returns
+    /// `Ok`.
     ///
     /// # Panics
     ///
@@ -355,10 +368,7 @@ impl HealthMonitor {
         if !loss.is_finite() {
             match self.health.on_non_finite {
                 OnNonFinite::Stop => {
-                    return Err(Error::NonFinite {
-                        step,
-                        location: "loss".to_string(),
-                    });
+                    return Err(self.stop(step, "loss".to_string()));
                 }
                 OnNonFinite::Warn if !self.loss_warned => {
                     self.loss_warned = true;
@@ -439,9 +449,10 @@ impl HealthMonitor {
     /// # Errors
     ///
     /// With [`OnNonFinite::Stop`], returns [`Error::NonFinite`] naming the first parameter
-    /// (in the order of the store) whose gradient held a NaN or an infinity. With
-    /// [`OnNonFinite::Warn`] it sends [`Warning::NonFinite`] for each such parameter instead
-    /// (at most once per epoch each) and returns `Ok`.
+    /// (in the order of the store) whose gradient held a NaN or an infinity, after sending
+    /// [`Warning::NonFinite`] to the sink. With [`OnNonFinite::Warn`] it sends
+    /// [`Warning::NonFinite`] for each such parameter instead (at most once per epoch each)
+    /// and returns `Ok`.
     ///
     /// # Panics
     ///
@@ -483,7 +494,7 @@ impl HealthMonitor {
                 Some((name, _)) => name.clone(),
                 None => format!("{id:?}"),
             };
-            return Err(Error::NonFinite { step, location });
+            return Err(self.stop(step, location));
         }
         self.warned.resize(names.len(), 0);
         let (high, low) = (self.health.grad_norm_high, self.health.grad_norm_low);
@@ -897,7 +908,7 @@ mod tests {
     }
 
     /// A non-finite gradient with a finite loss is reported by `after_update`, naming the
-    /// parameter.
+    /// parameter, both as the error and to the sink.
     #[test]
     fn non_finite_gradient_names_the_parameter() {
         let mut params = ParamStore::new();
@@ -907,11 +918,19 @@ mod tests {
         params.grads.accumulate(bias).0.data_mut()[0] = f32::INFINITY;
         let mut optimizer = Sgd::new(0.1);
         optimizer.step(&mut params);
-        let mut monitor = HealthMonitor::new(Health::default());
+        let (seen, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
         let err = monitor
             .after_update(5, optimizer.last_stats(), &net.parameter_names())
             .unwrap_err();
         assert!(is_non_finite(&err, 5, "0.bias"), "{err:?}");
+        assert_eq!(
+            *seen.borrow(),
+            [Warning::NonFinite {
+                step: 5,
+                location: "0.bias".to_string()
+            }]
+        );
     }
 
     /// Binary cross-entropy with one prediction of exactly 0 against a target of 1 gives the
@@ -961,10 +980,11 @@ mod tests {
         );
     }
 
-    /// `Trainer::step` keeps its signature under `OnNonFinite::Stop`: it returns the NaN loss,
-    /// skips the update, and `Trainer::end_epoch` returns the error once.
+    /// Under `OnNonFinite::Stop`, `Trainer::step` returns the error at the step that met
+    /// it, skips the update, counts the step and sends the warning to the sink; nothing is
+    /// held back for `Trainer::end_epoch`.
     #[test]
-    fn trainer_step_holds_the_error_for_end_epoch() {
+    fn trainer_step_returns_the_error_at_the_step() {
         let data = nan_dataset();
         let mut params = ParamStore::new();
         let net = classifier(&mut params);
@@ -974,14 +994,26 @@ mod tests {
         trainer.set_health(health(OnNonFinite::Stop, sink));
         let batcher = Batcher::new(64, 32, None);
         let mut batch = Batch::new(&data, 32);
-        let loss = trainer.step(&net, &mut params, batcher.gather(&data, 0..32, &mut batch));
-        assert!(loss.is_nan());
+        let err = trainer
+            .step(&net, &mut params, batcher.gather(&data, 0..32, &mut batch))
+            .unwrap_err();
+        assert!(is_non_finite(&err, 1, "loss"), "{err:?}");
         assert_eq!(parameter_bits(&net, &params), before);
         assert_eq!(trainer.steps(), 1);
-        let err = trainer.end_epoch(1).unwrap_err();
-        assert!(is_non_finite(&err, 1, "loss"), "{err:?}");
-        assert!(trainer.end_epoch(2).is_ok());
-        assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
+        assert_eq!(
+            *seen.borrow(),
+            [Warning::NonFinite {
+                step: 1,
+                location: "loss".to_string()
+            }]
+        );
+        assert!(trainer.end_epoch(1).is_ok());
+        // The second batch has no NaN, so the next step trains.
+        let loss = trainer
+            .step(&net, &mut params, batcher.gather(&data, 32..64, &mut batch))
+            .unwrap();
+        assert!(loss.is_finite());
+        assert_ne!(parameter_bits(&net, &params), before);
     }
 
     /// Each warning reads as one plain-English line.

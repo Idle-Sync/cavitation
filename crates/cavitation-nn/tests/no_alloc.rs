@@ -244,7 +244,7 @@ fn training_step() -> usize {
             batcher.epoch();
             for range in batcher.batches() {
                 let view = batcher.gather(&data, range, &mut batch);
-                sink += trainer.step(&net, &mut params, view);
+                sink += trainer.step(&net, &mut params, view).unwrap();
             }
         }
         made += allocations() - before;
@@ -310,7 +310,7 @@ fn hooked_epoch(
     batcher.epoch();
     for range in batcher.batches() {
         let view = batcher.gather(data, range, batch);
-        sum += trainer.step_with_hooks(net, params, view, hooks);
+        sum += trainer.step_with_hooks(net, params, view, hooks).unwrap();
     }
     sum
 }
@@ -396,7 +396,7 @@ fn masked_training_step() -> usize {
             batcher.epoch();
             for range in batcher.batches() {
                 let view = batcher.gather(&data, range, &mut batch);
-                sink += trainer.step(&net, &mut params, view);
+                sink += trainer.step(&net, &mut params, view).unwrap();
             }
         }
         made += allocations() - before;
@@ -437,7 +437,7 @@ fn health_steady_state() -> usize {
             batcher.epoch();
             for range in batcher.batches() {
                 let view = batcher.gather(&data, range, &mut batch);
-                sink += trainer.step(&net, &mut params, view);
+                sink += trainer.step(&net, &mut params, view).unwrap();
             }
             trainer.end_epoch(epoch).unwrap();
         }
