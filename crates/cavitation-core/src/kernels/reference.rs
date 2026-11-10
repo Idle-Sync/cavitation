@@ -215,6 +215,28 @@ mod tests {
         assert!(MatRef::new(&d, 0, 3, 3, 1).is_some());
     }
 
+    /// Overlapping strides are rejected by `MatMut`.
+    #[test]
+    fn matmut_rejects_overlapping_strides() {
+        let mut d = [0.0f32; 4];
+        assert!(MatMut::new(&mut d, 2, 2, 0, 0).is_none());
+        assert!(MatMut::new(&mut d[..3], 2, 2, 1, 1).is_none());
+    }
+
+    /// Size-1 dimensions may have any stride.
+    #[test]
+    fn matmut_accepts_size_one_dims_with_any_stride() {
+        let mut d = [0.0f32; 2];
+        assert!(MatMut::new(&mut d, 2, 1, 1, 0).is_some());
+    }
+
+    /// A transposed layout is accepted.
+    #[test]
+    fn matmut_accepts_transposed_layout() {
+        let mut d = [0.0f32; 6];
+        assert!(MatMut::new(&mut d, 2, 3, 1, 2).is_some());
+    }
+
     /// Shape mismatches panic with a message naming both shapes.
     #[test]
     #[should_panic(expected = "A is 2 x 3, B is 2 x 2")]

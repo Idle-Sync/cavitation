@@ -16,6 +16,30 @@ fn required_len(rows: usize, cols: usize, row_stride: usize, col_stride: usize) 
         .checked_add(1)
 }
 
+/// Whether no two distinct elements of a `rows` by `cols` view can share an offset.
+///
+/// Only dimensions with extent above 1 count. A single such dimension needs a stride of at
+/// least 1. Two need, with the smaller stride `s` and its extent `e`, `s >= 1` and
+/// `e * s <= ` the larger stride. This is sufficient, not necessary.
+fn is_non_aliasing(rows: usize, cols: usize, row_stride: usize, col_stride: usize) -> bool {
+    let mut dims: Vec<(usize, usize)> = Vec::with_capacity(2);
+    if rows > 1 {
+        dims.push((rows, row_stride));
+    }
+    if cols > 1 {
+        dims.push((cols, col_stride));
+    }
+    match dims.as_slice() {
+        [] => true,
+        [(_, stride)] => *stride >= 1,
+        [a, b] => {
+            let (small, large) = if a.1 <= b.1 { (a, b) } else { (b, a) };
+            small.1 >= 1 && small.0.checked_mul(small.1).is_some_and(|v| v <= large.1)
+        }
+        _ => unreachable!("a matrix has two dimensions"),
+    }
+}
+
 /// A read-only matrix view over a slice, with an independent stride for rows and columns.
 ///
 /// Element `(i, j)` is `data[i * row_stride + j * col_stride]`. A row-major `r` by `c`
@@ -166,8 +190,13 @@ impl<'a, T: Real> MatRef<'a, T> {
 
 /// A writable matrix view over a slice, with the same layout rules as [`MatRef`].
 ///
-/// Distinct elements of a view should map to distinct positions in the slice; with
-/// overlapping strides (for example a stride of 0) later writes overwrite earlier ones.
+/// A `MatMut` never aliases: `new` returns `None` unless distinct elements map to distinct
+/// positions in the slice, so writing different elements can never touch the same value.
+/// Only dimensions longer than 1 count (a single row or column may have any stride). For
+/// two such dimensions the rule is conservative: with the smaller stride `s` and its extent
+/// `e`, it needs `s >= 1` and `e * s <=` the larger stride. A few non-aliasing layouts, such
+/// as strides `(3, 2)` on a 2 x 2 view, are rejected too. A row-major, column-major or
+/// transposed layout is always accepted. ([`MatRef`] allows overlap, since reading is safe.)
 ///
 /// # Examples
 ///
@@ -193,12 +222,14 @@ pub struct MatMut<'a, T> {
 }
 
 impl<'a, T: Real> MatMut<'a, T> {
-    /// Builds a view, or returns `None` under the same bounds rule as [`MatRef::new`].
+    /// Builds a view, or returns `None` if the bounds rule of [`MatRef::new`] fails or two
+    /// distinct elements could share a position (see the type's documentation).
     ///
     /// ```
     /// use cavitation_core::kernels::MatMut;
     /// let mut data = [0.0f32; 5];
-    /// assert!(MatMut::new(&mut data, 2, 3, 3, 1).is_none());
+    /// assert!(MatMut::new(&mut data, 2, 3, 3, 1).is_none()); // out of bounds
+    /// assert!(MatMut::new(&mut data, 2, 2, 0, 0).is_none()); // aliasing
     /// ```
     pub fn new(
         data: &'a mut [T],
@@ -207,6 +238,9 @@ impl<'a, T: Real> MatMut<'a, T> {
         row_stride: usize,
         col_stride: usize,
     ) -> Option<Self> {
+        if !is_non_aliasing(rows, cols, row_stride, col_stride) {
+            return None;
+        }
         let need = required_len(rows, cols, row_stride, col_stride)?;
         if need > data.len() {
             return None;
