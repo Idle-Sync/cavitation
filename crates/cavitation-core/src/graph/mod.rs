@@ -345,6 +345,7 @@ impl<T: Real> Graph<T> {
             graph: self,
             params,
             id: NEXT_TAPE_ID.fetch_add(1, Ordering::Relaxed),
+            clamped_logs: 0,
         }
     }
 
@@ -396,6 +397,8 @@ pub struct Tape<'g, T: Real = f32> {
     params: &'g ParamValues<T>,
     /// This tape's id, carried by every [`Var`] it records.
     id: u32,
+    /// How many logarithms `binary_cross_entropy` has clamped on this tape.
+    clamped_logs: usize,
 }
 
 impl<T: Real> Tape<'_, T> {
@@ -647,6 +650,31 @@ impl<T: Real> Tape<'_, T> {
     /// A pooled buffer of `len` elements with unspecified contents, for a new node's value.
     pub(crate) fn take_buffer(&mut self, len: usize) -> Vec<T> {
         self.graph.pool.take(len)
+    }
+
+    /// Adds `n` to the count of clamped logarithms.
+    pub(crate) fn add_clamped_logs(&mut self, n: usize) {
+        self.clamped_logs += n;
+    }
+
+    /// The number of logarithms that `binary_cross_entropy` clamped at -100 while recording
+    /// on this tape (see [`Tape::binary_cross_entropy`]). It starts at 0 on every new tape,
+    /// so a clamp is never silent: the health checks read it and turn a non-zero count into a
+    /// warning.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Reduction, Tensor};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let p = tape.input(Tensor::from_vec(vec![0.0f32, 0.5], &[2]).unwrap().view());
+    /// let t = tape.input(Tensor::from_vec(vec![1.0f32, 1.0], &[2]).unwrap().view());
+    /// assert_eq!(tape.clamped_logs(), 0);
+    /// tape.binary_cross_entropy(p, t, Reduction::Mean);
+    /// assert_eq!(tape.clamped_logs(), 1);
+    /// ```
+    pub fn clamped_logs(&self) -> usize {
+        self.clamped_logs
     }
 
     /// Copies `labels` into the graph's label buffer, which keeps its capacity from step to

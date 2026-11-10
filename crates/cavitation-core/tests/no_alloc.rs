@@ -220,15 +220,53 @@ fn cross_entropy_steady_state() -> usize {
     made
 }
 
+/// Binary cross-entropy with logits and NLL, forward and backward, 12 times: a batch of 8
+/// samples with 10 classes through a linear layer. Returns the allocations made during steps
+/// 3 to 12.
+fn bce_and_nll_steady_state() -> usize {
+    let mut store = ParamStore::new();
+    let weight = store.add(Tensor::full(&[4, 10], 0.1f32));
+    let x = Tensor::from_vec((0..32).map(|i| (i as f32 * 0.7).cos()).collect(), &[8, 4]).unwrap();
+    let target = Tensor::full(&[8, 10], 0.25f32);
+    let labels = [3usize, 0, 9, 4, 4, 1, 7, 2];
+    let mut graph = Graph::new();
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for step in 1..=12 {
+        if step == 3 {
+            before = allocations();
+        }
+        store.zero_grad();
+        {
+            let mut tape = graph.tape(&store.values);
+            let xi = tape.input(x.view());
+            let w = tape.param(weight);
+            let logits = tape.matmul(xi, w);
+            let t = tape.input(target.view());
+            let bce = tape.binary_cross_entropy_with_logits(logits, t, Reduction::Mean);
+            let lsm = tape.log_softmax(logits);
+            let nll = tape.nll(lsm, &labels, Reduction::Mean);
+            let loss = tape.add(bce, nll);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0];
+        }
+        sink += store.grad(weight).data()[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// A named scenario: runs, and returns the allocations it made after warm-up.
 type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 3] = [
+    let scenarios: [Scenario; 4] = [
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
         ("cross_entropy_steady_state", cross_entropy_steady_state),
+        ("bce_and_nll_steady_state", bce_and_nll_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

@@ -381,3 +381,120 @@ fn gradcheck_losses_sharing_an_input() {
     );
     assert!(report.passed(), "shared logits: {report:?}");
 }
+
+/// A tensor of the given shape with entries in `[0.05, 0.95]`, for probabilities.
+fn probabilities(dims: &[usize], seed: u64) -> Tensor<f64> {
+    let mut rng = Rng::seed(seed);
+    let n: usize = dims.iter().product();
+    Tensor::from_vec((0..n).map(|_| rng.range(0.05, 0.95)).collect(), dims).unwrap()
+}
+
+/// Draws a prediction and a target in `[-2, 2]`, resampling each target until the
+/// difference is more than 1e-3 from 0 and from `knee`, so that no check sits on a kink.
+fn away_from_kinks(dims: &[usize], knee: f64, seed: u64) -> [Tensor<f64>; 2] {
+    let mut rng = Rng::seed(seed);
+    let n: usize = dims.iter().product();
+    let pred: Vec<f64> = (0..n).map(|_| rng.range(-2.0, 2.0)).collect();
+    let target: Vec<f64> = pred
+        .iter()
+        .map(|&p| {
+            loop {
+                let t = rng.range(-2.0, 2.0);
+                let d = (p - t).abs();
+                if d > 1e-3 && (d - knee).abs() > 1e-3 {
+                    break t;
+                }
+            }
+        })
+        .collect();
+    [
+        Tensor::from_vec(pred, dims).unwrap(),
+        Tensor::from_vec(target, dims).unwrap(),
+    ]
+}
+
+/// Binary cross-entropy has the right gradient for probabilities and targets under every
+/// reduction.
+#[test]
+fn gradcheck_binary_cross_entropy() {
+    let x = [probabilities(&[3, 4], 20), probabilities(&[3, 4], 21)];
+    for r in REDUCTIONS {
+        let report = gradcheck(|t, v| t.binary_cross_entropy(v[0], v[1], r), &x);
+        assert!(report.passed(), "bce {r:?}: {report:?}");
+    }
+}
+
+/// Binary cross-entropy with logits has the right gradient for logits and targets under every
+/// reduction.
+#[test]
+fn gradcheck_binary_cross_entropy_with_logits() {
+    let x = [spread(&[3, 4], 22), probabilities(&[3, 4], 23)];
+    for r in REDUCTIONS {
+        let report = gradcheck(|t, v| t.binary_cross_entropy_with_logits(v[0], v[1], r), &x);
+        assert!(report.passed(), "bce with logits {r:?}: {report:?}");
+    }
+}
+
+/// NLL has the right gradient directly and behind a log-softmax, under every reduction.
+#[test]
+fn gradcheck_nll() {
+    let x = [spread(&[5, 3], 24)];
+    let labels = [0usize, 2, 1, 1, 0];
+    for r in REDUCTIONS {
+        let direct = gradcheck(|t, v| t.nll(v[0], &labels, r), &x);
+        assert!(direct.passed(), "nll {r:?}: {direct:?}");
+        let through = gradcheck(
+            |t, v| {
+                let lp = t.log_softmax(v[0]);
+                t.nll(lp, &labels, r)
+            },
+            &x,
+        );
+        assert!(through.passed(), "log_softmax + nll {r:?}: {through:?}");
+    }
+}
+
+/// L1 has the right gradient for prediction and target under every reduction.
+#[test]
+fn gradcheck_l1() {
+    let x = away_from_kinks(&[3, 4], 0.0, 25);
+    for r in REDUCTIONS {
+        let report = gradcheck(|t, v| t.l1(v[0], v[1], r), &x);
+        assert!(report.passed(), "l1 {r:?}: {report:?}");
+    }
+}
+
+/// Huber has the right gradient in both regimes, for several deltas and every reduction.
+#[test]
+fn gradcheck_huber() {
+    for delta in [0.5, 1.0, 1.5] {
+        let x = away_from_kinks(&[3, 4], delta, 26);
+        for r in REDUCTIONS {
+            let report = gradcheck(|t, v| t.huber(v[0], v[1], delta, r), &x);
+            assert!(report.passed(), "huber {delta} {r:?}: {report:?}");
+        }
+    }
+}
+
+/// Smooth L1 has the right gradient in both regimes, for several betas and every reduction.
+#[test]
+fn gradcheck_smooth_l1() {
+    for beta in [0.5, 1.0, 1.5] {
+        let x = away_from_kinks(&[3, 4], beta, 27);
+        for r in REDUCTIONS {
+            let report = gradcheck(|t, v| t.smooth_l1(v[0], v[1], beta, r), &x);
+            assert!(report.passed(), "smooth_l1 {beta} {r:?}: {report:?}");
+        }
+    }
+}
+
+/// KL divergence has the right gradient for log-probabilities and targets under every
+/// reduction.
+#[test]
+fn gradcheck_kl_div() {
+    let x = [spread(&[3, 4], 28), probabilities(&[3, 4], 29)];
+    for r in REDUCTIONS {
+        let report = gradcheck(|t, v| t.kl_div(v[0], v[1], r), &x);
+        assert!(report.passed(), "kl_div {r:?}: {report:?}");
+    }
+}

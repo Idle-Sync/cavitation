@@ -95,6 +95,21 @@ pub(crate) enum Op {
     SoftmaxCrossEntropy(Var, Reduction, usize),
     /// Mean squared error of prediction and target: the reduction.
     Mse(Var, Var, Reduction),
+    /// Binary cross-entropy of probabilities and targets: the reduction.
+    BinaryCrossEntropy(Var, Var, Reduction),
+    /// Binary cross-entropy of logits and targets: the reduction.
+    BceWithLogits(Var, Var, Reduction),
+    /// Negative log-likelihood of `[batch, classes]` log-probabilities: the reduction, and
+    /// where the batch's labels start in the graph's label buffer.
+    Nll(Var, Reduction, usize),
+    /// Mean absolute error of prediction and target: the reduction.
+    L1(Var, Var, Reduction),
+    /// Huber loss with the given delta (kept as `f64`): the reduction.
+    Huber(Var, Var, f64, Reduction),
+    /// Smooth L1 loss with the given beta (kept as `f64`): the reduction.
+    SmoothL1(Var, Var, f64, Reduction),
+    /// KL divergence of log-probabilities from target probabilities: the reduction.
+    KlDiv(Var, Var, Reduction),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -149,6 +164,15 @@ impl Op {
                 loss::cross_entropy_backward(a, reduction, labels, out_grad, ctx)
             }
             Op::Mse(p, t, reduction) => loss::mse_backward(p, t, reduction, out_grad, ctx),
+            Op::BinaryCrossEntropy(p, t, r) => loss::bce_backward(p, t, r, out_grad, ctx),
+            Op::BceWithLogits(z, t, r) => loss::bce_logits_backward(z, t, r, out_grad, ctx),
+            Op::Nll(a, reduction, labels) => {
+                loss::nll_backward(a, reduction, labels, out_grad, ctx)
+            }
+            Op::L1(p, t, r) => loss::l1_backward(p, t, r, out_grad, ctx),
+            Op::Huber(p, t, delta, r) => loss::huber_backward(p, t, delta, r, out_grad, ctx),
+            Op::SmoothL1(p, t, beta, r) => loss::smooth_l1_backward(p, t, beta, r, out_grad, ctx),
+            Op::KlDiv(x, t, r) => loss::kl_div_backward(x, t, r, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]
