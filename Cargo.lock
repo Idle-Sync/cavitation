@@ -33,6 +33,10 @@ version = "0.1.0"
 [[package]]
 name = "cavitation-nn"
 version = "0.1.0"
+dependencies = [
+ "cavitation-core",
+ "serde_json",
+]
 
 [[package]]
 name = "itoa"

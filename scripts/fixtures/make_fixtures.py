@@ -8,6 +8,9 @@ inputs, the upstream gradient, PyTorch's f32 output and input gradients (the gra
 Operations that sum are compared with the float64 result, because PyTorch's f32 sums use a
 different order than ours.
 
+Layer fixtures (`nn.Linear`) go under `crates/cavitation-nn/tests/fixtures/layers/` in the same
+form, with the layer's weights as inputs after the data input.
+
 Inputs come from `torch.manual_seed(0)` with one thread, in a fixed order, so a rerun writes
 identical files. Inputs are kept away from kinks (zero for ReLU, the clamp edges, the points
 where Huber and smooth L1 change branch) so both sides take the same branch.
@@ -50,6 +53,7 @@ torch.manual_seed(0)
 
 TORCH_VERSION = torch.__version__.split("+")[0]
 CASES = []
+LAYER_CASES = []
 
 
 def rnd(*shape, scale=1.0):
@@ -104,12 +108,13 @@ def evaluate(fn, inputs, dtype, upstream=None):
     return out.detach(), upstream, grads
 
 
-def add_case(name, op, params, inputs, fn):
-    """Evaluates one case in f32 and float64 and records it."""
+def add_case(name, op, params, inputs, fn, cases=None):
+    """Evaluates one case in f32 and float64 and records it (in `cases`, `CASES` by default)."""
+    cases = CASES if cases is None else cases
     inputs = [x.float() for x in inputs]
     out, upstream, grads = evaluate(fn, inputs, torch.float32)
     out64, _, grads64 = evaluate(fn, inputs, torch.float64, upstream)
-    CASES.append(
+    cases.append(
         (
             name,
             {
@@ -389,6 +394,25 @@ def make_losses():
         )
 
 
+def make_layers():
+    """`nn.Linear(7, 5)` on a [3, 7] input, seeded 0 independently of the cases above.
+
+    The inputs are the layer input, its weight ([out, in]) and its bias, in that order; the
+    output is `x @ weight.T + bias`.
+    """
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(7, 5)
+    x = rnd(3, 7)
+    add_case(
+        "linear",
+        "linear",
+        {"inputs": 7, "outputs": 5},
+        [x, layer.weight.detach(), layer.bias.detach()],
+        lambda x, w, b: F.linear(x, w, b),
+        cases=LAYER_CASES,
+    )
+
+
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
@@ -400,6 +424,7 @@ def main():
     make_activations()
     make_softmax()
     make_losses()
+    make_layers()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):
@@ -415,6 +440,13 @@ def main():
             json.dump(body, f, separators=(",", ":"))
             f.write("\n")
     print(f"wrote {len(CASES)} fixtures to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
+    layer_dir = os.path.join(args.out, "cavitation-nn", "tests", "fixtures", "layers")
+    os.makedirs(layer_dir, exist_ok=True)
+    for name, body in LAYER_CASES:
+        with open(os.path.join(layer_dir, name + ".json"), "w") as f:
+            json.dump(body, f, separators=(",", ":"))
+            f.write("\n")
+    print(f"wrote {len(LAYER_CASES)} fixtures to {layer_dir} with torch {TORCH_VERSION}", file=sys.stderr)
 
 
 if __name__ == "__main__":

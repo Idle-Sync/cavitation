@@ -10,3 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
+
+[dependencies]
+cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
+
+[dev-dependencies]
+# Reads the PyTorch fixtures in tests/fixtures/layers (JSON).
+serde_json = "1"
