@@ -165,34 +165,72 @@ fn every_builtin_activation_layer_matches_its_tape_op() {
     }
 }
 
-/// `f` and `df` of every built-in equal the value and the gradient the tape operation gives.
+/// Whether two values agree: both NaN, or equal as numbers (so `-0.0` equals `0.0`) or within
+/// rounding (1e-12 relative).
+fn same(a: f64, b: f64) -> bool {
+    (a.is_nan() && b.is_nan()) || a == b || (a - b).abs() <= 1e-12 * (1.0 + b.abs())
+}
+
+/// Checks `f` and `df(x, f(x))` of `kind` against the value and the input gradient of the
+/// tape operation, at every point of `xs`.
+fn check_against_tape(kind: ActivationKind, xs: Vec<f64>) {
+    let mut store = ParamStore::<f64>::new_generic();
+    let n = xs.len();
+    let p = store.add(Tensor::from_vec(xs.clone(), &[n]).unwrap());
+    let mut graph = Graph::<f64>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let v = tape.param(p);
+    let y = tape_op(&mut tape, kind, v);
+    let ys = tape.value(y).data().to_vec();
+    let loss = tape.sum(y);
+    tape.backward(loss, &mut store.grads);
+    drop(tape);
+    let g = store.grad(p).data();
+    for (i, &xi) in xs.iter().enumerate() {
+        let f = Activation::<f64>::f(&kind, xi);
+        let df = Activation::<f64>::df(&kind, xi, f);
+        assert!(same(f, ys[i]), "{kind:?} f({xi}) = {f}, tape {}", ys[i]);
+        assert!(same(df, g[i]), "{kind:?} df({xi}) = {df}, tape {}", g[i]);
+    }
+}
+
+/// `f` and `df` of every built-in equal the value and the gradient the tape operation gives
+/// at smooth points.
 #[test]
 fn builtin_f_and_df_match_the_tape_op() {
     for kind in all_kinds() {
-        let mut store = ParamStore::<f64>::new_generic();
-        let x = input::<f64>();
-        let p = store.add(x.clone());
-        let mut graph = Graph::<f64>::new_generic();
-        let mut tape = graph.tape(&store.values);
-        let v = tape.param(p);
-        let y = tape_op(&mut tape, kind, v);
-        let ys = tape.value(y).data().to_vec();
-        let loss = tape.sum(y);
-        tape.backward(loss, &mut store.grads);
-        drop(tape);
-        let g = store.grad(p).data();
-        for (i, &xi) in x.data().iter().enumerate() {
-            let f = Activation::<f64>::f(&kind, xi);
-            let df = Activation::<f64>::df(&kind, xi, f);
-            assert!(
-                (f - ys[i]).abs() <= 1e-12 * (1.0 + ys[i].abs()),
-                "{kind:?} f({xi})"
-            );
-            assert!(
-                (df - g[i]).abs() <= 1e-12 * (1.0 + g[i].abs()),
-                "{kind:?} df({xi})"
-            );
+        check_against_tape(kind, input::<f64>().data().to_vec());
+    }
+}
+
+/// At the kinks, at each kind's own parameter boundaries and at NaN, `f` and `df` equal the
+/// tape operation. Agreement means: both NaN, or equal as numbers (`-0.0` equals `0.0`), or
+/// within 1e-12 relative.
+#[test]
+fn builtin_f_and_df_match_the_tape_op_at_kinks_and_nan() {
+    for kind in all_kinds() {
+        let mut xs = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            3.0,
+            -3.0,
+            6.0,
+            -6.0,
+            -0.5,
+            0.8,
+            f64::NAN,
+        ];
+        match kind {
+            ActivationKind::Hardtanh { min, max } => xs.extend([min, max]),
+            ActivationKind::Softplus { beta, threshold } => {
+                xs.extend([threshold / beta, -threshold / beta])
+            }
+            ActivationKind::Mish => xs.extend([20.0, -20.0]),
+            _ => {}
         }
+        check_against_tape(kind, xs);
     }
 }
 
