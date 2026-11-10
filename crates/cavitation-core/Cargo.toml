@@ -12,3 +12,7 @@ workspace = true
 [[test]]
 name = "no_alloc"
 harness = false
+
+[dev-dependencies]
+# Reads the PyTorch fixtures in tests/fixtures/ops (JSON).
+serde_json = "1"

@@ -1,0 +1,1 @@
+{"torch_version":"2.15.0","op":"relu","params":{},"inputs":[{"shape":[1,1],"data":[-0.293998271]}],"upstream":{"shape":[1,1],"data":[0.86167711]},"output":{"shape":[1,1],"data":[0.0]},"grads":[{"shape":[1,1],"data":[0.0]}],"output_f64":{"shape":[1,1],"data":[0.0]},"grads_f64":[{"shape":[1,1],"data":[0.0]}]}

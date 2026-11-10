@@ -1,0 +1,1 @@
+{"torch_version":"2.15.0","op":"sigmoid","params":{},"inputs":[{"shape":[1,1],"data":[-1.53646851]}],"upstream":{"shape":[1,1],"data":[1.08371294]},"output":{"shape":[1,1],"data":[0.177049249]},"grads":[{"shape":[1,1],"data":[0.15790002]}],"output_f64":{"shape":[1,1],"data":[0.17704923667232153]},"grads_f64":[{"shape":[1,1],"data":[0.15790001393088574]}]}

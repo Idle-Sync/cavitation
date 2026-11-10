@@ -1,0 +1,1 @@
+{"torch_version":"2.15.0","op":"tanh","params":{},"inputs":[{"shape":[1,1],"data":[1.63780999]}],"upstream":{"shape":[1,1],"data":[-0.680859506]},"output":{"shape":[1,1],"data":[0.927165806]},"grads":[{"shape":[1,1],"data":[-0.0955678746]}],"output_f64":{"shape":[1,1],"data":[0.9271657932339707]},"grads_f64":[{"shape":[1,1],"data":[-0.09556788583029924]}]}
