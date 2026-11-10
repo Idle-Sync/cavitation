@@ -392,8 +392,7 @@ impl<T: Real> Tape<'_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `alpha` is 0, or
-    ///     /// Panics if `x` was not recorded on this tape.
+    /// Panics if `alpha` is 0, or if `x` was not recorded on this tape.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -495,8 +494,7 @@ impl<T: Real> Tape<'_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `min > max` (or either is NaN), or
-    ///     /// Panics if `x` was not recorded on this tape.
+    /// Panics if `min > max` (or either is NaN), or if `x` was not recorded on this tape.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};

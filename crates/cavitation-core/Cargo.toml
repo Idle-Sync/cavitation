@@ -1,3 +1,5 @@
+# Package manifest for cavitation-core: tensors, automatic differentiation and CPU kernels.
+
 [package]
 name = "cavitation-core"
 description = "Tensors, automatic differentiation and CPU kernels for the cavitation neural network library."

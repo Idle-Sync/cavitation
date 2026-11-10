@@ -1,3 +1,5 @@
+# Package manifest for cavitation, the main crate to depend on.
+
 [package]
 name = "cavitation"
 description = "A fast, glass-box neural network library for the CPU."

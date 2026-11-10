@@ -7,10 +7,12 @@ use cavitation_core::{
     Tape, Tensor, TensorView, TensorViewMut, Var, gradcheck, gradcheck_params,
 };
 
+/// Builds a one-dimensional `f64` tensor from a slice.
 fn t(data: &[f64]) -> Tensor<f64> {
     Tensor::from_vec(data.to_vec(), &[data.len()]).unwrap()
 }
 
+/// Graph builder for gradient checks: the sum of the first two inputs.
 fn add_build(tape: &mut Tape<'_, f64>, v: &[Var]) -> Var {
     tape.add(v[0], v[1])
 }

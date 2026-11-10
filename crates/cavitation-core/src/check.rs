@@ -245,6 +245,7 @@ pub fn gradcheck_params(
 mod tests {
     use super::*;
 
+    /// Builds a one-dimensional `f64` tensor from a slice.
     fn t(data: &[f64]) -> Tensor<f64> {
         Tensor::from_vec(data.to_vec(), &[data.len()]).unwrap()
     }

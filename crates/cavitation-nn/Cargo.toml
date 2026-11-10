@@ -1,3 +1,5 @@
+# Package manifest for cavitation-nn: layers, optimisers and training.
+
 [package]
 name = "cavitation-nn"
 description = "Layers, optimisers and training for the cavitation neural network library."

@@ -1,7 +1,8 @@
 //! A fast, glass-box neural network library for the CPU.
 //!
-//! This crate is the one to depend on. It re-exports the tensor and autograd
-//! core and the layers, optimisers and training code.
+//! This is the main crate of the cavitation workspace, the one to depend on. It
+//! builds on the tensor and autograd core and the layers, optimisers and training
+//! crates.
 //!
 //! ```
 //! println!("cavitation {}", cavitation::VERSION);

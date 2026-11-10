@@ -221,6 +221,8 @@ impl Rng {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the random number generators: known published values and determinism.
+
     use super::*;
 
     /// SplitMix64 with seed 0 gives the published first output.

@@ -1,3 +1,5 @@
+# Package manifest for cavitation-datasets: datasets used by the examples, tests and benchmark.
+
 [package]
 name = "cavitation-datasets"
 description = "Datasets used by the cavitation examples, tests and benchmark."

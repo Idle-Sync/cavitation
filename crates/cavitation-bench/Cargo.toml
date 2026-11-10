@@ -1,3 +1,5 @@
+# Package manifest for cavitation-bench: the benchmark runner.
+
 [package]
 name = "cavitation-bench"
 description = "Benchmark runner for the cavitation neural network library."

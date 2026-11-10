@@ -1,5 +1,5 @@
-//! `Mulberry32`: the 32-bit generator the digits split uses, bit-for-bit the same as the
-//! JavaScript `rng()` in the original mockup.
+//! `Mulberry32`: the standard mulberry32 32-bit generator, reproduced exactly from its
+//! common JavaScript form. It shuffles the scikit-learn digits deterministically.
 
 /// The mulberry32 generator. Its sequence matches the JavaScript function
 /// `rng(seed)` (which uses `|0` and `Math.imul`) value for value.
@@ -64,11 +64,13 @@ impl Mulberry32 {
 
 #[cfg(test)]
 mod tests {
+    //! Tests for the mulberry32 generator against known outputs.
+
     use super::*;
 
-    /// Seed 42 gives the values the mockup's JavaScript generator gives.
+    /// Seed 42 gives the values the standard JavaScript mulberry32 gives.
     #[test]
-    fn mulberry32_matches_mockup() {
+    fn mulberry32_matches_javascript() {
         let mut rng = Mulberry32::new(42);
         let raw: Vec<u32> = (0..3).map(|_| rng.next_u32()).collect();
         assert_eq!(raw, [2581720956, 1925393290, 3661312704]);
