@@ -47,7 +47,10 @@ impl Shape {
         );
         let mut d = [0; MAX_RANK];
         d[..dims.len()].copy_from_slice(dims);
-        Shape { dims: d, rank: dims.len() }
+        Shape {
+            dims: d,
+            rank: dims.len(),
+        }
     }
 
     /// The dimensions as a slice.
@@ -100,8 +103,16 @@ impl Shape {
         let mut out = [0; MAX_RANK];
         for i in 0..rank {
             // Index from the right; a missing leading dimension counts as 1.
-            let da = if i < a.rank { a.dims[a.rank - 1 - i] } else { 1 };
-            let db = if i < b.rank { b.dims[b.rank - 1 - i] } else { 1 };
+            let da = if i < a.rank {
+                a.dims[a.rank - 1 - i]
+            } else {
+                1
+            };
+            let db = if i < b.rank {
+                b.dims[b.rank - 1 - i]
+            } else {
+                1
+            };
             out[rank - 1 - i] = match (da, db) {
                 (x, y) if x == y => x,
                 (1, y) => y,

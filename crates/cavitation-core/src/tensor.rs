@@ -63,7 +63,10 @@ impl<T: Real> Tensor<T> {
     /// ```
     pub fn full(shape: &[usize], value: T) -> Tensor<T> {
         let shape = Shape::new(shape);
-        Tensor { data: vec![value; shape.len()], shape }
+        Tensor {
+            data: vec![value; shape.len()],
+            shape,
+        }
     }
 
     /// Wraps `data` (row-major) as a tensor of the given shape.
@@ -88,7 +91,10 @@ impl<T: Real> Tensor<T> {
     pub fn from_vec(data: Vec<T>, shape: &[usize]) -> Result<Tensor<T>, Error> {
         let s = Shape::new(shape);
         if data.len() != s.len() {
-            return Err(Error::ShapeMismatch { expected: shape.to_vec(), found: vec![data.len()] });
+            return Err(Error::ShapeMismatch {
+                expected: shape.to_vec(),
+                found: vec![data.len()],
+            });
         }
         Ok(Tensor { data, shape: s })
     }
@@ -131,7 +137,10 @@ impl<T: Real> Tensor<T> {
     /// assert_eq!(t.view().data().len(), 3);
     /// ```
     pub fn view(&self) -> TensorView<'_, T> {
-        TensorView { data: &self.data, shape: self.shape }
+        TensorView {
+            data: &self.data,
+            shape: self.shape,
+        }
     }
 
     /// A borrowed mutable view of the whole tensor.
@@ -142,7 +151,10 @@ impl<T: Real> Tensor<T> {
     /// assert_eq!(t.data()[0], 1.0);
     /// ```
     pub fn view_mut(&mut self) -> TensorViewMut<'_, T> {
-        TensorViewMut { data: &mut self.data, shape: self.shape }
+        TensorViewMut {
+            data: &mut self.data,
+            shape: self.shape,
+        }
     }
 
     /// Changes the shape without touching the data.
@@ -199,7 +211,11 @@ fn flat_index(shape: &Shape, index: &[usize]) -> usize {
     );
     let mut offset = 0;
     for (&i, &d) in index.iter().zip(shape.dims()) {
-        assert!(i < d, "index {index:?} is out of range for shape {:?}", shape.dims());
+        assert!(
+            i < d,
+            "index {index:?} is out of range for shape {:?}",
+            shape.dims()
+        );
         offset = offset * d + i;
     }
     offset
@@ -250,7 +266,10 @@ impl<'a, T: Real> TensorView<'a, T> {
     /// assert_eq!(t.view().to_tensor(), t);
     /// ```
     pub fn to_tensor(&self) -> Tensor<T> {
-        Tensor { data: self.data.to_vec(), shape: self.shape }
+        Tensor {
+            data: self.data.to_vec(),
+            shape: self.shape,
+        }
     }
 }
 
@@ -311,7 +330,10 @@ impl<T: Real> TensorViewMut<'_, T> {
     /// assert_eq!(t.view_mut().to_tensor().data(), &[3.0]);
     /// ```
     pub fn to_tensor(&self) -> Tensor<T> {
-        Tensor { data: self.data.to_vec(), shape: self.shape }
+        Tensor {
+            data: self.data.to_vec(),
+            shape: self.shape,
+        }
     }
 }
 
