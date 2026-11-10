@@ -176,6 +176,111 @@ pub fn run(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
     run_on_pool(wanted, tasks, job);
 }
 
+/// Splits `M` mutable slices and one shared slice, all of the same length, into chunks of
+/// `chunk` elements (the last one shorter when the length is not a multiple) and runs `job`
+/// once per chunk through [`run`] on at most `threads` threads. Chunk `i` covers elements
+/// `i · chunk` onward of every slice; its job gets those parts of the mutable slices, of the
+/// shared slice, and `out[i]` to write its result into. Slots of `out` past the last chunk
+/// are left alone.
+///
+/// The chunks depend only on the length and `chunk`, never on `threads`, and each chunk is
+/// handled by one job, so a job whose result depends only on its own chunk gives the same
+/// result for any thread count. Allocates nothing once the pool has enough workers.
+///
+/// # Panics
+///
+/// Panics, naming the sizes and before any job runs, if a mutable slice's length differs
+/// from the shared slice's, if `chunk` is 0, or if `out` has fewer slots than there are
+/// chunks; also as [`run`] does (`threads` of 0, or a job that panics).
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::pool::run_chunks;
+/// let mut y = [1.0f32; 5];
+/// let x = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+/// let mut sums = [0.0f32; 3];
+/// // y += 2·x, and each chunk's sum of x, in chunks of 2.
+/// run_chunks(2, 2, [&mut y], &x, &mut sums, &|[y], x, sum| {
+///     for (y, x) in y.iter_mut().zip(x) {
+///         *y += 2.0 * x;
+///     }
+///     *sum = x.iter().sum();
+/// });
+/// assert_eq!(y, [3.0, 5.0, 7.0, 9.0, 11.0]);
+/// assert_eq!(sums, [3.0, 7.0, 5.0]);
+/// ```
+// The job's type says exactly what each task receives; an alias would only hide it.
+#[allow(clippy::type_complexity)]
+pub fn run_chunks<T: Send + Sync, S: Send, const M: usize>(
+    threads: usize,
+    chunk: usize,
+    muts: [&mut [T]; M],
+    shared: &[T],
+    out: &mut [S],
+    job: &(dyn Fn([&mut [T]; M], &[T], &mut S) + Sync),
+) {
+    let len = shared.len();
+    for (k, m) in muts.iter().enumerate() {
+        assert!(
+            m.len() == len,
+            "pool::run_chunks: mutable slice {k} has {} elements, the shared slice {len}",
+            m.len()
+        );
+    }
+    assert!(
+        chunk >= 1,
+        "pool::run_chunks: chunk must be at least 1, got 0"
+    );
+    let chunks = len.div_ceil(chunk);
+    assert!(
+        out.len() >= chunks,
+        "pool::run_chunks: {chunks} chunks need {chunks} output slots, got {}",
+        out.len()
+    );
+    let parts = muts.map(|m| SendPtr(m.as_mut_ptr()));
+    let slots = SendPtr(out.as_mut_ptr());
+    run(threads, chunks, &|t: Task| {
+        let start = t.index * chunk;
+        let n = chunk.min(len - start);
+        let mine = parts.map(|p| {
+            // SAFETY: each mutable slice holds `len` elements and `start + n <= len`, so the
+            // part is inside it; the slices are borrowed mutably for this whole call, and
+            // `run` gives each index to one task only, so no two parts in use overlap.
+            unsafe { std::slice::from_raw_parts_mut(p.ptr().add(start), n) }
+        });
+        // SAFETY: `t.index < chunks <= out.len()`, and only this task uses slot `t.index`.
+        let slot = unsafe { &mut *slots.ptr().add(t.index) };
+        job(mine, &shared[start..start + n], slot);
+    });
+}
+
+/// A pointer into a buffer whose disjoint parts [`run_chunks`] hands to tasks on several
+/// threads.
+struct SendPtr<T>(*mut T);
+
+impl<T> Clone for SendPtr<T> {
+    /// A copy of the pointer (written out because a derive would require `T: Clone`).
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for SendPtr<T> {}
+
+// SAFETY: `run_chunks` only forms references to disjoint parts of the buffer from it, one
+// task per part, while the buffer is mutably borrowed for the call; sending such a part to
+// another thread is sound when `T: Send`.
+unsafe impl<T: Send> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    /// The pointer. A method rather than a field access, so that closures capture the whole
+    /// `SendPtr` (which is `Sync`) instead of the bare pointer.
+    fn ptr(self) -> *mut T {
+        self.0
+    }
+}
+
 /// Runs every task on the calling thread as worker 0, then resumes the first panic, if any.
 fn run_inline(tasks: usize, job: &(dyn Fn(Task) + Sync)) {
     let mut first_panic = None;
@@ -612,6 +717,69 @@ mod tests {
             outer_seen[outer.index].fetch_add(1, Ordering::Relaxed);
         });
         assert!(outer_seen.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+    }
+
+    /// `run_chunks` hands every chunk of the slices to exactly one task, with the shared
+    /// slice's matching chunk and its own output slot, on 1 and 4 threads; the last chunk is
+    /// shorter, and output slots past the last chunk are left alone.
+    #[test]
+    fn run_chunks_visits_every_chunk_once() {
+        let _serial = serial();
+        for threads in [1, 4] {
+            let mut a = vec![0u32; 10];
+            let mut b = vec![0u32; 10];
+            let shared: Vec<u32> = (0..10).collect();
+            let mut out = vec![u32::MAX; 5];
+            run_chunks(
+                threads,
+                3,
+                [&mut a, &mut b],
+                &shared,
+                &mut out,
+                &|[a, b], s, o| {
+                    assert_eq!(a.len(), s.len());
+                    for ((x, y), &v) in a.iter_mut().zip(b.iter_mut()).zip(s) {
+                        *x += v + 1;
+                        *y += 2 * v;
+                    }
+                    *o = s[0] * 100 + s.len() as u32;
+                },
+            );
+            assert_eq!(a, (1..=10).collect::<Vec<u32>>(), "{threads} threads");
+            assert_eq!(b, (0..10).map(|v| 2 * v).collect::<Vec<u32>>());
+            assert_eq!(out, [3, 303, 603, 901, u32::MAX]);
+        }
+    }
+
+    /// Slices of different lengths, a chunk of 0 or too few output slots panic, naming the
+    /// sizes, before any task runs.
+    #[test]
+    fn run_chunks_checks_its_arguments() {
+        let job = |_: [&mut [u8]; 1], _: &[u8], _: &mut u8| panic!("no task may run");
+        let panics = |f: &dyn Fn()| {
+            catch_unwind(AssertUnwindSafe(f))
+                .err()
+                .map(|e| match e.downcast_ref::<&str>() {
+                    Some(s) => s.to_string(),
+                    None => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+                })
+                .unwrap_or_default()
+        };
+        let message =
+            panics(&|| run_chunks(2, 2, [&mut [0u8; 3][..]], &[0u8; 4], &mut [0u8; 2], &job));
+        assert!(
+            message.contains("mutable slice 0 has 3 elements, the shared slice 4"),
+            "{message}"
+        );
+        let message =
+            panics(&|| run_chunks(2, 0, [&mut [0u8; 4][..]], &[0u8; 4], &mut [0u8; 2], &job));
+        assert!(message.contains("chunk must be at least 1"), "{message}");
+        let message =
+            panics(&|| run_chunks(2, 1, [&mut [0u8; 4][..]], &[0u8; 4], &mut [0u8; 2], &job));
+        assert!(
+            message.contains("4 chunks need 4 output slots, got 2"),
+            "{message}"
+        );
     }
 
     /// Prints the median time of an empty 4-task `run` on 4 threads, over 1,000 calls. The

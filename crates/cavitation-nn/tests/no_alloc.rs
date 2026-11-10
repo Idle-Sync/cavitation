@@ -60,9 +60,10 @@ fn allocations() -> usize {
 /// A scenario: its name and a function returning the allocations made after warm-up.
 type Scenario = (&'static str, fn() -> usize);
 
-/// Steps each of the four optimisers 12 times on a store of a matrix and a vector with fresh
-/// gradients each step, reusing one `GradStats`. Returns the allocations made during steps
-/// 2 to 12 (the first step allocates the state).
+/// Steps each of the four optimisers 12 times on a store of a matrix, a vector and a
+/// 300 by 200 matrix (60,000 elements: several chunks, so the update runs on the thread pool)
+/// with fresh gradients each step, reusing one `GradStats`. Returns the allocations made
+/// during steps 2 to 12 (the first step allocates the state and starts the pool's workers).
 fn optimizers_steady_state() -> usize {
     let mut optimizers: Vec<Box<dyn Optimizer<f32>>> = vec![
         Box::new(Sgd::new(0.1)),
@@ -73,6 +74,7 @@ fn optimizers_steady_state() -> usize {
     let mut store = ParamStore::new();
     let w = store.add(Tensor::full(&[4, 3], 0.5f32));
     let b = store.add(Tensor::full(&[3], -0.5f32));
+    let big = store.add(Tensor::full(&[300, 200], 0.1f32));
     let mut stats = GradStats::new();
     let mut before = 0;
     let mut sink = 0.0;
@@ -84,6 +86,7 @@ fn optimizers_steady_state() -> usize {
             store.zero_grad();
             store.grads.accumulate(w).0.data_mut().fill(0.25);
             store.grads.accumulate(b).0.data_mut().fill(-0.125);
+            store.grads.accumulate(big).0.data_mut().fill(0.5);
             opt.step_with_stats(&mut store, &mut stats);
             sink += stats.norm(w);
         }
