@@ -20,7 +20,7 @@ fn add_build(tape: &mut Tape<'_, f64>, v: &[Var]) -> Var {
 /// `add` of two inputs has the right gradient for both.
 #[test]
 fn gradcheck_passes_for_add() {
-    let report = gradcheck(add_build, &[t(&[0.5, -1.0, 2.0]), t(&[1.5, 0.25, -3.0])]);
+    let report = gradcheck(&[t(&[0.5, -1.0, 2.0]), t(&[1.5, 0.25, -3.0])], add_build);
     report.assert_passed();
     assert!(report.passed());
     assert!(report.failures.is_empty());
@@ -50,7 +50,7 @@ fn gradcheck_params_checks_parameters() {
 #[test]
 fn weighting_is_deterministic() {
     let run = || -> GradcheckReport {
-        gradcheck(add_build, &[t(&[0.1, 0.2, 0.3]), t(&[-0.4, 0.5, 0.6])])
+        gradcheck(&[t(&[0.1, 0.2, 0.3]), t(&[-0.4, 0.5, 0.6])], add_build)
     };
     assert_eq!(run(), run());
 }
@@ -85,7 +85,7 @@ fn gradcheck_broadcast_binary_ops() {
         for (sa, sb) in BROADCAST_CASES {
             for (da, db) in [(sa, sb), (sb, sa)] {
                 let inputs = [filled(da, 0.3), filled(db, 1.1)];
-                let report = gradcheck(build, &inputs);
+                let report = gradcheck(&inputs, build);
                 assert!(report.passed(), "{name} {da:?} {db:?}: {report:?}");
             }
         }
@@ -95,7 +95,7 @@ fn gradcheck_broadcast_binary_ops() {
 /// `scale` has the right gradient.
 #[test]
 fn gradcheck_scale() {
-    let report = gradcheck(|t, v| t.scale(v[0], -2.5), &[filled(&[2, 3], 0.7)]);
+    let report = gradcheck(&[filled(&[2, 3], 0.7)], |t, v| t.scale(v[0], -2.5));
     report.assert_passed();
 }
 
@@ -112,13 +112,10 @@ fn gradcheck_keep_where() {
         (&[5], Tensor::from_vec(vec![1.0], &[]).unwrap()),
     ];
     for (dims, keep) in cases {
-        let report = gradcheck(
-            |t, v| {
-                let k = t.input(keep.view());
-                t.keep_where(v[0], k)
-            },
-            &[filled(dims, 0.4)],
-        );
+        let report = gradcheck(&[filled(dims, 0.4)], |t, v| {
+            let k = t.input(keep.view());
+            t.keep_where(v[0], k)
+        });
         assert!(report.passed(), "keep_where {dims:?}: {report:?}");
     }
 }
@@ -128,7 +125,7 @@ fn gradcheck_keep_where() {
 fn gradcheck_matmul() {
     for (da, db) in [(&[3, 4], &[4, 5]), (&[1, 7], &[7, 1])] {
         let inputs = [filled(da, 0.4), filled(db, 1.3)];
-        let report = gradcheck(|t, v| t.matmul(v[0], v[1]), &inputs);
+        let report = gradcheck(&inputs, |t, v| t.matmul(v[0], v[1]));
         assert!(report.passed(), "matmul {da:?} {db:?}: {report:?}");
     }
 }
@@ -138,7 +135,7 @@ fn gradcheck_matmul() {
 fn gradcheck_matmul_nt() {
     for (da, db) in [(&[2, 3], &[4, 3]), (&[1, 7], &[1, 7])] {
         let inputs = [filled(da, 0.6), filled(db, 1.9)];
-        let report = gradcheck(|t, v| t.matmul_nt(v[0], v[1]), &inputs);
+        let report = gradcheck(&inputs, |t, v| t.matmul_nt(v[0], v[1]));
         assert!(report.passed(), "matmul_nt {da:?} {db:?}: {report:?}");
     }
 }
@@ -178,8 +175,8 @@ fn away_from_zero(seed: u64) -> Tensor<f64> {
 #[test]
 fn gradcheck_full_reductions() {
     let x = [away_from_zero(11)];
-    gradcheck(|t, v| t.sum(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.mean(v[0]), &x).assert_passed();
+    gradcheck(&x, |t, v| t.sum(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.mean(v[0])).assert_passed();
 }
 
 /// `sum_axis` and `mean_axis` have the right gradient along each axis, with and without
@@ -189,9 +186,9 @@ fn gradcheck_axis_reductions() {
     let x = [away_from_zero(12)];
     for axis in 0..2 {
         for keep_dim in [false, true] {
-            let report = gradcheck(|t, v| t.sum_axis(v[0], axis, keep_dim), &x);
+            let report = gradcheck(&x, |t, v| t.sum_axis(v[0], axis, keep_dim));
             assert!(report.passed(), "sum_axis {axis} {keep_dim}: {report:?}");
-            let report = gradcheck(|t, v| t.mean_axis(v[0], axis, keep_dim), &x);
+            let report = gradcheck(&x, |t, v| t.mean_axis(v[0], axis, keep_dim));
             assert!(report.passed(), "mean_axis {axis} {keep_dim}: {report:?}");
         }
     }
@@ -202,17 +199,17 @@ fn gradcheck_axis_reductions() {
 fn gradcheck_reduction_middle_axis() {
     let data = (0..24).map(|i| (i as f64 * 0.7).sin()).collect();
     let x = [Tensor::from_vec(data, &[2, 3, 4]).unwrap()];
-    gradcheck(|t, v| t.sum_axis(v[0], 1, false), &x).assert_passed();
-    gradcheck(|t, v| t.mean_axis(v[0], 1, true), &x).assert_passed();
+    gradcheck(&x, |t, v| t.sum_axis(v[0], 1, false)).assert_passed();
+    gradcheck(&x, |t, v| t.mean_axis(v[0], 1, true)).assert_passed();
 }
 
 /// ReLU and Leaky ReLU have the right gradient away from the kink.
 #[test]
 fn gradcheck_relu_family() {
     let x = [away_from_zero(13)];
-    gradcheck(|t, v| t.relu(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.leaky_relu(v[0], 0.01), &x).assert_passed();
-    gradcheck(|t, v| t.leaky_relu(v[0], 0.2), &x).assert_passed();
+    gradcheck(&x, |t, v| t.relu(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.leaky_relu(v[0], 0.01)).assert_passed();
+    gradcheck(&x, |t, v| t.leaky_relu(v[0], 0.2)).assert_passed();
 }
 
 /// Tanh, sigmoid and both forms of GELU have the right gradient.
@@ -221,10 +218,10 @@ fn gradcheck_smooth_activations() {
     let mut rng = Rng::seed(14);
     let data = (0..20).map(|_| rng.range(-3.0, 3.0)).collect();
     let x = [Tensor::from_vec(data, &[4, 5]).unwrap()];
-    gradcheck(|t, v| t.tanh(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.sigmoid(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.gelu(v[0], GeluApprox::Exact), &x).assert_passed();
-    gradcheck(|t, v| t.gelu(v[0], GeluApprox::Tanh), &x).assert_passed();
+    gradcheck(&x, |t, v| t.tanh(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.sigmoid(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.gelu(v[0], GeluApprox::Exact)).assert_passed();
+    gradcheck(&x, |t, v| t.gelu(v[0], GeluApprox::Tanh)).assert_passed();
 }
 
 /// A parameter used by two activations gets both contributions.
@@ -265,43 +262,43 @@ fn away_from(kinks: &[f64], lo: f64, hi: f64, seed: u64) -> Tensor<f64> {
 #[test]
 fn gradcheck_exponential_linear_units() {
     let x = [away_from(&[0.0], -3.0, 3.0, 21)];
-    gradcheck(|t, v| t.elu(v[0], 1.0), &x).assert_passed();
-    gradcheck(|t, v| t.elu(v[0], 0.7), &x).assert_passed();
-    gradcheck(|t, v| t.selu(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.celu(v[0], 1.0), &x).assert_passed();
-    gradcheck(|t, v| t.celu(v[0], 2.0), &x).assert_passed();
-    gradcheck(|t, v| t.celu(v[0], 0.5), &x).assert_passed();
+    gradcheck(&x, |t, v| t.elu(v[0], 1.0)).assert_passed();
+    gradcheck(&x, |t, v| t.elu(v[0], 0.7)).assert_passed();
+    gradcheck(&x, |t, v| t.selu(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.celu(v[0], 1.0)).assert_passed();
+    gradcheck(&x, |t, v| t.celu(v[0], 2.0)).assert_passed();
+    gradcheck(&x, |t, v| t.celu(v[0], 0.5)).assert_passed();
 }
 
 /// SiLU, Mish, softplus, softsign and log-sigmoid have the right gradient.
 #[test]
 fn gradcheck_smooth_extra_activations() {
     let x = [away_from(&[], -4.0, 4.0, 22)];
-    gradcheck(|t, v| t.silu(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.mish(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.softplus(v[0], 1.0, 20.0), &x).assert_passed();
-    gradcheck(|t, v| t.softplus(v[0], 2.5, 20.0), &x).assert_passed();
-    gradcheck(|t, v| t.softsign(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.log_sigmoid(v[0]), &x).assert_passed();
+    gradcheck(&x, |t, v| t.silu(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.mish(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.softplus(v[0], 1.0, 20.0)).assert_passed();
+    gradcheck(&x, |t, v| t.softplus(v[0], 2.5, 20.0)).assert_passed();
+    gradcheck(&x, |t, v| t.softsign(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.log_sigmoid(v[0])).assert_passed();
 }
 
 /// Softplus has the right gradient on both sides of its threshold.
 #[test]
 fn gradcheck_softplus_threshold() {
     let x = [away_from(&[20.0], 15.0, 25.0, 23)];
-    gradcheck(|t, v| t.softplus(v[0], 1.0, 20.0), &x).assert_passed();
+    gradcheck(&x, |t, v| t.softplus(v[0], 1.0, 20.0)).assert_passed();
 }
 
 /// The clamp family has the right gradient away from its kinks.
 #[test]
 fn gradcheck_clamp_family() {
     let x = [away_from(&[-1.0, 1.0], -2.5, 2.5, 24)];
-    gradcheck(|t, v| t.hardtanh(v[0], -1.0, 1.0), &x).assert_passed();
+    gradcheck(&x, |t, v| t.hardtanh(v[0], -1.0, 1.0)).assert_passed();
     let x = [away_from(&[0.0, 6.0], -2.0, 8.0, 25)];
-    gradcheck(|t, v| t.relu6(v[0]), &x).assert_passed();
+    gradcheck(&x, |t, v| t.relu6(v[0])).assert_passed();
     let x = [away_from(&[-3.0, 3.0], -5.0, 5.0, 26)];
-    gradcheck(|t, v| t.hardsigmoid(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.hardswish(v[0]), &x).assert_passed();
+    gradcheck(&x, |t, v| t.hardsigmoid(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.hardswish(v[0])).assert_passed();
 }
 
 /// PReLU has the right gradient for x and for the slope, with one slope and one per channel.
@@ -311,7 +308,7 @@ fn gradcheck_prelu() {
     for dims in [&[1usize][..], &[5]] {
         let n: usize = dims.iter().product();
         let slope = Tensor::from_vec((0..n).map(|i| 0.1 + 0.2 * i as f64).collect(), dims).unwrap();
-        let report = gradcheck(|t, v| t.prelu(v[0], v[1]), &[x.clone(), slope]);
+        let report = gradcheck(&[x.clone(), slope], |t, v| t.prelu(v[0], v[1]));
         assert!(report.passed(), "prelu slope {dims:?}: {report:?}");
     }
 }
@@ -339,7 +336,7 @@ fn gradcheck_glu() {
         Gate::Relu,
         Gate::Silu,
     ] {
-        let report = gradcheck(|t, v| t.glu(v[0], gate), &x);
+        let report = gradcheck(&x, |t, v| t.glu(v[0], gate));
         assert!(report.passed(), "glu {gate:?}: {report:?}");
     }
 }
@@ -363,8 +360,8 @@ const REDUCTIONS: [Reduction; 4] = [
 #[test]
 fn gradcheck_softmax_and_log_softmax() {
     let x = [spread(&[3, 4], 10)];
-    gradcheck(|t, v| t.softmax(v[0]), &x).assert_passed();
-    gradcheck(|t, v| t.log_softmax(v[0]), &x).assert_passed();
+    gradcheck(&x, |t, v| t.softmax(v[0])).assert_passed();
+    gradcheck(&x, |t, v| t.log_softmax(v[0])).assert_passed();
 }
 
 /// Softmax cross-entropy has the right gradient under every reduction.
@@ -373,7 +370,7 @@ fn gradcheck_softmax_cross_entropy() {
     let x = [spread(&[5, 3], 11)];
     let labels = [0usize, 2, 1, 1, 0];
     for r in REDUCTIONS {
-        let report = gradcheck(|t, v| t.softmax_cross_entropy(v[0], &labels, r), &x);
+        let report = gradcheck(&x, |t, v| t.softmax_cross_entropy(v[0], &labels, r));
         assert!(report.passed(), "cross-entropy {r:?}: {report:?}");
     }
 }
@@ -383,7 +380,7 @@ fn gradcheck_softmax_cross_entropy() {
 fn gradcheck_mse() {
     let x = [spread(&[2, 3], 12), spread(&[2, 3], 13)];
     for r in REDUCTIONS {
-        let report = gradcheck(|t, v| t.mse(v[0], v[1], r), &x);
+        let report = gradcheck(&x, |t, v| t.mse(v[0], v[1], r));
         assert!(report.passed(), "mse {r:?}: {report:?}");
     }
 }
@@ -394,19 +391,16 @@ fn gradcheck_mse() {
 fn gradcheck_losses_sharing_an_input() {
     let x = [spread(&[4, 3], 14)];
     let labels = [2usize, 0, 1, 2];
-    let report = gradcheck(
-        |t, v| {
-            let ce = t.softmax_cross_entropy(v[0], &labels, Reduction::Mean);
-            let ls = t.log_softmax(v[0]);
-            let total = t.sum(ls);
-            let sm = t.softmax(v[0]);
-            let target = t.softmax(ls);
-            let err = t.mse(sm, target, Reduction::Sum);
-            let a = t.add(ce, total);
-            t.add(a, err)
-        },
-        &x,
-    );
+    let report = gradcheck(&x, |t, v| {
+        let ce = t.softmax_cross_entropy(v[0], &labels, Reduction::Mean);
+        let ls = t.log_softmax(v[0]);
+        let total = t.sum(ls);
+        let sm = t.softmax(v[0]);
+        let target = t.softmax(ls);
+        let err = t.mse(sm, target, Reduction::Sum);
+        let a = t.add(ce, total);
+        t.add(a, err)
+    });
     assert!(report.passed(), "shared logits: {report:?}");
 }
 
@@ -447,7 +441,7 @@ fn away_from_kinks(dims: &[usize], knee: f64, seed: u64) -> [Tensor<f64>; 2] {
 fn gradcheck_binary_cross_entropy() {
     let x = [probabilities(&[3, 4], 20), probabilities(&[3, 4], 21)];
     for r in REDUCTIONS {
-        let report = gradcheck(|t, v| t.binary_cross_entropy(v[0], v[1], r), &x);
+        let report = gradcheck(&x, |t, v| t.binary_cross_entropy(v[0], v[1], r));
         assert!(report.passed(), "bce {r:?}: {report:?}");
     }
 }
@@ -458,7 +452,7 @@ fn gradcheck_binary_cross_entropy() {
 fn gradcheck_binary_cross_entropy_with_logits() {
     let x = [spread(&[3, 4], 22), probabilities(&[3, 4], 23)];
     for r in REDUCTIONS {
-        let report = gradcheck(|t, v| t.binary_cross_entropy_with_logits(v[0], v[1], r), &x);
+        let report = gradcheck(&x, |t, v| t.binary_cross_entropy_with_logits(v[0], v[1], r));
         assert!(report.passed(), "bce with logits {r:?}: {report:?}");
     }
 }
@@ -469,15 +463,12 @@ fn gradcheck_nll() {
     let x = [spread(&[5, 3], 24)];
     let labels = [0usize, 2, 1, 1, 0];
     for r in REDUCTIONS {
-        let direct = gradcheck(|t, v| t.nll(v[0], &labels, r), &x);
+        let direct = gradcheck(&x, |t, v| t.nll(v[0], &labels, r));
         assert!(direct.passed(), "nll {r:?}: {direct:?}");
-        let through = gradcheck(
-            |t, v| {
-                let lp = t.log_softmax(v[0]);
-                t.nll(lp, &labels, r)
-            },
-            &x,
-        );
+        let through = gradcheck(&x, |t, v| {
+            let lp = t.log_softmax(v[0]);
+            t.nll(lp, &labels, r)
+        });
         assert!(through.passed(), "log_softmax + nll {r:?}: {through:?}");
     }
 }
@@ -487,7 +478,7 @@ fn gradcheck_nll() {
 fn gradcheck_l1() {
     let x = away_from_kinks(&[3, 4], 0.0, 25);
     for r in REDUCTIONS {
-        let report = gradcheck(|t, v| t.l1(v[0], v[1], r), &x);
+        let report = gradcheck(&x, |t, v| t.l1(v[0], v[1], r));
         assert!(report.passed(), "l1 {r:?}: {report:?}");
     }
 }
@@ -498,7 +489,7 @@ fn gradcheck_huber() {
     for delta in [0.5, 1.0, 1.5] {
         let x = away_from_kinks(&[3, 4], delta, 26);
         for r in REDUCTIONS {
-            let report = gradcheck(|t, v| t.huber(v[0], v[1], delta, r), &x);
+            let report = gradcheck(&x, |t, v| t.huber(v[0], v[1], delta, r));
             assert!(report.passed(), "huber {delta} {r:?}: {report:?}");
         }
     }
@@ -510,7 +501,7 @@ fn gradcheck_smooth_l1() {
     for beta in [0.5, 1.0, 1.5] {
         let x = away_from_kinks(&[3, 4], beta, 27);
         for r in REDUCTIONS {
-            let report = gradcheck(|t, v| t.smooth_l1(v[0], v[1], beta, r), &x);
+            let report = gradcheck(&x, |t, v| t.smooth_l1(v[0], v[1], beta, r));
             assert!(report.passed(), "smooth_l1 {beta} {r:?}: {report:?}");
         }
     }
@@ -522,7 +513,7 @@ fn gradcheck_smooth_l1() {
 fn gradcheck_kl_div() {
     let x = [spread(&[3, 4], 28), probabilities(&[3, 4], 29)];
     for r in REDUCTIONS {
-        let report = gradcheck(|t, v| t.kl_div(v[0], v[1], r), &x);
+        let report = gradcheck(&x, |t, v| t.kl_div(v[0], v[1], r));
         assert!(report.passed(), "kl_div {r:?}: {report:?}");
     }
 }
@@ -563,7 +554,7 @@ impl<T: Real> CustomOp<T> for WrongCube {
 #[test]
 fn custom_op_wrong_backward_is_caught() {
     let op: Arc<dyn CustomOp<f64> + Send + Sync> = Arc::new(WrongCube);
-    let report = gradcheck(|t, v| t.custom(&op, &[v[0]]), &[t(&[0.5, -1.5, 2.0])]);
+    let report = gradcheck(&[t(&[0.5, -1.5, 2.0])], |t, v| t.custom(&op, &[v[0]]));
     assert!(!report.passed());
     assert_eq!(report.failures.len(), 3);
 }
@@ -612,10 +603,9 @@ impl<T: Real> CustomOp<T> for CustomMul {
 fn custom_op_same_var_twice() {
     let op: Arc<dyn CustomOp<f64> + Send + Sync> = Arc::new(CustomMul);
     let x = t(&[0.5, -1.5, 2.0]);
-    gradcheck(
-        |t, v| t.custom(&op, &[v[0], v[0]]),
-        std::slice::from_ref(&x),
-    )
+    gradcheck(std::slice::from_ref(&x), |t, v| {
+        t.custom(&op, &[v[0], v[0]])
+    })
     .assert_passed();
 
     let mut store = ParamStore::<f64>::new_generic();

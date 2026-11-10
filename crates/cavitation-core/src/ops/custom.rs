@@ -65,7 +65,7 @@ pub(crate) const MAX_INPUTS: usize = 4;
 ///
 /// let op: Arc<dyn CustomOp<f64> + Send + Sync> = Arc::new(Square);
 /// let x = Tensor::from_vec(vec![0.5, -1.0, 2.0], &[3]).unwrap();
-/// gradcheck(|tape, v| tape.custom(&op, &[v[0]]), &[x]).assert_passed();
+/// gradcheck(&[x], |tape, v| tape.custom(&op, &[v[0]])).assert_passed();
 /// ```
 pub trait CustomOp<T: Real> {
     /// The operation's name, used in panic messages.

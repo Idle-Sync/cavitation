@@ -36,7 +36,7 @@ pub struct GradcheckFailure {
 /// use cavitation_core::{gradcheck, Tensor};
 /// let x = Tensor::from_vec(vec![1.0, 2.0], &[2]).unwrap();
 /// let y = Tensor::from_vec(vec![3.0, 4.0], &[2]).unwrap();
-/// let report = gradcheck(|tape, v| tape.add(v[0], v[1]), &[x, y]);
+/// let report = gradcheck(&[x, y], |tape, v| tape.add(v[0], v[1]));
 /// assert!(report.passed());
 /// report.assert_passed();
 /// ```
@@ -64,7 +64,7 @@ impl GradcheckReport {
     /// ```
     /// use cavitation_core::{gradcheck, Tensor};
     /// let x = Tensor::from_vec(vec![0.5], &[1]).unwrap();
-    /// gradcheck(|tape, v| tape.add(v[0], v[0]), &[x]).assert_passed();
+    /// gradcheck(&[x], |tape, v| tape.add(v[0], v[0])).assert_passed();
     /// ```
     pub fn assert_passed(&self) {
         if self.passed() {
@@ -93,7 +93,8 @@ impl GradcheckReport {
 }
 
 /// Checks the gradients of a computation of `inputs` against central differences.
-/// Shorthand for [`gradcheck_params`] with no parameters.
+/// Shorthand for [`gradcheck_params`] with no parameters; the arguments come in the same
+/// order, the closure last.
 ///
 /// `build` records the computation on the tape from one variable per input and returns
 /// its output, of any shape. The loss is the sum of the output's elements, each multiplied
@@ -109,11 +110,11 @@ impl GradcheckReport {
 /// use cavitation_core::{gradcheck, Tensor};
 /// let a = Tensor::from_vec(vec![1.0, -2.0, 0.5], &[3]).unwrap();
 /// let b = Tensor::from_vec(vec![0.1, 0.2, 0.3], &[3]).unwrap();
-/// gradcheck(|tape, v| tape.add(v[0], v[1]), &[a, b]).assert_passed();
+/// gradcheck(&[a, b], |tape, v| tape.add(v[0], v[1])).assert_passed();
 /// ```
 pub fn gradcheck(
-    build: impl Fn(&mut Tape<'_, f64>, &[Var]) -> Var,
     inputs: &[Tensor<f64>],
+    build: impl Fn(&mut Tape<'_, f64>, &[Var]) -> Var,
 ) -> GradcheckReport {
     gradcheck_params(&mut ParamStore::new_generic(), inputs, build)
 }
@@ -254,7 +255,7 @@ mod tests {
     /// `assert_passed` panics.
     #[test]
     fn gradcheck_catches_a_wrong_backward() {
-        let report = gradcheck(|tape, v| tape.wrong_identity(v[0]), &[t(&[1.0, 2.0, 3.0])]);
+        let report = gradcheck(&[t(&[1.0, 2.0, 3.0])], |tape, v| tape.wrong_identity(v[0]));
         assert!(!report.passed());
         assert!(!report.failures.is_empty());
         let result = std::panic::catch_unwind(|| report.assert_passed());
@@ -282,8 +283,8 @@ mod tests {
     #[test]
     fn nan_fails() {
         let report = gradcheck(
-            |tape, v| tape.add(v[0], v[0]),
             &[Tensor::from_vec(vec![f64::NAN], &[1]).unwrap()],
+            |tape, v| tape.add(v[0], v[0]),
         );
         assert!(!report.passed());
     }
@@ -291,7 +292,7 @@ mod tests {
     /// An infinite analytic gradient fails.
     #[test]
     fn infinite_analytic_gradient_fails() {
-        let report = gradcheck(|tape, v| tape.infinite_grad(v[0]), &[t(&[1.0, 2.0])]);
+        let report = gradcheck(&[t(&[1.0, 2.0])], |tape, v| tape.infinite_grad(v[0]));
         assert_eq!(report.failures.len(), 2);
         assert!(report.worst_abs.is_infinite());
     }
@@ -300,7 +301,7 @@ mod tests {
     /// gradient, which fails.
     #[test]
     fn infinite_numeric_gradient_fails() {
-        let report = gradcheck(|tape, v| tape.blow_up(v[0]), &[t(&[1.0])]);
+        let report = gradcheck(&[t(&[1.0])], |tape, v| tape.blow_up(v[0]));
         assert!(!report.passed());
         assert!(!report.failures[0].numeric.is_finite());
     }
@@ -330,6 +331,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "tensor 0 element 0")]
     fn assert_passed_lists_failures() {
-        gradcheck(|tape, v| tape.wrong_identity(v[0]), &[t(&[1.0])]).assert_passed();
+        gradcheck(&[t(&[1.0])], |tape, v| tape.wrong_identity(v[0])).assert_passed();
     }
 }
