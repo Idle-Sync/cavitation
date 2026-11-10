@@ -4,9 +4,11 @@
 //! The layer sums over its inputs, so ours (f32) is compared with PyTorch's float64 result
 //! within `2 * (k + 2) * 1.19e-7 * sum|terms| + 1e-30`, with `k` the length of the sum and
 //! `sum|terms|` the sum of the absolute values of the terms, computed here in f64 from the
-//! fixture's inputs.
+//! fixture's inputs. The optimisers are compared with `torch.optim` from the fixtures in
+//! `tests/fixtures/optim/`, on both update paths.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use cavitation_core::kernels::{Level, level, set_level, supported};
 use cavitation_core::{Graph, ParamId, ParamStore, Rng, Tensor};
@@ -155,6 +157,10 @@ fn check_at_current_level() {
 /// Every kernel level, in the order of their numbers.
 const ALL_LEVELS: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
 
+/// Serialises the tests that change the process-wide kernel level, so each one knows which
+/// level, and so which path, the code it compares with PyTorch runs on.
+static LEVEL_LOCK: Mutex<()> = Mutex::new(());
+
 /// Restores the kernel level it was created under when dropped, even during a panic.
 struct RestoreLevel(Level);
 
@@ -166,9 +172,10 @@ impl Drop for RestoreLevel {
 }
 
 /// `Linear` matches `nn.Linear` (output and the gradients of input, weight and bias) on every
-/// kernel level this CPU supports.
+/// kernel level this CPU supports, holding the level lock throughout.
 #[test]
 fn linear_matches_pytorch() {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _restore = RestoreLevel(level());
     for l in ALL_LEVELS.into_iter().filter(|&l| supported(l)) {
         set_level(l).expect("a supported level can be set");
@@ -233,9 +240,25 @@ fn optimizer_for(v: &Value) -> Box<dyn Optimizer<f32>> {
 }
 
 /// Every optimiser fixture: ten steps on a weight and a bias, with the fixture's gradients,
-/// agree with `torch.optim` after every step.
+/// agree with `torch.optim` after every step, on both update paths: the plain loop (run at
+/// `Level::Reference`) and the chunked loop (run at the first faster level this CPU
+/// supports, when there is one). The level lock is held throughout, so another test cannot
+/// switch the path mid-run.
 #[test]
 fn optimizers_match_pytorch() {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = RestoreLevel(level());
+    let fast = ALL_LEVELS
+        .into_iter()
+        .find(|&l| l != Level::Reference && supported(l));
+    for l in std::iter::once(Level::Reference).chain(fast) {
+        set_level(l).expect("a supported level can be set");
+        check_optimizers(l);
+    }
+}
+
+/// Runs every optimiser fixture at the current kernel level `at`, naming it in failures.
+fn check_optimizers(at: Level) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/optim");
     let mut names: Vec<_> = std::fs::read_dir(&dir)
         .expect("fixture directory")
@@ -244,7 +267,7 @@ fn optimizers_match_pytorch() {
     names.sort();
     assert_eq!(names.len(), 5, "expected five optimiser fixtures");
     for path in names {
-        let case = path.file_stem().unwrap().to_string_lossy().into_owned();
+        let case = format!("{} at {at}", path.file_stem().unwrap().to_string_lossy());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let mut opt = optimizer_for(&v);
         let mut params = ParamStore::new();
