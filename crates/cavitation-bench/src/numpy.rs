@@ -104,28 +104,33 @@ fn script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/bench/numpy_mlp.py")
 }
 
+/// Advice appended to every failure to run the baseline: the script runs under `python -I`,
+/// which does not see user-site packages.
+const NUMPY_ADVICE: &str = "The baseline runs under `python3 -I`, which does not see \
+    user-site packages (`pip install --user`). Install numpy into a virtual environment and \
+    pass its interpreter with `--python <path>` or `CAVITATION_BENCH_PYTHON`.";
+
 /// Runs `python -I scripts/bench/numpy_mlp.py <args>` and parses its result.
 ///
 /// # Errors
 ///
-/// Returns a message if the interpreter cannot start (for example numpy missing is reported
-/// from its standard error), exits with a failure, or prints no result line.
+/// Returns a message if the interpreter cannot start, exits with a failure (for example
+/// `ModuleNotFoundError: No module named 'numpy'`, shown from its standard error), or prints
+/// no result line. The first two messages end with advice: the script runs under `-I`,
+/// which does not see user-site packages, so numpy belongs in a virtual environment whose
+/// interpreter is passed with `--python <path>` or `CAVITATION_BENCH_PYTHON`.
 pub fn run(python: &str, args: &[String]) -> Result<NumpyResult, String> {
     let out = Command::new(python)
         .arg("-I")
         .arg(script_path())
         .args(args)
         .output()
-        .map_err(|e| {
-            format!(
-                "could not run `{python}`: {e}; pass --python <path> or set CAVITATION_BENCH_PYTHON"
-            )
-        })?;
+        .map_err(|e| format!("could not run `{python}`: {e}\n{NUMPY_ADVICE}"))?;
     if !out.status.success() {
         return Err(format!(
-            "`{python} -I numpy_mlp.py` failed ({}):\n{}",
+            "`{python} -I numpy_mlp.py` failed ({}):\n{}\n{NUMPY_ADVICE}",
             out.status,
-            String::from_utf8_lossy(&out.stderr)
+            String::from_utf8_lossy(&out.stderr).trim_end()
         ));
     }
     parse_output(&String::from_utf8_lossy(&out.stdout))
@@ -177,5 +182,19 @@ mod tests {
                 .unwrap_err()
                 .contains("timed 3 epochs or rounds, cavitation timed 4")
         );
+    }
+
+    /// An interpreter that exits with a failure, or does not exist, gets advice on making
+    /// numpy visible to the baseline.
+    #[test]
+    fn failed_baseline_explains_how_to_make_numpy_visible() {
+        for python in ["false", "no-such-python-interpreter"] {
+            let err = run(python, &[]).unwrap_err();
+            assert!(err.contains("python3 -I"), "{err}");
+            assert!(err.contains("pip install --user"), "{err}");
+            assert!(err.contains("virtual environment"), "{err}");
+            assert!(err.contains("--python <path>"), "{err}");
+            assert!(err.contains("CAVITATION_BENCH_PYTHON"), "{err}");
+        }
     }
 }
