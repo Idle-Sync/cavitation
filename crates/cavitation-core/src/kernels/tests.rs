@@ -401,11 +401,63 @@ fn product_bits(
     c.into_iter().map(f32::to_bits).collect()
 }
 
+/// Fails unless the thread pool runs tasks on its workers, not only on the caller: runs 64
+/// short tasks on 4 threads, again for up to 10 seconds, until one runs on a worker other
+/// than 0.
+fn assert_pool_runs_on_workers() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let start = std::time::Instant::now();
+    loop {
+        let highest = AtomicUsize::new(0);
+        super::pool::run(4, 64, &|t: super::pool::Task| {
+            let spin = std::time::Instant::now();
+            while spin.elapsed() < std::time::Duration::from_micros(20) {}
+            highest.fetch_max(t.worker, Ordering::Relaxed);
+        });
+        if highest.into_inner() > 0 {
+            return;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "the pool ran every task on the caller for 10 s"
+        );
+    }
+}
+
 /// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the
 /// training shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and
-/// 32 x 256 x 1024, at every fast level.
+/// 32 x 256 x 1024, at every fast level. The test binary re-runs itself as a child that runs
+/// only `threads_bit_identical_child`, so nothing else holds the thread pool and the
+/// multi-threaded products really use its workers.
 #[test]
 fn threads_bit_identical() {
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let out = std::process::Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+            "kernels::twin_tests::threads_bit_identical_child",
+        ])
+        .output()
+        .expect("the test binary runs");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // A filter that matches nothing also exits 0; "1 passed" shows the helper ran.
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "the child should run the helper and pass; stdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    print!("{stdout}");
+}
+
+/// The body of `threads_bit_identical`, run in a child process after checking that the pool
+/// runs tasks on its workers. Ignored by default.
+#[test]
+#[ignore = "run in a child process by threads_bit_identical"]
+fn threads_bit_identical_child() {
+    assert_pool_runs_on_workers();
     for (level, ..) in fast_levels("threads_bit_identical") {
         let mut rng = Rng::seed(11);
         for (m, n, k, b_transposed) in [

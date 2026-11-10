@@ -1310,12 +1310,71 @@ mod tests {
             .collect()
     }
 
+    /// Runs the ignored test `name` of this test binary in a child process, alone, and fails
+    /// unless it ran and passed. Alone in its process, nothing else holds the thread pool, so
+    /// a call on several threads is never sent to the inline path because another test's call
+    /// is using the pool.
+    fn run_alone(name: &str) {
+        let exe = std::env::current_exe().expect("the test binary's path");
+        let out = std::process::Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+                name,
+            ])
+            .output()
+            .expect("the test binary runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // A filter that matches nothing also exits 0; "1 passed" shows the test ran.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{name} failed or did not run; stdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// Fails unless the thread pool runs tasks on its workers, not only on the caller: runs
+    /// 64 short tasks on 4 threads, again for up to 10 seconds, until one runs on a worker
+    /// other than 0.
+    fn assert_pool_runs_on_workers() {
+        use cavitation_core::kernels::pool::{Task, run};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let start = std::time::Instant::now();
+        loop {
+            let highest = AtomicUsize::new(0);
+            run(4, 64, &|t: Task| {
+                let spin = std::time::Instant::now();
+                while spin.elapsed() < std::time::Duration::from_micros(20) {}
+                highest.fetch_max(t.worker, Ordering::Relaxed);
+            });
+            if highest.into_inner() > 0 {
+                return;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the pool ran every task on the caller for 10 s"
+            );
+        }
+    }
+
     /// The chunked update gives the same parameters and the same optimiser state, bit for
     /// bit, as the reference loop, for every setting, over 3 steps (the last with a NaN and
     /// an infinity in one gradient) and on 1, 2 and 4 threads. Its statistics differ from
-    /// the reference only by the order of the sum: within 1e-12 relative.
+    /// the reference only by the order of the sum: within 1e-12 relative. Runs alone in a
+    /// child process, so the 2- and 4-thread runs really use the pool's workers.
     #[test]
     fn chunked_update_matches_the_reference_bit_for_bit() {
+        run_alone("optim::tests::chunked_update_matches_the_reference_child");
+    }
+
+    /// The body of `chunked_update_matches_the_reference_bit_for_bit`, run in a child
+    /// process after checking that the pool runs tasks on its workers.
+    #[test]
+    #[ignore = "run in a child process by chunked_update_matches_the_reference_bit_for_bit"]
+    fn chunked_update_matches_the_reference_child() {
+        assert_pool_runs_on_workers();
         for (name, make) in chunk_configs() {
             let (mut reference, ids) = chunk_store();
             let mut ref_opt = make();
@@ -1360,9 +1419,19 @@ mod tests {
     }
 
     /// The chunked statistics are bit-identical on 1, 2 and 4 threads: each chunk sums in
-    /// fixed partial sums and the chunks combine in order.
+    /// fixed partial sums and the chunks combine in order. Runs alone in a child process, so
+    /// the 2- and 4-thread runs really use the pool's workers.
     #[test]
     fn chunked_statistics_do_not_depend_on_the_thread_count() {
+        run_alone("optim::tests::chunked_statistics_child");
+    }
+
+    /// The body of `chunked_statistics_do_not_depend_on_the_thread_count`, run in a child
+    /// process after checking that the pool runs tasks on its workers.
+    #[test]
+    #[ignore = "run in a child process by chunked_statistics_do_not_depend_on_the_thread_count"]
+    fn chunked_statistics_child() {
+        assert_pool_runs_on_workers();
         for (name, make) in chunk_configs() {
             let norms: Vec<Vec<u64>> = [1, 2, 4]
                 .into_iter()
