@@ -7,6 +7,7 @@
 mod activation;
 mod elementwise;
 mod erf;
+mod glu;
 mod matmul;
 mod reduce;
 #[cfg(test)]
@@ -17,6 +18,7 @@ use crate::graph::{BackwardCtx, ParamId, Var};
 pub use activation::GeluApprox;
 use elementwise::Kind;
 pub(crate) use erf::{erf_f32, erf_f64};
+pub use glu::Gate;
 
 /// A recorded operation: what produced a node, with its inputs and anything its backward
 /// pass needs, stored inline so that recording never allocates.
@@ -80,6 +82,8 @@ pub(crate) enum Op {
     LogSigmoid(Var),
     /// PReLU: the input, then the slope (shape `[1]` or `[C]`).
     Prelu(Var, Var),
+    /// A gated linear unit: the last axis split into value and gate halves.
+    Glu(Var, Gate),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -127,6 +131,7 @@ impl Op {
             Op::HardSwish(a) => activation::hardswish_backward(a, out_grad, ctx),
             Op::LogSigmoid(a) => activation::log_sigmoid_backward(a, out_grad, ctx),
             Op::Prelu(a, slope) => activation::prelu_backward(a, slope, out_grad, ctx),
+            Op::Glu(a, gate) => glu::backward(a, gate, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]

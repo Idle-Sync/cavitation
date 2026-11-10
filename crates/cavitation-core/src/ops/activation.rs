@@ -39,13 +39,40 @@ const FRAC_1_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// `1 / (1 + e^-x)` for `x >= 0` and `e^x / (1 + e^x)` below, so the exponential never
 /// overflows.
-fn sigmoid_value<T: Real>(x: T) -> T {
+pub(super) fn sigmoid_value<T: Real>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
     } else {
         let e = x.exp();
         e / (T::ONE + e)
     }
+}
+
+/// `max(x, 0)`; NaN stays NaN.
+pub(super) fn relu_value<T: Real>(x: T) -> T {
+    if x <= T::ZERO { T::ZERO } else { x }
+}
+
+/// The derivative of ReLU: 1 above 0, 0 at and below it, NaN for NaN.
+pub(super) fn relu_derivative<T: Real>(x: T) -> T {
+    if x > T::ZERO {
+        T::ONE
+    } else if x <= T::ZERO {
+        T::ZERO
+    } else {
+        nan()
+    }
+}
+
+/// `x · σ(x)`.
+pub(super) fn silu_value<T: Real>(x: T) -> T {
+    x * sigmoid_value(x)
+}
+
+/// The derivative of SiLU: `σ(x) · (1 + x · (1 - σ(x)))`.
+pub(super) fn silu_derivative<T: Real>(x: T) -> T {
+    let s = sigmoid_value(x);
+    s * (T::ONE + x * (T::ONE - s))
 }
 
 /// SELU's scale, `1.0507009873554804934...`.
@@ -180,7 +207,7 @@ fn prelu_channel(i: usize, slopes: usize) -> usize {
 }
 
 /// GELU of `x` in the given form.
-fn gelu_value<T: Real>(x: T, approx: GeluApprox) -> T {
+pub(super) fn gelu_value<T: Real>(x: T, approx: GeluApprox) -> T {
     let half = T::from_f64(0.5);
     match approx {
         GeluApprox::Exact => half * x * (T::ONE + (x * T::from_f64(FRAC_1_SQRT_2)).erf()),
@@ -192,7 +219,7 @@ fn gelu_value<T: Real>(x: T, approx: GeluApprox) -> T {
 }
 
 /// The derivative of GELU at `x` in the given form.
-fn gelu_derivative<T: Real>(x: T, approx: GeluApprox) -> T {
+pub(super) fn gelu_derivative<T: Real>(x: T, approx: GeluApprox) -> T {
     let half = T::from_f64(0.5);
     match approx {
         GeluApprox::Exact => {
@@ -230,7 +257,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0, 2.0]);
     /// ```
     pub fn relu(&mut self, x: Var) -> Var {
-        self.map(Op::Relu(x), x, |v| if v <= T::ZERO { T::ZERO } else { v })
+        self.map(Op::Relu(x), x, relu_value)
     }
 
     /// Records Leaky ReLU: `x` where `x > 0`, `slope · x` elsewhere. PyTorch's default slope
@@ -400,7 +427,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0, 2000.0]);
     /// ```
     pub fn silu(&mut self, x: Var) -> Var {
-        self.map(Op::Silu(x), x, |v| v * sigmoid_value(v))
+        self.map(Op::Silu(x), x, silu_value)
     }
 
     /// Records Mish: `x · tanh(softplus(x))`, with softplus at PyTorch's defaults (`beta` 1, threshold 20). The derivative is `tanh(sp) + x · σ(x) · (1 - tanh²(sp))`.
@@ -651,15 +678,7 @@ fn backward_with<T: Real>(
 /// input is NaN.
 pub(super) fn relu_backward<T: Real>(x: Var, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
     let input = ctx.value(x);
-    backward_with(x, out_grad, ctx, |i| {
-        if input[i] > T::ZERO {
-            T::ONE
-        } else if input[i] <= T::ZERO {
-            T::ZERO
-        } else {
-            nan()
-        }
-    });
+    backward_with(x, out_grad, ctx, |i| relu_derivative(input[i]));
 }
 
 /// Backward of `leaky_relu`: the gradient where the input is positive, `slope` times it
@@ -762,10 +781,7 @@ pub(super) fn celu_backward<T: Real>(
 /// Backward of `silu`: `σ(x) · (1 + x · (1 - σ(x)))`.
 pub(super) fn silu_backward<T: Real>(x: Var, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
     let input = ctx.value(x);
-    backward_with(x, out_grad, ctx, |i| {
-        let s = sigmoid_value(input[i]);
-        s * (T::ONE + input[i] * (T::ONE - s))
-    });
+    backward_with(x, out_grad, ctx, |i| silu_derivative(input[i]));
 }
 
 /// Backward of `mish`.

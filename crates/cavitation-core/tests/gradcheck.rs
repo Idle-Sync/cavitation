@@ -1,7 +1,8 @@
 //! Gradient checks of the operations, through the numerical check harness.
 
 use cavitation_core::{
-    GeluApprox, GradcheckReport, ParamStore, Rng, Tape, Tensor, Var, gradcheck, gradcheck_params,
+    Gate, GeluApprox, GradcheckReport, ParamStore, Rng, Tape, Tensor, Var, gradcheck,
+    gradcheck_params,
 };
 
 fn t(data: &[f64]) -> Tensor<f64> {
@@ -284,5 +285,33 @@ fn gradcheck_prelu() {
         let slope = Tensor::from_vec((0..n).map(|i| 0.1 + 0.2 * i as f64).collect(), dims).unwrap();
         let report = gradcheck(|t, v| t.prelu(v[0], v[1]), &[x.clone(), slope]);
         assert!(report.passed(), "prelu slope {dims:?}: {report:?}");
+    }
+}
+
+/// Every gated linear unit has the right gradient on a `[3, 6]` input; for the ReLU gate the
+/// second half of each row is resampled until every entry is farther than `1e-3` from 0.
+#[test]
+fn gradcheck_glu() {
+    let mut rng = Rng::seed(35);
+    let data: Vec<f64> = (0..18)
+        .map(|i| {
+            loop {
+                let x = rng.range(-2.5, 2.5);
+                if i % 6 < 3 || x.abs() > 1e-3 {
+                    break x;
+                }
+            }
+        })
+        .collect();
+    let x = [Tensor::from_vec(data, &[3, 6]).unwrap()];
+    for gate in [
+        Gate::Sigmoid,
+        Gate::Gelu(GeluApprox::Exact),
+        Gate::Gelu(GeluApprox::Tanh),
+        Gate::Relu,
+        Gate::Silu,
+    ] {
+        let report = gradcheck(|t, v| t.glu(v[0], gate), &x);
+        assert!(report.passed(), "glu {gate:?}: {report:?}");
     }
 }
