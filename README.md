@@ -14,7 +14,7 @@ Cavitation trains and runs small and medium neural networks on the CPU, inside a
 What v0.1 contains:
 
 - An f32 tensor and reverse-mode autograd over a recorded tape.
-- Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, 18 activations (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
+- Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, 17 activations plus the learnable PReLU layer (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
 - `Linear`, activation layers and `Sequential`; Xavier and He initialisation; SGD (with momentum and weight decay), Adam and AdamW; cosine learning-rate decay.
 - `fit`, a step-by-step `Trainer`, and the manual loop.
 - Hooks, neuron masks, and health checks that warn about NaN or infinity, exploding and vanishing gradients and dead ReLU neurons.
@@ -143,12 +143,12 @@ Known results, from tests with fixed seeds (`crates/cavitation/tests/known_resul
 - scikit-learn 8×8 digits: the 64 → 256 → 128 → 10 network (50,826 parameters) reaches 97.50% (351 of 360) on the held-out digits after 20 epochs of Adam.
 - MNIST: the 784 → 1024 → 256 → 10 network (1,068,810 parameters) reaches 98.63% on the 10,000 test images after 10 epochs of Adam with cosine decay. This test is ignored by default because it needs the data; run it with `cargo test --release -p cavitation -- --ignored mnist_known_result --nocapture`.
 
-Speed, measured on an Intel Celeron N5105 (4 cores, SSE4.2, no AVX) with `cargo run --release -p cavitation-bench -- all`: release build, kernel level `sse4.2`, 4 threads, plain SGD for training, with numpy measured in the same run on the same network, batch, data and step count.
+Speed, measured on an Intel Celeron N5105 (4 cores, SSE4.2, no AVX) with `cargo run --release -p cavitation-bench -- all`: release build, kernel level `sse4.2`, 4 threads, plain SGD for training, with numpy 2.4.4 (Python 3.14) measured in the same run on the same network, batch, data and step count; built with rustc 1.99.1.
 
 - MNIST, 784 → 1024 → 256 → 10, batch 128: measured 6.17 s per epoch of 60,000 images; numpy measured 9.35 s (1.52× faster). The v0.1 target is ≤ 10 s.
-- The same network at batch 32: measured 10.21 s per epoch; numpy measured 14.68 s (1.44× faster).
-- Digits, 64 → 256 → 128 → 10, batch 128: measured 116,893 samples/s; numpy measured 87,070 samples/s (1.34× faster). The v0.1 target is ≥ 94,000 samples/s.
-- One input through the digits network in inference mode: measured 6.74 µs; numpy measured 33.44 µs (4.96× faster). The v0.1 target is ≤ 7 µs.
+- The same network at batch 32: measured 10.19 s per epoch; numpy measured 14.61 s (1.43× faster).
+- Digits, 64 → 256 → 128 → 10, batch 128: measured 116,904 samples/s; numpy measured 86,787 samples/s (1.35× faster). The v0.1 target is ≥ 94,000 samples/s.
+- One input through the digits network in inference mode: measured 6.77 µs; numpy measured 32.35 µs (4.78× faster). The v0.1 target is ≤ 7 µs.
 
 Each training figure is the median of 3 timed epochs (MNIST) or 100 epochs (digits); the inference figure is the median of 10 rounds of 10,000 calls. Your numbers will differ on other machines.
 
@@ -189,7 +189,7 @@ mdbook serve book   # then open http://localhost:3000
 
 ## Status
 
-Status: in development. No release yet.
+In development; no release yet.
 
 ## Licence
 
