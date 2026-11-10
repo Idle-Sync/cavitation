@@ -187,9 +187,7 @@ The guide is in `book/`. Its first chapter, "Backprop by hand", works through th
 mdbook serve book   # then open http://localhost:3000
 ```
 
-## Status
-
-In development; no release yet.
+Status: in development. No release yet.
 
 ## Licence
 
