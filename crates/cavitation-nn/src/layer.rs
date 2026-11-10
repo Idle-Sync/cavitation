@@ -1,8 +1,8 @@
 //! The `Layer` trait.
 
-use cavitation_core::{ParamId, Real, Tape, Var};
+use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
-use crate::Activation;
+use crate::{Activation, InferenceLayer};
 
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
@@ -174,5 +174,31 @@ pub trait Layer<T: Real>: Send + Sync {
             *d = act.df(v, act.f(v));
         }
         true
+    }
+
+    /// The layer's form for [`InferenceModel`](crate::InferenceModel), with its parameters
+    /// read from `params` (the `f32` values of the store the layer was created with), or
+    /// `None` if it has none. Every built-in layer has one; the default is `None`, so a
+    /// model with a layer of your own cannot be compiled for inference unless that layer
+    /// describes itself as one of the [`InferenceLayer`] forms.
+    ///
+    /// # Panics
+    ///
+    /// A layer may panic if its parameters in `params` do not have the shapes it created
+    /// them with (`Linear` does).
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{InferenceLayer, Layer, Linear};
+    /// let mut params = ParamStore::new();
+    /// let layer = Linear::new(&mut params, 4, 2, &mut Rng::seed(0));
+    /// match Layer::<f32>::inference(&layer, &params.values) {
+    ///     Some(InferenceLayer::Linear { inputs, outputs, .. }) => assert_eq!((inputs, outputs), (4, 2)),
+    ///     _ => unreachable!(),
+    /// }
+    /// ```
+    fn inference(&self, params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        let _ = params;
+        None
     }
 }

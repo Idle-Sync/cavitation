@@ -4,6 +4,7 @@
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
 pub mod gemm;
+pub mod matvec;
 pub mod pool;
 pub mod reference;
 #[cfg(target_arch = "x86_64")]

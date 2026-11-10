@@ -7,10 +7,10 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
+use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Health, Hooks, Init, Linear, Loss, NeuronMask,
-    Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trainer, Warning,
+    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Health, Hooks, InferenceModel, Init, Linear,
+    Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -445,9 +445,56 @@ fn health_steady_state() -> usize {
     made
 }
 
+/// Compiles the 50k network with a mask on its second ReLU and runs one input through it
+/// once as a warm-up, then 10,000 more inputs. Returns the allocations made after the
+/// warm-up.
+fn infer_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let mut net = network_50k(&mut params);
+    let mut mask = NeuronMask::all_on(128);
+    mask.set(5, false);
+    net.set_mask(3, mask);
+    let mut model = InferenceModel::compile(&net, &params).unwrap();
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    let mut sink = model.infer(&rows[..64])[0];
+    let before = allocations();
+    for i in 0..10_000 {
+        let at = (i % 1437) * 64;
+        sink += model.infer(&rows[at..at + 64])[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
+/// Compiles the 50k network and runs one batch of 128 rows through `infer_batch` as a
+/// warm-up, then 10,000 more batches, alternating 128 and 29 rows (the digits training set's
+/// last batch). Returns the allocations made after the warm-up.
+fn infer_batch_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut model = InferenceModel::compile(&net, &params).unwrap();
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    let batch = |start: usize, n: usize| {
+        TensorView::from_slice(&rows[start * 64..(start + n) * 64], &[n, 64]).unwrap()
+    };
+    let mut sink = model.infer_batch(batch(0, 128)).data()[0];
+    let before = allocations();
+    for i in 0..10_000 {
+        let n = if i % 2 == 0 { 128 } else { 29 };
+        let start = (i * 37) % (1437 - 128);
+        sink += model.infer_batch(batch(start, n)).data()[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 8] = [
+    let scenarios: [Scenario; 10] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -456,6 +503,8 @@ fn main() -> ExitCode {
         ("no_hooks_no_cost", no_hooks_no_cost),
         ("masked_training_step", masked_training_step),
         ("health_steady_state", health_steady_state),
+        ("infer_steady_state", infer_steady_state),
+        ("infer_batch_steady_state", infer_batch_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

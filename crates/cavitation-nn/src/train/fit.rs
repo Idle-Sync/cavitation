@@ -7,7 +7,9 @@ use std::time::Instant;
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Reduction, Tape, TensorView, Var};
 
 use super::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
-use crate::{Adam, AdamW, Health, HealthMonitor, Hooks, Optimizer, Sequential, Sgd, Trace};
+use crate::{
+    Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, Optimizer, Sequential, Sgd, Trace,
+};
 
 /// The loss [`Trainer`] and [`fit`] minimise, always averaged over the batch.
 ///
@@ -794,11 +796,16 @@ pub fn fit_with_hooks(
 /// label, running `batch` rows at a time. A row whose outputs are all NaN counts as wrong;
 /// among equal largest outputs the first counts.
 ///
+/// The model is compiled once into an [`InferenceModel`] and each batch runs through
+/// [`InferenceModel::infer_batch`]. A model that cannot be compiled (a layer of your own
+/// without an inference form) runs through the training graph's forward pass instead.
+///
 /// # Panics
 ///
 /// Panics if `data` has value targets rather than class labels, if it has no rows, if the
-/// labels are not one per row, or if `batch` is 0; and as [`Sequential::forward`] does when
-/// the shapes do not fit.
+/// labels are not one per row, or if `batch` is 0; and as [`InferenceModel::compile`] and
+/// [`InferenceModel::infer_batch`] (or [`Sequential::forward`]) do when the shapes do not
+/// fit.
 ///
 /// # Examples
 ///
@@ -824,6 +831,7 @@ pub fn accuracy(model: &Sequential, params: &ParamStore, data: &Dataset, batch: 
         "accuracy: the data has {rows} rows but {} labels",
         labels.len()
     );
+    let mut compiled = InferenceModel::compile(model, params).ok();
     let mut graph = Graph::new();
     let mut correct = 0usize;
     for start in (0..rows).step_by(batch) {
@@ -833,14 +841,21 @@ pub fn accuracy(model: &Sequential, params: &ParamStore, data: &Dataset, batch: 
             &[end - start, features],
         )
         .expect("a run of whole rows of x has the batch's shape");
-        let mut tape = graph.tape(&params.values);
-        let input = tape.input(x);
-        let out = model.forward(&mut tape, input);
-        let scores = tape.value(out);
-        let classes = scores.data().len() / (end - start);
-        for (row, &label) in scores.data().chunks(classes).zip(&labels[start..end]) {
-            if argmax(row) == Some(label) {
-                correct += 1;
+        let mut count = |scores: &[f32]| {
+            let classes = scores.len() / (end - start);
+            for (row, &label) in scores.chunks(classes).zip(&labels[start..end]) {
+                if argmax(row) == Some(label) {
+                    correct += 1;
+                }
+            }
+        };
+        match compiled.as_mut() {
+            Some(inference) => count(inference.infer_batch(x).data()),
+            None => {
+                let mut tape = graph.tape(&params.values);
+                let input = tape.input(x);
+                let out = model.forward(&mut tape, input);
+                count(tape.value(out).data());
             }
         }
     }

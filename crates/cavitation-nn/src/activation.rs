@@ -5,11 +5,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use cavitation_core::{
-    CustomOp, Gate, GeluApprox, ParamId, ParamStore, Real, Shape, Tape, Tensor, TensorView,
-    TensorViewMut, Var,
+    CustomOp, Gate, GeluApprox, ParamId, ParamStore, ParamValues, Real, Shape, Tape, Tensor,
+    TensorView, TensorViewMut, Var,
 };
 
-use crate::Layer;
+use crate::{InferenceLayer, Layer};
 
 /// A function applied to every value of a layer's input on its own: its value `f` and its
 /// derivative `df`.
@@ -255,11 +255,12 @@ impl ActivationKind {
                     c(alpha) * (x.exp() - T::ONE)
                 }
             }
+            // `scale · (alpha · (eˣ - 1))`, grouped as the tape's SELU computes it.
             ActivationKind::Selu => {
                 if x > T::ZERO {
                     c(SELU_SCALE) * x
                 } else {
-                    c(SELU_SCALE) * c(SELU_ALPHA) * (x.exp() - T::ONE)
+                    c(SELU_SCALE) * (c(SELU_ALPHA) * (x.exp() - T::ONE))
                 }
             }
             ActivationKind::Celu(alpha) => {
@@ -602,6 +603,11 @@ impl<T: Real> Layer<T> for ActivationLayer<T> {
     fn activation(&self) -> Option<&dyn Activation<T>> {
         Some(&*self.act)
     }
+
+    /// [`InferenceLayer::Activation`] for a built-in activation; `None` for one of your own.
+    fn inference(&self, _params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        self.kind.map(InferenceLayer::Activation)
+    }
 }
 
 /// Defines a built-in activation layer: its struct, and its `Activation` and `Layer` impls
@@ -703,6 +709,11 @@ macro_rules! builtin_layer {
             /// The layer itself.
             fn activation(&self) -> Option<&dyn Activation<T>> {
                 Some(self)
+            }
+
+            /// [`InferenceLayer::Activation`] with the matching kind.
+            fn inference(&self, _params: &ParamValues<f32>) -> Option<InferenceLayer> {
+                Some(InferenceLayer::Activation(self.kind()))
             }
         }
     };
@@ -851,6 +862,10 @@ impl<T: Real> Layer<T> for Softmax {
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         Vec::new()
     }
+    /// [`InferenceLayer::Softmax`].
+    fn inference(&self, _params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        Some(InferenceLayer::Softmax)
+    }
 }
 
 /// Log-softmax over the last axis. Not an element-wise function, so it has no [`Activation`].
@@ -887,6 +902,10 @@ impl<T: Real> Layer<T> for LogSoftmax {
     /// No parameters.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         Vec::new()
+    }
+    /// [`InferenceLayer::LogSoftmax`].
+    fn inference(&self, _params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        Some(InferenceLayer::LogSoftmax)
     }
 }
 
@@ -932,6 +951,10 @@ impl<T: Real> Layer<T> for Glu {
     /// No parameters.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         Vec::new()
+    }
+    /// [`InferenceLayer::Glu`] with the layer's gate.
+    fn inference(&self, _params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        Some(InferenceLayer::Glu(self.gate))
     }
 }
 
@@ -1044,5 +1067,20 @@ impl<T: Real> Layer<T> for Prelu {
     /// Returns `weight`.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         vec![("weight", self.weight)]
+    }
+    /// [`InferenceLayer::Prelu`] with the slopes copied from `params`.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the shape, if the slopes in `params` are not `[channels]`.
+    fn inference(&self, params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        let w = params.get(self.weight);
+        assert!(
+            w.shape().dims() == [self.channels],
+            "prelu: expected slopes [{}], got {:?}",
+            self.channels,
+            w.shape().dims()
+        );
+        Some(InferenceLayer::Prelu(w.data().to_vec()))
     }
 }

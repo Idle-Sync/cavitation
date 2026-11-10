@@ -3,6 +3,7 @@
 mod activation;
 mod health;
 mod hooks;
+mod inference;
 mod init;
 mod layer;
 mod linear;
@@ -18,6 +19,7 @@ pub use activation::{
 };
 pub use health::{Health, HealthMonitor, OnNonFinite, Warning};
 pub use hooks::{HookId, Hooks, LayerEvent};
+pub use inference::{InferenceLayer, InferenceModel};
 pub use init::Init;
 pub use layer::Layer;
 pub use linear::Linear;

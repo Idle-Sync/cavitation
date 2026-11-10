@@ -105,6 +105,27 @@ pub(super) fn check_gemm_shapes<T: Real>(a: &MatRef<T>, b: &MatRef<T>, c: &MatMu
 /// assert_eq!(out, [4.5, 5.5]);
 /// ```
 pub fn matvec<T: Real>(w_t: MatRef<T>, x: &[T], bias: Option<&[T]>, out: &mut [T]) {
+    check_matvec_shapes(&w_t, x, bias, out);
+    for (j, o) in out.iter_mut().enumerate() {
+        let mut acc = T::ZERO;
+        for (i, &xi) in x.iter().enumerate() {
+            acc += xi * w_t.get(i, j);
+        }
+        *o = match bias {
+            Some(bias) => bias[j] + acc,
+            None => acc,
+        };
+    }
+}
+
+/// Panics, naming the lengths, unless `x` has `w_t.rows()` values, `out` has `w_t.cols()`
+/// and the bias, if present, as many as `out`.
+pub(super) fn check_matvec_shapes<T: Real>(
+    w_t: &MatRef<T>,
+    x: &[T],
+    bias: Option<&[T]>,
+    out: &[T],
+) {
     assert!(
         x.len() == w_t.rows(),
         "matvec: input has {} values but w_t is {} x {}",
@@ -126,16 +147,6 @@ pub fn matvec<T: Real>(w_t: MatRef<T>, x: &[T], bias: Option<&[T]>, out: &mut [T
             bias.len(),
             out.len()
         );
-    }
-    for (j, o) in out.iter_mut().enumerate() {
-        let mut acc = T::ZERO;
-        for (i, &xi) in x.iter().enumerate() {
-            acc += xi * w_t.get(i, j);
-        }
-        *o = match bias {
-            Some(bias) => bias[j] + acc,
-            None => acc,
-        };
     }
 }
 

@@ -1,11 +1,14 @@
-//! aarch64 microkernels: the NEON GEMM tile (8 by 12, fused multiply-add by vector lane).
+//! aarch64 microkernels: the NEON GEMM tile (8 by 12, fused multiply-add by vector lane) and
+//! the NEON inference matvec kernel.
 
 use std::arch::aarch64::{
-    float32x4_t, vaddq_f32, vdupq_n_f32, vfmaq_laneq_f32, vld1q_f32, vmulq_f32, vst1q_f32,
+    float32x4_t, vaddq_f32, vbslq_f32, vcleq_f32, vdupq_n_f32, vfmaq_f32, vfmaq_laneq_f32,
+    vld1q_f32, vmulq_f32, vst1q_f32,
 };
 
 use super::MatRef;
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
+use super::matvec::Job;
 
 /// The NEON GEMM kernel: 8 by 12 tiles held in 24 four-wide accumulators, updated with
 /// fused multiply-add (with the three `B` vectors and two vectors of `A`, 29 of the 32 NEON
@@ -137,5 +140,91 @@ unsafe fn tile_8x12(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f
                 }
             }
         }
+    }
+}
+
+/// The NEON inference matvec, streaming the weights in storage order as the SSE4.2 one does
+/// (8 rows at a time into every four-wide vector of outputs, partial sums kept in `out`),
+/// with one fused multiply-add per step. The last `n mod 4` outputs are computed one at a
+/// time, and the bias and ReLU are applied in a final pass.
+///
+/// # Safety
+///
+/// `job` must satisfy [`Job`]'s invariant for `out.len()` outputs. NEON is part of the
+/// aarch64 baseline, so every aarch64 CPU runs it.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn matvec_neon(job: &Job, out: &mut [f32]) {
+    let n = out.len();
+    let nv = n / 4 * 4;
+    let (k, vecs) = (job.x.len(), &mut out[..nv]);
+    let mut i = 0;
+    while i < k {
+        let rows = if i + 8 <= k { 8 } else { 1 };
+        // SAFETY: rows `i..i + rows` are below `k` and the columns `0..nv` are outputs, so
+        // the weights read are inside `job.w` by the `Job` invariant this function's caller
+        // upholds; `vecs` holds `nv` values, a multiple of the vector width.
+        unsafe {
+            match (rows, i == 0) {
+                (8, true) => neon_rows::<8, true>(job, i, vecs),
+                (8, false) => neon_rows::<8, false>(job, i, vecs),
+                (_, true) => neon_rows::<1, true>(job, i, vecs),
+                _ => neon_rows::<1, false>(job, i, vecs),
+            }
+        }
+        i += rows;
+    }
+    if k == 0 {
+        vecs.fill(0.0);
+    }
+    let zero = vdupq_n_f32(0.0);
+    for (j, o) in vecs.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        // SAFETY: `o` holds 4 floats; `vld1q_f32` needs no more than f32 alignment.
+        let mut v = unsafe { vld1q_f32(o.as_ptr()) };
+        if let Some(b) = job.bias {
+            let b = &b[4 * j..4 * j + 4];
+            // SAFETY: `b` holds 4 floats; `vld1q_f32` needs no more than f32 alignment.
+            v = vaddq_f32(unsafe { vld1q_f32(b.as_ptr()) }, v);
+        }
+        if job.relu {
+            // 0 where v <= 0 (so -0 becomes +0), v elsewhere; NaN fails the comparison and
+            // stays.
+            v = vbslq_f32(vcleq_f32(v, zero), zero, v);
+        }
+        // SAFETY: `o` holds 4 floats; `vst1q_f32` needs no more than f32 alignment.
+        unsafe { vst1q_f32(o.as_mut_ptr(), v) };
+    }
+    job.scalar_tail(nv, &mut out[nv..]);
+}
+
+/// Adds rows `i0..i0 + R` of the NEON matvec into every four-wide vector of `out`, in row
+/// order, one fused multiply-add per row. With `FIRST` the sums start from zero instead of
+/// `out`.
+///
+/// # Safety
+///
+/// Weights `(i, j)` must lie inside `job.w` for `i0 <= i < i0 + R` and `j < out.len()` (a
+/// multiple of 4), and `i0 + R <= job.x.len()`.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn neon_rows<const R: usize, const FIRST: bool>(job: &Job, i0: usize, out: &mut [f32]) {
+    let xs: [float32x4_t; R] = std::array::from_fn(|r| vdupq_n_f32(job.x[i0 + r]));
+    let w = job.w.as_ptr();
+    let ld = job.ld;
+    for (j, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let mut a = if FIRST {
+            vdupq_n_f32(0.0)
+        } else {
+            // SAFETY: `o` holds 4 floats; `vld1q_f32` needs no more than f32 alignment.
+            unsafe { vld1q_f32(o.as_ptr()) }
+        };
+        for (r, &xv) in xs.iter().enumerate() {
+            // SAFETY: row `i0 + r` and columns `4j..4j + 4` are inside `job.w` (this
+            // function's contract), contiguous since a row's columns are adjacent;
+            // `vld1q_f32` needs no more than f32 alignment.
+            let wv = unsafe { vld1q_f32(w.add((i0 + r) * ld + 4 * j)) };
+            a = vfmaq_f32(a, xv, wv);
+        }
+        // SAFETY: `o` holds 4 floats; `vst1q_f32` needs no more than f32 alignment.
+        unsafe { vst1q_f32(o.as_mut_ptr(), a) };
     }
 }

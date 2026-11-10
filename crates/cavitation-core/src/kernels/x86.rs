@@ -1,15 +1,18 @@
 //! x86_64 microkernels: the SSE4.2 GEMM tile (6 by 8, multiply then add; SSE has no fused
-//! multiply-add) with its packing routines, and the AVX2 tile (6 by 16, fused multiply-add).
+//! multiply-add) with its packing routines, the AVX2 tile (6 by 16, fused multiply-add), and
+//! the SSE4.2 and AVX2 inference matvec kernels.
 
 use std::arch::x86_64::{
-    __m128, __m256, _mm_add_ps, _mm_load_ps, _mm_loadu_ps, _mm_movehl_ps, _mm_movelh_ps,
-    _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_storeu_ps, _mm_unpackhi_ps,
-    _mm_unpacklo_ps, _mm256_add_ps, _mm256_broadcast_ss, _mm256_fmadd_ps, _mm256_loadu_ps,
-    _mm256_mul_ps, _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    __m128, __m256, _CMP_LE_OQ, _mm_add_ps, _mm_andnot_ps, _mm_cmple_ps, _mm_load_ps, _mm_loadu_ps,
+    _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps,
+    _mm_storeu_ps, _mm_unpackhi_ps, _mm_unpacklo_ps, _mm256_add_ps, _mm256_andnot_ps,
+    _mm256_broadcast_ss, _mm256_cmp_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
+    _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
 };
 
 use super::MatRef;
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
+use super::matvec::Job;
 
 /// The SSE4.2 GEMM kernel: 6 by 8 tiles held in 12 four-wide accumulators (with the two
 /// `B` vectors, all 16 SSE registers in use, nothing spilled).
@@ -383,5 +386,170 @@ unsafe fn tile_6x16(kc: usize, a: *const f32, b: *const f32, alpha: f32, beta: f
                 }
             }
         }
+    }
+}
+
+/// The SSE4.2 inference matvec, streaming the weights in storage order: the input is taken
+/// 8 rows at a time (then one at a time for the last `k mod 8`), and each group adds its rows,
+/// in order, into every four-wide vector of outputs, keeping the partial sums in `out`
+/// between groups. Each step of a sum is a multiply and then an add, as in the reference,
+/// so every output equals the reference's bit for bit. The last `n mod 4` outputs are
+/// computed one at a time, and the bias and ReLU are applied in a final pass.
+///
+/// # Safety
+///
+/// `job` must satisfy [`Job`]'s invariant for `out.len()` outputs, and the CPU must support
+/// SSE4.2.
+#[target_feature(enable = "sse4.2")]
+pub(super) unsafe fn matvec_sse(job: &Job, out: &mut [f32]) {
+    let n = out.len();
+    let nv = n / 4 * 4;
+    let (k, vecs) = (job.x.len(), &mut out[..nv]);
+    let mut i = 0;
+    while i < k {
+        let rows = if i + 8 <= k { 8 } else { 1 };
+        // SAFETY: rows `i..i + rows` are below `k` and the columns `0..nv` are outputs, so
+        // the weights read are inside `job.w` by the `Job` invariant this function's caller
+        // upholds; `vecs` holds `nv` values, a multiple of the vector width; the CPU
+        // supports SSE4.2.
+        unsafe {
+            match (rows, i == 0) {
+                (8, true) => sse_rows::<8, true>(job, i, vecs),
+                (8, false) => sse_rows::<8, false>(job, i, vecs),
+                (_, true) => sse_rows::<1, true>(job, i, vecs),
+                _ => sse_rows::<1, false>(job, i, vecs),
+            }
+        }
+        i += rows;
+    }
+    if k == 0 {
+        vecs.fill(0.0);
+    }
+    let zero = _mm_setzero_ps();
+    for (j, o) in vecs.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let mut v = load4(o);
+        if let Some(b) = job.bias {
+            v = _mm_add_ps(load4(&b[4 * j..]), v);
+        }
+        if job.relu {
+            // 0 where v <= 0 (so -0 becomes +0), v elsewhere; NaN fails the comparison and
+            // stays.
+            v = _mm_andnot_ps(_mm_cmple_ps(v, zero), v);
+        }
+        store4(o, v);
+    }
+    job.scalar_tail(nv, &mut out[nv..]);
+}
+
+/// Adds rows `i0..i0 + R` of the SSE4.2 matvec into every four-wide vector of `out`, in row
+/// order: `out[j] = out[j] + x[i0]·w[i0][j] + ... + x[i0 + R - 1]·w[i0 + R - 1][j]`, each step
+/// a multiply and then an add. With `FIRST` the sums start from zero instead of `out`.
+///
+/// # Safety
+///
+/// Weights `(i, j)` must lie inside `job.w` for `i0 <= i < i0 + R` and `j < out.len()` (a
+/// multiple of 4), `i0 + R <= job.x.len()`, and the CPU must support SSE4.2.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+unsafe fn sse_rows<const R: usize, const FIRST: bool>(job: &Job, i0: usize, out: &mut [f32]) {
+    let xs: [__m128; R] = std::array::from_fn(|r| _mm_set1_ps(job.x[i0 + r]));
+    let w = job.w.as_ptr();
+    let ld = job.ld;
+    for (j, o) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+        let mut a = if FIRST { _mm_setzero_ps() } else { load4(o) };
+        for (r, &xv) in xs.iter().enumerate() {
+            // SAFETY: row `i0 + r` and columns `4j..4j + 4` are inside `job.w` (this
+            // function's contract), contiguous since a row's columns are adjacent; the load
+            // is unaligned.
+            let wv = unsafe { _mm_loadu_ps(w.add((i0 + r) * ld + 4 * j)) };
+            a = _mm_add_ps(a, _mm_mul_ps(xv, wv));
+        }
+        store4(o, a);
+    }
+}
+
+/// The AVX2 inference matvec, streaming the weights in storage order as the SSE4.2 one
+/// does, with eight-wide vectors and one fused multiply-add per step. The last `n mod 8`
+/// outputs are computed one at a time.
+///
+/// # Safety
+///
+/// `job` must satisfy [`Job`]'s invariant for `out.len()` outputs, and the CPU must support
+/// AVX2 and FMA.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn matvec_avx2(job: &Job, out: &mut [f32]) {
+    let n = out.len();
+    let nv = n / 8 * 8;
+    let (k, vecs) = (job.x.len(), &mut out[..nv]);
+    let mut i = 0;
+    while i < k {
+        let rows = if i + 8 <= k { 8 } else { 1 };
+        // SAFETY: rows `i..i + rows` are below `k` and the columns `0..nv` are outputs, so
+        // the weights read are inside `job.w` by the `Job` invariant this function's caller
+        // upholds; `vecs` holds `nv` values, a multiple of the vector width; the CPU
+        // supports AVX2 and FMA.
+        unsafe {
+            match (rows, i == 0) {
+                (8, true) => avx2_rows::<8, true>(job, i, vecs),
+                (8, false) => avx2_rows::<8, false>(job, i, vecs),
+                (_, true) => avx2_rows::<1, true>(job, i, vecs),
+                _ => avx2_rows::<1, false>(job, i, vecs),
+            }
+        }
+        i += rows;
+    }
+    if k == 0 {
+        vecs.fill(0.0);
+    }
+    let zero = _mm256_setzero_ps();
+    for (j, o) in vecs.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        // SAFETY: `o` holds 8 floats; the load is unaligned.
+        let mut v = unsafe { _mm256_loadu_ps(o.as_ptr()) };
+        if let Some(b) = job.bias {
+            let b = &b[8 * j..8 * j + 8];
+            // SAFETY: `b` holds 8 floats; the load is unaligned.
+            v = _mm256_add_ps(unsafe { _mm256_loadu_ps(b.as_ptr()) }, v);
+        }
+        if job.relu {
+            // 0 where v <= 0 (so -0 becomes +0), v elsewhere; NaN fails the ordered
+            // comparison and stays.
+            v = _mm256_andnot_ps(_mm256_cmp_ps::<_CMP_LE_OQ>(v, zero), v);
+        }
+        // SAFETY: `o` holds 8 floats; the store is unaligned.
+        unsafe { _mm256_storeu_ps(o.as_mut_ptr(), v) };
+    }
+    job.scalar_tail(nv, &mut out[nv..]);
+}
+
+/// Adds rows `i0..i0 + R` of the AVX2 matvec into every eight-wide vector of `out`, in row
+/// order, one fused multiply-add per row. With `FIRST` the sums start from zero instead of
+/// `out`.
+///
+/// # Safety
+///
+/// Weights `(i, j)` must lie inside `job.w` for `i0 <= i < i0 + R` and `j < out.len()` (a
+/// multiple of 8), `i0 + R <= job.x.len()`, and the CPU must support AVX2 and FMA.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn avx2_rows<const R: usize, const FIRST: bool>(job: &Job, i0: usize, out: &mut [f32]) {
+    let xs: [__m256; R] = std::array::from_fn(|r| _mm256_set1_ps(job.x[i0 + r]));
+    let w = job.w.as_ptr();
+    let ld = job.ld;
+    for (j, o) in out.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+        let mut a = if FIRST {
+            _mm256_setzero_ps()
+        } else {
+            // SAFETY: `o` holds 8 floats; the load is unaligned.
+            unsafe { _mm256_loadu_ps(o.as_ptr()) }
+        };
+        for (r, &xv) in xs.iter().enumerate() {
+            // SAFETY: row `i0 + r` and columns `8j..8j + 8` are inside `job.w` (this
+            // function's contract), contiguous since a row's columns are adjacent; the load
+            // is unaligned.
+            let wv = unsafe { _mm256_loadu_ps(w.add((i0 + r) * ld + 8 * j)) };
+            a = _mm256_fmadd_ps(xv, wv, a);
+        }
+        // SAFETY: `o` holds 8 floats; the store is unaligned.
+        unsafe { _mm256_storeu_ps(o.as_mut_ptr(), a) };
     }
 }

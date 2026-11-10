@@ -2,6 +2,7 @@
 //! so tests never depend on, or race on, the process-wide level setting.
 
 use super::gemm::{gemm_f32, gemm_f32_with, threads_used};
+use super::matvec::{matvec_f32, matvec_f32_with};
 use super::{Level, MatMut, MatRef, reference, supported};
 use crate::Rng;
 
@@ -560,4 +561,176 @@ fn gemm_f32_uses_a_supported_level() {
     let mut c = [f32::NAN; 4];
     gemm_f32(1.0, rm(&a, 2, 2), rm(&b, 2, 2), 0.0, rm_mut(&mut c, 2, 2));
     assert_eq!(c, [19.0, 22.0, 43.0, 50.0]);
+}
+
+/// Every level this CPU runs: the reference loops and each supported fast level. Prints each
+/// fast level it skips.
+fn every_level(test: &str) -> Vec<Level> {
+    std::iter::once(Level::Reference)
+        .chain(fast_levels(test).into_iter().map(|(level, ..)| level))
+        .collect()
+}
+
+/// The matvec tolerance for each output `j` of `bias + x · w_t` (`w_t` row-major, `k` by
+/// `n`), computed in f64: `2·(k + 2)·1.19e-7·(Σᵢ |xᵢ|·|wᵢⱼ| + |biasⱼ|) + 1e-30`.
+fn matvec_bounds(w_t: &[f32], x: &[f32], bias: Option<&[f32]>, n: usize) -> Vec<f64> {
+    let k = x.len();
+    (0..n)
+        .map(|j| {
+            let s: f64 = (0..k)
+                .map(|i| f64::from(x[i]).abs() * f64::from(w_t[i * n + j]).abs())
+                .sum();
+            let b = bias.map_or(0.0, |b| f64::from(b[j]).abs());
+            2.0 * (k as f64 + 2.0) * 1.19e-7 * (s + b) + 1e-30
+        })
+        .collect()
+}
+
+/// The fast matvec at every supported level matches the reference (followed by ReLU when
+/// asked) within the matvec tolerance, and the SSE4.2 one bit for bit, for input widths 1, 3, 7, 64, 785 and 1023 by output
+/// widths 1, 5, 10, 256 and 1024, with and without a bias and ReLU. The weights are stored
+/// with 3 NaN values of padding after each row, so reading past a row shows up as NaN; the
+/// output starts as NaN, so an element left unwritten shows up too.
+#[test]
+fn matvec_levels_match_reference() {
+    let mut rng = Rng::seed(17);
+    for level in every_level("matvec_levels_match_reference") {
+        for k in [1usize, 3, 7, 64, 785, 1023] {
+            for n in [1usize, 5, 10, 256, 1024] {
+                let w = random(&mut rng, k * n);
+                let x = random(&mut rng, k);
+                let b = random(&mut rng, n);
+                let stored = Stored::new(&w, k, n, false, 3);
+                for (bias, relu) in [
+                    (None, false),
+                    (Some(&b[..]), false),
+                    (Some(&b[..]), true),
+                    (None, true),
+                ] {
+                    let mut want = vec![0.0f32; n];
+                    reference::matvec(rm(&w, k, n), &x, bias, &mut want);
+                    if relu {
+                        for v in &mut want {
+                            *v = if *v <= 0.0 { 0.0 } else { *v };
+                        }
+                    }
+                    let mut got = vec![f32::NAN; n];
+                    matvec_f32_with(level, stored.view(), &x, bias, relu, &mut got);
+                    let bound = matvec_bounds(&w, &x, bias, n);
+                    let what = format!(
+                        "{level}: matvec {k} -> {n}, bias {}, relu {relu}",
+                        bias.is_some()
+                    );
+                    assert_within(&got, &want, &bound, n, &what);
+                    if matches!(level, Level::Reference | Level::Sse42) {
+                        // A separate multiply and add in the reference's order: the same bits.
+                        let same = got
+                            .iter()
+                            .zip(&want)
+                            .all(|(g, w)| g.to_bits() == w.to_bits());
+                        assert!(same, "{what}: not bit-identical to the reference");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A weight matrix whose columns are not contiguous (a transposed view, and general
+/// strides) still gives the reference's answer, at every supported level.
+#[test]
+fn matvec_strided_weights_match_reference() {
+    let mut rng = Rng::seed(19);
+    let (k, n) = (37, 21);
+    let w = random(&mut rng, k * n);
+    let x = random(&mut rng, k);
+    let b = random(&mut rng, n);
+    let mut want = vec![0.0f32; n];
+    reference::matvec(rm(&w, k, n), &x, Some(&b), &mut want);
+    let bound = matvec_bounds(&w, &x, Some(&b), n);
+    for level in every_level("matvec_strided_weights_match_reference") {
+        for stored in [Stored::new(&w, k, n, true, 2), Stored::strided(&w, k, n)] {
+            let mut got = vec![f32::NAN; n];
+            matvec_f32_with(level, stored.view(), &x, Some(&b), false, &mut got);
+            assert_within(&got, &want, &bound, n, &format!("{level}: strided matvec"));
+        }
+    }
+}
+
+/// The fused ReLU keeps NaN and turns negative values into +0, and an empty input
+/// gives the bias (then ReLU), at every supported level; the same call twice gives the same
+/// bits.
+#[test]
+fn matvec_relu_edges_and_repeats() {
+    for level in every_level("matvec_relu_edges_and_repeats") {
+        let w = [1.0f32, -1.0, f32::NAN, 0.0, 2.0, -0.0, 1.0, 0.5, 3.0];
+        let x = [1.0f32, 0.0, 0.0];
+        let mut out = [9.0f32; 3];
+        // Row 1 and row 2 are multiplied by 0; the NaN in row 0 reaches output 2.
+        matvec_f32_with(level, rm(&w, 3, 3), &x, None, true, &mut out);
+        assert_eq!(out[0].to_bits(), 1.0f32.to_bits(), "{level}");
+        assert_eq!(out[1].to_bits(), 0.0f32.to_bits(), "{level}");
+        assert!(out[2].is_nan(), "{level}");
+        let mut empty = [9.0f32; 2];
+        let empty_w = MatRef::new(&[], 0, 2, 2, 1).unwrap();
+        matvec_f32_with(level, empty_w, &[], Some(&[-0.5, 0.5]), true, &mut empty);
+        assert_eq!(empty, [0.0, 0.5], "{level}");
+        let mut rng = Rng::seed(23);
+        let (k, n) = (300, 77);
+        let w = random(&mut rng, k * n);
+        let x = random(&mut rng, k);
+        let (mut first, mut again) = (vec![0.0f32; n], vec![0.0f32; n]);
+        matvec_f32_with(level, rm(&w, k, n), &x, None, false, &mut first);
+        matvec_f32_with(level, rm(&w, k, n), &x, None, false, &mut again);
+        assert!(
+            first
+                .iter()
+                .zip(&again)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "{level}"
+        );
+    }
+}
+
+/// `matvec_f32` at the current level matches a hand-worked product.
+#[test]
+fn matvec_f32_uses_a_supported_level() {
+    let w_t = [1.0f32, 2.0, 3.0, 4.0];
+    let mut out = [f32::NAN; 2];
+    matvec_f32(
+        rm(&w_t, 2, 2),
+        &[1.0, 1.0],
+        Some(&[0.5, -10.0]),
+        true,
+        &mut out,
+    );
+    assert_eq!(out, [4.5, 0.0]);
+}
+
+/// Asking the matvec for a level this CPU cannot run panics, naming the level.
+#[test]
+#[should_panic(expected = "cannot run kernel level")]
+fn matvec_with_unsupported_level_panics() {
+    let foreign = if cfg!(target_arch = "aarch64") {
+        Level::Avx2Fma
+    } else {
+        Level::Neon
+    };
+    let mut out = [0.0f32; 2];
+    matvec_f32_with(
+        foreign,
+        rm(&[1.0; 4], 2, 2),
+        &[1.0, 1.0],
+        None,
+        false,
+        &mut out,
+    );
+}
+
+/// A wrong input length panics with the reference's message, at a fast level too.
+#[test]
+#[should_panic(expected = "input has 3 values")]
+fn matvec_with_wrong_input_length_panics() {
+    let mut out = [0.0f32; 2];
+    matvec_f32(rm(&[1.0; 4], 2, 2), &[1.0; 3], None, false, &mut out);
 }

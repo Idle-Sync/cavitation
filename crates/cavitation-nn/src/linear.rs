@@ -1,8 +1,8 @@
 //! `Linear`: a fully connected layer.
 
-use cavitation_core::{ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
+use cavitation_core::{ParamId, ParamStore, ParamValues, Real, Rng, Tape, Tensor, Var};
 
-use crate::{Init, Layer};
+use crate::{InferenceLayer, Init, Layer};
 
 /// A fully connected layer: `y = x · Wᵀ + b`.
 ///
@@ -193,6 +193,37 @@ impl<T: Real> Layer<T> for Linear {
     /// Returns `weight` and `bias`.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         vec![("weight", self.weight), ("bias", self.bias)]
+    }
+
+    /// [`InferenceLayer::Linear`], with the weight copied transposed to
+    /// `[inputs, outputs]`.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the shapes, if the weight in `params` is not `[outputs, inputs]` or
+    /// the bias not `[outputs]`.
+    fn inference(&self, params: &ParamValues<f32>) -> Option<InferenceLayer> {
+        let (w, b) = (params.get(self.weight), params.get(self.bias));
+        let (inputs, outputs) = (self.inputs, self.outputs);
+        assert!(
+            w.shape().dims() == [outputs, inputs] && b.shape().dims() == [outputs],
+            "linear: expected weight [{outputs}, {inputs}] and bias [{outputs}], got {:?} and {:?}",
+            w.shape().dims(),
+            b.shape().dims()
+        );
+        let w = w.data();
+        let mut w_t = vec![0.0f32; inputs * outputs];
+        for (i, row) in w_t.chunks_exact_mut(outputs).enumerate() {
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = w[j * inputs + i];
+            }
+        }
+        Some(InferenceLayer::Linear {
+            w_t,
+            bias: b.data().to_vec(),
+            inputs,
+            outputs,
+        })
     }
 }
 
