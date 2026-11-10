@@ -216,6 +216,12 @@ pub struct Comparison {
     pub numpy: Vec<f64>,
     /// Samples per epoch (training) or calls per round (latency): the work in each timed sample.
     pub work: f64,
+    /// What each side's timed region includes.
+    pub timing_note: String,
+    /// The numpy version that ran the baseline.
+    pub numpy_version: String,
+    /// The BLAS thread setting the baseline saw.
+    pub blas_threads: String,
     /// How to show a median: `epoch`, `samples/s` or `us/call`.
     pub unit: Unit,
 }
@@ -376,6 +382,7 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
     .to_vec();
     let theirs = numpy::run(python, &args)?;
     let steps = data.len().div_ceil(spec.batch);
+    theirs.check("train", steps, spec.epochs)?;
     Ok(Comparison {
         name: spec.name.clone(),
         detail: format!(
@@ -395,6 +402,11 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
         ),
         ours,
         numpy: theirs.samples,
+        timing_note: "ours times the batch copy, the step with its loss value and health \
+                      checks, and end_epoch; numpy times the gradient step only"
+            .to_string(),
+        numpy_version: theirs.numpy_version,
+        blas_threads: theirs.blas_threads,
         work: data.len() as f64,
         unit: spec.unit,
     })
@@ -452,6 +464,7 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
     .map(String::from)
     .to_vec();
     let theirs = numpy::run(python, &args)?;
+    theirs.check("infer", LATENCY_CALLS, LATENCY_ROUNDS)?;
     Ok(Comparison {
         name: "latency".to_string(),
         detail: format!(
@@ -461,6 +474,9 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
         ),
         ours,
         numpy: theirs.samples,
+        timing_note: "both time back-to-back single-input forward passes".to_string(),
+        numpy_version: theirs.numpy_version,
+        blas_threads: theirs.blas_threads,
         work: LATENCY_CALLS as f64,
         unit: Unit::MicrosPerCall,
     })

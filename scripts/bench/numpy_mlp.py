@@ -13,7 +13,9 @@
 # repository root): the four MNIST IDX files, or the digits CSV (first 1,437 rows). Batches
 # are consecutive slices of the data; the last batch of an epoch is the remainder. The JSON
 # line has "kind", "units" (steps per epoch, or calls per round), "samples" (seconds per
-# epoch, or per round) and "median".
+# epoch, or per round), "median", "numpy_version" and "blas_threads" (the BLAS libraries and
+# their thread counts when threadpoolctl is installed, otherwise the thread environment
+# variables). The timed region is the gradient step only (no data copy, loss value or checks).
 import argparse
 import json
 import os
@@ -130,6 +132,22 @@ def infer(args, sizes, rng):
     return args.calls, samples
 
 
+def blas_threads():
+    """Describes the BLAS thread setting: threadpoolctl's view if installed, else the env."""
+    try:
+        from threadpoolctl import threadpool_info
+
+        found = [f"{i.get('internal_api')}:{i.get('num_threads')}" for i in threadpool_info()]
+        if found:
+            return " ".join(found)
+    except ImportError:
+        pass
+    return " ".join(
+        f"{k}={os.environ.get(k, 'unset')}"
+        for k in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS")
+    )
+
+
 def main():
     """Parses the arguments, runs the timing and prints the JSON line."""
     root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data")
@@ -157,6 +175,8 @@ def main():
                 "units": units,
                 "samples": samples,
                 "median": float(np.median(samples)),
+                "numpy_version": np.__version__,
+                "blas_threads": blas_threads(),
             }
         )
     )

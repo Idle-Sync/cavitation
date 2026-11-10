@@ -201,6 +201,12 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
         level(),
         threads()
     );
+    if let Some(first) = rows.first() {
+        println!(
+            "numpy {}, BLAS threads: {}",
+            first.numpy_version, first.blas_threads
+        );
+    }
     println!(
         "{:<24} {:>12} {:>12} {:>10}  unit",
         "run", "cavitation", "numpy", "ratio"
@@ -217,7 +223,7 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
     }
     println!("ratio = numpy time over cavitation time; medians of the timed epochs or rounds.");
     for row in rows {
-        println!("{}: {}", row.name, row.detail);
+        println!("{}: {}; {}", row.name, row.detail, row.timing_note);
     }
     write_results(rows, &load)
 }
@@ -240,11 +246,12 @@ fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
         .iter()
         .map(|r| {
             format!(
-                "    {{\"name\": \"{}\", \"detail\": \"{}\", \"unit\": \"{}\", \
+                "    {{\"name\": \"{}\", \"detail\": \"{}\", \"timing\": \"{}\", \"unit\": \"{}\", \
                  \"cavitation\": {:e}, \"numpy\": {:e}, \"ratio\": {:e},\n     \
                  \"cavitation_seconds\": {}, \"numpy_seconds\": {}}}",
                 escape(&r.name),
                 escape(&r.detail),
+                escape(&r.timing_note),
                 r.unit_label(),
                 r.value(runs::median(&r.ours)),
                 r.value(runs::median(&r.numpy)),
@@ -256,12 +263,14 @@ fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
         .collect();
     let text = format!(
         "{{\n  \"cpu\": \"{}\",\n  \"logical_cores\": {},\n  \"kernel\": \"{}\",\n  \
-         \"threads\": {},\n  \"rustc\": \"{}\",\n  \"load_average\": \"{}\",\n  \"runs\": [\n{}\n  ]\n}}\n",
+         \"threads\": {},\n  \"rustc\": \"{}\",\n  \"numpy_version\": \"{}\",\n  \"blas_threads\": \"{}\",\n  \"load_average\": \"{}\",\n  \"runs\": [\n{}\n  ]\n}}\n",
         escape(&machine.cpu_model),
         machine.logical_cores,
         level(),
         threads(),
         escape(&machine::rustc_version()),
+        escape(rows.first().map_or("", |r| &r.numpy_version)),
+        escape(rows.first().map_or("", |r| &r.blas_threads)),
         load,
         runs.join(",\n")
     );
