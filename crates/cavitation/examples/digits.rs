@@ -8,7 +8,6 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use cavitation::prelude::*;
-use cavitation::{EpochReport, Warning};
 
 /// Loads the digits, trains with Adam, prints accuracy and the time of one inference.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -32,10 +31,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .push(Relu)
         .push(he(128, 10));
 
-    // Health checks stay on. A dead-ReLU warning means a ReLU neuron output zero for every
-    // row of a batch, so it passed no signal and got no gradient on that step. In a network
-    // this size a handful of neurons end up there; it costs little. The warnings are
-    // collected here and summarised at the end instead of printed every epoch.
+    // Health checks stay on. A dead-ReLU warning means a ReLU neuron output exactly 0 for
+    // every sample of an epoch: it passed no signal forward and received no gradient, so
+    // training cannot revive it. The warnings are collected here and summarised at the end
+    // instead of printed every epoch.
     let warnings: Rc<RefCell<Vec<String>>> = Rc::default();
     let sink = Rc::clone(&warnings);
     let health = Health {

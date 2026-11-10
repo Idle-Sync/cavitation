@@ -7,7 +7,6 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use cavitation::prelude::*;
-use cavitation::{EpochReport, Warning};
 
 /// Loads MNIST from `data/mnist/`, trains with Adam, prints the test accuracy.
 fn main() -> ExitCode {
@@ -51,7 +50,8 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
         .push(Relu)
         .push(he(128, 10));
 
-    // Dead-ReLU warnings (a neuron that output zero for a whole batch) are counted and
+    // A dead-ReLU warning means a ReLU neuron output exactly 0 for every sample of an epoch,
+    // so it passed no signal forward and received no gradient. The warnings are counted and
     // summarised at the end rather than printed every epoch.
     let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let counter = std::rc::Rc::clone(&count);

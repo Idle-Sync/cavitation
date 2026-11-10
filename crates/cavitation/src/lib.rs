@@ -4,8 +4,9 @@
 //! builds on the tensor and autograd core and the layers, optimisers and training
 //! crates.
 //!
-//! Everything in those crates is re-exported at the top level, and [`prelude`] gathers
-//! the names most programs need. A complete, small training run:
+//! Both crates are re-exported by name (`cavitation::cavitation_core`,
+//! `cavitation::cavitation_nn`), and [`prelude`] gathers the names most programs need. A
+//! complete, small training run:
 //!
 //! ```
 //! use cavitation::prelude::*;
@@ -29,8 +30,8 @@
 //! println!("cavitation {}", cavitation::VERSION);
 //! ```
 
-pub use cavitation_core::*;
-pub use cavitation_nn::*;
+pub use cavitation_core;
+pub use cavitation_nn;
 
 /// The names most programs need, for `use cavitation::prelude::*;`: tensors and autograd,
 /// layers and activations, optimisers, the training loop, health checks, hooks, inference,
@@ -49,14 +50,14 @@ pub use cavitation_nn::*;
 /// ```
 pub mod prelude {
     pub use cavitation_core::{
-        Graph, ParamStore, Rng, Tape, Tensor, Var, gradcheck, gradcheck_params,
+        Error, Graph, ParamStore, Reduction, Rng, Tape, Tensor, Var, gradcheck, gradcheck_params,
     };
     pub use cavitation_nn::{
-        Activation, Adam, AdamW, Batcher, Celu, Dataset, Elu, FitConfig, Gelu, Glu, Hardsigmoid,
-        Hardswish, Hardtanh, Health, HealthMonitor, Hooks, InferenceModel, Init, Layer, LeakyRelu,
-        Linear, LogSigmoid, LogSoftmax, Loss, Mish, NeuronMask, Optimizer, OptimizerConfig, Prelu,
-        Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, Tanh,
-        Targets, Trainer, accuracy, fit, load, save,
+        Activation, Adam, AdamW, Batcher, Celu, Dataset, Elu, EpochReport, FitConfig, Gelu, Glu,
+        Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, Hooks, InferenceModel, Init,
+        Layer, LeakyRelu, Linear, LogSigmoid, LogSoftmax, Loss, Mish, NeuronMask, Optimizer,
+        OptimizerConfig, Prelu, Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax,
+        Softplus, Softsign, Tanh, Targets, Trace, Trainer, Warning, accuracy, fit, load, save,
     };
 }
 

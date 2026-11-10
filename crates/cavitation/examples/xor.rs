@@ -3,8 +3,10 @@
 //!
 //! Run it with `cargo run --release --example xor -p cavitation`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use cavitation::prelude::*;
-use cavitation::{Error, Reduction, Trace};
 
 /// Prints the values of a tensor view as one short line, to three decimals.
 fn row(values: &[f32]) -> String {
@@ -37,7 +39,16 @@ fn main() -> Result<(), Error> {
 
     let names = net.parameter_names();
     let mut optimizer = Sgd::new(0.5);
-    let mut monitor = HealthMonitor::new(Health::default());
+    // Health checks stay on. Warnings (for example a gradient norm outside the bounds) are
+    // collected here and summarised at the end instead of printed in the middle of the run.
+    let warnings: Rc<RefCell<Vec<String>>> = Rc::default();
+    let sink = Rc::clone(&warnings);
+    let mut monitor = HealthMonitor::new(Health {
+        sink: Some(Box::new(move |w: &Warning| {
+            sink.borrow_mut().push(w.to_string())
+        })),
+        ..Health::default()
+    });
     let mut graph = Graph::new();
     let mut trace = Trace::new();
 
@@ -71,8 +82,15 @@ fn main() -> Result<(), Error> {
     for layer in 0..net.len() {
         hooks.on_forward(layer, move |e| {
             println!("forward  layer {layer} ({})", e.name);
-            println!("  input  (z)    : {}", row(tail(e.input.data())));
-            println!("  output (a)    : {}", row(tail(e.output.data())));
+            // z, a and f'(z) are the names for an activation layer; the layers that
+            // carry no element-wise derivative are the Linear layers.
+            let (z, a) = if e.local_derivative.is_some() {
+                ("input  (z)", "output (a)")
+            } else {
+                ("input     ", "output    ")
+            };
+            println!("  {z}    : {}", row(tail(e.input.data())));
+            println!("  {a}    : {}", row(tail(e.output.data())));
             if let Some(d) = &e.local_derivative {
                 println!("  f'(z)         : {}", row(tail(d.data())));
             }
@@ -99,5 +117,10 @@ fn main() -> Result<(), Error> {
 
     println!("\nPredictions (targets 0, 1, 1, 0):");
     println!("  {}", row(tape.value(out).data()));
+    let warnings = warnings.borrow();
+    match warnings.last() {
+        Some(last) => println!("health: {} warnings; last: {last}", warnings.len()),
+        None => println!("health: no warnings"),
+    }
     Ok(())
 }
