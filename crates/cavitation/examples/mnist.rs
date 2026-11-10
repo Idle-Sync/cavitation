@@ -1,6 +1,8 @@
-//! Trains a 784 -> 256 -> 128 -> 10 ReLU network on MNIST with `fit`, Adam and a cosine
-//! learning-rate schedule, and prints the test accuracy. It needs the data files; run
-//! `scripts/data/get-mnist.sh` once to fetch them.
+//! Trains a 784 -> 1024 -> 256 -> 10 ReLU network (1,068,810 parameters) on MNIST with `fit`,
+//! Adam and a cosine learning-rate schedule, and prints the test accuracy. This is the network
+//! and schedule of the MNIST known-result test, which reaches 98.63% on the 10,000 test images
+//! after 10 epochs. It needs the data files; run `scripts/data/get-mnist.sh` once to fetch
+//! them.
 //!
 //! Run it with `cargo run --release --example mnist -p cavitation`.
 
@@ -47,11 +49,11 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
         )
     };
     let net = Sequential::new()
-        .push(he(784, 256))
+        .push(he(784, 1024))
         .push(Relu)
-        .push(he(256, 128))
+        .push(he(1024, 256))
         .push(Relu)
-        .push(he(128, 10));
+        .push(he(256, 10));
 
     // A dead-ReLU warning means a ReLU neuron output exactly 0 for every sample of an epoch,
     // so it passed no signal forward and received no gradient. The warnings are counted and
