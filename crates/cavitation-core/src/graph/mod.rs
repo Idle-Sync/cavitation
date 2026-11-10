@@ -181,6 +181,8 @@ pub(crate) struct BackwardCtx<'a, T: Real> {
     /// Gradients of the nodes before the one being differentiated; `None` until the first
     /// contribution.
     grads: &'a mut [Option<Vec<T>>],
+    /// The labels recorded by operations that take them (`Tape::push_labels`).
+    labels: &'a [usize],
     /// Where new gradient buffers come from.
     pool: &'a mut Pool<T>,
     /// Parameter gradients, written under the overwrite-then-add rule.
@@ -191,6 +193,12 @@ impl<'a, T: Real> BackwardCtx<'a, T> {
     /// The elements of `v`.
     pub(crate) fn value(&self, v: Var) -> &'a [T] {
         self.values.get(v)
+    }
+
+    /// The labels the tape recorded, all operations' together; an operation reads the range
+    /// it kept the start of.
+    pub(crate) fn labels(&self) -> &'a [usize] {
+        self.labels
     }
 
     /// The shape of `v`.
@@ -277,6 +285,9 @@ pub struct Graph<T: Real = f32> {
     nodes: Vec<Node<T>>,
     /// The gradient of each node after a backward pass; empty between tapes, capacity kept.
     grads: Vec<Option<Vec<T>>>,
+    /// Class labels recorded by the tape's loss operations, for their backward passes; empty
+    /// between tapes, capacity kept.
+    labels: Vec<usize>,
 }
 
 impl Graph<f32> {
@@ -311,6 +322,7 @@ impl<T: Real> Graph<T> {
             pool: Pool::new(),
             nodes: Vec::new(),
             grads: Vec::new(),
+            labels: Vec::new(),
         }
     }
 
@@ -336,10 +348,11 @@ impl<T: Real> Graph<T> {
         }
     }
 
-    /// Returns every node value and gradient buffer to the pool and empties the node lists,
-    /// keeping their capacity.
+    /// Returns every node value and gradient buffer to the pool and empties the node and
+    /// label lists, keeping their capacity.
     fn reclaim(&mut self) {
         self.reclaim_grads();
+        self.labels.clear();
         for node in self.nodes.drain(..) {
             self.pool.give(node.value);
         }
@@ -578,7 +591,9 @@ impl<T: Real> Tape<'_, T> {
             pool,
             nodes,
             grads: node_grads,
+            labels,
         } = &mut *self.graph;
+        let labels: &[usize] = labels;
         node_grads.resize_with(nodes.len(), || None);
         let values = Values {
             tape: self.id,
@@ -588,6 +603,7 @@ impl<T: Real> Tape<'_, T> {
         let mut seed_ctx = BackwardCtx {
             values,
             grads: node_grads,
+            labels,
             pool,
             params: grads,
         };
@@ -602,6 +618,7 @@ impl<T: Real> Tape<'_, T> {
             let mut ctx = BackwardCtx {
                 values,
                 grads: before,
+                labels,
                 pool,
                 params: grads,
             };
@@ -630,6 +647,14 @@ impl<T: Real> Tape<'_, T> {
     /// A pooled buffer of `len` elements with unspecified contents, for a new node's value.
     pub(crate) fn take_buffer(&mut self, len: usize) -> Vec<T> {
         self.graph.pool.take(len)
+    }
+
+    /// Copies `labels` into the graph's label buffer, which keeps its capacity from step to
+    /// step, and returns where they start.
+    pub(crate) fn push_labels(&mut self, labels: &[usize]) -> usize {
+        let start = self.graph.labels.len();
+        self.graph.labels.extend_from_slice(labels);
+        start
     }
 
     /// Appends a node and returns its variable.

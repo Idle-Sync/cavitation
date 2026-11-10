@@ -8,6 +8,7 @@ mod activation;
 mod elementwise;
 mod erf;
 mod glu;
+mod loss;
 mod matmul;
 mod reduce;
 #[cfg(test)]
@@ -19,6 +20,7 @@ pub use activation::GeluApprox;
 use elementwise::Kind;
 pub(crate) use erf::{erf_f32, erf_f64};
 pub use glu::Gate;
+pub use loss::Reduction;
 
 /// A recorded operation: what produced a node, with its inputs and anything its backward
 /// pass needs, stored inline so that recording never allocates.
@@ -84,6 +86,15 @@ pub(crate) enum Op {
     Prelu(Var, Var),
     /// A gated linear unit: the last axis split into value and gate halves.
     Glu(Var, Gate),
+    /// Softmax over the last axis.
+    Softmax(Var),
+    /// Log-softmax over the last axis.
+    LogSoftmax(Var),
+    /// Softmax cross-entropy of `[batch, classes]` logits: the reduction, and where the
+    /// batch's labels start in the graph's label buffer.
+    SoftmaxCrossEntropy(Var, Reduction, usize),
+    /// Mean squared error of prediction and target: the reduction.
+    Mse(Var, Var, Reduction),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -132,6 +143,12 @@ impl Op {
             Op::LogSigmoid(a) => activation::log_sigmoid_backward(a, out_grad, ctx),
             Op::Prelu(a, slope) => activation::prelu_backward(a, slope, out_grad, ctx),
             Op::Glu(a, gate) => glu::backward(a, gate, out_grad, ctx),
+            Op::Softmax(a) => loss::softmax_backward(a, out, out_grad, ctx),
+            Op::LogSoftmax(a) => loss::log_softmax_backward(a, out, out_grad, ctx),
+            Op::SoftmaxCrossEntropy(a, reduction, labels) => {
+                loss::cross_entropy_backward(a, reduction, labels, out_grad, ctx)
+            }
+            Op::Mse(p, t, reduction) => loss::mse_backward(p, t, reduction, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]

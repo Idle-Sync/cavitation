@@ -1,7 +1,7 @@
 //! Gradient checks of the operations, through the numerical check harness.
 
 use cavitation_core::{
-    Gate, GeluApprox, GradcheckReport, ParamStore, Rng, Tape, Tensor, Var, gradcheck,
+    Gate, GeluApprox, GradcheckReport, ParamStore, Reduction, Rng, Tape, Tensor, Var, gradcheck,
     gradcheck_params,
 };
 
@@ -314,4 +314,70 @@ fn gradcheck_glu() {
         let report = gradcheck(|t, v| t.glu(v[0], gate), &x);
         assert!(report.passed(), "glu {gate:?}: {report:?}");
     }
+}
+
+/// A deterministic tensor of the given shape with entries in `[-2, 2]`.
+fn spread(dims: &[usize], seed: u64) -> Tensor<f64> {
+    let mut rng = Rng::seed(seed);
+    let n: usize = dims.iter().product();
+    Tensor::from_vec((0..n).map(|_| rng.range(-2.0, 2.0)).collect(), dims).unwrap()
+}
+
+/// Every reduction, for the loss checks.
+const REDUCTIONS: [Reduction; 4] = [
+    Reduction::None,
+    Reduction::Sum,
+    Reduction::Mean,
+    Reduction::BatchMean,
+];
+
+/// Softmax and log-softmax have the right gradient on a `[3, 4]` input.
+#[test]
+fn gradcheck_softmax_and_log_softmax() {
+    let x = [spread(&[3, 4], 10)];
+    gradcheck(|t, v| t.softmax(v[0]), &x).assert_passed();
+    gradcheck(|t, v| t.log_softmax(v[0]), &x).assert_passed();
+}
+
+/// Softmax cross-entropy has the right gradient under every reduction.
+#[test]
+fn gradcheck_softmax_cross_entropy() {
+    let x = [spread(&[5, 3], 11)];
+    let labels = [0usize, 2, 1, 1, 0];
+    for r in REDUCTIONS {
+        let report = gradcheck(|t, v| t.softmax_cross_entropy(v[0], &labels, r), &x);
+        assert!(report.passed(), "cross-entropy {r:?}: {report:?}");
+    }
+}
+
+/// MSE has the right gradient for the prediction and the target under every reduction.
+#[test]
+fn gradcheck_mse() {
+    let x = [spread(&[2, 3], 12), spread(&[2, 3], 13)];
+    for r in REDUCTIONS {
+        let report = gradcheck(|t, v| t.mse(v[0], v[1], r), &x);
+        assert!(report.passed(), "mse {r:?}: {report:?}");
+    }
+}
+
+/// Gradients from several losses on the same logits add up (the second contribution takes
+/// the add path), and a loss through a softmax layer is checked end to end.
+#[test]
+fn gradcheck_losses_sharing_an_input() {
+    let x = [spread(&[4, 3], 14)];
+    let labels = [2usize, 0, 1, 2];
+    let report = gradcheck(
+        |t, v| {
+            let ce = t.softmax_cross_entropy(v[0], &labels, Reduction::Mean);
+            let ls = t.log_softmax(v[0]);
+            let total = t.sum(ls);
+            let sm = t.softmax(v[0]);
+            let target = t.softmax(ls);
+            let err = t.mse(sm, target, Reduction::Sum);
+            let a = t.add(ce, total);
+            t.add(a, err)
+        },
+        &x,
+    );
+    assert!(report.passed(), "shared logits: {report:?}");
 }

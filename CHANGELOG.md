@@ -15,3 +15,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `sum`, `sum_axis`, `mean`, `mean_axis`, `relu`, `leaky_relu`, `tanh`, `sigmoid` and `gelu` (exact and tanh forms, `GeluApprox`) on the tape, and `Real::erf` (ported from FreeBSD msun).
 - `elu`, `selu`, `celu`, `silu`, `mish`, `softplus`, `softsign`, `hardtanh`, `relu6`, `hardsigmoid`, `hardswish`, `log_sigmoid` and `prelu` on the tape, following PyTorch's definitions and boundary conventions; `relu` and the clamp family now pass NaN through instead of turning it into 0.
 - `glu` on the tape with `Gate`: GLU (sigmoid, as PyTorch `F.glu`), GeGLU, ReGLU and SwiGLU, splitting the last axis; NaN passes through every gate.
+- `softmax`, `log_softmax`, `softmax_cross_entropy` and `mse` on the tape, with `Reduction` (`Mean`, `Sum`, `None`, `BatchMean`); cross-entropy is fused, uses the log-sum-exp form and gives a NaN loss for NaN logits.
