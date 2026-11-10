@@ -658,9 +658,10 @@ impl<T: Real> Tape<'_, T> {
     }
 
     /// The number of logarithms that `binary_cross_entropy` clamped at -100 while recording
-    /// on this tape (see [`Tape::binary_cross_entropy`]). It starts at 0 on every new tape,
-    /// so a clamp is never silent: the health checks read it and turn a non-zero count into a
-    /// warning.
+    /// on this tape and that carry weight: `ln p` with a non-zero target, `ln(1 - p)` with a
+    /// target other than 1 (see [`Tape::binary_cross_entropy`]). A saturated correct
+    /// prediction is not counted. It starts at 0 on every new tape; the health checks read it
+    /// and turn a non-zero count into a warning.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Reduction, Tensor};

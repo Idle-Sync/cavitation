@@ -392,16 +392,20 @@ impl<T: Real> Tape<'_, T> {
     /// Records the binary cross-entropy `-[t ln p + (1 - t) ln(1 - p)]` of probabilities
     /// `probs` against `target`, elementwise, reduced by `reduction`. Each logarithm is
     /// clamped to be at least -100, as PyTorch does, so `p = 0` or `p = 1` gives a finite
-    /// loss (100 for a wrong certain prediction). Every clamped logarithm adds one to
-    /// [`Tape::clamped_logs`], which the health checks read, so a clamp is never silent.
-    /// NaN in `probs` or `target` gives a NaN loss, and a NaN is not a clamp.
+    /// loss (100 for a wrong certain prediction). A clamped logarithm adds one to
+    /// [`Tape::clamped_logs`], which the health checks read, only when it carries weight:
+    /// `ln p` when `t` is not 0, `ln(1 - p)` when `1 - t` is not 0. A saturated correct
+    /// prediction (`p = 0, t = 0` or `p = 1, t = 1`) is not counted, since the clamp does not
+    /// change its loss. A NaN weight counts nothing, and a NaN `p` is not a clamp. NaN in
+    /// `probs` or `target` gives a NaN loss.
     ///
     /// The unreduced loss has the shape of `probs`. For [`Reduction::BatchMean`] the batch is
     /// the first dimension. Both inputs take gradients. For `probs` the gradient per element
     /// is `(p - t) / (p (1 - p))` times the upstream gradient and the reduction's factor,
     /// where neither logarithm was clamped. Where one was clamped, its term is constant and
     /// contributes 0, so only the other term's derivative remains (`-t / p` or
-    /// `(1 - t) / (1 - p)`); this never divides by zero. For `target` the gradient is
+    /// `(1 - t) / (1 - p)`); this never divides by zero. This differs from PyTorch, which
+    /// divides by `max(p (1 - p), 1e-12)` and so gives a large finite gradient there. For `target` the gradient is
     /// `ln(1 - p) - ln p` with the clamped logarithms.
     ///
     /// # Panics
@@ -426,7 +430,9 @@ impl<T: Real> Tape<'_, T> {
         let (shape, out) =
             self.pairwise_loss("binary_cross_entropy", probs, target, reduction, |p, t| {
                 let (lp, lq) = (clamped_ln(p), clamped_ln(T::ONE - p));
-                clamped += usize::from(lp.1) + usize::from(lq.1);
+                let weighted = |w: T| w != T::ZERO && !is_nan(w);
+                clamped +=
+                    usize::from(lp.1 && weighted(t)) + usize::from(lq.1 && weighted(T::ONE - t));
                 -(t * lp.0 + (T::ONE - t) * lq.0)
             });
         self.add_clamped_logs(clamped);
@@ -1241,9 +1247,17 @@ mod tests {
             let p = tape.input(Tensor::from_vec(vec![0.0, 1.0, 0.5], &[3]).unwrap().view());
             let t = tape.input(Tensor::from_vec(vec![1.0, 1.0, 1.0], &[3]).unwrap().view());
             tape.binary_cross_entropy(p, t, Reduction::Sum);
-            assert_eq!(tape.clamped_logs(), 2);
+            assert_eq!(tape.clamped_logs(), 1);
         }
         assert_eq!(graph.tape(&store.values).clamped_logs(), 0);
+    }
+
+    /// A saturated correct prediction clamps a logarithm that has weight 0, so it is not
+    /// counted.
+    #[test]
+    fn bce_saturated_correct_prediction_counts_zero() {
+        assert_eq!(bce_one(0.0, 0.0), (0.0, 0));
+        assert_eq!(bce_one(1.0, 1.0), (0.0, 0));
     }
 
     /// NaN in the probability or the target gives a NaN loss, and a NaN is not a clamp.
