@@ -60,6 +60,9 @@ pub enum Error {
         /// Where it appeared, for example a parameter name.
         location: String,
     },
+    /// Training data that does not suit the model or the loss, for example class labels
+    /// for a loss that needs target values, or a label the model has no output for.
+    InvalidData(String),
     /// The request is valid but not supported.
     Unsupported(String),
 }
@@ -91,6 +94,7 @@ impl fmt::Display for Error {
             Error::NonFinite { step, location } => {
                 write!(f, "non-finite value at step {step} in {location}")
             }
+            Error::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             Error::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }

@@ -709,13 +709,13 @@ impl fmt::Debug for FitConfig {
 /// per row.
 fn check_dataset(data: &Dataset) -> Result<(), Error> {
     let &[rows, _] = data.x.shape().dims() else {
-        return Err(Error::Format(format!(
+        return Err(Error::InvalidData(format!(
             "the inputs must have shape [rows, features], found {:?}",
             data.x.shape().dims()
         )));
     };
     if rows == 0 {
-        return Err(Error::Format("the data set has no rows".to_string()));
+        return Err(Error::InvalidData("the data set has no rows".to_string()));
     }
     match &data.targets {
         Targets::Classes(labels) if labels.len() != rows => Err(Error::ShapeMismatch {
@@ -728,11 +728,61 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
                 expected: vec![rows, outputs],
                 found: t.shape().dims().to_vec(),
             }),
-            dims => Err(Error::Format(format!(
+            dims => Err(Error::InvalidData(format!(
                 "value targets must have shape [rows, outputs], found {dims:?}"
             ))),
         },
         Targets::Classes(_) => Ok(()),
+    }
+}
+
+/// Checks, before any training, that `model` and `loss` suit `data` (already passed by
+/// [`check_dataset`]): the inputs are as wide as each layer that names an input width
+/// expects, the kind of targets is the kind `loss` needs, every class label is below the
+/// model's output width, and value targets are as wide as the model's output.
+fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Result<(), Error> {
+    let (rows, mut width) = (data.len(), data.features());
+    for i in 0..model.len() {
+        let layer = model.layer(i);
+        if let Some(expected) = layer.input_width()
+            && expected != width
+        {
+            if i == 0 {
+                return Err(Error::ShapeMismatch {
+                    expected: vec![rows, expected],
+                    found: vec![rows, width],
+                });
+            }
+            // The layers themselves disagree: a model error, which the forward pass reports
+            // with both layers named.
+            break;
+        }
+        width = layer.output_width(width);
+    }
+    let kind = |classes: bool| if classes { "class" } else { "value" };
+    let has_classes = matches!(data.targets, Targets::Classes(_));
+    if loss.needs_classes() != has_classes {
+        return Err(Error::InvalidData(format!(
+            "Loss::{loss:?} needs {} targets, but the data has {} targets",
+            kind(loss.needs_classes()),
+            kind(has_classes)
+        )));
+    }
+    match &data.targets {
+        Targets::Classes(labels) => match labels.iter().position(|&l| l >= width) {
+            Some(row) => Err(Error::InvalidData(format!(
+                "the label of row {row} is {}, but the model has {width} outputs (classes 0..{width})",
+                labels[row]
+            ))),
+            None => Ok(()),
+        },
+        Targets::Values(t) => match t.shape().dims() {
+            &[_, outputs] if outputs != width => Err(Error::ShapeMismatch {
+                expected: vec![rows, width],
+                found: t.shape().dims().to_vec(),
+            }),
+            _ => Ok(()),
+        },
     }
 }
 
@@ -745,9 +795,12 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// Returns, before training, [`Error::Format`] if `train.x` is not a matrix or has no rows
-/// (or value targets are not a matrix), and [`Error::ShapeMismatch`] if the targets do not
-/// have one entry per row. During training, with `config.health.on_non_finite` set to
+/// Returns, before training, [`Error::InvalidData`] if `train.x` is not a matrix or has no
+/// rows, if value targets are not a matrix, if the kind of targets is not the kind
+/// `config.loss` needs (see [`Loss`]), or if a class label is not below the model's output
+/// width; and [`Error::ShapeMismatch`] if the targets do not have one entry per row, value
+/// targets are not as wide as the model's output, or the inputs are not as wide as the
+/// first layer expects. During training, with `config.health.on_non_finite` set to
 /// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`] at
 /// the first step whose loss or gradient is NaN or infinite, naming the step and `"loss"` or
 /// the parameter (for example `"0.weight"`), after sending the matching warning to the
@@ -756,8 +809,8 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 ///
 /// # Panics
 ///
-/// Panics if `config.batch` is 0, and as [`Trainer::step`] does: when the targets do not
-/// suit the loss or the shapes do not fit the model.
+/// Panics if `config.batch` is 0, and as [`Trainer::step`] does when the layers' shapes do
+/// not fit one another.
 ///
 /// # Examples
 ///
@@ -826,6 +879,7 @@ pub fn fit_with_hooks(
     hooks: &mut Hooks<'_>,
 ) -> Result<History, Error> {
     check_dataset(train)?;
+    check_model_and_loss(model, config.loss, train)?;
     let mut trainer =
         Trainer::with_boxed(model, config.optimizer.build(), config.loss, config.batch);
     trainer.set_health(config.health);
@@ -1286,6 +1340,68 @@ mod tests {
             targets: Targets::Classes(vec![]),
         };
         assert!(fit(&net, &mut params, &empty, FitConfig::default()).is_err());
+        assert_eq!(parameter_bits(&net, &params), before);
+    }
+
+    /// `fit` returns an error, before training and without panicking, when the targets do
+    /// not suit the loss, a class label is not below the model's output width, value targets
+    /// are not as wide as the model's output, or the inputs are not as wide as the first
+    /// layer expects.
+    #[test]
+    fn fit_rejects_data_that_does_not_suit_the_loss_or_the_model() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0)));
+        let before = parameter_bits(&net, &params);
+        let mse = || FitConfig {
+            loss: Loss::Mse,
+            ..FitConfig::default()
+        };
+        let cases: [(Dataset, FitConfig, &str); 5] = [
+            (
+                Dataset {
+                    x: Tensor::zeros(&[4, 3]),
+                    targets: Targets::Values(Tensor::zeros(&[4, 2])),
+                },
+                FitConfig::default(),
+                "invalid data: Loss::CrossEntropy needs class targets, but the data has value targets",
+            ),
+            (
+                classes_dataset(4),
+                mse(),
+                "invalid data: Loss::Mse needs value targets, but the data has class targets",
+            ),
+            (
+                Dataset {
+                    x: Tensor::zeros(&[4, 3]),
+                    targets: Targets::Classes(vec![0, 1, 2, 1]),
+                },
+                FitConfig::default(),
+                "invalid data: the label of row 2 is 2, but the model has 2 outputs (classes 0..2)",
+            ),
+            (
+                Dataset {
+                    x: Tensor::zeros(&[4, 3]),
+                    targets: Targets::Values(Tensor::zeros(&[4, 1])),
+                },
+                mse(),
+                "shape mismatch: expected [4, 2], found [4, 1]",
+            ),
+            (
+                Dataset {
+                    x: Tensor::zeros(&[4, 5]),
+                    targets: Targets::Classes(vec![0; 4]),
+                },
+                FitConfig::default(),
+                "shape mismatch: expected [4, 3], found [4, 5]",
+            ),
+        ];
+        for (data, config, message) in cases {
+            let result = catch_unwind(AssertUnwindSafe(|| fit(&net, &mut params, &data, config)));
+            let err = result
+                .expect("fit returns the error instead of panicking")
+                .unwrap_err();
+            assert_eq!(err.to_string(), message);
+        }
         assert_eq!(parameter_bits(&net, &params), before);
     }
 
