@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/cavitation-core",
+    "crates/cavitation-nn",
+    "crates/cavitation",
+    "crates/cavitation-datasets",
+    "crates/cavitation-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+missing_docs_in_private_items = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.release]
+debug = 1
+lto = "thin"
+
+[profile.test]
+opt-level = 2
+
+[profile.bench]
+inherits = "release"

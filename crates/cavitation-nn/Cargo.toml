@@ -1,0 +1,10 @@
+[package]
+name = "cavitation-nn"
+description = "Layers, optimisers and training for the cavitation neural network library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+

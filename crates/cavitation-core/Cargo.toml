@@ -1,0 +1,10 @@
+[package]
+name = "cavitation-core"
+description = "Tensors, automatic differentiation and CPU kernels for the cavitation neural network library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
