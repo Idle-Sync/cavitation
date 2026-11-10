@@ -62,6 +62,9 @@ fn tape_steady_state() -> usize {
     let big = store.add(Tensor::full(&[3, 4], 2.0f32));
     let x = Tensor::from_vec(vec![3.0f32], &[1]).unwrap();
     let wide = Tensor::full(&[3, 4], 1.0f32);
+    let row = store.add(Tensor::full(&[4], 0.5f32));
+    let col = store.add(Tensor::full(&[3, 1], 0.25f32));
+    let cell = Tensor::full(&[1, 1], 2.0f32);
     let mut graph = Graph::new();
     let mut sink = 0.0f32;
     let mut before = 0;
@@ -87,6 +90,31 @@ fn tape_steady_state() -> usize {
             let s = tape.add(w, p);
             let t = tape.add(s, s);
             sink += tape.value(t).data()[11];
+        }
+        {
+            // Broadcast add (the bias add), outer-product sub, broadcast mul and scale on
+            // larger tensors, forward only.
+            let mut tape = graph.tape(&store.values);
+            let w = tape.input(wide.view());
+            let (r, c) = (tape.param(row), tape.param(col));
+            let h = tape.add(w, r);
+            let d = tape.sub(h, c);
+            let m = tape.mul(d, r);
+            let out = tape.scale(m, 0.5);
+            sink += tape.value(out).data()[11];
+        }
+        {
+            // The same operations with a backward pass, on shapes that broadcast to one
+            // element, so each input's gradient is reduced through a scratch buffer.
+            let mut tape = graph.tape(&store.values);
+            let xi = tape.input(cell.view());
+            let (a, b) = (tape.param(p1), tape.param(p2));
+            let h = tape.add(xi, a);
+            let d = tape.sub(h, b);
+            let m = tape.mul(d, a);
+            let loss = tape.scale(m, 0.5);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0];
         }
         sink += store.grad(p1).data()[0] + store.grad(big).data()[0];
     }

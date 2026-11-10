@@ -49,3 +49,47 @@ fn weighting_is_deterministic() {
     };
     assert_eq!(run(), run());
 }
+
+/// A deterministic tensor of the given shape with entries away from zero.
+fn filled(dims: &[usize], seed: f64) -> Tensor<f64> {
+    let n: usize = dims.iter().product();
+    let data = (0..n)
+        .map(|i| 0.3 + 0.17 * ((i as f64 * 1.7 + seed).sin() + 1.5))
+        .collect();
+    Tensor::from_vec(data, dims).unwrap()
+}
+
+/// Shape pairs for the broadcasting checks.
+const BROADCAST_CASES: [(&[usize], &[usize]); 4] = [
+    (&[3, 4], &[3, 4]),
+    (&[3, 4], &[4]),
+    (&[3, 1], &[1, 4]),
+    (&[], &[5]),
+];
+
+/// `add`, `sub` and `mul` have the right gradient for both inputs under broadcasting.
+#[test]
+fn gradcheck_broadcast_binary_ops() {
+    type Build = fn(&mut Tape<'_, f64>, &[Var]) -> Var;
+    let builds: [(&str, Build); 3] = [
+        ("add", |t, v| t.add(v[0], v[1])),
+        ("sub", |t, v| t.sub(v[0], v[1])),
+        ("mul", |t, v| t.mul(v[0], v[1])),
+    ];
+    for (name, build) in builds {
+        for (sa, sb) in BROADCAST_CASES {
+            for (da, db) in [(sa, sb), (sb, sa)] {
+                let inputs = [filled(da, 0.3), filled(db, 1.1)];
+                let report = gradcheck(build, &inputs);
+                assert!(report.passed(), "{name} {da:?} {db:?}: {report:?}");
+            }
+        }
+    }
+}
+
+/// `scale` has the right gradient.
+#[test]
+fn gradcheck_scale() {
+    let report = gradcheck(|t, v| t.scale(v[0], -2.5), &[filled(&[2, 3], 0.7)]);
+    report.assert_passed();
+}

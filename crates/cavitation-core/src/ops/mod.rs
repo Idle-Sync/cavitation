@@ -10,6 +10,7 @@ mod wrong;
 
 use crate::Real;
 use crate::graph::{BackwardCtx, ParamId, Var};
+use elementwise::Kind;
 
 /// A recorded operation: what produced a node, with its inputs and anything its backward
 /// pass needs, stored inline so that recording never allocates.
@@ -19,8 +20,14 @@ pub(crate) enum Op {
     Input,
     /// A parameter read in place from the borrowed parameter values.
     Param(ParamId),
-    /// Elementwise `a + b` of two values of the same shape.
+    /// Elementwise `a + b`, broadcasting.
     Add(Var, Var),
+    /// Elementwise `a - b`, broadcasting.
+    Sub(Var, Var),
+    /// Elementwise `a * b`, broadcasting.
+    Mul(Var, Var),
+    /// Every element of the value times a scalar, kept as `f64` (exact for f32 and f64).
+    Scale(Var, f64),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
@@ -38,7 +45,10 @@ impl Op {
     pub(crate) fn backward<T: Real>(&self, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
         match *self {
             Op::Input | Op::Param(_) => {}
-            Op::Add(a, b) => elementwise::add_backward(a, b, out_grad, ctx),
+            Op::Add(a, b) => elementwise::binary_backward(Kind::Add, a, b, out_grad, ctx),
+            Op::Sub(a, b) => elementwise::binary_backward(Kind::Sub, a, b, out_grad, ctx),
+            Op::Mul(a, b) => elementwise::binary_backward(Kind::Mul, a, b, out_grad, ctx),
+            Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
             #[cfg(test)]

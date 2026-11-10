@@ -129,6 +129,36 @@ impl<T: Real> GradSlot<'_, T> {
     }
 }
 
+impl<T: Real> GradSlot<'_, T> {
+    /// Contributes `scale * src`: writes it when overwriting, adds it otherwise. A
+    /// parameter's gradient becomes current only after the write.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src` and the buffer differ in length, before writing anything.
+    pub(crate) fn add_scaled_from(self, src: &[T], scale: T) {
+        assert_eq!(
+            self.buf.len(),
+            src.len(),
+            "gradient length {} does not match the value's length {}",
+            src.len(),
+            self.buf.len()
+        );
+        if self.overwrite {
+            for (d, &s) in self.buf.iter_mut().zip(src) {
+                *d = scale * s;
+            }
+        } else {
+            for (d, &s) in self.buf.iter_mut().zip(src) {
+                *d += scale * s;
+            }
+        }
+        if let Some(stale) = self.stale {
+            *stale = false;
+        }
+    }
+}
+
 /// What an operation's backward pass writes into: the gradients of the nodes recorded
 /// before it, and the parameter gradients.
 pub(crate) struct BackwardCtx<'a, T: Real> {
@@ -141,6 +171,37 @@ pub(crate) struct BackwardCtx<'a, T: Real> {
     pool: &'a mut Pool<T>,
     /// Parameter gradients, written under the overwrite-then-add rule.
     params: &'a mut ParamGrads<T>,
+}
+
+impl<'a, T: Real> BackwardCtx<'a, T> {
+    /// The elements of `v`.
+    pub(crate) fn value(&self, v: Var) -> &'a [T] {
+        self.values.get(v)
+    }
+
+    /// The shape of `v`.
+    pub(crate) fn shape(&self, v: Var) -> Shape {
+        self.values.nodes[v.index_on(self.values.tape)].shape
+    }
+
+    /// Whether `v` takes a gradient: everything but an input does.
+    pub(crate) fn takes_grad(&self, v: Var) -> bool {
+        !matches!(
+            self.values.nodes[v.index_on(self.values.tape)].op,
+            Op::Input
+        )
+    }
+
+    /// A pooled scratch buffer of `len` elements with unspecified contents; give it back
+    /// with [`release`](Self::release).
+    pub(crate) fn scratch(&mut self, len: usize) -> Vec<T> {
+        self.pool.take(len)
+    }
+
+    /// Returns a scratch buffer to the pool.
+    pub(crate) fn release(&mut self, buf: Vec<T>) {
+        self.pool.give(buf);
+    }
 }
 
 impl<T: Real> BackwardCtx<'_, T> {

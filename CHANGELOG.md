@@ -10,3 +10,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - Strided matrix views (`MatRef`, `MatMut`) and reference `gemm` and `matvec` kernels in `cavitation-core`.
 - Reverse-mode autograd in `cavitation-core`: `Graph`, `Tape` and `Var`, the `ParamStore` for parameters and their gradients, and the first operation, `add`.
 - `gradcheck` and `gradcheck_params`: a numerical gradient check in `f64` (central differences) with a report of every element outside the tolerance.
+- `sub`, `mul` and `scale` on the tape, and NumPy-style broadcasting for `add`, `sub` and `mul` (with a fast path for the bias add).
