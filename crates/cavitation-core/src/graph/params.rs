@@ -299,6 +299,14 @@ impl<T: Real> ParamStore<T> {
         id
     }
 
+    /// Removes every parameter added after the first `len`, with its gradient. The shared
+    /// zeros buffer keeps its size. Does nothing if the store holds `len` or fewer.
+    pub(crate) fn truncate(&mut self, len: usize) {
+        self.values.tensors.truncate(len);
+        self.grads.tensors.truncate(len);
+        self.grads.stale.truncate(len);
+    }
+
     /// The number of parameters.
     ///
     /// ```

@@ -43,7 +43,7 @@ pub struct GradcheckFailure {
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradcheckReport {
     /// The largest `|numeric - analytic|` over all checked elements (infinite if any
-    /// gradient is not a number).
+    /// gradient is infinite or not a number).
     pub worst_abs: f64,
     /// The largest `|numeric - analytic| / max(|numeric|, |analytic|, 1e-7)`.
     pub worst_rel: f64,
@@ -97,8 +97,9 @@ impl GradcheckReport {
 ///
 /// `build` records the computation on the tape from one variable per input and returns
 /// its output, of any shape. The loss is the sum of the output's elements, each multiplied
-/// by a fixed pseudo-random weight in `[-1, 1]` (the same weights every run), so every
-/// output element affects the check.
+/// by a fixed pseudo-random weight (the same weights every run) whose magnitude lies in
+/// `[0.5, 1]` and whose sign is random, so every output element affects the check at full
+/// strength.
 ///
 /// # Panics
 ///
@@ -122,10 +123,10 @@ pub fn gradcheck(
 /// `|numeric - analytic| <= 1e-7 + 1e-5 * max(|numeric|, |analytic|)`).
 ///
 /// The inputs are added to `params` as extra parameters so that they receive gradients;
-/// they stay in the store afterwards. `build` receives one variable per input, in order,
+/// they are removed again before the call returns, so the store is unchanged. `build` receives one variable per input, in order,
 /// and reads the parameters it needs through their [`ParamId`]s. Parameter values are
 /// perturbed in place and restored exactly. The store's gradients are zeroed before and
-/// after the check.
+/// after the analytic pass.
 ///
 /// Failures name checked tensors by position: the parameters that were in the store
 /// before the call come first, then the inputs.
@@ -150,6 +151,7 @@ pub fn gradcheck_params(
     inputs: &[Tensor<f64>],
     build: impl Fn(&mut Tape<'_, f64>, &[Var]) -> Var,
 ) -> GradcheckReport {
+    let original_len = params.len();
     let mut checked: Vec<ParamId> = params.iter_mut().map(|(id, _, _)| id).collect();
     let input_ids: Vec<ParamId> = inputs.iter().map(|x| params.add(x.clone())).collect();
     checked.extend(&input_ids);
@@ -164,7 +166,14 @@ pub fn gradcheck_params(
         let out = build(&mut tape, &vars);
         let mut rng = Rng::seed(0);
         let w: Vec<f64> = (0..tape.shape(out).len())
-            .map(|_| rng.range(-1.0, 1.0))
+            .map(|_| {
+                let magnitude = rng.range(0.5, 1.0);
+                if rng.uniform_f64() < 0.5 {
+                    -magnitude
+                } else {
+                    magnitude
+                }
+            })
             .collect();
         tape.backward_seeded(out, &w, &mut params.grads);
         w
@@ -208,15 +217,16 @@ pub fn gradcheck_params(
 
             let diff = (numeric - analytic).abs();
             let scale = numeric.abs().max(analytic.abs());
-            let (abs_err, rel_err) = if diff.is_nan() {
+            let finite = numeric.is_finite() && analytic.is_finite();
+            let (abs_err, rel_err) = if !finite {
                 (f64::INFINITY, f64::INFINITY)
             } else {
                 (diff, diff / scale.max(REL_FLOOR))
             };
             report.worst_abs = report.worst_abs.max(abs_err);
             report.worst_rel = report.worst_rel.max(rel_err);
-            // A NaN difference fails.
-            if diff.is_nan() || diff > ABS_TOL + REL_TOL * scale {
+            // A gradient that is not finite always fails.
+            if !finite || diff > ABS_TOL + REL_TOL * scale {
                 report.failures.push(GradcheckFailure {
                     input: k,
                     index,
@@ -226,6 +236,7 @@ pub fn gradcheck_params(
             }
         }
     }
+    params.truncate(original_len);
     report
 }
 
@@ -274,6 +285,44 @@ mod tests {
             &[Tensor::from_vec(vec![f64::NAN], &[1]).unwrap()],
         );
         assert!(!report.passed());
+    }
+
+    /// An infinite analytic gradient fails.
+    #[test]
+    fn infinite_analytic_gradient_fails() {
+        let report = gradcheck(|tape, v| tape.infinite_grad(v[0]), &[t(&[1.0, 2.0])]);
+        assert_eq!(report.failures.len(), 2);
+        assert!(report.worst_abs.is_infinite());
+    }
+
+    /// A forward pass that overflows for a perturbed input gives a non-finite numeric
+    /// gradient, which fails.
+    #[test]
+    fn infinite_numeric_gradient_fails() {
+        let report = gradcheck(|tape, v| tape.blow_up(v[0]), &[t(&[1.0])]);
+        assert!(!report.passed());
+        assert!(!report.failures[0].numeric.is_finite());
+    }
+
+    /// The store keeps its length and values, and repeated calls report the same indices.
+    #[test]
+    fn gradcheck_params_leaves_store_unchanged() {
+        let mut params = ParamStore::<f64>::new_generic();
+        let p = params.add(t(&[1.0, 2.0]));
+        let run = |params: &mut ParamStore<f64>| {
+            gradcheck_params(params, &[t(&[3.0, 4.0])], |tape, v| {
+                let w = tape.param(p);
+                let w = tape.wrong_identity(w);
+                let x = tape.wrong_identity(v[0]);
+                tape.add(w, x)
+            })
+        };
+        let first = run(&mut params);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params.value(p).data(), &[1.0, 2.0]);
+        let second = run(&mut params);
+        assert_eq!(first, second);
+        assert_eq!(params.len(), 1);
     }
 
     /// The panic message lists failures and the worst errors.

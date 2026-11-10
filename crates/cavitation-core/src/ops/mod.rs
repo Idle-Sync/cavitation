@@ -24,6 +24,12 @@ pub(crate) enum Op {
     /// Test only: the identity, whose backward pass returns twice the true gradient.
     #[cfg(test)]
     WrongIdentity(Var),
+    /// Test only: the identity, whose backward pass returns infinity.
+    #[cfg(test)]
+    InfiniteGrad(Var),
+    /// Test only: `x` where `x == 1`, infinity elsewhere; its backward pass is the identity's.
+    #[cfg(test)]
+    BlowUp(Var),
 }
 
 impl Op {
@@ -35,6 +41,10 @@ impl Op {
             Op::Add(a, b) => elementwise::add_backward(a, b, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),
+            #[cfg(test)]
+            Op::InfiniteGrad(a) => wrong::infinite_backward(a, out_grad, ctx),
+            #[cfg(test)]
+            Op::BlowUp(a) => wrong::blow_up_backward(a, out_grad, ctx),
         }
     }
 }

@@ -37,8 +37,8 @@ fn gradcheck_params_checks_parameters() {
     // The parameter's value is restored exactly.
     assert_eq!(params.value(p).data(), &[1.0, 2.0]);
 
-    // The input was appended to the store as an extra parameter.
-    assert_eq!(params.len(), 2);
+    // The input is not left in the store.
+    assert_eq!(params.len(), 1);
 }
 
 /// Two runs give identical reports.
