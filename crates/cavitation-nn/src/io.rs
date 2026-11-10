@@ -25,6 +25,11 @@ fn convert(path: &Path, err: SafeTensorError) -> Error {
 /// `[outputs, inputs]` weight layout are those of a PyTorch `state_dict`, so the file loads
 /// with `safetensors.torch.load_file` into the same network built in PyTorch.
 ///
+/// The file is written to a temporary file in the same folder and then renamed over
+/// `path`, so a failed save leaves no partial file. On Unix the temporary file is created
+/// with mode 0600 and keeps it through the rename, so the saved file can be read only by
+/// its owner; widen it with [`std::fs::set_permissions`] if another user must read it.
+///
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the file cannot be written.
@@ -46,7 +51,12 @@ fn convert(path: &Path, err: SafeTensorError) -> Error {
 /// std::fs::remove_file(&path).ok();
 /// # Ok::<(), cavitation_core::Error>(())
 /// ```
-pub fn save(path: &Path, model: &Sequential<f32>, params: &ParamStore<f32>) -> Result<(), Error> {
+pub fn save(
+    path: impl AsRef<Path>,
+    model: &Sequential<f32>,
+    params: &ParamStore<f32>,
+) -> Result<(), Error> {
+    let path = path.as_ref();
     let names = model.parameter_names();
     let buffers: Vec<Vec<u8>> = names
         .iter()
@@ -89,15 +99,17 @@ pub fn save(path: &Path, model: &Sequential<f32>, params: &ParamStore<f32>) -> R
 /// use cavitation_nn::{Linear, Sequential, load};
 /// let mut params = ParamStore::new();
 /// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
-/// let missing = std::env::temp_dir().join("cavitation-doc-no-such-file.safetensors");
-/// assert!(matches!(load(&missing, &net, &mut params), Err(Error::Io { .. })));
+/// assert!(matches!(
+///     load("cavitation-doc-no-such-file.safetensors", &net, &mut params),
+///     Err(Error::Io { .. })
+/// ));
 /// ```
 pub fn load(
-    path: &Path,
+    path: impl AsRef<Path>,
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
 ) -> Result<(), Error> {
-    load_impl(path, model, params, true)
+    load_impl(path.as_ref(), model, params, true)
 }
 
 /// Like [`load`], but keys in the file that the model does not have are ignored. Every key
@@ -118,14 +130,14 @@ pub fn load(
 /// let mut params = ParamStore::new();
 /// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
 /// let missing = std::env::temp_dir().join("cavitation-doc-no-such-file.safetensors");
-/// assert!(matches!(load_lenient(&missing, &net, &mut params), Err(Error::Io { .. })));
+/// assert!(matches!(load_lenient(missing, &net, &mut params), Err(Error::Io { .. })));
 /// ```
 pub fn load_lenient(
-    path: &Path,
+    path: impl AsRef<Path>,
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
 ) -> Result<(), Error> {
-    load_impl(path, model, params, false)
+    load_impl(path.as_ref(), model, params, false)
 }
 
 /// The shared body of [`load`] and [`load_lenient`]: parses and checks every tensor into
@@ -288,7 +300,7 @@ mod tests {
     fn pytorch_state_dict_loads_and_predicts() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
         let (net, mut params) = mlp(7);
-        load(&dir.join("mlp.safetensors"), &net, &mut params).expect("load");
+        load(dir.join("mlp.safetensors"), &net, &mut params).expect("load");
 
         let text = std::fs::read_to_string(dir.join("mlp-io.json")).unwrap();
         let v: Value = serde_json::from_str(&text).unwrap();
