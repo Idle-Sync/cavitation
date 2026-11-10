@@ -61,8 +61,8 @@ fn allocations() -> usize {
     ALLOCATIONS.load(Ordering::Relaxed)
 }
 
-/// Builds the same small graph 12 times, with a backward pass, a forward-only tape of larger
-/// tensors and `zero_grad` each step. Returns the allocations made during steps 3 to 12.
+/// Builds the same small graphs 12 times, with backward passes (`keep_where` among them), a
+/// forward-only tape of larger tensors and `zero_grad` each step. Returns the allocations made during steps 3 to 12.
 fn tape_steady_state() -> usize {
     let mut store = ParamStore::new();
     let p1 = store.add(Tensor::from_vec(vec![0.5f32], &[1]).unwrap());
@@ -77,6 +77,7 @@ fn tape_steady_state() -> usize {
     let mw = store.add(Tensor::full(&[4, 3], 0.25f32));
     let mq = store.add(Tensor::full(&[3, 2], 0.5f32));
     let mv = store.add(Tensor::full(&[1, 2], 0.75f32));
+    let keep = Tensor::from_vec(vec![1.0f32, 0.0, 1.0, 1.0], &[4]).unwrap();
     let mut graph = Graph::new();
     let mut sink = 0.0f32;
     let mut before = 0;
@@ -141,6 +142,17 @@ fn tape_steady_state() -> usize {
             let loss = tape.matmul_nt(g, v);
             tape.backward(loss, &mut store.grads);
             sink += tape.value(loss).data()[0] + store.grad(mw).data()[0];
+        }
+        {
+            // keep_where with a broadcast keep row, forward and backward, as a neuron mask
+            // records it: [3, 4] parameter, [4] keep, then a sum to one value.
+            let mut tape = graph.tape(&store.values);
+            let p = tape.param(big);
+            let k = tape.input(keep.view());
+            let masked = tape.keep_where(p, k);
+            let loss = tape.sum(masked);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0];
         }
         sink += store.grad(p1).data()[0] + store.grad(big).data()[0];
     }

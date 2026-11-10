@@ -671,6 +671,58 @@ mod tests {
         assert_eq!(store.grad(px).data(), &[5.0, 0.0, 0.0, 8.0]);
     }
 
+    /// The backward pass is a select, not a product with `keep`: where `keep` is 0 the input's
+    /// gradient is exactly +0 even when the output gradient there is NaN or infinite (a
+    /// product would give NaN), and where `keep` is non-zero it is bit-for-bit the output
+    /// gradient, NaN payload and the sign of zero included.
+    #[test]
+    fn keep_where_backward_selects_even_nan_and_inf() {
+        let mut store = ParamStore::new();
+        let px = store.add(Tensor::from_vec(vec![1.0f32; 8], &[2, 4]).unwrap());
+        let keep =
+            Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, -2.0, 1.0, 0.0], &[2, 4]).unwrap();
+        let payload_nan = f32::from_bits(0x7fc0_1234);
+        let seed = [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            1.0,
+            payload_nan,
+            f32::INFINITY,
+            -0.0,
+            f32::NAN,
+        ];
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let (x, k) = (tape.param(px), tape.input(keep.view()));
+        let out = tape.keep_where(x, k);
+        tape.backward_seeded(out, &seed, &mut store.grads);
+        drop(tape);
+        let bits: Vec<u32> = store.grad(px).data().iter().map(|v| v.to_bits()).collect();
+        let want: Vec<u32> = [0.0f32, 0.0, 0.0, 1.0, payload_nan, f32::INFINITY, -0.0, 0.0]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        assert_eq!(bits, want);
+    }
+
+    /// A NaN in `keep` is not 0, so it keeps the value and passes the gradient, as
+    /// `torch.where(keep != 0, x, 0)` does.
+    #[test]
+    fn keep_where_nan_keep_keeps() {
+        let mut store = ParamStore::new();
+        let px = store.add(Tensor::from_vec(vec![3.0f32, -4.0], &[2]).unwrap());
+        let keep = Tensor::from_vec(vec![f32::NAN, 0.0], &[2]).unwrap();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let (x, k) = (tape.param(px), tape.input(keep.view()));
+        let out = tape.keep_where(x, k);
+        assert_eq!(tape.value(out).data(), &[3.0, 0.0]);
+        tape.backward_seeded(out, &[5.0, 6.0], &mut store.grads);
+        drop(tape);
+        assert_eq!(store.grad(px).data(), &[5.0, 0.0]);
+    }
+
     /// A `keep` that does not broadcast to the input's shape panics naming both shapes.
     #[test]
     #[should_panic(expected = "keep_where: cannot broadcast keep [4] to the input's shape [2, 3]")]
