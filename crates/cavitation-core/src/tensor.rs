@@ -239,6 +239,12 @@ pub struct TensorView<'a, T: Real = f32> {
 }
 
 impl<'a, T: Real> TensorView<'a, T> {
+    /// Wraps a slice that holds exactly `shape.len()` elements.
+    pub(crate) fn from_parts(data: &'a [T], shape: Shape) -> TensorView<'a, T> {
+        debug_assert_eq!(data.len(), shape.len(), "view length must match its shape");
+        TensorView { data, shape }
+    }
+
     /// The shape.
     ///
     /// ```

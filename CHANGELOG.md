@@ -8,3 +8,4 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `Real`, `Shape`, `Tensor` (with views) and `Error` in `cavitation-core`.
 - `SplitMix64` and `Rng` (xoshiro256++) in `cavitation-core`.
 - Strided matrix views (`MatRef`, `MatMut`) and reference `gemm` and `matvec` kernels in `cavitation-core`.
+- Reverse-mode autograd in `cavitation-core`: `Graph`, `Tape` and `Var`, the `ParamStore` for parameters and their gradients, and the first operation, `add`.
