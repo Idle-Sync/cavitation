@@ -37,7 +37,16 @@ pub enum Error {
     MissingKey(String),
     /// A weight file held a key the model does not have.
     UnexpectedKey(String),
-    /// A stored tensor had an unsupported element type.
+    /// A stored tensor had a different shape from the parameter it should fill.
+    WrongShape {
+        /// The key of the tensor.
+        key: String,
+        /// The dimensions the parameter has.
+        expected: Vec<usize>,
+        /// The dimensions that were stored.
+        found: Vec<usize>,
+    },
+    /// A stored tensor had an unsupported element type (only `F32` is read).
     Dtype {
         /// The key of the tensor.
         key: String,
@@ -71,8 +80,13 @@ impl fmt::Display for Error {
             Error::Format(msg) => write!(f, "bad format: {msg}"),
             Error::MissingKey(key) => write!(f, "missing key `{key}`"),
             Error::UnexpectedKey(key) => write!(f, "unexpected key `{key}`"),
+            Error::WrongShape {
+                key,
+                expected,
+                found,
+            } => write!(f, "key `{key}` has shape {found:?}, expected {expected:?}"),
             Error::Dtype { key, found } => {
-                write!(f, "key `{key}` has unsupported element type {found}")
+                write!(f, "key `{key}` has element type {found}, expected F32")
             }
             Error::NonFinite { step, location } => {
                 write!(f, "non-finite value at step {step} in {location}")

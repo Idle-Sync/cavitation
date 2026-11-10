@@ -11,6 +11,11 @@ different order than ours.
 Layer fixtures (`nn.Linear`) go under `crates/cavitation-nn/tests/fixtures/layers/` in the same
 form, with the layer's weights as inputs after the data input.
 
+The state-dict fixture goes under `crates/cavitation-nn/tests/fixtures/state-dict/`: the
+`state_dict` of `nn.Sequential(Linear(4, 8), ReLU(), Linear(8, 3))` (seed 0) saved with
+`safetensors.torch.save_file` as `mlp.safetensors`, and `mlp-io.json` with five inputs and the
+network's outputs in f32 and float64. `--only state-dict` writes just these two files.
+
 Inputs come from `torch.manual_seed(0)` with one thread, in a fixed order, so a rerun writes
 identical files. Inputs are kept away from kinks (zero for ReLU, the clamp edges, the points
 where Huber and smooth L1 change branch) so both sides take the same branch.
@@ -38,6 +43,7 @@ import warnings
 
 import torch
 import torch.nn.functional as F
+from safetensors.torch import save_file
 
 F32_DIGITS = 9
 F64_DIGITS = 17
@@ -478,11 +484,39 @@ def make_select():
     add_case("keep-where-7x1-with-scalar", "keep_where", {}, [rnd(7, 1), torch.tensor(0.0)], keep_where)
 
 
+def write_state_dict(crates_dir):
+    """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` and its outputs for five inputs."""
+    out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
+    os.makedirs(out_dir, exist_ok=True)
+    torch.manual_seed(0)
+    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 3))
+    save_file(model.state_dict(), os.path.join(out_dir, "mlp.safetensors"))
+    x = rnd(5, 4)
+    with torch.no_grad():
+        out32 = model(x)
+        out64 = model.double()(x.double())
+    body = {
+        "torch_version": TORCH_VERSION,
+        "keys": list(model.state_dict().keys()),
+        "input": tensor_json(x, F32_DIGITS),
+        "output": tensor_json(out32, F32_DIGITS),
+        "output_f64": tensor_json(out64, F64_DIGITS),
+    }
+    with open(os.path.join(out_dir, "mlp-io.json"), "w") as f:
+        json.dump(body, f, separators=(",", ":"))
+        f.write("\n")
+    print(f"wrote the state-dict fixture to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
+
+
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
     parser.add_argument("--out", required=True, help="the crates directory (files go under cavitation-core/tests/fixtures/ops)")
+    parser.add_argument("--only", choices=["state-dict"], help="write only this fixture family")
     args = parser.parse_args()
+    if args.only == "state-dict":
+        write_state_dict(args.out)
+        return
     make_arithmetic()
     make_matmul()
     make_reductions()
@@ -521,6 +555,7 @@ def main():
             json.dump(body, f, separators=(",", ":"))
             f.write("\n")
     print(f"wrote {len(OPTIM_CASES)} fixtures to {optim_dir} with torch {TORCH_VERSION}", file=sys.stderr)
+    write_state_dict(args.out)
 
 
 if __name__ == "__main__":
