@@ -130,6 +130,20 @@ impl<T: Real> GradSlot<'_, T> {
 }
 
 impl<T: Real> GradSlot<'_, T> {
+    /// Lets `f` write the contribution straight into the gradient buffer, as a GEMM does.
+    /// `f` gets the buffer and the `beta` to use: zero when this is the buffer's first
+    /// contribution this step (so `f` must write every element and never read the old
+    /// contents), one when it adds to what is there. A parameter's gradient becomes current
+    /// only after `f` returns.
+    pub(crate) fn update_with(self, f: impl FnOnce(&mut [T], T)) {
+        f(self.buf, if self.overwrite { T::ZERO } else { T::ONE });
+        if let Some(stale) = self.stale {
+            *stale = false;
+        }
+    }
+}
+
+impl<T: Real> GradSlot<'_, T> {
     /// Contributes `scale * src`: writes it when overwriting, adds it otherwise. A
     /// parameter's gradient becomes current only after the write.
     ///

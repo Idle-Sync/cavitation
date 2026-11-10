@@ -93,3 +93,37 @@ fn gradcheck_scale() {
     let report = gradcheck(|t, v| t.scale(v[0], -2.5), &[filled(&[2, 3], 0.7)]);
     report.assert_passed();
 }
+
+/// `matmul` has the right gradient for both inputs, including a 1 x 1 result.
+#[test]
+fn gradcheck_matmul() {
+    for (da, db) in [(&[3, 4], &[4, 5]), (&[1, 7], &[7, 1])] {
+        let inputs = [filled(da, 0.4), filled(db, 1.3)];
+        let report = gradcheck(|t, v| t.matmul(v[0], v[1]), &inputs);
+        assert!(report.passed(), "matmul {da:?} {db:?}: {report:?}");
+    }
+}
+
+/// `matmul_nt` has the right gradient for both inputs.
+#[test]
+fn gradcheck_matmul_nt() {
+    for (da, db) in [(&[2, 3], &[4, 3]), (&[1, 7], &[1, 7])] {
+        let inputs = [filled(da, 0.6), filled(db, 1.9)];
+        let report = gradcheck(|t, v| t.matmul_nt(v[0], v[1]), &inputs);
+        assert!(report.passed(), "matmul_nt {da:?} {db:?}: {report:?}");
+    }
+}
+
+/// A parameter used by two matmuls gets both contributions (overwrite, then add).
+#[test]
+fn gradcheck_matmul_shared_parameter() {
+    let mut params = ParamStore::<f64>::new_generic();
+    let w = params.add(filled(&[3, 3], 0.2));
+    let build = |tape: &mut Tape<'_, f64>, v: &[Var]| {
+        let wv = tape.param(w);
+        let h = tape.matmul(v[0], wv);
+        tape.matmul_nt(h, wv)
+    };
+    let report = gradcheck_params(&mut params, &[filled(&[2, 3], 0.9)], build);
+    assert!(report.passed(), "{report:?}");
+}

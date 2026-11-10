@@ -5,6 +5,7 @@
 //! its file's forward and backward functions.
 
 mod elementwise;
+mod matmul;
 #[cfg(test)]
 mod wrong;
 
@@ -26,6 +27,10 @@ pub(crate) enum Op {
     Sub(Var, Var),
     /// Elementwise `a * b`, broadcasting.
     Mul(Var, Var),
+    /// Matrix product `a · b` of `[m, k]` and `[k, n]`.
+    MatMul(Var, Var),
+    /// Matrix product `a · bᵀ` of `[m, k]` and `[n, k]`.
+    MatMulNt(Var, Var),
     /// Every element of the value times a scalar, kept as `f64` (exact for f32 and f64).
     Scale(Var, f64),
     /// Test only: the identity, whose backward pass returns twice the true gradient.
@@ -48,6 +53,8 @@ impl Op {
             Op::Add(a, b) => elementwise::binary_backward(Kind::Add, a, b, out_grad, ctx),
             Op::Sub(a, b) => elementwise::binary_backward(Kind::Sub, a, b, out_grad, ctx),
             Op::Mul(a, b) => elementwise::binary_backward(Kind::Mul, a, b, out_grad, ctx),
+            Op::MatMul(a, b) => matmul::backward(false, a, b, out_grad, ctx),
+            Op::MatMulNt(a, b) => matmul::backward(true, a, b, out_grad, ctx),
             Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
             #[cfg(test)]
             Op::WrongIdentity(a) => wrong::backward(a, out_grad, ctx),

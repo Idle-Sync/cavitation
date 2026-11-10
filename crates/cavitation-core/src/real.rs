@@ -1,6 +1,8 @@
 //! `Real`: the sealed number trait implemented by f32 and f64.
 
 use std::fmt::{Debug, Display};
+
+use crate::kernels::{MatMut, MatRef};
 use std::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// Keeps `Real` closed: only this crate can name `Sealed`, so only f32 and f64 implement it.
@@ -147,6 +149,37 @@ pub trait Real:
     /// assert!(!f32::NAN.is_finite());
     /// ```
     fn is_finite(self) -> bool;
+    /// General matrix multiply, `C = alpha * A * B + beta * C`, with the kernel for this type.
+    /// Results match [`kernels::reference::gemm`](crate::kernels::reference::gemm) within the
+    /// rounding of a different summation order; when `beta` is zero the old contents of `C`
+    /// are never read.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the shapes, if the inner dimensions differ or `C` has the wrong shape.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// use cavitation_core::kernels::{MatMut, MatRef};
+    /// let a = [1.0f32, 2.0];
+    /// let b = [3.0f32, 4.0];
+    /// let mut c = [0.0f32];
+    /// f32::gemm(
+    ///     1.0,
+    ///     MatRef::new(&a, 1, 2, 2, 1).unwrap(),
+    ///     MatRef::new(&b, 2, 1, 1, 1).unwrap(),
+    ///     0.0,
+    ///     MatMut::new(&mut c, 1, 1, 1, 1).unwrap(),
+    /// );
+    /// assert_eq!(c, [11.0]);
+    /// ```
+    fn gemm(alpha: Self, a: MatRef<Self>, b: MatRef<Self>, beta: Self, c: MatMut<Self>);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test builds only: the number of [`Real::gemm`] calls made by this thread.
+    pub(crate) static GEMM_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Implements `Real` for a primitive float type by forwarding to its inherent methods.
@@ -191,6 +224,11 @@ macro_rules! impl_real {
             }
             fn is_finite(self) -> bool {
                 $t::is_finite(self)
+            }
+            fn gemm(alpha: Self, a: MatRef<Self>, b: MatRef<Self>, beta: Self, c: MatMut<Self>) {
+                #[cfg(test)]
+                GEMM_CALLS.with(|n| n.set(n.get() + 1));
+                crate::kernels::reference::gemm(alpha, a, b, beta, c);
             }
         }
     };

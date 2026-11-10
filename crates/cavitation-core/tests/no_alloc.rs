@@ -65,6 +65,10 @@ fn tape_steady_state() -> usize {
     let row = store.add(Tensor::full(&[4], 0.5f32));
     let col = store.add(Tensor::full(&[3, 1], 0.25f32));
     let cell = Tensor::full(&[1, 1], 2.0f32);
+    let rowvec = Tensor::full(&[1, 4], 0.5f32);
+    let mw = store.add(Tensor::full(&[4, 3], 0.25f32));
+    let mq = store.add(Tensor::full(&[3, 2], 0.5f32));
+    let mv = store.add(Tensor::full(&[1, 2], 0.75f32));
     let mut graph = Graph::new();
     let mut sink = 0.0f32;
     let mut before = 0;
@@ -115,6 +119,20 @@ fn tape_steady_state() -> usize {
             let loss = tape.scale(m, 0.5);
             tape.backward(loss, &mut store.grads);
             sink += tape.value(loss).data()[0];
+        }
+        {
+            // matmul and matmul_nt, forward and backward, ending in a 1 x 1 result:
+            // [1, 4] . [4, 3] . [3, 2] -> [1, 2], then . [1, 2]^T -> [1, 1]. All three
+            // weights take gradients; the input takes none.
+            let mut tape = graph.tape(&store.values);
+            let xi = tape.input(rowvec.view());
+            let (w, v) = (tape.param(mw), tape.param(mv));
+            let h = tape.matmul(xi, w);
+            let q = tape.param(mq);
+            let g = tape.matmul(h, q);
+            let loss = tape.matmul_nt(g, v);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0] + store.grad(mw).data()[0];
         }
         sink += store.grad(p1).data()[0] + store.grad(big).data()[0];
     }
