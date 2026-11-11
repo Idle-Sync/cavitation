@@ -1,0 +1,18 @@
+# Package manifest for cavitation-bench: the benchmark runner.
+
+[package]
+name = "cavitation-bench"
+description = "Benchmark runner for the cavitation neural network library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+
+[dependencies]
+cavitation-core = { path = "../cavitation-core" }
+cavitation-datasets = { path = "../cavitation-datasets" }
+cavitation-nn = { path = "../cavitation-nn" }

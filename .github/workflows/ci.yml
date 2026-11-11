@@ -1,0 +1,120 @@
+# Continuous integration: tests every kernel level on Linux x86, Windows x86 and Apple Silicon, and checks formatting, lints, docs and the guide book.
+# The kernel level is forced with CAVITATION_KERNEL; `cavitation-bench info` must report that level, so a job can never silently test a different one.
+# The MNIST tests are #[ignore]d and do not run here; the digits known result runs as part of `cargo test`.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux-x86:
+    name: linux-x86 (${{ matrix.kernel }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [reference, sse4.2, avx2]
+    env:
+      CAVITATION_KERNEL: ${{ matrix.kernel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.kernel }}
+      - name: Test
+        run: cargo test --workspace --release --no-fail-fast
+      - name: Check the forced kernel level
+        run: |
+          cargo run --release -p cavitation-bench -- info | tee info.txt
+          grep -Fx "current kernel level: ${KERNEL}" info.txt
+        env:
+          KERNEL: ${{ matrix.kernel }}
+
+  macos-arm:
+    name: macos-arm (${{ matrix.kernel }})
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [reference, neon]
+    env:
+      CAVITATION_KERNEL: ${{ matrix.kernel }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.kernel }}
+      - name: Test
+        run: cargo test --workspace --release --no-fail-fast
+      - name: Check the forced kernel level
+        run: |
+          cargo run --release -p cavitation-bench -- info | tee info.txt
+          grep -Fx "current kernel level: ${KERNEL}" info.txt
+        env:
+          KERNEL: ${{ matrix.kernel }}
+
+  windows-x86:
+    name: windows-x86 (${{ matrix.kernel }})
+    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [reference, avx2]
+    env:
+      CAVITATION_KERNEL: ${{ matrix.kernel }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: ${{ matrix.kernel }}
+      - name: Test
+        run: cargo test --workspace --release --no-fail-fast
+      - name: Check the forced kernel level
+        run: |
+          cargo run --release -p cavitation-bench -- info | tee info.txt
+          grep -Fx "current kernel level: ${KERNEL}" info.txt
+        env:
+          KERNEL: ${{ matrix.kernel }}
+
+  lint:
+    runs-on: ubuntu-24.04
+    env:
+      MDBOOK_VERSION: v0.5.4
+      MDBOOK_SHA256: 3f28de05dafca9d0f2eab99c662116b0e37b89b1d96a08f8f430b9eeae958cd7
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+      - name: Doc tests
+        run: cargo test --workspace --doc
+      - name: Install mdBook
+        run: |
+          curl -sSfL -o mdbook.tar.gz "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${MDBOOK_SHA256}  mdbook.tar.gz" | sha256sum --check
+          tar -xzf mdbook.tar.gz -C "$HOME/.cargo/bin" mdbook
+      - name: Build the guide
+        run: mdbook build book

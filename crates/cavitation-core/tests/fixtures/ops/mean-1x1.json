@@ -1,0 +1,1 @@
+{"torch_version":"2.15.0","op":"mean","params":{},"inputs":[{"shape":[1,1],"data":[1.03783751]}],"upstream":{"shape":[],"data":[0.92714411]},"output":{"shape":[],"data":[1.03783751]},"grads":[{"shape":[1,1],"data":[0.92714411]}],"output_f64":{"shape":[],"data":[1.0378375053405762]},"grads_f64":[{"shape":[1,1],"data":[0.9271441102027893]}]}

@@ -1,0 +1,22 @@
+# Package manifest for cavitation, the main crate to depend on.
+
+[package]
+name = "cavitation"
+description = "A fast, glass-box neural network library for the CPU."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+
+[lints]
+workspace = true
+
+[dependencies]
+cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
+cavitation-nn = { path = "../cavitation-nn", version = "0.1.0" }
+
+[dev-dependencies]
+# Real datasets for the examples and known-result tests.
+cavitation-datasets = { path = "../cavitation-datasets" }

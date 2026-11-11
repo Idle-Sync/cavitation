@@ -1,0 +1,18 @@
+# Package manifest for cavitation-datasets: datasets used by the examples, tests and benchmark.
+
+[package]
+name = "cavitation-datasets"
+description = "Datasets used by the cavitation examples, tests and benchmark."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+[lints]
+workspace = true
+
+
+[dependencies]
+cavitation-core = { path = "../cavitation-core" }
+cavitation-nn = { path = "../cavitation-nn" }

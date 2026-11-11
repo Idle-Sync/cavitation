@@ -1,0 +1,1 @@
+{"torch_version":"2.15.0","op":"softmax","params":{},"inputs":[{"shape":[1,1],"data":[-0.488143712]}],"upstream":{"shape":[1,1],"data":[-0.243428752]},"output":{"shape":[1,1],"data":[1.0]},"grads":[{"shape":[1,1],"data":[0.0]}],"output_f64":{"shape":[1,1],"data":[1.0]},"grads_f64":[{"shape":[1,1],"data":[0.0]}]}
