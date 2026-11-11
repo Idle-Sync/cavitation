@@ -9,11 +9,11 @@ use std::time::Instant;
 
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
-use cavitation_core::{ParamStore, Rng};
+use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_datasets::{digits, mnist};
 use cavitation_nn::{
-    Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, OptimizerConfig, Relu,
-    Sequential, Trainer, Warning,
+    Adam, Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, Optimizer,
+    OptimizerConfig, Relu, Sequential, Sgd, Trainer, Warning,
 };
 
 use crate::numpy;
@@ -511,4 +511,57 @@ mod tests {
         assert_eq!(work("digits128"), 269_824.0);
         assert!(shapes("cifar").is_err());
     }
+}
+
+/// Elements of the one parameter of the `subnormal` run: 1,068,810, the size of the 1M
+/// network.
+pub const SUBNORMAL_ELEMENTS: usize = 1_068_810;
+
+/// Steps per block of the `subnormal` run's report.
+pub const BLOCK: usize = 100;
+
+/// One optimiser's update times from the `subnormal` run.
+#[derive(Clone, Debug)]
+pub struct SubnormalRun {
+    /// The optimiser's name.
+    pub name: &'static str,
+    /// The median update time, in seconds, of each block of [`BLOCK`] steps.
+    pub blocks: Vec<f64>,
+    /// The median of the blocks from step 901 on over the median of the blocks of steps 1 to
+    /// 700 (`None` when the run is shorter than 1,000 steps).
+    pub ratio: Option<f64>,
+}
+
+/// Times `steps` updates of `opt` on one parameter of [`SUBNORMAL_ELEMENTS`] elements whose
+/// gradient is 1e-3 on the first step and 0 on every later one, so the optimiser's state
+/// decays through the subnormal range. Only the update is timed.
+fn time_decay<O: Optimizer<f32>>(name: &'static str, mut opt: O, steps: usize) -> SubnormalRun {
+    let mut store = ParamStore::new();
+    let p = store.add(Tensor::full(&[SUBNORMAL_ELEMENTS], 1.0f32));
+    let mut times = Vec::with_capacity(steps);
+    for step in 0..steps {
+        store.zero_grad();
+        let g = if step == 0 { 1e-3 } else { 0.0 };
+        store.grads.accumulate(p).0.data_mut().fill(g);
+        let start = Instant::now();
+        opt.step(&mut store);
+        times.push(start.elapsed().as_secs_f64());
+    }
+    let blocks: Vec<f64> = times.chunks(BLOCK).map(median).collect();
+    let ratio = (steps >= 1000).then(|| median(&blocks[9..]) / median(&blocks[..7]));
+    SubnormalRun {
+        name,
+        blocks,
+        ratio,
+    }
+}
+
+/// Runs the `subnormal` benchmark: SGD, SGD with momentum 0.9 and Adam (lr 1e-3) for `steps`
+/// steps each, one after the other.
+pub fn subnormal(steps: usize) -> Vec<SubnormalRun> {
+    vec![
+        time_decay("sgd", Sgd::new(0.01), steps),
+        time_decay("sgd momentum 0.9", Sgd::new(0.01).with_momentum(0.9), steps),
+        time_decay("adam lr 1e-3", Adam::new(1e-3), steps),
+    ]
 }

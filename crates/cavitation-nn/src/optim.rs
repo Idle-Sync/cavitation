@@ -2,7 +2,9 @@
 //! statistics they collect while they update.
 //!
 //! All arithmetic is done per element in `f64` and stored back as `T`, so an `f32` run
-//! rounds once per stored value. Momentum and Adam's moment estimates are stored as `T`.
+//! rounds once per stored value. Momentum and Adam's moment estimates are stored as `T`, with
+//! any value smaller than the type's smallest normal number stored as 0: left to decay, they
+//! would pass through the subnormal range, where each update runs many times slower.
 //!
 //! Each parameter is updated in chunks of [`CHUNK`] elements, split over the kernel thread
 //! pool ([`threads`]), with the gradient's sum of squares kept in [`LANES`] partial sums per
@@ -23,6 +25,20 @@ const CHUNK: usize = 1 << 14;
 /// Partial sums of the gradient's squares per chunk: independent sums the compiler can keep
 /// in vector registers, instead of one chain of dependent adds.
 const LANES: usize = 8;
+
+/// `x` stored as a `T` for optimiser state, with any value below the type's smallest normal
+/// number ([`Real::MIN_POSITIVE`]) stored as 0. Momentum and Adam's moments decay towards
+/// zero, through the subnormal range, where reading and writing a value takes many times
+/// longer; flushing it keeps every update at full speed. The test is on the `f64` value, a
+/// compare and a select, so the result does not depend on the thread count.
+#[inline(always)]
+fn store_state<T: Real>(x: f64) -> T {
+    if x.abs() < T::MIN_POSITIVE.to_f64() {
+        T::ZERO
+    } else {
+        T::from_f64(x)
+    }
+}
 
 /// Which loops an update runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,6 +542,26 @@ impl<T: Real> Sgd<T> {
 }
 
 impl<T: Real> Sgd<T> {
+    /// The momentum buffer of parameter `id`, or `None` while there is none: the optimiser
+    /// has no momentum, has not stepped yet, or has not updated this parameter yet. The ids
+    /// are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Optimizer, Sgd};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = Sgd::new(0.1).with_momentum(0.9);
+    /// assert!(opt.momentum(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// assert_eq!(opt.momentum(p), Some(&[2.0f32][..]));
+    /// ```
+    pub fn momentum(&self, id: ParamId) -> Option<&[T]> {
+        let k = id.position();
+        (*self.started.get(k)?).then(|| &self.buffers[k][..])
+    }
+
     /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
     fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
         if self.sizes.prepare("Sgd", params) && self.momentum != 0.0 {
@@ -617,7 +653,7 @@ fn sgd_reference<T: Real>(
             } else {
                 mu * buf.to_f64() + step
             };
-            *buf = T::from_f64(step);
+            *buf = store_state(step);
         }
         values[i] = T::from_f64(p - lr * step);
     }
@@ -663,7 +699,7 @@ fn sgd_momentum_chunk<T: Real, const WD: bool, const FIRST: bool>(
         } else {
             mu * buf.to_f64() + step
         };
-        *buf = T::from_f64(step);
+        *buf = store_state(step);
         *value = T::from_f64(p - lr * step);
     })
 }
@@ -737,6 +773,12 @@ impl<T: Real> AdamCore<T> {
             stats: GradStats::new(),
             partials: Vec::new(),
         }
+    }
+
+    /// The two moments of parameter `id`, or `None` until it has been updated once.
+    fn moments(&self, id: ParamId) -> Option<(&[T], &[T])> {
+        let k = id.position();
+        (*self.steps.get(k)? > 0).then(|| (&self.m[k][..], &self.v[k][..]))
     }
 
     /// Checks the decay rates.
@@ -859,8 +901,8 @@ fn adam_reference<T: Real>(
         }
         let mi = c.b1 * m[i].to_f64() + (1.0 - c.b1) * g;
         let vi = c.b2 * v[i].to_f64() + (1.0 - c.b2) * g * g;
-        m[i] = T::from_f64(mi);
-        v[i] = T::from_f64(vi);
+        m[i] = store_state(mi);
+        v[i] = store_state(vi);
         let m_hat = mi / c.correction1;
         let v_hat = vi / c.correction2;
         values[i] = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
@@ -887,8 +929,8 @@ fn adam_chunk<T: Real, const DECOUPLED: bool, const WD: bool>(
         }
         let mi = c.b1 * m.to_f64() + (1.0 - c.b1) * g;
         let vi = c.b2 * v.to_f64() + (1.0 - c.b2) * g * g;
-        *m = T::from_f64(mi);
-        *v = T::from_f64(vi);
+        *m = store_state(mi);
+        *v = store_state(vi);
         let m_hat = mi / c.correction1;
         let v_hat = vi / c.correction2;
         *value = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
@@ -965,6 +1007,28 @@ impl<T: Real> Adam<T> {
     pub fn with_weight_decay(mut self, weight_decay: f64) -> Adam<T> {
         self.core.weight_decay = weight_decay;
         self
+    }
+}
+
+impl<T: Real> Adam<T> {
+    /// The first and second moment estimates of parameter `id`, or `None` until it has been
+    /// updated once. The ids are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Adam, Optimizer};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = Adam::new(0.01);
+    /// assert!(opt.moments(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// let (m, v) = opt.moments(p).unwrap();
+    /// // m = (1 - 0.9)·2 and v = (1 - 0.999)·2².
+    /// assert!((m[0] - 0.2).abs() < 1e-7 && (v[0] - 0.004).abs() < 1e-7);
+    /// ```
+    pub fn moments(&self, id: ParamId) -> Option<(&[T], &[T])> {
+        self.core.moments(id)
     }
 }
 
@@ -1063,6 +1127,28 @@ impl<T: Real> AdamW<T> {
     pub fn with_weight_decay(mut self, weight_decay: f64) -> AdamW<T> {
         self.core.weight_decay = weight_decay;
         self
+    }
+}
+
+impl<T: Real> AdamW<T> {
+    /// The first and second moment estimates of parameter `id`, or `None` until it has been
+    /// updated once. The ids are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{AdamW, Optimizer};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = AdamW::new(0.01);
+    /// assert!(opt.moments(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// let (m, v) = opt.moments(p).unwrap();
+    /// // m = (1 - 0.9)·2 and v = (1 - 0.999)·2².
+    /// assert!((m[0] - 0.2).abs() < 1e-7 && (v[0] - 0.004).abs() < 1e-7);
+    /// ```
+    pub fn moments(&self, id: ParamId) -> Option<(&[T], &[T])> {
+        self.core.moments(id)
     }
 }
 
@@ -1589,5 +1675,112 @@ mod tests {
         opt.step(&mut store);
         assert_eq!(opt.learning_rate(), 0.25);
         assert_eq!(store.value(p).data(), &[0.75]);
+    }
+
+    /// Whether every value is 0 or at least `f32::MIN_POSITIVE` in magnitude (NaN passes).
+    fn none_subnormal(values: &[f32]) -> bool {
+        values
+            .iter()
+            .all(|x| *x == 0.0 || x.abs() >= f32::MIN_POSITIVE || x.is_nan())
+    }
+
+    /// A parameter of 1,000 elements that gets gradient 1e-3 on the first step and 0 on all
+    /// later ones, so the optimiser's state decays through the subnormal range.
+    fn decaying_store() -> (ParamStore, ParamId) {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[1000], 1.0f32));
+        (store, p)
+    }
+
+    /// Momentum's buffer never holds a subnormal value over 2,000 steps (it decays from 1e-3
+    /// by a factor 0.9 a step, so it crosses `f32::MIN_POSITIVE` near step 800), on the
+    /// chunked loops and on the reference loop, and ends at exactly 0.
+    #[test]
+    fn momentum_state_never_subnormal() {
+        for path in [Path::Reference, Path::Chunked(1)] {
+            let (mut store, p) = decaying_store();
+            let mut opt = Sgd::new(0.01).with_momentum(0.9);
+            let mut stats = GradStats::new();
+            for step in 0..2000 {
+                set_grad(
+                    &mut store,
+                    p,
+                    &vec![if step == 0 { 1e-3 } else { 0.0 }; 1000],
+                );
+                opt.update(&mut store, &mut stats, path);
+                let buf = opt.momentum(p).unwrap();
+                assert!(none_subnormal(buf), "{path:?}: step {step}: {:e}", buf[0]);
+            }
+            assert!(
+                opt.momentum(p).unwrap().iter().all(|&x| x == 0.0),
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Adam's moments never hold a subnormal value over 2,000 steps, on both paths: with
+    /// the default betas the first moment crosses the bound near step 800, and with
+    /// both betas 0.9 the second moment crosses it near step 400 too.
+    #[test]
+    fn adam_state_never_subnormal() {
+        for path in [Path::Reference, Path::Chunked(1)] {
+            for betas in [(0.9, 0.999), (0.9, 0.9)] {
+                let (mut store, p) = decaying_store();
+                let mut core = AdamCore::<f32>::new(1e-3, 0.0);
+                core.set_betas(betas.0, betas.1);
+                let mut stats = GradStats::new();
+                for step in 0..2000 {
+                    set_grad(
+                        &mut store,
+                        p,
+                        &vec![if step == 0 { 1e-3 } else { 0.0 }; 1000],
+                    );
+                    core.step("Adam", false, &mut store, &mut stats, path);
+                    let (m, v) = core.moments(p).unwrap();
+                    assert!(
+                        none_subnormal(m),
+                        "{path:?} {betas:?}: step {step}: m {:e}",
+                        m[0]
+                    );
+                    assert!(
+                        none_subnormal(v),
+                        "{path:?} {betas:?}: step {step}: v {:e}",
+                        v[0]
+                    );
+                }
+                let (m, _) = core.moments(p).unwrap();
+                assert!(m.iter().all(|&x| x == 0.0), "{path:?} {betas:?}");
+            }
+        }
+    }
+
+    /// The accessors return `None` before a parameter's first update and the state after
+    /// it: after two steps with gradient g, momentum 0.9 holds 1.9·g, and Adam and AdamW
+    /// hold m = 0.19·g and v = 0.001999·g².
+    #[test]
+    fn state_accessors() {
+        let g = 0.5f32;
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[3], 1.0f32));
+        let mut sgd = Sgd::new(0.1).with_momentum(0.9);
+        let mut plain = Sgd::<f32>::new(0.1);
+        let mut adam = Adam::new(0.01);
+        let mut adamw = AdamW::new(0.01);
+        assert!(sgd.momentum(p).is_none() && adam.moments(p).is_none());
+        assert!(adamw.moments(p).is_none());
+        for _ in 0..2 {
+            set_grad(&mut store, p, &[g; 3]);
+            sgd.step(&mut store);
+            plain.step(&mut store);
+            adam.step(&mut store);
+            adamw.step(&mut store);
+        }
+        assert!(plain.momentum(p).is_none());
+        let close = |got: &[f32], want: f32| got.iter().all(|x| (x - want).abs() <= 1e-6 * want);
+        assert!(close(sgd.momentum(p).unwrap(), 1.9 * g));
+        for (m, v) in [adam.moments(p).unwrap(), adamw.moments(p).unwrap()] {
+            assert!(close(m, 0.19 * g), "{m:?}");
+            assert!(close(v, 0.001999 * g * g), "{v:?}");
+        }
     }
 }

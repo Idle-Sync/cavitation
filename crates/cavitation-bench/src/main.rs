@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|digits|latency|gemm|info>`:
+//! `cavitation-bench <all|mnist|digits|latency|gemm|subnormal|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -13,6 +13,11 @@
 //!   training step of the named network at the current kernel level and thread count
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
 //!   GFLOPS (`2·m·n·k` / time) and threads used, then the rate over all eight.
+//! - `subnormal [--steps N]` (default 2,000) times the optimiser update of one parameter of
+//!   1,068,810 elements whose gradient is 1e-3 on the first step and 0 after, for SGD,
+//!   SGD with momentum 0.9 and Adam (lr 1e-3), so their state decays through the subnormal
+//!   range. It prints the median update time of each block of 100 steps, and the ratio of
+//!   the blocks from step 901 on to the blocks of steps 1 to 700.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
@@ -29,12 +34,13 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|digits|latency|gemm|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|digits|latency|gemm|subnormal|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH]\n\
     \x20 digits  [--python PATH]\n\
     \x20 latency [--python PATH]\n\
     \x20 all     [--python PATH]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
+    \x20 subnormal [--steps N]\n\
     \x20 info";
 
 /// Entry point of the benchmark runner.
@@ -51,6 +57,7 @@ fn main() -> ExitCode {
             .then(info)
             .ok_or_else(|| "info takes no arguments".to_string()),
         "gemm" => gemm(rest),
+        "subnormal" => subnormal(rest),
         "mnist" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
             let mut rows = Vec::new();
             if command == "all" {
@@ -324,5 +331,51 @@ fn gemm(args: &[String]) -> Result<(), String> {
         seconds * 1e6,
         flops / seconds / 1e9
     );
+    Ok(())
+}
+
+/// Runs the `subnormal` subcommand with its arguments (after `subnormal`).
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument or a `--steps` that is not a positive number.
+fn subnormal(args: &[String]) -> Result<(), String> {
+    let mut steps = 2000usize;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--steps" => {
+                let v = rest.next().ok_or("--steps needs a value")?;
+                steps = v
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("--steps must be a positive number, got `{v}`"))?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    println!(
+        "subnormal: one parameter of {} elements, gradient 1e-3 on step 1 and 0 after, \
+         kernel {}, {} threads",
+        runs::SUBNORMAL_ELEMENTS,
+        level(),
+        threads()
+    );
+    println!(
+        "median update time in ms per block of {} steps",
+        runs::BLOCK
+    );
+    for run in runs::subnormal(steps) {
+        println!("{}", run.name);
+        for (b, t) in run.blocks.iter().enumerate() {
+            let (first, last) = (b * runs::BLOCK + 1, (b + 1) * runs::BLOCK);
+            println!("  steps {first:>5}-{last:<5} {:>8.3}", t * 1e3);
+        }
+        match run.ratio {
+            Some(r) => println!("  steps 901+ over steps 1-700: {r:.2}x"),
+            None => println!("  steps 901+ over steps 1-700: needs at least 1,000 steps"),
+        }
+    }
     Ok(())
 }
