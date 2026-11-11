@@ -5,7 +5,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::pool::{self, Task};
@@ -363,6 +363,30 @@ fn pool_steady_state() -> usize {
     made
 }
 
+/// The pool's slow path: the caller first sleeps on the pool's condition variable only in
+/// the counted rounds. Warm-up runs 100 instant jobs, so the caller never runs out of spin;
+/// the counted rounds make every worker task sleep 1 ms, longer than the caller spins, so
+/// the caller waits on the condition variable. On Apple targets that variable allocates on
+/// its first use unless the pool has used it before. Returns the allocations made during
+/// the counted rounds, on any thread.
+fn pool_wait_steady_state() -> usize {
+    let slow = AtomicBool::new(false);
+    let job = |t: Task| {
+        if t.worker != 0 && slow.load(Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    for _ in 0..100 {
+        pool::run(4, 4, &job);
+    }
+    slow.store(true, Ordering::Relaxed);
+    let before = allocations();
+    for _ in 0..20 {
+        pool::run(4, 4, &job);
+    }
+    allocations() - before
+}
+
 /// The f32 GEMM on 4 threads at the current kernel level, alternating a large forward-pass
 /// product (128 x 1024 x 784, B transposed) and a small one (32 x 10 x 256): 3 warm-up rounds
 /// (which size the packing buffers), then 10 counted rounds. Returns the allocations made
@@ -419,6 +443,7 @@ fn main() -> ExitCode {
         ("bce_and_nll_steady_state", bce_and_nll_steady_state),
         ("custom_op_steady_state", custom_op_steady_state),
         ("pool_steady_state", pool_steady_state),
+        ("pool_wait_steady_state", pool_wait_steady_state),
         ("gemm_steady_state", gemm_steady_state),
     ];
     let mut failed = false;
