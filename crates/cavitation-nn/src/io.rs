@@ -1,6 +1,8 @@
 //! Saving and loading weights in the safetensors format, compatible with a PyTorch
 //! `state_dict` saved with `safetensors.torch.save_file`.
 
+use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 
 use cavitation_core::{Error, ParamId, ParamStore};
@@ -18,6 +20,26 @@ fn convert(path: &Path, err: SafeTensorError) -> Error {
         },
         other => Error::Format(other.to_string()),
     }
+}
+
+/// Returns [`Error::Format`] telling the user to save with safetensors if `bytes` starts like
+/// a `torch.save` file: `PK\x03\x04` (the zip archive `torch.save` writes by default) or a
+/// pickle stream (the legacy format, which starts with the byte `0x80`). A safetensors file
+/// starts with its header length as 8 little-endian bytes and its header, a JSON object, at
+/// byte 8; a header of 128 bytes also starts with `0x80`, so a file whose byte 8 is `{` is
+/// never taken for a pickle. A file of 8 bytes or fewer is never taken for a pickle (it cannot
+/// hold a safetensors header either, so the parser reports it as a format error).
+fn check_not_torch_save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let zip = bytes.starts_with(b"PK\x03\x04");
+    let pickle = bytes.len() > 8 && bytes[0] == 0x80 && bytes[8] != b'{';
+    if zip || pickle {
+        return Err(Error::Format(format!(
+            "{}: this is a torch.save file (a zip archive or a pickle), not safetensors; save \
+             the weights with safetensors.torch.save_file(model.state_dict(), path)",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Writes every parameter of `model` to `path` as an F32 safetensors file, each tensor
@@ -86,7 +108,8 @@ pub fn save(
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the file cannot be read, [`Error::Format`] if it is not a valid
-/// safetensors file (for example truncated), [`Error::MissingKey`] for an absent key,
+/// safetensors file (for example truncated, or a `torch.save` file, which the message says),
+/// [`Error::MissingKey`] for an absent key,
 /// [`Error::WrongShape`] or [`Error::Dtype`] (both name the key and what was expected) for a
 /// tensor that does not fit, and [`Error::UnexpectedKey`] for a key the model does not have.
 ///
@@ -109,7 +132,7 @@ pub fn load(
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
 ) -> Result<(), Error> {
-    load_impl(path.as_ref(), model, params, true)
+    load_with(path, model, params, LoadOptions::default())
 }
 
 /// Like [`load`], but keys in the file that the model does not have are ignored. Every key
@@ -137,29 +160,193 @@ pub fn load_lenient(
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
 ) -> Result<(), Error> {
-    load_impl(path.as_ref(), model, params, false)
+    let options = LoadOptions {
+        strict: false,
+        ..LoadOptions::default()
+    };
+    load_with(path, model, params, options)
 }
 
-/// The shared body of [`load`] and [`load_lenient`]: parses and checks every tensor into
-/// staging buffers, and only then copies them into the store.
-fn load_impl(
-    path: &Path,
+/// How [`load_with`] matches the keys of a file to the keys of the model.
+///
+/// `rename` turns each key of the file into the key the model uses, for files whose keys
+/// differ from the model's by a wrapper prefix or by shifted indices. `strict` makes a key
+/// that the model lacks, after renaming, an error. The default is no rename and strict,
+/// which is what [`load`] does.
+///
+/// Two ready-made cases: [`LoadOptions::strip_prefix`] for a file saved from a PyTorch
+/// `DataParallel` or `DistributedDataParallel` model (every key starts with `module.`), and a
+/// closure for a model whose layers sit at different indices in PyTorch, for example because
+/// it has `Dropout` layers that this model leaves out.
+///
+/// ```
+/// use cavitation_nn::LoadOptions;
+///
+/// let default = LoadOptions::default();
+/// assert!(default.rename.is_none() && default.strict);
+///
+/// // Every key of a `DataParallel` file starts with `module.`; this removes it.
+/// let options = LoadOptions::strip_prefix("module.");
+/// assert!(options.rename.is_some());
+/// ```
+pub struct LoadOptions<'a> {
+    /// Maps each key in the file to the key the model uses; `None` keeps the keys as they are.
+    #[allow(clippy::type_complexity)]
+    pub rename: Option<Box<dyn Fn(&str) -> String + 'a>>,
+    /// Whether a key that the model lacks (after renaming) is an [`Error::UnexpectedKey`]
+    /// (`true`) or ignored (`false`).
+    pub strict: bool,
+}
+
+impl fmt::Debug for LoadOptions<'_> {
+    /// Shows `strict` and whether `rename` is set (a closure has no text to show).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoadOptions")
+            .field("rename", &self.rename.is_some())
+            .field("strict", &self.strict)
+            .finish()
+    }
+}
+
+impl Default for LoadOptions<'_> {
+    /// No rename, strict: what [`load`] does.
+    fn default() -> Self {
+        LoadOptions {
+            rename: None,
+            strict: true,
+        }
+    }
+}
+
+impl<'a> LoadOptions<'a> {
+    /// Options that remove `prefix` from the start of each key in the file; a key without
+    /// the prefix is kept as it is. Strict.
+    ///
+    /// ```
+    /// use cavitation_nn::LoadOptions;
+    ///
+    /// let options = LoadOptions::strip_prefix("module.");
+    /// let rename = options.rename.unwrap();
+    /// assert_eq!(rename("module.0.weight"), "0.weight");
+    /// assert_eq!(rename("0.weight"), "0.weight"); // no prefix: kept as it is
+    /// ```
+    pub fn strip_prefix(prefix: &'a str) -> LoadOptions<'a> {
+        LoadOptions {
+            rename: Some(Box::new(move |key| {
+                key.strip_prefix(prefix).unwrap_or(key).to_string()
+            })),
+            strict: true,
+        }
+    }
+}
+
+/// Like [`load`], with the key matching set by `options`: each key of the file is first
+/// renamed by `options.rename`, then the model's keys are looked up among the renamed ones,
+/// and with `options.strict` a renamed key the model lacks is an error. Nothing is written
+/// into `params` unless every check passes, a collision between renamed keys included.
+///
+/// # Errors
+///
+/// The errors of [`load`] (the keys in [`Error::MissingKey`] and [`Error::UnexpectedKey`] are
+/// the renamed ones), and [`Error::Format`] when two keys of the file rename to the same key;
+/// the message names both. For two keys that collide, the first in alphabetical order is
+/// named first.
+///
+/// # Panics
+///
+/// Panics if `model` was built from a different [`ParamStore`] than `params`.
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng};
+/// use cavitation_nn::{Linear, LoadOptions, Relu, Sequential, load, load_with, save};
+///
+/// // A file from a PyTorch model that has a `Dropout` after each ReLU. Relu layers stand in
+/// // for the Dropouts here, since they have no parameters either: the Linear layers sit at
+/// // indices 0, 3 and 6, so the file's keys are `0.*`, `3.*` and `6.*`.
+/// let mut file_params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let in_file = Sequential::new()
+///     .push(Linear::new(&mut file_params, 2, 3, &mut rng))
+///     .push(Relu)
+///     .push(Relu)
+///     .push(Linear::new(&mut file_params, 3, 3, &mut rng))
+///     .push(Relu)
+///     .push(Relu)
+///     .push(Linear::new(&mut file_params, 3, 1, &mut rng));
+/// let path = std::env::temp_dir().join(format!("cavitation-doc-load-with-{}.safetensors", std::process::id()));
+/// save(&path, &in_file, &file_params)?;
+///
+/// // This model leaves the Dropouts out, so its Linear layers are at 0, 2 and 4.
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(1);
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 3, 3, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 3, 1, &mut rng));
+/// assert!(load(&path, &net, &mut params).is_err()); // the keys `3.*` and `6.*` do not match
+///
+/// // A closure renumbers: 3 becomes 2 and 6 becomes 4.
+/// let renumber = |key: &str| {
+///     if let Some(rest) = key.strip_prefix("3.") {
+///         format!("2.{rest}")
+///     } else if let Some(rest) = key.strip_prefix("6.") {
+///         format!("4.{rest}")
+///     } else {
+///         key.to_string()
+///     }
+/// };
+/// let options = LoadOptions { rename: Some(Box::new(renumber)), ..LoadOptions::default() };
+/// load_with(&path, &net, &mut params, options)?;
+///
+/// // The last Linear of the model now holds the values of the file's `6.weight`.
+/// let loaded = params.value(net.parameter_names()[4].1).data().to_vec();
+/// let saved = file_params.value(in_file.parameter_names()[4].1).data().to_vec();
+/// assert_eq!(loaded, saved);
+/// std::fs::remove_file(&path).ok();
+/// # Ok::<(), cavitation_core::Error>(())
+/// ```
+pub fn load_with(
+    path: impl AsRef<Path>,
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
-    strict: bool,
+    options: LoadOptions<'_>,
 ) -> Result<(), Error> {
+    let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
         source,
     })?;
+    check_not_torch_save(path, &bytes)?;
     let file = SafeTensors::deserialize(&bytes).map_err(|e| convert(path, e))?;
     let names = model.parameter_names();
 
+    // Renamed key -> key in the file, over every key of the file, so a collision is found
+    // before anything is read from a tensor.
+    let mut file_keys: Vec<&str> = file.names().into_iter().collect();
+    file_keys.sort_unstable();
+    let mut by_name: HashMap<String, &str> = HashMap::with_capacity(file_keys.len());
+    for key in file_keys {
+        let renamed = match &options.rename {
+            Some(rename) => rename(key),
+            None => key.to_string(),
+        };
+        if let Some(first) = by_name.get(&renamed) {
+            return Err(Error::Format(format!(
+                "{}: the keys {first} and {key} both map to {renamed}",
+                path.display()
+            )));
+        }
+        by_name.insert(renamed, key);
+    }
+
     let mut staged: Vec<(ParamId, Vec<f32>)> = Vec::with_capacity(names.len());
     for (name, id) in &names {
-        let tensor = file
-            .tensor(name)
-            .map_err(|_| Error::MissingKey(name.clone()))?;
+        let tensor = by_name
+            .get(name)
+            .and_then(|key| file.tensor(key).ok())
+            .ok_or_else(|| Error::MissingKey(name.clone()))?;
         if tensor.dtype() != Dtype::F32 {
             return Err(Error::Dtype {
                 key: name.clone(),
@@ -183,11 +370,14 @@ fn load_impl(
             .collect();
         staged.push((*id, values));
     }
-    if strict {
-        for key in file.names() {
-            if !names.iter().any(|(name, _)| name == key) {
-                return Err(Error::UnexpectedKey(key.to_string()));
-            }
+    if options.strict {
+        let mut extra: Vec<&String> = by_name
+            .keys()
+            .filter(|renamed| !names.iter().any(|(name, _)| name == *renamed))
+            .collect();
+        extra.sort_unstable();
+        if let Some(key) = extra.first() {
+            return Err(Error::UnexpectedKey((*key).clone()));
         }
     }
 
@@ -207,7 +397,7 @@ mod tests {
     use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     use serde_json::Value;
 
-    use super::{load, load_lenient, save};
+    use super::{LoadOptions, load, load_lenient, load_with, save};
     use crate::{Linear, Relu, Sequential};
 
     /// A path in the temporary folder that no other test or process uses.
@@ -574,6 +764,241 @@ mod tests {
             let err = load_bytes(name, &bytes).unwrap_err();
             assert!(matches!(err, Error::Format(_)), "{name}: {err:?}");
         }
+    }
+
+    /// Writes `bytes` to a fresh path, loads it into the MLP and returns the error.
+    fn load_error_of(name: &str, bytes: &[u8]) -> Error {
+        load_bytes(name, bytes).unwrap_err()
+    }
+
+    /// A zip archive, which is what `torch.save` writes by default, is named as such.
+    #[test]
+    fn zip_file_is_recognised() {
+        let mut bytes = b"PK\x03\x04".to_vec();
+        bytes.extend_from_slice(&[0; 60]);
+        let err = load_error_of("zip", &bytes);
+        assert!(
+            matches!(&err, Error::Format(m) if m.contains("torch.save") && m.contains("zip")),
+            "{err:?}"
+        );
+    }
+
+    /// A pickle stream, the legacy `torch.save` format, is named as such.
+    #[test]
+    fn pickle_file_is_recognised() {
+        let mut bytes = vec![0x80, 0x02];
+        bytes.extend_from_slice(&[0; 60]);
+        let err = load_error_of("pickle", &bytes);
+        assert!(
+            matches!(&err, Error::Format(m) if m.contains("torch.save")),
+            "{err:?}"
+        );
+    }
+
+    /// A safetensors file whose header is exactly 128 bytes starts with the byte 0x80 and is
+    /// not mistaken for a pickle.
+    #[test]
+    fn header_of_128_bytes_is_not_a_pickle() {
+        let header = format!("{{}}{}", " ".repeat(126));
+        let path = temp_path("header-128");
+        std::fs::write(&path, with_header(&header, &[])).unwrap();
+        let net = Sequential::<f32>::new();
+        let mut params = ParamStore::new();
+        load(&path, &net, &mut params).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Empty, 1-byte (a lone pickle marker) and 3-byte files are format errors from the
+    /// safetensors parser, not panics and not the `torch.save` message.
+    #[test]
+    fn tiny_files_are_format_errors() {
+        for (name, bytes) in [
+            ("tiny-0", vec![]),
+            ("tiny-1", vec![0x80]),
+            ("tiny-3", vec![b'P', b'K', 3]),
+        ] {
+            let err = load_error_of(name, &bytes);
+            assert!(
+                matches!(&err, Error::Format(m) if !m.contains("torch.save")),
+                "{name}: {err:?}"
+            );
+        }
+    }
+
+    /// The MLP of seed 3 saved with `prefix` before each key, returned with its parameters.
+    fn save_prefixed(path: &Path, prefix: &str) -> (Sequential<f32>, ParamStore<f32>) {
+        let (net, params) = mlp(3);
+        let names = net.parameter_names();
+        let keys: Vec<String> = names.iter().map(|(n, _)| format!("{prefix}{n}")).collect();
+        let buffers: Vec<Vec<u8>> = names
+            .iter()
+            .map(|(_, id)| {
+                params
+                    .value(*id)
+                    .data()
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect()
+            })
+            .collect();
+        let views: Vec<(&str, TensorView<'_>)> = names
+            .iter()
+            .zip(&keys)
+            .zip(&buffers)
+            .map(|(((_, id), key), bytes)| {
+                let shape = params.value(*id).shape().dims().to_vec();
+                (
+                    key.as_str(),
+                    TensorView::new(Dtype::F32, shape, bytes).unwrap(),
+                )
+            })
+            .collect();
+        serialize_to_file(views, None, path).unwrap();
+        (net, params)
+    }
+
+    /// A `DataParallel` file, every key starting with `module.`, loads through
+    /// `strip_prefix` and gives the saved values; plain `load` rejects it.
+    #[test]
+    fn module_prefix_loads() {
+        let path = temp_path("module-prefix");
+        let (net, saved) = save_prefixed(&path, "module.");
+        let (net2, mut params) = mlp(4);
+        assert!(load(&path, &net2, &mut params).is_err());
+        load_with(
+            &path,
+            &net2,
+            &mut params,
+            LoadOptions::strip_prefix("module."),
+        )
+        .unwrap();
+        assert_eq!(bits(&net, &saved), bits(&net2, &params));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `strip_prefix` keeps keys without the prefix as they are.
+    #[test]
+    fn strip_prefix_keeps_other_keys() {
+        let path = temp_path("module-mixed");
+        let mut entries = good_entries();
+        entries[0].name = "module.0.weight";
+        write_entries(&path, &entries);
+        let (net, mut params) = mlp(1);
+        load_with(
+            &path,
+            &net,
+            &mut params,
+            LoadOptions::strip_prefix("module."),
+        )
+        .unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file saved from a network with a Dropout at index 2 and 5 (keys `0.*`, `3.*`,
+    /// `6.*`) loads into the network without them with a closure that renumbers the keys.
+    #[test]
+    fn dropout_shifted_indices_load() {
+        let path = temp_path("dropout-shift");
+        write_entries(
+            &path,
+            &[
+                Entry {
+                    bytes: 1.0f32.to_le_bytes().repeat(32),
+                    ..zeros("0.weight", &[8, 4])
+                },
+                zeros("0.bias", &[8]),
+                zeros("3.weight", &[8, 8]),
+                zeros("3.bias", &[8]),
+                zeros("6.weight", &[3, 8]),
+                zeros("6.bias", &[3]),
+            ],
+        );
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(5);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 4, 8, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 8, 8, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 8, 3, &mut rng));
+        let rename = |key: &str| {
+            if let Some(rest) = key.strip_prefix("3.") {
+                format!("2.{rest}")
+            } else if let Some(rest) = key.strip_prefix("6.") {
+                format!("4.{rest}")
+            } else {
+                key.to_string()
+            }
+        };
+        let options = LoadOptions {
+            rename: Some(Box::new(rename)),
+            ..LoadOptions::default()
+        };
+        load_with(&path, &net, &mut params, options).unwrap();
+        let names = net.parameter_names();
+        let first = params.value(names[0].1).data();
+        assert_eq!(first.len(), 32);
+        assert!(first.iter().all(|&w| w == 1.0));
+        assert!(params.value(names[2].1).data().iter().all(|&w| w == 0.0));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Two file keys renamed to one key are an error naming both and the key, and nothing
+    /// is written.
+    #[test]
+    fn rename_collision_is_an_error() {
+        let path = temp_path("collision");
+        write_entries(&path, &good_entries());
+        let (net, mut params) = mlp(1);
+        let before = bits(&net, &params);
+        let options = LoadOptions {
+            rename: Some(Box::new(|_| "0.weight".to_string())),
+            ..LoadOptions::default()
+        };
+        let err = load_with(&path, &net, &mut params, options).unwrap_err();
+        let want = format!(
+            "{}: the keys 0.bias and 0.weight both map to 0.weight",
+            path.display()
+        );
+        assert!(matches!(&err, Error::Format(m) if *m == want), "{err:?}");
+        assert_eq!(bits(&net, &params), before);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// With a rename, `strict` checks the renamed keys: a key mapped to a name the model
+    /// lacks is `UnexpectedKey` with the renamed key, and ignored when not strict.
+    #[test]
+    fn strict_checks_renamed_keys() {
+        let path = temp_path("renamed-extra");
+        let mut entries = good_entries();
+        entries.push(zeros("x.weight", &[2, 2]));
+        write_entries(&path, &entries);
+        let (net, mut params) = mlp(1);
+        let rename = |key: &str| key.replace("x.", "9.");
+        let strict = LoadOptions {
+            rename: Some(Box::new(rename)),
+            ..LoadOptions::default()
+        };
+        let err = load_with(&path, &net, &mut params, strict).unwrap_err();
+        assert!(
+            matches!(&err, Error::UnexpectedKey(k) if k == "9.weight"),
+            "{err:?}"
+        );
+        let lenient = LoadOptions {
+            rename: Some(Box::new(rename)),
+            strict: false,
+        };
+        load_with(&path, &net, &mut params, lenient).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `Debug` shows whether a rename is set, and `Default` is strict with none.
+    #[test]
+    fn load_options_debug_and_default() {
+        let default = LoadOptions::default();
+        assert!(default.rename.is_none() && default.strict);
+        assert!(format!("{default:?}").contains("rename: false"));
+        assert!(format!("{:?}", LoadOptions::strip_prefix("m.")).contains("rename: true"));
     }
 
     /// The model behind `from-rust.safetensors`: the fixture's MLP with every parameter set

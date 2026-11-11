@@ -252,7 +252,7 @@ impl ActivationKind {
                 if x > T::ZERO {
                     x
                 } else {
-                    c(alpha) * (x.exp() - T::ONE)
+                    c(alpha) * x.exp_m1()
                 }
             }
             // `scale · (alpha · (eˣ - 1))`, grouped as the tape's SELU computes it.
@@ -260,14 +260,14 @@ impl ActivationKind {
                 if x > T::ZERO {
                     c(SELU_SCALE) * x
                 } else {
-                    c(SELU_SCALE) * (c(SELU_ALPHA) * (x.exp() - T::ONE))
+                    c(SELU_SCALE) * (c(SELU_ALPHA) * x.exp_m1())
                 }
             }
             ActivationKind::Celu(alpha) => {
                 if x > T::ZERO {
                     x
                 } else {
-                    c(alpha) * ((x / c(alpha)).exp() - T::ONE)
+                    c(alpha) * (x / c(alpha)).exp_m1()
                 }
             }
             ActivationKind::Silu => x * sigmoid(x),
@@ -335,8 +335,10 @@ impl ActivationKind {
             ActivationKind::LeakyRelu(slope) => {
                 if x > T::ZERO {
                     T::ONE
-                } else {
+                } else if x <= T::ZERO {
                     c(slope)
+                } else {
+                    nan()
                 }
             }
             ActivationKind::Tanh => T::ONE - y * y,
@@ -1045,20 +1047,22 @@ impl<T: Real> Layer<T> for Prelu {
         tape.prelu(x, slope)
     }
 
-    /// 1 where `x` is above 0 and the value's slope elsewhere (at 0 and for NaN too), as the
-    /// tape's PReLU gradient uses.
+    /// 1 where `x` is above 0, the value's slope where `x` is at or below 0, and NaN for a
+    /// NaN input, as the tape's PReLU gradient uses.
     fn local_derivative(&self, tape: &Tape<'_, T>, x: Var, out: &mut [T]) -> bool {
         let slopes = tape.param_value(self.weight);
         let slopes = slopes.data();
         for (i, (d, &v)) in out.iter_mut().zip(tape.value(x).data()).enumerate() {
             *d = if v > T::ZERO {
                 T::ONE
-            } else {
+            } else if v <= T::ZERO {
                 slopes[if slopes.len() == 1 {
                     0
                 } else {
                     i % slopes.len()
                 }]
+            } else {
+                nan()
             };
         }
         true

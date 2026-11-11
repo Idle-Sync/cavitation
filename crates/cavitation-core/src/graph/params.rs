@@ -43,6 +43,17 @@ fn index_in(store: u32, id: ParamId) -> usize {
     id.index
 }
 
+/// Panics unless parameter `index`'s value and gradient have the same shape.
+fn check_shapes(index: usize, value: &Shape, grad: &Shape) {
+    assert!(
+        value == grad,
+        "parameter {index}: its value has shape {:?} but its gradient has shape {:?}; \
+         change a parameter's elements, never its shape",
+        value.dims(),
+        grad.dims()
+    );
+}
+
 /// The values of every parameter in a [`ParamStore`], indexed by [`ParamId`].
 ///
 /// A [`Tape`](crate::Tape) borrows this half of the store while it records, so that
@@ -87,7 +98,9 @@ impl<T: Real> ParamValues<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` was created by another store.
+    /// Panics if `id` was created by another store. A value whose shape was changed is
+    /// caught later: [`ParamStore::iter_mut`] panics when the iterator reaches that
+    /// parameter (for example during an optimiser step), and so does the backward pass.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -182,8 +195,18 @@ impl<T: Real> ParamGrads<T> {
 
     /// The gradient buffer of `id` and its stale flag, left unchanged, for a writer that
     /// clears the flag only once its write has succeeded.
-    pub(crate) fn buffer_and_flag(&mut self, id: ParamId) -> (&mut [T], &mut bool) {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value_shape`, the shape of the parameter's value, differs from the
+    /// gradient buffer's shape.
+    pub(crate) fn buffer_and_flag(
+        &mut self,
+        id: ParamId,
+        value_shape: &Shape,
+    ) -> (&mut [T], &mut bool) {
         let i = index_in(self.store, id);
+        check_shapes(i, value_shape, self.tensors[i].shape());
         (self.tensors[i].data_mut(), &mut self.stale[i])
     }
 
@@ -363,7 +386,9 @@ impl<T: Real> ParamStore<T> {
     ///
     /// # Panics
     ///
-    /// Panics if `id` was created by another store.
+    /// Panics if `id` was created by another store. A value whose shape was changed is
+    /// caught later: [`iter_mut`](Self::iter_mut) panics when the iterator reaches that
+    /// parameter (for example during an optimiser step), and so does the backward pass.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -398,6 +423,13 @@ impl<T: Real> ParamStore<T> {
     /// `None` for a parameter the backward pass did not reach. The optimisers skip such a
     /// parameter.
     ///
+    /// # Panics
+    ///
+    /// Panics, while the iterator is consumed, at a parameter whose value shape differs
+    /// from its gradient's shape (its shape was changed through
+    /// [`value_mut`](Self::value_mut)). The check runs as the iterator reaches each
+    /// parameter, so a lazily consumed iterator panics only at the offending one.
+    ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
     /// let mut store = ParamStore::new();
@@ -424,6 +456,7 @@ impl<T: Real> ParamStore<T> {
             .enumerate()
             .map(move |(index, value)| {
                 let id = ParamId { index, store };
+                check_shapes(index, value.shape(), grads.tensors[index].shape());
                 let grad = (!grads.stale[index]).then(|| grads.view(id));
                 (id, value, grad)
             })
@@ -481,5 +514,46 @@ mod tests {
         let p = s1.add(Tensor::full(&[1], 1.0f32));
         s2.add(Tensor::full(&[1], 2.0f32));
         s2.value(p);
+    }
+
+    /// A store with one `[2, 3]` parameter whose value was reshaped to `[3, 2]` through
+    /// `value_mut`, and its id.
+    fn reshaped_store() -> (ParamStore, ParamId) {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[2, 3], 1.0f32));
+        store.value_mut(p).reshape(&[3, 2]).unwrap();
+        (store, p)
+    }
+
+    /// An optimiser step over a parameter whose value changed shape panics.
+    #[test]
+    #[should_panic(expected = "its value has shape [3, 2] but its gradient has shape [2, 3]")]
+    fn reshaped_param_panics_at_optimizer_step() {
+        let (mut store, p) = reshaped_store();
+        store.grads.accumulate(p).0.data_mut().fill(1.0);
+        let _ = store.iter_mut().count();
+    }
+
+    /// The backward pass into a parameter whose value changed shape panics.
+    #[test]
+    #[should_panic(expected = "its value has shape [3, 2] but its gradient has shape [2, 3]")]
+    fn reshaped_param_panics_at_backward() {
+        let (mut store, p) = reshaped_store();
+        let mut graph = crate::Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let loss = tape.sum(v);
+        tape.backward(loss, &mut store.grads);
+    }
+
+    /// Writing elements through `value_mut` is fine: the shape is unchanged.
+    #[test]
+    fn element_writes_through_value_mut_still_work() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[2, 3], 1.0f32));
+        store.value_mut(p).data_mut()[0] = 4.0;
+        store.grads.accumulate(p).0.data_mut().fill(1.0);
+        assert_eq!(store.iter_mut().count(), 1);
+        assert_eq!(store.value(p).data()[0], 4.0);
     }
 }

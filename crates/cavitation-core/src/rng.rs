@@ -139,7 +139,12 @@ impl Rng {
         (self.next_u64() >> 11) as f64 * (1.0 / 9_007_199_254_740_992.0)
     }
 
-    /// Returns a uniform `f64` in `[lo, hi)`.
+    /// Returns a uniform `f64` in `[lo, hi)` when `lo < hi`, and `lo` when `lo == hi`.
+    ///
+    /// Rounding can push `lo + (hi - lo) * u` up to `hi` for the largest draws; the result
+    /// is then the largest `f64` below `hi` (but not below `lo`), so `hi` is never returned.
+    /// With reversed bounds (`lo > hi`) the draw is `lo + (hi - lo) * u`, a value in
+    /// `(hi, lo]`, with no clamp.
     ///
     /// # Examples
     ///
@@ -149,7 +154,20 @@ impl Rng {
     /// assert!((-2.0..3.0).contains(&x));
     /// ```
     pub fn range(&mut self, lo: f64, hi: f64) -> f64 {
-        lo + (hi - lo) * self.uniform_f64()
+        let u = self.uniform_f64();
+        Rng::range_from(lo, hi, u)
+    }
+
+    /// Maps the unit draw `u` in `[0, 1)` onto `[lo, hi)`, stepping back below `hi` when
+    /// rounding reaches it and never going below `lo`. The step back applies only when
+    /// `lo < hi`; reversed bounds return the plain mapping.
+    fn range_from(lo: f64, hi: f64, u: f64) -> f64 {
+        let x = lo + (hi - lo) * u;
+        if lo < hi && x >= hi {
+            hi.next_down().max(lo)
+        } else {
+            x
+        }
     }
 
     /// Returns a standard normal draw (mean 0, variance 1) by the Box-Muller transform.
@@ -286,5 +304,36 @@ mod tests {
             seen[k as usize] = true;
         }
         assert!(seen.iter().all(|&s| s));
+    }
+
+    /// Even the largest draw never reaches `hi`, whatever the rounding, and never goes
+    /// below `lo`.
+    #[test]
+    fn range_never_returns_hi() {
+        let u = 1.0 - f64::EPSILON / 2.0;
+        for (lo, hi) in [
+            (0.0, 1.0),
+            (1.0, 1.0 + f64::EPSILON * 4.0),
+            (-1e-300, 1e-300),
+            (1e15, 1e15 + 1.0),
+        ] {
+            let x = Rng::range_from(lo, hi, u);
+            assert!(x < hi && x >= lo, "range_from({lo}, {hi}) gave {x}");
+        }
+    }
+
+    /// Reversed bounds keep the plain `lo + (hi - lo) * u` mapping, as in v0.1, instead of
+    /// collapsing to `lo`.
+    #[test]
+    fn range_reversed_bounds_stays_uniform() {
+        for u in [0.0, 0.3, 0.7] {
+            assert_eq!(Rng::range_from(3.0, 1.0, u), 3.0 + (1.0 - 3.0) * u);
+        }
+    }
+
+    /// With equal bounds the only possible value is the bound itself.
+    #[test]
+    fn range_equal_bounds_returns_lo() {
+        assert_eq!(Rng::seed(3).range(2.5, 2.5), 2.5);
     }
 }

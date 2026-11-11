@@ -737,28 +737,12 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 }
 
 /// Checks, before any training, that `model` and `loss` suit `data` (already passed by
-/// [`check_dataset`]): the inputs are as wide as each layer that names an input width
-/// expects, the kind of targets is the kind `loss` needs, every class label is below the
+/// [`check_dataset`]): the kind of targets is the kind `loss` needs, binary cross-entropy
+/// targets are in `[0, 1]` (neither needs the output width, so both run even for a model
+/// whose layers disagree), the inputs are as wide as each layer that names an input width
+/// expects, every class label is below the
 /// model's output width, and value targets are as wide as the model's output.
 fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Result<(), Error> {
-    let (rows, mut width) = (data.len(), data.features());
-    for i in 0..model.len() {
-        let layer = model.layer(i);
-        if let Some(expected) = layer.input_width()
-            && expected != width
-        {
-            if i == 0 {
-                return Err(Error::ShapeMismatch {
-                    expected: vec![rows, expected],
-                    found: vec![rows, width],
-                });
-            }
-            // The layers themselves disagree: a model error, which the forward pass reports
-            // with both layers named.
-            break;
-        }
-        width = layer.output_width(width);
-    }
     let kind = |classes: bool| if classes { "class" } else { "value" };
     let has_classes = matches!(data.targets, Targets::Classes(_));
     if loss.needs_classes() != has_classes {
@@ -767,6 +751,42 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
             kind(loss.needs_classes()),
             kind(has_classes)
         )));
+    }
+    if matches!(
+        loss,
+        Loss::BinaryCrossEntropy | Loss::BinaryCrossEntropyWithLogits
+    ) && let Targets::Values(t) = &data.targets
+        && let &[_, columns] = t.shape().dims()
+        && let Some(i) = t.data().iter().position(|v| !(0.0..=1.0).contains(v))
+    {
+        let value = t.data()[i];
+        return Err(Error::InvalidData(format!(
+            "row {}, column {}: the target is {value}, but Loss::{loss:?} needs targets in [0, 1]",
+            i / columns,
+            i % columns
+        )));
+    }
+    let (rows, mut width) = (data.len(), data.features());
+    // Whether an earlier layer named an input width, so that `width` is checked against it.
+    let mut named = false;
+    for i in 0..model.len() {
+        let layer = model.layer(i);
+        if let Some(expected) = layer.input_width() {
+            if expected != width {
+                if !named {
+                    return Err(Error::ShapeMismatch {
+                        expected: vec![rows, expected],
+                        found: vec![rows, data.features()],
+                    });
+                }
+                // Two layers disagree: a model error, which the forward pass reports with
+                // both layers named. The output width is unknown, so the checks that need it
+                // (the labels and the value-target width) are skipped.
+                return Ok(());
+            }
+            named = true;
+        }
+        width = layer.output_width(width);
     }
     match &data.targets {
         Targets::Classes(labels) => match labels.iter().position(|&l| l >= width) {
@@ -797,10 +817,15 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
 ///
 /// Returns, before training, [`Error::InvalidData`] if `train.x` is not a matrix or has no
 /// rows, if value targets are not a matrix, if the kind of targets is not the kind
-/// `config.loss` needs (see [`Loss`]), or if a class label is not below the model's output
-/// width; and [`Error::ShapeMismatch`] if the targets do not have one entry per row, value
+/// `config.loss` needs (see [`Loss`]), if a class label is not below the model's output
+/// width, or, for [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`],
+/// if a target is NaN, infinite or outside `[0, 1]` (the message names its row and
+/// column); and [`Error::ShapeMismatch`] if the targets do not have one entry per row, value
 /// targets are not as wide as the model's output, or the inputs are not as wide as the
-/// first layer expects. During training, with `config.health.on_non_finite` set to
+/// first layer that names an input width expects (layers that do not, such as activations,
+/// may come before it). Two layers that disagree on a width are a model error, not a data
+/// error: the checks that need the output width are skipped and the first forward pass
+/// panics naming both layers. During training, with `config.health.on_non_finite` set to
 /// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`] at
 /// the first step whose loss or gradient is NaN or infinite, naming the step and `"loss"` or
 /// the parameter (for example `"0.weight"`), after sending the matching warning to the
@@ -885,7 +910,7 @@ pub fn fit_with_hooks(
     trainer.set_health(config.health);
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut history = History {
-        epochs: Vec::with_capacity(config.epochs),
+        epochs: Vec::with_capacity(config.epochs.min(1024)),
     };
     params.zero_grad();
     let initial_lr = trainer.optimizer.learning_rate();
@@ -921,7 +946,8 @@ pub fn fit_with_hooks(
 /// # Panics
 ///
 /// Panics if `data` has value targets rather than class labels, if it has no rows, if the
-/// labels are not one per row, or if `batch` is 0; and as [`InferenceModel::compile`] and
+/// labels are not one per row, if a label is not below the model's output width, or if
+/// `batch` is 0; and as [`InferenceModel::compile`] and
 /// [`InferenceModel::infer_batch`] (or [`Sequential::forward`]) do when the shapes do not
 /// fit.
 ///
@@ -961,7 +987,12 @@ pub fn accuracy(model: &Sequential, params: &ParamStore, data: &Dataset, batch: 
         .expect("a run of whole rows of x has the batch's shape");
         let mut count = |scores: &[f32]| {
             let classes = scores.len() / (end - start);
-            for (row, &label) in scores.chunks(classes).zip(&labels[start..end]) {
+            for (i, (row, &label)) in scores.chunks(classes).zip(&labels[start..end]).enumerate() {
+                assert!(
+                    label < classes,
+                    "accuracy: the label of row {} is {label}, but the model has {classes} outputs (classes 0..{classes})",
+                    start + i
+                );
                 if argmax(row) == Some(label) {
                     correct += 1;
                 }
@@ -1405,6 +1436,173 @@ mod tests {
         assert_eq!(parameter_bits(&net, &params), before);
     }
 
+    /// A one-column value data set with the given targets and zero inputs.
+    fn unit_targets(targets: Vec<f32>) -> Dataset<f32> {
+        let rows = targets.len();
+        Dataset {
+            x: Tensor::zeros(&[rows, 1]),
+            targets: Targets::Values(Tensor::from_vec(targets, &[rows, 1]).unwrap()),
+        }
+    }
+
+    /// A one-input, one-output network.
+    fn one_to_one(params: &mut ParamStore) -> Sequential {
+        Sequential::new().push(Linear::new(params, 1, 1, &mut Rng::seed(0)))
+    }
+
+    /// A one-input, one-output network that ends in a sigmoid, so its output is a probability.
+    fn one_to_one_probability(params: &mut ParamStore) -> Sequential {
+        one_to_one(params).push(Sigmoid)
+    }
+
+    /// `fit` config for `loss` with two epochs.
+    fn config_for(loss: Loss) -> FitConfig {
+        FitConfig {
+            epochs: 2,
+            batch: 2,
+            loss,
+            ..FitConfig::default()
+        }
+    }
+
+    /// A binary cross-entropy target outside `[0, 1]` is a data error naming its row, column
+    /// and value, for both binary losses.
+    #[test]
+    fn bce_rejects_target_outside_unit_interval() {
+        for loss in [Loss::BinaryCrossEntropy, Loss::BinaryCrossEntropyWithLogits] {
+            let mut params = ParamStore::new();
+            let net = one_to_one_probability(&mut params);
+            let data = unit_targets(vec![0.0, 3.0]);
+            let err = fit(&net, &mut params, &data, config_for(loss)).unwrap_err();
+            let Error::InvalidData(message) = &err else {
+                panic!("expected InvalidData, found {err:?}");
+            };
+            assert!(message.contains("row 1, column 0"), "{message}");
+            assert!(message.contains('3'), "{message}");
+        }
+    }
+
+    /// A NaN binary cross-entropy target is a data error, for both binary losses.
+    #[test]
+    fn bce_rejects_nan_target() {
+        for loss in [Loss::BinaryCrossEntropy, Loss::BinaryCrossEntropyWithLogits] {
+            let mut params = ParamStore::new();
+            let net = one_to_one_probability(&mut params);
+            let data = unit_targets(vec![f32::NAN, 1.0]);
+            let err = fit(&net, &mut params, &data, config_for(loss)).unwrap_err();
+            assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        }
+    }
+
+    /// Targets of exactly 0 and 1 are valid binary cross-entropy targets.
+    #[test]
+    fn bce_accepts_zero_and_one() {
+        for loss in [Loss::BinaryCrossEntropy, Loss::BinaryCrossEntropyWithLogits] {
+            let mut params = ParamStore::new();
+            let net = one_to_one_probability(&mut params);
+            let data = unit_targets(vec![0.0, 1.0]);
+            let config = FitConfig {
+                optimizer: OptimizerConfig::Sgd {
+                    lr: 0.01,
+                    momentum: 0.0,
+                    weight_decay: 0.0,
+                },
+                ..config_for(loss)
+            };
+            fit(&net, &mut params, &data, config).unwrap();
+        }
+    }
+
+    /// Two layers that disagree on a width are a model error: `fit` does not return a data
+    /// error, and the forward pass panics naming both layers.
+    #[test]
+    #[should_panic(expected = "layer 1 (")]
+    fn disagreeing_layers_panic_in_forward() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut rng))
+            .push(Linear::new(&mut params, 5, 2, &mut rng));
+        let data = Dataset {
+            x: Tensor::zeros(&[4, 3]),
+            targets: Targets::Values(Tensor::zeros(&[4, 2])),
+        };
+        let config = FitConfig {
+            loss: Loss::Mse,
+            ..FitConfig::default()
+        };
+        let _ = fit(&net, &mut params, &data, config);
+    }
+
+    /// Binary cross-entropy targets outside `[0, 1]` are a data error even when the model's
+    /// layers disagree on a width, because that check does not need the output width.
+    #[test]
+    fn bce_target_check_runs_for_disagreeing_layers() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut rng))
+            .push(Linear::new(&mut params, 5, 1, &mut rng));
+        let data = Dataset {
+            x: Tensor::zeros(&[2, 3]),
+            targets: Targets::Values(Tensor::from_vec(vec![0.0, 3.0], &[2, 1]).unwrap()),
+        };
+        let err = fit(
+            &net,
+            &mut params,
+            &data,
+            config_for(Loss::BinaryCrossEntropy),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+    }
+
+    /// Inputs of the wrong width are a data error even when an activation comes before the
+    /// first layer that names a width.
+    #[test]
+    fn activation_first_wrong_width() {
+        let mut params = ParamStore::new();
+        let net =
+            Sequential::new()
+                .push(Tanh)
+                .push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0)));
+        let data = Dataset {
+            x: Tensor::zeros(&[4, 4]),
+            targets: Targets::Classes(vec![0; 4]),
+        };
+        let err = fit(&net, &mut params, &data, FitConfig::default()).unwrap_err();
+        assert!(
+            matches!(&err, Error::ShapeMismatch { expected, found }
+                if expected == &[4, 3] && found == &[4, 4]),
+            "{err:?}"
+        );
+    }
+
+    /// `fit` with an epoch count of `usize::MAX` stops at the first non-finite loss and does
+    /// not reserve room for every epoch's report.
+    #[test]
+    fn fit_huge_epochs_does_not_reserve() {
+        let mut params = ParamStore::new();
+        let net = one_to_one(&mut params);
+        let data = Dataset {
+            x: Tensor::from_vec(vec![1.0f32, 2.0], &[2, 1]).unwrap(),
+            targets: Targets::Values(Tensor::from_vec(vec![5.0f32, 9.0], &[2, 1]).unwrap()),
+        };
+        let config = FitConfig {
+            epochs: usize::MAX,
+            batch: 2,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 1e20,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            ..FitConfig::default()
+        };
+        let err = fit(&net, &mut params, &data, config).unwrap_err();
+        assert!(matches!(err, Error::NonFinite { .. }), "{err:?}");
+    }
+
     /// `on_epoch` sees each epoch's report, numbered from 1, the same reports `fit` returns.
     #[test]
     fn fit_reports_every_epoch() {
@@ -1656,6 +1854,20 @@ mod tests {
         let data = Dataset {
             x: Tensor::zeros(&[3, 2]),
             targets: Targets::Values(Tensor::zeros(&[3, 1])),
+        };
+        accuracy(&net, &params, &data, 2);
+    }
+
+    /// A label equal to the output width is out of range, and `accuracy` panics naming the
+    /// row, the label and the width.
+    #[test]
+    #[should_panic(expected = "the label of row 1 is 3, but the model has 3 outputs")]
+    fn accuracy_label_equal_to_width_panics() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+        let data = Dataset {
+            x: Tensor::zeros(&[2, 2]),
+            targets: Targets::Classes(vec![0, 3]),
         };
         accuracy(&net, &params, &data, 2);
     }

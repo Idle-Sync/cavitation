@@ -165,9 +165,22 @@ def hyphen(op):
     return op.replace("_", "-")
 
 
-def unary(op, fn, params=None, shape=(16, 33), scale=2.5, kinks=(), suffix="", margin=0.05):
-    """A case of an operation of one input."""
+TINY_NEGATIVES = [-1e-10, -1e-5, -0.0, -1e-40]
+
+
+def unary(
+    op, fn, params=None, shape=(16, 33), scale=2.5, kinks=(), suffix="", margin=0.05, tiny=False
+):
+    """A case of an operation of one input.
+
+    With `tiny`, the first four elements are replaced by `TINY_NEGATIVES` (a value near zero,
+    negative zero and an f32 subnormal), where `exp(x) - 1` loses precision. They replace
+    values instead of being appended, so the random stream, and with it every other case, is
+    unchanged.
+    """
     x = away(rnd(*shape, scale=scale), kinks, margin) if kinks else rnd(*shape, scale=scale)
+    if tiny:
+        x.view(-1)[: len(TINY_NEGATIVES)] = torch.tensor(TINY_NEGATIVES)
     add_case(hyphen(op) + suffix, op, params or {}, [x], fn)
 
 
@@ -233,10 +246,10 @@ def make_activations():
         "gelu", lambda x: F.gelu(x, approximate="tanh"), {"approximate": "tanh"}, suffix="-tanh"
     )
     alpha = 1.3
-    unary("elu", lambda x: F.elu(x, alpha), {"alpha": alpha}, kinks=[0.0])
-    unary("selu", F.selu, kinks=[0.0])
+    unary("elu", lambda x: F.elu(x, alpha), {"alpha": alpha}, kinks=[0.0], tiny=True)
+    unary("selu", F.selu, kinks=[0.0], tiny=True)
     alpha = 0.7
-    unary("celu", lambda x: F.celu(x, alpha), {"alpha": alpha}, kinks=[0.0])
+    unary("celu", lambda x: F.celu(x, alpha), {"alpha": alpha}, kinks=[0.0], tiny=True)
     unary("silu", F.silu)
     unary("mish", F.mish)
     beta, threshold = 1.5, 20.0

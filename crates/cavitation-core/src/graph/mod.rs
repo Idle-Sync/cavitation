@@ -242,7 +242,7 @@ impl<T: Real> BackwardCtx<'_, T> {
         match node.op {
             Op::Input => None,
             Op::Param(id) => {
-                let (buf, stale) = self.params.buffer_and_flag(id);
+                let (buf, stale) = self.params.buffer_and_flag(id, &node.shape);
                 Some(GradSlot {
                     buf,
                     overwrite: *stale,
@@ -846,13 +846,13 @@ mod tests {
         tape.backward(loss, &mut s2.grads);
     }
 
-    /// A gradient write that panics on a length mismatch leaves the parameter stale.
+    /// A gradient write that panics on a shape mismatch leaves the parameter stale.
     #[test]
     fn failed_gradient_write_leaves_param_stale() {
         let mut store = ParamStore::new();
         let p = store.add(Tensor::full(&[2], 1.0f32));
         // Shrinking the value breaks the documented rule on purpose: the gradient buffer
-        // keeps two elements while the loss below sends back one.
+        // keeps two elements while the value has one.
         *store.value_mut(p) = Tensor::full(&[1], 1.0f32);
         let mut graph = Graph::new();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -863,7 +863,7 @@ mod tests {
         }));
         let message = result.unwrap_err();
         let message = message.downcast_ref::<String>().unwrap();
-        assert!(message.contains("gradient length 1"), "{message}");
+        assert!(message.contains("its gradient has shape [2]"), "{message}");
         assert!(store.grads.is_stale(p));
     }
 }

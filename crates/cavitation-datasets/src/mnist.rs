@@ -45,7 +45,10 @@ fn parse_idx(
         return Err(bad(format!("magic number {}, expected {magic}", word(0))));
     }
     let sizes: Vec<usize> = (0..dims).map(|d| word(4 + 4 * d) as usize).collect();
-    let expected: usize = sizes.iter().product();
+    let expected = sizes
+        .iter()
+        .try_fold(1usize, |total, &size| total.checked_mul(size))
+        .ok_or_else(|| bad(format!("dimensions {sizes:?} overflow")))?;
     if bytes.len() - header != expected {
         return Err(bad(format!(
             "{} data bytes for dimensions {sizes:?}, expected {expected}",
@@ -90,7 +93,8 @@ fn load_split(dir: &Path, prefix: &str) -> Result<Dataset, Error> {
 ///
 /// Returns [`Error::Io`] naming the file if one cannot be read; for a missing file the message
 /// points to `scripts/data/get-mnist.sh`. Returns [`Error::Format`] if a file has the wrong
-/// magic number or length, or if the image and label counts differ.
+/// magic number, a length that does not match its dimensions (including dimensions whose
+/// product overflows `usize`), or if the image and label counts differ.
 ///
 /// # Examples
 ///
@@ -207,6 +211,26 @@ mod tests {
         write_set(&dir, 3, 2);
         write_idx(&dir.join("train-labels-idx1-ubyte"), 2049, &[2], &[0, 1]);
         assert!(matches!(load(&dir), Err(Error::Format(_))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A header whose dimensions overflow `usize` is a `Format` error naming the dimensions,
+    /// not a panic (debug) or a wrapped length (release).
+    #[test]
+    fn overflowing_dimensions_are_a_format_error() {
+        let dir = temp_dir("overflow");
+        write_set(&dir, 3, 2);
+        write_idx(
+            &dir.join("train-images-idx3-ubyte"),
+            2051,
+            &[u32::MAX, u32::MAX, u32::MAX],
+            &[0; 16],
+        );
+        let err = load(&dir).unwrap_err();
+        assert!(matches!(err, Error::Format(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("overflow"), "{text}");
+        assert!(text.contains("train-images-idx3-ubyte"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
