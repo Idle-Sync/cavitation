@@ -111,7 +111,9 @@ impl fmt::Display for Warning {
             ),
             Warning::Vanishing { step, layer, norm } => write!(
                 f,
-                "step {step}: the gradient norm of {layer} is {norm:.3e}, below the vanishing limit"
+                "step {step}: the gradient norm of {layer} is {norm:.3e}, below the vanishing limit \
+                 (a gradient this small with a loss that has not fallen 10000-fold is a vanishing \
+                 gradient)"
             ),
             Warning::DeadNeurons {
                 epoch,
@@ -152,7 +154,9 @@ pub struct Health {
     pub on_non_finite: OnNonFinite,
     /// A gradient norm above this sends [`Warning::Exploding`].
     pub grad_norm_high: f64,
-    /// A gradient norm below this sends [`Warning::Vanishing`].
+    /// A gradient norm below this sends [`Warning::Vanishing`]. A gradient this small with a
+    /// loss that has not fallen is a vanishing gradient; once the loss has fallen 10,000-fold
+    /// from its first value (or to 0), the warning is not sent, since that is convergence.
     pub grad_norm_low: f64,
     /// Whether to look for dead ReLU and ReLU6 neurons (one pass over those layers' outputs
     /// each step).
@@ -197,6 +201,10 @@ const WARNED_NON_FINITE: u8 = 1;
 const WARNED_EXPLODING: u8 = 2;
 /// Bit in a parameter's warned flags: [`Warning::Vanishing`] was sent this epoch.
 const WARNED_VANISHING: u8 = 4;
+
+/// A run whose latest loss is at most this fraction of its first loss has converged, so a
+/// small gradient is not a vanishing one.
+const CONVERGED_LOSS_RATIO: f64 = 1e-4;
 
 /// Where one ReLU or ReLU6 layer's neurons sit in the monitor's `alive` buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -281,6 +289,10 @@ pub struct HealthMonitor {
     tracked: bool,
     /// The layers whose dead-neuron report was printed to standard error (with no sink).
     dead_printed: Vec<usize>,
+    /// The first finite loss seen by `after_backward`, kept for the monitor's whole life.
+    first_loss: Option<f64>,
+    /// The latest finite loss seen by `after_backward`.
+    latest_loss: Option<f64>,
 }
 
 impl HealthMonitor {
@@ -301,6 +313,17 @@ impl HealthMonitor {
             alive: Vec::new(),
             tracked: false,
             dead_printed: Vec::new(),
+            first_loss: None,
+            latest_loss: None,
+        }
+    }
+
+    /// Whether the loss has fallen to at most [`CONVERGED_LOSS_RATIO`] of its first value.
+    /// False when no finite loss was recorded.
+    fn converged(&self) -> bool {
+        match (self.first_loss, self.latest_loss) {
+            (Some(first), Some(latest)) => latest <= first * CONVERGED_LOSS_RATIO,
+            _ => false,
         }
     }
 
@@ -382,7 +405,11 @@ impl HealthMonitor {
                 count: clamped,
             });
         }
-        if !loss.is_finite() {
+        if loss.is_finite() {
+            let loss = f64::from(loss);
+            self.first_loss.get_or_insert(loss);
+            self.latest_loss = Some(loss);
+        } else {
             match self.health.on_non_finite {
                 OnNonFinite::Stop => {
                     return Err(self.stop(step, "loss".to_string()));
@@ -458,7 +485,9 @@ impl HealthMonitor {
     /// (compute it once, before training). Each named parameter's gradient must be finite,
     /// and its norm between [`Health::grad_norm_low`] and [`Health::grad_norm_high`]: one
     /// outside sends [`Warning::Vanishing`] or [`Warning::Exploding`], at most once per
-    /// epoch for each parameter.
+    /// epoch for each parameter. No [`Warning::Vanishing`] is sent once the latest loss given
+    /// to [`after_backward`](HealthMonitor::after_backward) is at most 1e-4 of the first
+    /// (the run has converged); without a recorded loss the check always runs.
     ///
     /// The update has already applied the gradients when this runs, so a non-finite
     /// gradient has reached the parameters by then.
@@ -516,6 +545,7 @@ impl HealthMonitor {
         }
         self.warned.resize(names.len(), 0);
         let (high, low) = (self.health.grad_norm_high, self.health.grad_norm_low);
+        let converged = self.converged();
         for (k, (name, id)) in names.iter().enumerate() {
             // A sum of squares of finite `f32` values is finite in `f64`, so a norm that is
             // not finite means the gradient held a NaN or an infinity.
@@ -525,6 +555,9 @@ impl HealthMonitor {
             } else if norm > high {
                 WARNED_EXPLODING
             } else if norm < low {
+                if converged {
+                    continue;
+                }
                 WARNED_VANISHING
             } else {
                 continue;
@@ -1114,6 +1147,90 @@ mod tests {
         assert_ne!(parameter_bits(&net, &params), before);
     }
 
+    /// A `Linear` 1 → 1 fitting `y = 2x + 1` on 8 points evenly spaced in `[-1, 1]` (full
+    /// batch, SGD with a learning rate of 0.5, mean squared error, 400 epochs) reaches a mean
+    /// loss below 1e-8, and its gradients fall below the vanishing limit only because it has
+    /// converged: the sink receives no `Vanishing`.
+    #[test]
+    fn converged_regression_sends_no_vanishing() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+        let xs: Vec<f32> = (0..8).map(|i| -1.0 + 2.0 * i as f32 / 7.0).collect();
+        let ys: Vec<f32> = xs.iter().map(|x| 2.0 * x + 1.0).collect();
+        let data = Dataset {
+            x: Tensor::from_vec(xs, &[8, 1]).unwrap(),
+            targets: Targets::Values(Tensor::from_vec(ys, &[8, 1]).unwrap()),
+        };
+        let (seen, sink) = collecting_sink();
+        let config = FitConfig {
+            epochs: 400,
+            batch: 8,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.5,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            shuffle_seed: None,
+            health: health(OnNonFinite::Stop, sink),
+            ..FitConfig::default()
+        };
+        let history = fit(&net, &mut params, &data, config).unwrap();
+        let last = history.epochs.last().unwrap().mean_loss;
+        assert!(last < 1e-8, "{last}");
+        let vanishing: Vec<Warning> = seen
+            .borrow()
+            .iter()
+            .filter(|w| matches!(w, Warning::Vanishing { .. }))
+            .cloned()
+            .collect();
+        // Each epoch is one step, so epoch `i` holds the loss of step `i`. The bias gradient
+        // is about 0 after the first update (its curvature times the learning rate is 1), so
+        // early steps may warn while the weight is still far off; none may once the loss has
+        // fallen 10000-fold.
+        let first = history.epochs[0].mean_loss;
+        let late: Vec<&Warning> = vanishing
+            .iter()
+            .filter(|w| match w {
+                Warning::Vanishing { step, .. } => {
+                    history.epochs[*step as usize - 1].mean_loss <= first * 1e-4
+                }
+                _ => false,
+            })
+            .collect();
+        assert!(
+            late.is_empty(),
+            "{} warnings, first {:?}",
+            late.len(),
+            late.first()
+        );
+    }
+
+    /// A loss that falls from 1 to exactly 0 counts as converged: zero gradients then send no
+    /// `Vanishing`, with no division by the loss.
+    #[test]
+    fn zero_loss_counts_as_converged() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+        let names = net.parameter_names();
+        let mut graph = Graph::new();
+        let trace = crate::Trace::new();
+        let mut optimizer = Sgd::new(0.1);
+        optimizer.step(&mut params);
+        let (seen, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
+        let tape = graph.tape(&params.values);
+        for (step, loss) in [(1, 1.0), (2, 0.0)] {
+            monitor
+                .after_backward(step, loss, &tape, &trace, &net)
+                .unwrap();
+        }
+        monitor
+            .after_update(2, optimizer.last_stats(), &names)
+            .unwrap();
+        assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
+    }
+
     /// Each warning reads as one plain-English line.
     #[test]
     fn warnings_display() {
@@ -1149,7 +1266,8 @@ mod tests {
                 "step 3: binary cross-entropy met 2 probabilities of exactly 0 or 1 and clamped their logarithms to -100",
                 "step 1: a NaN or infinite value in loss",
                 "step 2: the gradient norm of 0.weight is 2.500e4, above the exploding limit",
-                "step 2: the gradient norm of 2.bias is 0.000e0, below the vanishing limit",
+                "step 2: the gradient norm of 2.bias is 0.000e0, below the vanishing limit (a gradient \
+                 this small with a loss that has not fallen 10000-fold is a vanishing gradient)",
                 "epoch 1: 2 neurons of layer 1 output 0 for every sample (dead ReLU): [0, 3]",
             ]
         );
