@@ -363,17 +363,29 @@ fn pool_steady_state() -> usize {
     made
 }
 
-/// The pool's slow path: the caller first sleeps on the pool's condition variable only in
-/// the counted rounds. Warm-up runs 100 instant jobs, so the caller never runs out of spin;
-/// the counted rounds make every worker task sleep 1 ms, longer than the caller spins, so
-/// the caller waits on the condition variable. On Apple targets that variable allocates on
-/// its first use unless the pool has used it before. Returns the allocations made during
-/// the counted rounds, on any thread.
+/// The pool's slow path: the caller sleeps on the pool's condition variable for the first
+/// time in the counted rounds. Runs first, so no earlier scenario has made the caller sleep.
+/// Warm-up runs 100 instant jobs. In each counted round the caller's task waits until the
+/// three worker tasks have started (so the caller cannot take them itself), and each worker
+/// task then sleeps 2 ms, longer than the caller spins, so the caller must sleep on the
+/// condition variable. On Apple targets that variable and its lock allocate on first use
+/// unless the pool has used them before. Returns the allocations made during the counted
+/// rounds, on any thread.
 fn pool_wait_steady_state() -> usize {
     let slow = AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
     let job = |t: Task| {
-        if t.worker != 0 && slow.load(Ordering::Relaxed) {
-            std::thread::sleep(std::time::Duration::from_millis(1));
+        if !slow.load(Ordering::Relaxed) {
+            return;
+        }
+        if t.worker == 0 {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while started.load(Ordering::Acquire) < 3 && std::time::Instant::now() < deadline {
+                std::hint::spin_loop();
+            }
+        } else {
+            started.fetch_add(1, Ordering::Release);
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     };
     for _ in 0..100 {
@@ -382,6 +394,7 @@ fn pool_wait_steady_state() -> usize {
     slow.store(true, Ordering::Relaxed);
     let before = allocations();
     for _ in 0..20 {
+        started.store(0, Ordering::Relaxed);
         pool::run(4, 4, &job);
     }
     allocations() - before
@@ -437,13 +450,13 @@ type Scenario = (&'static str, fn() -> usize);
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
     let scenarios: [Scenario; 8] = [
+        ("pool_wait_steady_state", pool_wait_steady_state),
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
         ("cross_entropy_steady_state", cross_entropy_steady_state),
         ("bce_and_nll_steady_state", bce_and_nll_steady_state),
         ("custom_op_steady_state", custom_op_steady_state),
         ("pool_steady_state", pool_steady_state),
-        ("pool_wait_steady_state", pool_wait_steady_state),
         ("gemm_steady_state", gemm_steady_state),
     ];
     let mut failed = false;
