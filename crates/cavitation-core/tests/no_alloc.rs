@@ -436,7 +436,7 @@ type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 7] = [
+    let scenarios: [Scenario; 8] = [
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
         ("cross_entropy_steady_state", cross_entropy_steady_state),
