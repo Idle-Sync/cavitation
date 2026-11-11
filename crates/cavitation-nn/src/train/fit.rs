@@ -8,7 +8,8 @@ use cavitation_core::{Error, Graph, ParamId, ParamStore, Reduction, Tape, Tensor
 
 use super::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
 use crate::{
-    Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, Optimizer, Sequential, Sgd, Trace,
+    Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, Optimizer, Sequential, Sgd,
+    StepInputs, Trace,
 };
 
 /// The loss [`Trainer`] and [`fit`] minimise, always averaged over the batch.
@@ -58,6 +59,24 @@ pub enum Loss {
 }
 
 impl Loss {
+    /// Whether this loss cannot be negative on valid inputs: true for
+    /// [`CrossEntropy`](Loss::CrossEntropy), [`Nll`](Loss::Nll), [`Mse`](Loss::Mse),
+    /// [`L1`](Loss::L1), [`Huber`](Loss::Huber), [`SmoothL1`](Loss::SmoothL1),
+    /// [`BinaryCrossEntropy`](Loss::BinaryCrossEntropy) and
+    /// [`BinaryCrossEntropyWithLogits`](Loss::BinaryCrossEntropyWithLogits); false for
+    /// [`KlDiv`](Loss::KlDiv), which is negative when its input is not a log-probability
+    /// vector. [`Trainer`] sends [`Warning::NegativeLoss`](crate::Warning::NegativeLoss) when
+    /// a loss for which this is true comes out below 0.
+    ///
+    /// ```
+    /// use cavitation_nn::Loss;
+    /// assert!(Loss::Nll.non_negative());
+    /// assert!(!Loss::KlDiv.non_negative());
+    /// ```
+    pub fn non_negative(&self) -> bool {
+        !matches!(self, Loss::KlDiv)
+    }
+
     /// Whether the loss takes class labels rather than target values.
     fn needs_classes(self) -> bool {
         matches!(self, Loss::CrossEntropy | Loss::Nll)
@@ -161,7 +180,9 @@ impl Loss {
 ///
 /// ```
 /// use cavitation_core::{Error, Graph, ParamStore, Reduction, Rng, Tensor};
-/// use cavitation_nn::{Health, HealthMonitor, Linear, Optimizer, Sequential, Sgd, Trace};
+/// use cavitation_nn::{
+///     Health, HealthMonitor, Linear, Optimizer, Sequential, Sgd, StepInputs, TargetsView, Trace,
+/// };
 /// let x = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap();
 /// let y = Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap();
 /// let mut params = ParamStore::new();
@@ -181,7 +202,8 @@ impl Loss {
 ///         let loss = tape.l1(out, target, Reduction::Sum);
 ///         let value = tape.value(loss).data()[0];
 ///         tape.backward(loss, &mut params.grads);
-///         monitor.after_backward(step, value, &tape, &trace, &net)?;
+///         let inputs = StepInputs { x: x.view(), targets: TargetsView::Values(y.view()), rows: None };
+///         monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
 ///         drop(tape);
 ///         optimizer.step(&mut params);
 ///         monitor.after_update(step, optimizer.last_stats(), &names)?;
@@ -254,7 +276,7 @@ impl Trainer {
             batch_size: batch,
             batch: None,
             steps: 0,
-            health: HealthMonitor::new(Health::default()),
+            health: HealthMonitor::new(Health::default()).with_loss(loss),
             names: model.parameter_names(),
         }
     }
@@ -272,7 +294,7 @@ impl Trainer {
     /// assert!(trainer.end_epoch(1).is_ok());
     /// ```
     pub fn set_health(&mut self, health: Health) {
-        self.health = HealthMonitor::new(health);
+        self.health = HealthMonitor::new(health).with_loss(self.loss);
     }
 
     /// Ends epoch `epoch` of the health checks ([`HealthMonitor::end_epoch`]: the dead-neuron
@@ -309,7 +331,9 @@ impl Trainer {
     /// Under [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns
     /// [`Error::NonFinite`] when the loss or a gradient is NaN or infinite, naming the step
     /// and `"loss"` or the parameter, and sends the matching [`Warning::NonFinite`] to the
-    /// health sink. A NaN or infinite loss skips the optimiser step, so the parameters stay
+    /// health sink. For a non-finite loss the error's `detail` names the first NaN or infinite
+    /// value in the batch's inputs or value targets (with no dataset row, as `step` does not
+    /// know one), or says that the inputs were finite and the values overflowed. A NaN or infinite loss skips the optimiser step, so the parameters stay
     /// as they were; a NaN or infinite gradient with a finite loss is found after the update
     /// has applied it. The step is counted and the gradients are marked stale either way.
     /// [`fit`] stops at this error. Under [`OnNonFinite::Warn`](crate::OnNonFinite) the step
@@ -390,7 +414,7 @@ impl Trainer {
         batch: BatchView<'_, f32>,
         hooks: &mut Hooks<'_>,
     ) -> Result<f32, Error> {
-        let (value, checked) = self.checked_step(model, params, batch, hooks);
+        let (value, checked) = self.checked_step(model, params, batch, None, hooks);
         checked.map(|()| value)
     }
 
@@ -402,6 +426,7 @@ impl Trainer {
         model: &Sequential,
         params: &mut ParamStore,
         batch: BatchView<'_, f32>,
+        rows: Option<&[usize]>,
         hooks: &mut Hooks<'_>,
     ) -> (f32, Result<(), Error>) {
         self.loss.check_targets(batch.targets);
@@ -416,9 +441,14 @@ impl Trainer {
             let value = tape.value(loss).data()[0];
             tape.backward(loss, &mut params.grads);
             hooks.run_backward(&tape, &self.trace, model);
-            let checked = self
-                .health
-                .after_backward(step, value, &tape, &self.trace, model);
+            let inputs = StepInputs {
+                x: batch.x,
+                targets: batch.targets,
+                rows,
+            };
+            let checked =
+                self.health
+                    .after_backward(step, value, &tape, &self.trace, model, inputs);
             (value, checked)
         };
         if checked.is_ok() {
@@ -469,8 +499,10 @@ impl Trainer {
         let mut checked = Ok(());
         for range in batcher.batches() {
             let rows = range.len() as f64;
-            let view = batcher.gather(data, range, &mut batch);
-            let (loss, step_checked) = self.checked_step(model, params, view, hooks);
+            let view = batcher.gather(data, range.clone(), &mut batch);
+            let rows_of_batch = &batcher.order()[range];
+            let (loss, step_checked) =
+                self.checked_step(model, params, view, Some(rows_of_batch), hooks);
             total += f64::from(loss) * rows;
             if step_checked.is_err() {
                 checked = step_checked;
@@ -2043,5 +2075,49 @@ mod tests {
         ];
         let lrs: Vec<f64> = configs.iter().map(|c| c.build().learning_rate()).collect();
         assert_eq!(lrs, [0.1, 0.01, 0.001]);
+    }
+
+    /// Every loss that cannot be negative on valid inputs says so, and `KlDiv`, which can be
+    /// negative, does not.
+    #[test]
+    fn non_negative_losses_listed() {
+        let listed = [
+            Loss::CrossEntropy,
+            Loss::Nll,
+            Loss::Mse,
+            Loss::L1,
+            Loss::Huber { delta: 1.0 },
+            Loss::SmoothL1 { beta: 1.0 },
+            Loss::BinaryCrossEntropy,
+            Loss::BinaryCrossEntropyWithLogits,
+        ];
+        assert!(listed.iter().all(|l| l.non_negative()), "{listed:?}");
+        assert!(!Loss::KlDiv.non_negative());
+    }
+
+    /// An epoch over a shuffled batcher that reaches a NaN names the dataset row the batcher
+    /// put at the bad position, not just the position in the batch.
+    #[test]
+    fn non_finite_input_names_the_dataset_row() {
+        let mut data = classes_dataset(12);
+        data.x.data_mut()[5 * 3 + 1] = f32::NAN;
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 3, 10, &mut Rng::seed(0)));
+        let mut trainer = Trainer::new(&net, Sgd::new(0.01), Loss::CrossEntropy, 4);
+        trainer.set_health(Health::quiet());
+        let mut batcher = Batcher::new(12, 4, Some(9));
+        let mut shuffled = batcher.clone();
+        shuffled.epoch();
+        let at = shuffled.order().iter().position(|&r| r == 5).unwrap();
+        let err = trainer
+            .run_epoch(&net, &mut params, &data, &mut batcher, &mut Hooks::new())
+            .unwrap_err();
+        let text = err.to_string();
+        let expected = format!(
+            "the batch's input held NaN at batch position {}, feature 1 (row 5 of the dataset)",
+            at % 4
+        );
+        assert!(text.ends_with(&expected), "{text}");
+        assert_eq!(trainer.steps(), at as u64 / 4 + 1);
     }
 }

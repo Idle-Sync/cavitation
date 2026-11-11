@@ -73,7 +73,7 @@ pub use activation::{
     Hardtanh, LeakyRelu, LogSigmoid, LogSoftmax, Mish, Prelu, Relu, Relu6, Selu, Sigmoid, Silu,
     Softmax, Softplus, Softsign, Tanh,
 };
-pub use health::{Health, HealthMonitor, OnNonFinite, Warning, WarningKind};
+pub use health::{BadInput, Health, HealthMonitor, OnNonFinite, StepInputs, Warning, WarningKind};
 pub use hooks::{HookId, Hooks, LayerEvent};
 pub use inference::{InferenceLayer, InferenceModel};
 pub use init::Init;

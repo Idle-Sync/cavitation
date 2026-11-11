@@ -45,6 +45,10 @@ pub enum Error {
         step: u64,
         /// Where it appeared, for example a parameter name.
         location: String,
+        /// What the health checks found out about the cause, when they looked: the first
+        /// non-finite input value, or that the inputs were finite. `None` when they did not
+        /// look, as for a gradient.
+        detail: Option<String>,
     },
     /// Training data that does not suit the model or the loss, for example class labels
     /// for a loss that needs target values, or a label the model has no output for.
@@ -68,8 +72,16 @@ impl fmt::Display for Error {
             Error::Io { path, source } => write!(f, "I/O error on {}: {source}", path.display()),
             Error::Format(msg) => write!(f, "bad format: {msg}"),
             Error::Keys(keys) => keys.fmt(f),
-            Error::NonFinite { step, location } => {
-                write!(f, "non-finite value at step {step} in {location}")
+            Error::NonFinite {
+                step,
+                location,
+                detail,
+            } => {
+                write!(f, "non-finite value at step {step} in {location}")?;
+                match detail {
+                    Some(detail) => write!(f, ": {detail}"),
+                    None => Ok(()),
+                }
             }
             Error::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             Error::Unsupported(msg) => write!(f, "unsupported: {msg}"),
