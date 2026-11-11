@@ -1024,6 +1024,42 @@ mod tests {
         close(d, (-0.5f64).exp());
     }
 
+    /// Runs `build` on the f32 inputs `xs` and returns the outputs.
+    fn f32_outputs(xs: &[f32], build: impl Fn(&mut Tape<'_, f32>, Var) -> Var) -> Vec<f32> {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = Tensor::from_vec(xs.to_vec(), &[xs.len()]).unwrap();
+        let x = tape.input(x.view());
+        let y = build(&mut tape, x);
+        tape.value(y).data().to_vec()
+    }
+
+    /// ELU, SELU and CELU keep the sign of `-0.0`, keep a negative result for a subnormal
+    /// negative input, and ELU matches `alpha * x` to one ulp for a tiny input.
+    #[test]
+    fn exp_family_keeps_signed_zero_and_subnormals() {
+        let selu = f32_outputs(&[-0.0], |t, x| t.selu(x));
+        assert!(selu[0] == 0.0 && selu[0].is_sign_negative(), "selu(-0.0)");
+        let celu = f32_outputs(&[-0.0], |t, x| t.celu(x, 1.0));
+        assert!(celu[0] == 0.0 && celu[0].is_sign_negative(), "celu(-0.0)");
+
+        let tiny = -1e-40f32;
+        for (name, y) in [
+            ("elu", f32_outputs(&[tiny], |t, x| t.elu(x, 1.0))[0]),
+            ("selu", f32_outputs(&[tiny], |t, x| t.selu(x))[0]),
+            ("celu", f32_outputs(&[tiny], |t, x| t.celu(x, 1.0))[0]),
+        ] {
+            assert!(y < 0.0, "{name}(-1e-40) = {y}");
+        }
+
+        let x = -1e-10f32;
+        let y = f32_outputs(&[x], |t, v| t.elu(v, 1.3))[0];
+        let want = 1.3f32 * x;
+        let ulp = (want.to_bits() as i64 - y.to_bits() as i64).abs();
+        assert!(ulp <= 1, "elu(-1e-10, 1.3) = {y}, wanted {want}");
+    }
+
     /// SiLU at 1.
     #[test]
     fn silu_values() {

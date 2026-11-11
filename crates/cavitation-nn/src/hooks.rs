@@ -442,8 +442,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        Batch, Batcher, Dataset, FitConfig, Glu, Linear, LogSoftmax, Loss, OptimizerConfig, Prelu,
-        Relu, Sequential, Sgd, Softmax, Tanh, Targets, Trace, Trainer, fit, fit_with_hooks,
+        Batch, Batcher, Dataset, FitConfig, Glu, LeakyRelu, Linear, LogSoftmax, Loss,
+        OptimizerConfig, Prelu, Relu, Sequential, Sgd, Softmax, Tanh, Targets, Trace, Trainer, fit,
+        fit_with_hooks,
     };
     use cavitation_core::{Gate, Graph, ParamStore, Real, Reduction, Rng, Tensor};
 
@@ -573,17 +574,13 @@ mod tests {
         assert_eq!(local, [0.0, 0.0, 1.0, 0.0, 1.0, 1.0]);
     }
 
-    /// PReLU's local derivative is 1 above 0 and the channel's slope elsewhere (at 0 too).
+    /// The local derivative of leaky ReLU is 1 above 0, the slope at and below 0, and NaN
+    /// for a NaN input.
     #[test]
-    fn prelu_derivative_is_one_or_slope() {
-        let mut params = ParamStore::new();
-        let prelu = Prelu::new(&mut params, 2);
-        params
-            .value_mut(prelu.weight())
-            .data_mut()
-            .copy_from_slice(&[0.25, 0.5]);
-        let net = Sequential::new().push(prelu);
-        let x = Tensor::from_vec(vec![-2.0f32, 3.0, 0.0, -1.0], &[2, 2]).unwrap();
+    fn leaky_relu_hook_derivative_is_one_slope_or_nan() {
+        let params = ParamStore::new();
+        let net = Sequential::new().push(LeakyRelu { slope: 0.2 });
+        let x = Tensor::from_vec(vec![-1.0f32, 0.0, 2.0, f32::NAN], &[2, 2]).unwrap();
         let mut local = Vec::new();
         {
             let mut hooks = Hooks::new();
@@ -595,7 +592,36 @@ mod tests {
             net.forward_traced(&mut tape, xv, &mut trace);
             hooks.run_forward(&tape, &trace, &net);
         }
-        assert_eq!(local, [0.25, 1.0, 0.25, 0.5]);
+        assert_eq!(&local[..3], [0.2, 0.2, 1.0]);
+        assert!(local[3].is_nan());
+    }
+
+    /// PReLU's local derivative is 1 above 0, the channel's slope at and below 0, and NaN
+    /// for a NaN input.
+    #[test]
+    fn prelu_derivative_is_one_or_slope() {
+        let mut params = ParamStore::new();
+        let prelu = Prelu::new(&mut params, 2);
+        params
+            .value_mut(prelu.weight())
+            .data_mut()
+            .copy_from_slice(&[0.25, 0.5]);
+        let net = Sequential::new().push(prelu);
+        let x = Tensor::from_vec(vec![-2.0f32, 3.0, 0.0, -1.0, f32::NAN, 1.0], &[3, 2]).unwrap();
+        let mut local = Vec::new();
+        {
+            let mut hooks = Hooks::new();
+            hooks.on_forward(0, |e| local = e.local_derivative.unwrap().data().to_vec());
+            let mut graph = Graph::new();
+            let mut trace = Trace::new();
+            let mut tape = graph.tape(&params.values);
+            let xv = tape.input(x.view());
+            net.forward_traced(&mut tape, xv, &mut trace);
+            hooks.run_forward(&tape, &trace, &net);
+        }
+        assert_eq!(&local[..4], [0.25, 1.0, 0.25, 0.5]);
+        assert!(local[4].is_nan());
+        assert_eq!(local[5], 1.0);
     }
 
     /// `Linear`, `Softmax`, `LogSoftmax` and `Glu` are not element-wise functions of one
