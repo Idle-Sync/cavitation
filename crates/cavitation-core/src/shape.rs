@@ -79,7 +79,8 @@ impl Shape {
     ///
     /// # Panics
     ///
-    /// Panics if the product does not fit in `usize`; [`Shape::new`] already rules that out.
+    /// Panics if the product does not fit in `usize`. [`Shape::new`] rejects such shapes, but
+    /// [`Shape::broadcast`] builds its result directly, so the check here is the guard for those.
     ///
     /// ```
     /// assert_eq!(cavitation_core::Shape::new(&[2, 3, 4]).len(), 24);

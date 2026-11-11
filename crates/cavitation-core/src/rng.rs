@@ -143,6 +143,8 @@ impl Rng {
     ///
     /// Rounding can push `lo + (hi - lo) * u` up to `hi` for the largest draws; the result
     /// is then the largest `f64` below `hi` (but not below `lo`), so `hi` is never returned.
+    /// With reversed bounds (`lo > hi`) the draw is `lo + (hi - lo) * u`, a value in
+    /// `(hi, lo]`, with no clamp.
     ///
     /// # Examples
     ///
@@ -157,10 +159,15 @@ impl Rng {
     }
 
     /// Maps the unit draw `u` in `[0, 1)` onto `[lo, hi)`, stepping back below `hi` when
-    /// rounding reaches it and never going below `lo`.
+    /// rounding reaches it and never going below `lo`. The step back applies only when
+    /// `lo < hi`; reversed bounds return the plain mapping.
     fn range_from(lo: f64, hi: f64, u: f64) -> f64 {
         let x = lo + (hi - lo) * u;
-        if x < hi { x } else { hi.next_down().max(lo) }
+        if lo < hi && x >= hi {
+            hi.next_down().max(lo)
+        } else {
+            x
+        }
     }
 
     /// Returns a standard normal draw (mean 0, variance 1) by the Box-Muller transform.
@@ -312,6 +319,15 @@ mod tests {
         ] {
             let x = Rng::range_from(lo, hi, u);
             assert!(x < hi && x >= lo, "range_from({lo}, {hi}) gave {x}");
+        }
+    }
+
+    /// Reversed bounds keep the plain `lo + (hi - lo) * u` mapping, as in v0.1, instead of
+    /// collapsing to `lo`.
+    #[test]
+    fn range_reversed_bounds_stays_uniform() {
+        for u in [0.0, 0.3, 0.7] {
+            assert_eq!(Rng::range_from(3.0, 1.0, u), 3.0 + (1.0 - 3.0) * u);
         }
     }
 
