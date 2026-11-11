@@ -298,13 +298,14 @@ mod tests {
         tape.custom(&op, &[v; 5]);
     }
 
-    /// An output shape whose element count overflows is rejected before any buffer is
+    /// An output shape whose element count fits `usize` but whose buffer would not fit in
+    /// memory is rejected before any buffer is
     /// taken.
     #[test]
     #[should_panic(expected = "custom op fixed: output shape [")]
     fn oversized_output_shape_panics() {
         let op: Arc<dyn CustomOp<f32> + Send + Sync> =
-            Arc::new(Fixed(Shape::new(&[usize::MAX, 2])));
+            Arc::new(Fixed(Shape::new(&[usize::MAX / 2])));
         let store = ParamStore::new();
         let mut graph = Graph::new();
         let mut tape = graph.tape(&store.values);

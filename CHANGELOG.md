@@ -12,9 +12,9 @@ The first release: a CPU neural network library for multilayer perceptrons whose
 
 ### Tensors and autograd (`cavitation-core`)
 
-- `Real` (implemented for `f32` and `f64`, with `Real::erf` ported from FreeBSD msun), `Shape`, `Tensor` with `TensorView` and `TensorViewMut`, and `Error` for the failures a caller can recover from (bad data, bad files, unsupported requests, non-finite values during training).
-- `Rng` (xoshiro256++) seeded through `SplitMix64`.
-- Reverse-mode automatic differentiation: `Graph`, `Tape` and `Var`, and the `ParamStore` that holds parameters and their gradients. `zero_grad` marks gradients stale without writing them; `ParamStore::iter_mut` gives `None` for a gradient nothing has contributed to since.
+- `Real` (implemented for `f32` and `f64`, with `Real::erf` ported from FreeBSD msun), `Shape` (`Shape::new` panics if the element count overflows `usize`), `Tensor` with `TensorView` and `TensorViewMut`, and `Error` for the failures a caller can recover from (bad data, bad files, unsupported requests, non-finite values during training).
+- `Rng` (xoshiro256++) seeded through `SplitMix64`; `Rng::range(lo, hi)` is in `[lo, hi)` and never returns `hi` (it returns `lo` when the bounds are equal).
+- Reverse-mode automatic differentiation: `Graph`, `Tape` and `Var`, and the `ParamStore` that holds parameters and their gradients. `zero_grad` marks gradients stale without writing them; `ParamStore::iter_mut` gives `None` for a gradient nothing has contributed to since. A parameter whose value was reshaped through `value_mut` panics in `iter_mut` and in the backward pass, naming the two shapes.
 - Tape operations, following PyTorch's definitions and boundary conventions:
   - arithmetic with NumPy-style broadcasting: `add`, `sub`, `mul`, `scale`;
   - `matmul` and `matmul_nt`, with gradients computed on strided views;

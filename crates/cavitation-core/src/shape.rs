@@ -33,7 +33,8 @@ impl Shape {
     ///
     /// # Panics
     ///
-    /// Panics if `dims` has more than [`Shape::MAX_RANK`] entries.
+    /// Panics if `dims` has more than [`Shape::MAX_RANK`] entries, or if the product of
+    /// the dimensions does not fit in `usize`.
     ///
     /// ```
     /// let s = cavitation_core::Shape::new(&[4, 5]);
@@ -47,10 +48,13 @@ impl Shape {
         );
         let mut d = [0; MAX_RANK];
         d[..dims.len()].copy_from_slice(dims);
-        Shape {
+        let shape = Shape {
             dims: d,
             rank: dims.len(),
-        }
+        };
+        // Checks the element count once, so an overflowing shape panics where it is made.
+        shape.len();
+        shape
     }
 
     /// The dimensions as a slice.
@@ -73,11 +77,23 @@ impl Shape {
 
     /// The number of elements: the product of the dimensions, 1 for a scalar.
     ///
+    /// # Panics
+    ///
+    /// Panics if the product does not fit in `usize`; [`Shape::new`] already rules that out.
+    ///
     /// ```
     /// assert_eq!(cavitation_core::Shape::new(&[2, 3, 4]).len(), 24);
     /// ```
     pub fn len(&self) -> usize {
-        self.dims().iter().product()
+        self.dims()
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(d))
+            .unwrap_or_else(|| {
+                panic!(
+                    "shape {:?} has more elements than fit in usize",
+                    self.dims()
+                )
+            })
     }
 
     /// Whether the shape holds no elements (some dimension is 0).
@@ -150,5 +166,12 @@ mod tests {
         assert_eq!(b(&[2, 3], &[3]), Some(Shape::new(&[2, 3])));
         assert_eq!(b(&[2, 3], &[2]), None);
         assert_eq!(b(&[], &[5]), Some(Shape::new(&[5])));
+    }
+
+    /// A shape whose element count overflows `usize` panics where it is made.
+    #[test]
+    #[should_panic(expected = "more elements than fit in usize")]
+    fn len_overflow_panics() {
+        Shape::new(&[usize::MAX, 2]);
     }
 }
