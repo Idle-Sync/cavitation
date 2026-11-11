@@ -20,6 +20,25 @@ fn convert(path: &Path, err: SafeTensorError) -> Error {
     }
 }
 
+/// Returns [`Error::Format`] telling the user to save with safetensors if `bytes` starts like
+/// a `torch.save` file: `PK\x03\x04` (the zip archive `torch.save` writes by default) or a
+/// pickle stream (the legacy format, which starts with the byte `0x80`). A safetensors file
+/// starts with its header length as 8 little-endian bytes and its header, a JSON object, at
+/// byte 8; a header of 128 bytes also starts with `0x80`, so a file whose byte 8 is `{` is
+/// never taken for a pickle. A file shorter than 4 bytes is checked on the bytes it has.
+fn check_not_torch_save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let zip = bytes.starts_with(b"PK\x03\x04");
+    let pickle = bytes.first() == Some(&0x80) && bytes.get(8) != Some(&b'{');
+    if zip || pickle {
+        return Err(Error::Format(format!(
+            "{}: this is a torch.save file (a zip archive or a pickle), not safetensors; save \
+             the weights with safetensors.torch.save_file(model.state_dict(), path)",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Writes every parameter of `model` to `path` as an F32 safetensors file, each tensor
 /// named by [`Sequential::parameter_names`] (`0.weight`, `2.bias`, ...). The names and the
 /// `[outputs, inputs]` weight layout are those of a PyTorch `state_dict`, so the file loads
@@ -86,7 +105,8 @@ pub fn save(
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the file cannot be read, [`Error::Format`] if it is not a valid
-/// safetensors file (for example truncated), [`Error::MissingKey`] for an absent key,
+/// safetensors file (for example truncated, or a `torch.save` file, which the message says),
+/// [`Error::MissingKey`] for an absent key,
 /// [`Error::WrongShape`] or [`Error::Dtype`] (both name the key and what was expected) for a
 /// tensor that does not fit, and [`Error::UnexpectedKey`] for a key the model does not have.
 ///
@@ -152,6 +172,7 @@ fn load_impl(
         path: path.to_path_buf(),
         source,
     })?;
+    check_not_torch_save(path, &bytes)?;
     let file = SafeTensors::deserialize(&bytes).map_err(|e| convert(path, e))?;
     let names = model.parameter_names();
 
@@ -573,6 +594,61 @@ mod tests {
         for (name, bytes) in cases {
             let err = load_bytes(name, &bytes).unwrap_err();
             assert!(matches!(err, Error::Format(_)), "{name}: {err:?}");
+        }
+    }
+
+    /// Writes `bytes` to a fresh path, loads it into the MLP and returns the error.
+    fn load_error_of(name: &str, bytes: &[u8]) -> Error {
+        load_bytes(name, bytes).unwrap_err()
+    }
+
+    /// A zip archive, which is what `torch.save` writes by default, is named as such.
+    #[test]
+    fn zip_file_is_recognised() {
+        let mut bytes = b"PK\x03\x04".to_vec();
+        bytes.extend_from_slice(&[0; 60]);
+        let err = load_error_of("zip", &bytes);
+        assert!(
+            matches!(&err, Error::Format(m) if m.contains("torch.save") && m.contains("zip")),
+            "{err:?}"
+        );
+    }
+
+    /// A pickle stream, the legacy `torch.save` format, is named as such.
+    #[test]
+    fn pickle_file_is_recognised() {
+        let mut bytes = vec![0x80, 0x02];
+        bytes.extend_from_slice(&[0; 60]);
+        let err = load_error_of("pickle", &bytes);
+        assert!(
+            matches!(&err, Error::Format(m) if m.contains("torch.save")),
+            "{err:?}"
+        );
+    }
+
+    /// A safetensors file whose header is exactly 128 bytes starts with the byte 0x80 and is
+    /// not mistaken for a pickle.
+    #[test]
+    fn header_of_128_bytes_is_not_a_pickle() {
+        let header = format!("{{}}{}", " ".repeat(126));
+        let path = temp_path("header-128");
+        std::fs::write(&path, with_header(&header, &[])).unwrap();
+        let net = Sequential::<f32>::new();
+        let mut params = ParamStore::new();
+        load(&path, &net, &mut params).unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Empty and 3-byte files are format errors from the safetensors parser, not panics and
+    /// not the `torch.save` message.
+    #[test]
+    fn tiny_files_are_format_errors() {
+        for (name, bytes) in [("tiny-0", vec![]), ("tiny-3", vec![b'P', b'K', 3])] {
+            let err = load_error_of(name, &bytes);
+            assert!(
+                matches!(&err, Error::Format(m) if !m.contains("torch.save")),
+                "{name}: {err:?}"
+            );
         }
     }
 
