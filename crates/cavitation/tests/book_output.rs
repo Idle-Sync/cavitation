@@ -34,8 +34,13 @@ fn chapter_output(chapter: &str) -> Vec<String> {
 fn xor_chapter_output_matches() {
     let root = workspace_root();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    // The printed digits can differ between kernel levels (an AVX2 or NEON kernel may round
+    // sums differently), so the child runs the reference level on one thread, whatever level
+    // the test run itself uses. The chapter shows the reference output.
     let run = Command::new(cargo)
         .current_dir(&root)
+        .env("CAVITATION_KERNEL", "reference")
+        .env("CAVITATION_THREADS", "1")
         .args([
             "run",
             "--release",
@@ -53,8 +58,10 @@ fn xor_chapter_output_matches() {
         String::from_utf8_lossy(&run.stderr)
     );
     let printed = String::from_utf8(run.stdout).expect("the output is UTF-8");
+    // A checkout on Windows may turn the chapter's line endings into CRLF.
     let chapter = std::fs::read_to_string(root.join("book/src/backprop-by-hand.md"))
-        .expect("the chapter exists");
+        .expect("the chapter exists")
+        .replace("\r\n", "\n");
     let expected = chapter_output(&chapter);
     let actual: Vec<&str> = printed.lines().collect();
     for (i, (want, got)) in expected.iter().zip(&actual).enumerate() {

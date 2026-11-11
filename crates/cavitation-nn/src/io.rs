@@ -240,8 +240,8 @@ pub struct LoadOptions<'a> {
     /// Maps each key in the file to the key the model uses; `None` keeps the keys as they are.
     #[allow(clippy::type_complexity)]
     pub rename: Option<Box<dyn Fn(&str) -> String + 'a>>,
-    /// Whether a key that the model lacks (after renaming) is an error, listed in [`KeyErrors::unexpected`]
-    /// (`true`) or ignored (`false`).
+    /// Whether a key that the model lacks (after renaming) is an error, listed in
+    /// [`KeyErrors::unexpected`] (`true`), or ignored (`false`).
     pub strict: bool,
 }
 
@@ -298,8 +298,8 @@ impl<'a> LoadOptions<'a> {
 ///
 /// # Errors
 ///
-/// The errors of [`load`] (the keys in [`Error::Keys`] are the renamed ones), and [`Error::Format`] when two keys of the file rename to the same key;
-/// the message names both. For two keys that collide, the first in alphabetical order is
+/// The errors of [`load`] (the keys in [`Error::Keys`] are the renamed ones), and
+/// [`Error::Format`] when two keys of the file rename to the same key; the message names both. For two keys that collide, the first in alphabetical order is
 /// named first.
 ///
 /// # Panics
@@ -1195,7 +1195,8 @@ mod tests {
     }
 
     /// With a rename, `strict` checks the renamed keys: a key mapped to a name the model
-    /// lacks is `UnexpectedKey` with the renamed key, and ignored when not strict.
+    /// lacks is listed in `KeyErrors::unexpected` under the renamed key, and ignored (and
+    /// returned) when not strict.
     #[test]
     fn strict_checks_renamed_keys() {
         let path = temp_path("renamed-extra");
