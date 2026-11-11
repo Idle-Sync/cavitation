@@ -3,6 +3,9 @@
 use std::fmt;
 use std::path::PathBuf;
 
+/// The most keys of one kind that a [`KeyErrors`] message lists; the rest are counted.
+const LISTED: usize = 10;
+
 /// A failure the caller can recover from: bad data, bad files, unsupported requests.
 ///
 /// Shape errors inside recorded operations are programming errors and panic instead.
@@ -11,8 +14,8 @@ use std::path::PathBuf;
 ///
 /// ```
 /// use cavitation_core::Error;
-/// let e = Error::MissingKey("layer0.weight".to_string());
-/// assert_eq!(e.to_string(), "missing key `layer0.weight`");
+/// let e = Error::Format("not a safetensors file".to_string());
+/// assert_eq!(e.to_string(), "bad format: not a safetensors file");
 /// ```
 #[derive(Debug)]
 #[non_exhaustive]
@@ -33,26 +36,9 @@ pub enum Error {
     },
     /// A file was not in the expected format.
     Format(String),
-    /// A required key was absent from a weight file.
-    MissingKey(String),
-    /// A weight file held a key the model does not have.
-    UnexpectedKey(String),
-    /// A stored tensor had a different shape from the parameter it should fill.
-    WrongShape {
-        /// The key of the tensor.
-        key: String,
-        /// The dimensions the parameter has.
-        expected: Vec<usize>,
-        /// The dimensions that were stored.
-        found: Vec<usize>,
-    },
-    /// A stored tensor had an unsupported element type (only `F32` is read).
-    Dtype {
-        /// The key of the tensor.
-        key: String,
-        /// The element type that was found.
-        found: String,
-    },
+    /// A weight file does not fit the model: the keys that are missing, unexpected, of the
+    /// wrong shape or of the wrong element type, all listed together.
+    Keys(Box<KeyErrors>),
     /// A value that must be finite was NaN or infinite.
     NonFinite {
         /// The training step at which it appeared.
@@ -81,16 +67,7 @@ impl fmt::Display for Error {
             }
             Error::Io { path, source } => write!(f, "I/O error on {}: {source}", path.display()),
             Error::Format(msg) => write!(f, "bad format: {msg}"),
-            Error::MissingKey(key) => write!(f, "missing key `{key}`"),
-            Error::UnexpectedKey(key) => write!(f, "unexpected key `{key}`"),
-            Error::WrongShape {
-                key,
-                expected,
-                found,
-            } => write!(f, "key `{key}` has shape {found:?}, expected {expected:?}"),
-            Error::Dtype { key, found } => {
-                write!(f, "key `{key}` has element type {found}, expected F32")
-            }
+            Error::Keys(keys) => keys.fmt(f),
             Error::NonFinite { step, location } => {
                 write!(f, "non-finite value at step {step} in {location}")
             }
@@ -113,5 +90,114 @@ impl std::error::Error for Error {
             Error::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+/// Everything wrong between a weight file and the model it was loaded into, found in one
+/// pass, so a single error shows all of it. Carried by [`Error::Keys`].
+///
+/// The keys are the ones the model uses: when a load renames the file's keys first, the
+/// renamed keys are listed.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{Error, KeyErrors};
+/// let keys = KeyErrors {
+///     missing: vec!["0.weight".to_string()],
+///     unexpected: vec!["fc1.weight".to_string()],
+///     wrong_shape: vec![],
+///     wrong_dtype: vec![],
+///     file_keys: vec!["fc1.weight".to_string()],
+/// };
+/// let text = Error::Keys(Box::new(keys)).to_string();
+/// assert!(text.contains("missing keys (1): 0.weight"));
+/// assert!(text.contains("the file holds: fc1.weight"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct KeyErrors {
+    /// Keys the model needs that the file lacks, in the model's parameter order.
+    pub missing: Vec<String>,
+    /// Keys in the file that the model lacks, sorted. Empty when the load ignores them.
+    pub unexpected: Vec<String>,
+    /// Keys whose stored shape differs from the parameter's, as `(key, expected, found)`.
+    pub wrong_shape: Vec<(String, Vec<usize>, Vec<usize>)>,
+    /// Keys stored with an element type other than `F32`, as `(key, found type)`.
+    pub wrong_dtype: Vec<(String, String)>,
+    /// When no key the model needs was found, the first five keys of the file (after any
+    /// renaming), sorted, to show what it holds; empty otherwise.
+    pub file_keys: Vec<String>,
+}
+
+/// Writes `title (n): a, b, c` with at most [`LISTED`] items and `and N more` for the rest.
+fn write_list(f: &mut fmt::Formatter<'_>, title: &str, items: &[String]) -> fmt::Result {
+    write!(
+        f,
+        "\n  {title} ({}): {}",
+        items.len(),
+        items[..items.len().min(LISTED)].join(", ")
+    )?;
+    if items.len() > LISTED {
+        write!(f, ", and {} more", items.len() - LISTED)?;
+    }
+    Ok(())
+}
+
+impl fmt::Display for KeyErrors {
+    /// Writes one line per kind of problem, listing up to ten keys of each and counting the
+    /// rest, the file's own first keys when no key the model needs was found, and a hint
+    /// when a shape is the expected one reversed.
+    ///
+    /// ```
+    /// use cavitation_core::KeyErrors;
+    /// let keys = KeyErrors {
+    ///     wrong_shape: vec![("0.weight".to_string(), vec![256, 64], vec![64, 256])],
+    ///     ..KeyErrors::default()
+    /// };
+    /// let text = keys.to_string();
+    /// assert!(text.contains("key `0.weight` has shape [64, 256], expected [256, 64]"));
+    /// assert!(text.contains("this looks transposed"));
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the weight file does not match the model:")?;
+        if !self.missing.is_empty() {
+            write_list(f, "missing keys", &self.missing)?;
+        }
+        if !self.unexpected.is_empty() {
+            write_list(f, "unexpected keys", &self.unexpected)?;
+        }
+        let shapes: Vec<String> = self
+            .wrong_shape
+            .iter()
+            .map(|(key, expected, found)| {
+                format!("key `{key}` has shape {found:?}, expected {expected:?}")
+            })
+            .collect();
+        if !shapes.is_empty() {
+            write_list(f, "wrong shapes", &shapes)?;
+        }
+        let types: Vec<String> = self
+            .wrong_dtype
+            .iter()
+            .map(|(key, found)| format!("key `{key}` has element type {found}, expected F32"))
+            .collect();
+        if !types.is_empty() {
+            write_list(f, "wrong element types", &types)?;
+        }
+        let transposed = self.wrong_shape.iter().any(|(_, expected, found)| {
+            expected.len() == 2
+                && expected.iter().rev().eq(found.iter())
+                && expected[0] != expected[1]
+        });
+        if transposed {
+            write!(
+                f,
+                "\n  this looks transposed: PyTorch and Cavitation store Linear weights as [outputs, inputs]"
+            )?;
+        }
+        if !self.file_keys.is_empty() {
+            write!(f, "\n  the file holds: {}", self.file_keys.join(", "))?;
+        }
+        Ok(())
     }
 }

@@ -61,7 +61,7 @@ mod tensor;
 mod test_child;
 
 pub use check::{GradcheckFailure, GradcheckReport, gradcheck, gradcheck_params};
-pub use error::Error;
+pub use error::{Error, KeyErrors};
 pub use graph::{Graph, ParamGrads, ParamId, ParamStore, ParamValues, Tape, Var};
 pub use ops::{CustomOp, Gate, GeluApprox, Reduction, log_softmax_row, softmax_row};
 pub use real::Real;

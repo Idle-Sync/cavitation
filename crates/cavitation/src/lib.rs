@@ -146,8 +146,8 @@ pub use cavitation_nn;
 /// ```
 pub mod prelude {
     pub use cavitation_core::{
-        CustomOp, Error, Gate, GeluApprox, Graph, ParamId, ParamStore, Real, Reduction, Rng, Tape,
-        Tensor, TensorView, Var, gradcheck, gradcheck_params,
+        CustomOp, Error, Gate, GeluApprox, Graph, KeyErrors, ParamId, ParamStore, Real, Reduction,
+        Rng, Tape, Tensor, TensorView, Var, gradcheck, gradcheck_params,
     };
     pub use cavitation_nn::{
         Activation, ActivationLayer, Adam, AdamW, Batch, BatchView, Batcher, Celu, Dataset, Elu,
