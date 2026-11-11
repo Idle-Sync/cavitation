@@ -299,8 +299,7 @@ mod tests {
     }
 
     /// An output shape whose element count fits `usize` but whose buffer would not fit in
-    /// memory is rejected before any buffer is
-    /// taken.
+    /// memory is rejected before any buffer is taken.
     #[test]
     #[should_panic(expected = "custom op fixed: output shape [")]
     fn oversized_output_shape_panics() {

@@ -99,8 +99,8 @@ impl<T: Real> ParamValues<T> {
     /// # Panics
     ///
     /// Panics if `id` was created by another store. A value whose shape was changed is
-    /// caught later, by a panic in [`ParamStore::iter_mut`] (the optimisers) and in the
-    /// backward pass.
+    /// caught later: [`ParamStore::iter_mut`] panics when the iterator reaches that
+    /// parameter (for example during an optimiser step), and so does the backward pass.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -387,8 +387,8 @@ impl<T: Real> ParamStore<T> {
     /// # Panics
     ///
     /// Panics if `id` was created by another store. A value whose shape was changed is
-    /// caught later, by a panic in [`iter_mut`](Self::iter_mut) (the optimisers) and in the
-    /// backward pass.
+    /// caught later: [`iter_mut`](Self::iter_mut) panics when the iterator reaches that
+    /// parameter (for example during an optimiser step), and so does the backward pass.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -422,6 +422,13 @@ impl<T: Real> ParamStore<T> {
     /// contributed to it since [`zero_grad`](Self::zero_grad)), as PyTorch's `grad` is
     /// `None` for a parameter the backward pass did not reach. The optimisers skip such a
     /// parameter.
+    ///
+    /// # Panics
+    ///
+    /// Panics, while the iterator is consumed, at a parameter whose value shape differs
+    /// from its gradient's shape (its shape was changed through
+    /// [`value_mut`](Self::value_mut)). The check runs as the iterator reaches each
+    /// parameter, so a lazily consumed iterator panics only at the offending one.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
