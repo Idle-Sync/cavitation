@@ -289,6 +289,23 @@ fn gradcheck_softplus_threshold() {
     gradcheck(&x, |t, v| t.softplus(v[0], 1.0, 20.0)).assert_passed();
 }
 
+/// Softplus with `beta = 2` and `threshold = 3` has the right gradient on both sides of
+/// `x = 1.5`, where `beta · x` crosses the threshold, and at least `1e-3` away from it.
+#[test]
+fn softplus_beta_two_gradcheck() {
+    let x = [away_from(&[1.5], 0.5, 2.5, 25)];
+    let data = x[0].data();
+    assert!(
+        data.iter().any(|&v| v < 1.5),
+        "no input below the threshold"
+    );
+    assert!(
+        data.iter().any(|&v| v > 1.5),
+        "no input above the threshold"
+    );
+    gradcheck(&x, |t, v| t.softplus(v[0], 2.0, 3.0)).assert_passed();
+}
+
 /// The clamp family has the right gradient away from its kinks.
 #[test]
 fn gradcheck_clamp_family() {

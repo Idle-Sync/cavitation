@@ -252,7 +252,7 @@ impl ActivationKind {
                 if x > T::ZERO {
                     x
                 } else {
-                    c(alpha) * (x.exp() - T::ONE)
+                    c(alpha) * x.exp_m1()
                 }
             }
             // `scale · (alpha · (eˣ - 1))`, grouped as the tape's SELU computes it.
@@ -260,14 +260,14 @@ impl ActivationKind {
                 if x > T::ZERO {
                     c(SELU_SCALE) * x
                 } else {
-                    c(SELU_SCALE) * (c(SELU_ALPHA) * (x.exp() - T::ONE))
+                    c(SELU_SCALE) * (c(SELU_ALPHA) * x.exp_m1())
                 }
             }
             ActivationKind::Celu(alpha) => {
                 if x > T::ZERO {
                     x
                 } else {
-                    c(alpha) * ((x / c(alpha)).exp() - T::ONE)
+                    c(alpha) * (x / c(alpha)).exp_m1()
                 }
             }
             ActivationKind::Silu => x * sigmoid(x),
@@ -335,8 +335,10 @@ impl ActivationKind {
             ActivationKind::LeakyRelu(slope) => {
                 if x > T::ZERO {
                     T::ONE
-                } else {
+                } else if x <= T::ZERO {
                     c(slope)
+                } else {
+                    nan()
                 }
             }
             ActivationKind::Tanh => T::ONE - y * y,

@@ -85,21 +85,19 @@ fn nan<T: Real>() -> T {
     T::from_f64(f64::NAN)
 }
 
-/// ELU: `x` above 0, `alpha · (eˣ - 1)` elsewhere.
+/// ELU: `x` above 0, `alpha · (eˣ - 1)` elsewhere, with `eˣ - 1` from `exp_m1` so tiny
+/// negative inputs keep their precision and `-0.0` keeps its sign.
 fn elu_value<T: Real>(x: T, alpha: T) -> T {
-    if x > T::ZERO {
-        x
-    } else {
-        alpha * (x.exp() - T::ONE)
-    }
+    if x > T::ZERO { x } else { alpha * x.exp_m1() }
 }
 
-/// CELU: `x` above 0, `alpha · (e^(x/alpha) - 1)` elsewhere.
+/// CELU: `x` above 0, `alpha · (e^(x/alpha) - 1)` elsewhere, with the difference from
+/// `exp_m1`.
 fn celu_value<T: Real>(x: T, alpha: T) -> T {
     if x > T::ZERO {
         x
     } else {
-        alpha * ((x / alpha).exp() - T::ONE)
+        alpha * (x / alpha).exp_m1()
     }
 }
 
@@ -680,7 +678,7 @@ pub(super) fn relu_backward<T: Real>(x: Var, out_grad: &[T], ctx: &mut BackwardC
 }
 
 /// Backward of `leaky_relu`: the gradient where the input is positive, `slope` times it
-/// elsewhere (including at 0).
+/// elsewhere (including at 0), NaN where the input is NaN.
 pub(super) fn leaky_relu_backward<T: Real>(
     x: Var,
     slope: f64,
@@ -690,7 +688,13 @@ pub(super) fn leaky_relu_backward<T: Real>(
     let input = ctx.value(x);
     let slope = T::from_f64(slope);
     backward_with(x, out_grad, ctx, |i| {
-        if input[i] > T::ZERO { T::ONE } else { slope }
+        if input[i] > T::ZERO {
+            T::ONE
+        } else if input[i] <= T::ZERO {
+            slope
+        } else {
+            nan()
+        }
     });
 }
 
@@ -851,6 +855,7 @@ pub(super) fn log_sigmoid_backward<T: Real>(x: Var, out_grad: &[T], ctx: &mut Ba
 
 /// Backward of `prelu`: `x` gets the gradient where `x > 0` and `slope` times it elsewhere;
 /// each slope gets the sum of `gradient · x` over the non-positive elements of its channel.
+/// A NaN input gives a NaN input gradient and makes its channel's slope gradient NaN.
 pub(super) fn prelu_backward<T: Real>(
     x: Var,
     slope: Var,
@@ -862,8 +867,10 @@ pub(super) fn prelu_backward<T: Real>(
     backward_with(x, out_grad, ctx, |i| {
         if input[i] > T::ZERO {
             T::ONE
-        } else {
+        } else if input[i] <= T::ZERO {
             slopes[prelu_channel(i, slopes.len())]
+        } else {
+            nan()
         }
     });
     if !ctx.takes_grad(slope) {
@@ -872,9 +879,11 @@ pub(super) fn prelu_backward<T: Real>(
     let mut sums = ctx.scratch(slopes.len());
     sums.fill(T::ZERO);
     for (i, (&g, &v)) in out_grad.iter().zip(input).enumerate() {
-        if v <= T::ZERO {
-            sums[prelu_channel(i, slopes.len())] += g * v;
+        if v > T::ZERO {
+            continue;
         }
+        // Not above 0 includes NaN, which `g * v` carries into the sum.
+        sums[prelu_channel(i, slopes.len())] += g * v;
     }
     if let Some(slot) = ctx.slot(slope) {
         slot.add_from(&sums);
@@ -885,6 +894,7 @@ pub(super) fn prelu_backward<T: Real>(
 /// Tests for the activations.
 #[cfg(test)]
 mod tests {
+    use super::{SELU_ALPHA, SELU_SCALE};
     use crate::{GeluApprox, Graph, ParamStore, Tape, Tensor, Var};
 
     /// ReLU's derivative at exactly zero is zero, and 1 above it.
@@ -1176,5 +1186,88 @@ mod tests {
         assert!(v.is_nan() && d.is_nan(), "{v} {d}");
         let (v, d) = value_and_derivative(f64::NAN, |t, x| t.hardswish(x));
         assert!(v.is_nan() && d.is_nan(), "{v} {d}");
+    }
+
+    /// Whether two `f32` values differ by at most one unit in the last place (same sign).
+    fn within_one_ulp(a: f32, b: f32) -> bool {
+        a.to_bits().abs_diff(b.to_bits()) <= 1
+    }
+
+    /// The forward value of `build` at one `f32` input.
+    fn forward_f32(x: f32, build: impl Fn(&mut Tape<'_, f32>, Var) -> Var) -> f32 {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let input = Tensor::from_vec(vec![x], &[1]).unwrap();
+        let input = tape.input(input.view());
+        let y = build(&mut tape, input);
+        tape.value(y).data()[0]
+    }
+
+    /// ELU, SELU and CELU keep full precision for tiny negative inputs: `e^x - 1` computed
+    /// as `exp_m1` is within 1 ulp of `x`, where `exp(x) - 1` would round to 0 or a
+    /// multiple of 2^-24.
+    #[test]
+    fn elu_tiny_negative_keeps_precision() {
+        let x = -1e-10f32;
+        let elu = forward_f32(x, |t, v| t.elu(v, 1.0));
+        assert!(within_one_ulp(elu, x), "elu {elu:e} vs {x:e}");
+        let scale = SELU_SCALE as f32;
+        let alpha = SELU_ALPHA as f32;
+        let selu = forward_f32(x, |t, v| t.selu(v));
+        let want = scale * alpha * x;
+        assert!(within_one_ulp(selu, want), "selu {selu:e} vs {want:e}");
+        let celu = forward_f32(x, |t, v| t.celu(v, 1.0));
+        assert!(within_one_ulp(celu, x), "celu {celu:e} vs {x:e}");
+    }
+
+    /// `elu(-0.0)` keeps the sign of the zero.
+    #[test]
+    fn elu_negative_zero() {
+        let y = forward_f32(-0.0, |t, v| t.elu(v, 1.0));
+        assert_eq!(y, 0.0);
+        assert!(y.is_sign_negative(), "sign bit lost: {y:?}");
+    }
+
+    /// Leaky ReLU's input gradient is NaN where the input is NaN, and the usual slope
+    /// elsewhere.
+    #[test]
+    fn leaky_relu_nan_gradient() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::from_vec(vec![f32::NAN, 1.0, -1.0], &[3]).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let r = tape.leaky_relu(v, 0.5);
+        let loss = tape.sum(r);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        let g = store.grad(p).data();
+        assert!(g[0].is_nan(), "{g:?}");
+        assert_eq!(&g[1..], &[1.0, 0.5]);
+    }
+
+    /// PReLU's input gradient and its slope gradient are NaN where the input is NaN.
+    #[test]
+    fn prelu_nan_gradient() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::from_vec(vec![f32::NAN, 1.0, -1.0], &[3]).unwrap());
+        let s = store.add(Tensor::from_vec(vec![0.25], &[1]).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let sv = tape.param(s);
+        let r = tape.prelu(v, sv);
+        let loss = tape.sum(r);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        let g = store.grad(p).data();
+        assert!(g[0].is_nan(), "{g:?}");
+        assert_eq!(&g[1..], &[1.0, 0.25]);
+        assert!(
+            store.grad(s).data()[0].is_nan(),
+            "{:?}",
+            store.grad(s).data()
+        );
     }
 }

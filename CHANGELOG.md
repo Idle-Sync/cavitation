@@ -12,14 +12,14 @@ The first release: a CPU neural network library for multilayer perceptrons whose
 
 ### Tensors and autograd (`cavitation-core`)
 
-- `Real` (implemented for `f32` and `f64`, with `Real::erf` ported from FreeBSD msun), `Shape` (`Shape::new` panics if the element count overflows `usize`), `Tensor` with `TensorView` and `TensorViewMut`, and `Error` for the failures a caller can recover from (bad data, bad files, unsupported requests, non-finite values during training).
+- `Real` (implemented for `f32` and `f64`, with `Real::erf` ported from FreeBSD msun and `Real::exp_m1` for `eˣ - 1` without cancellation), `Shape` (`Shape::new` panics if the element count overflows `usize`), `Tensor` with `TensorView` and `TensorViewMut`, and `Error` for the failures a caller can recover from (bad data, bad files, unsupported requests, non-finite values during training).
 - `Rng` (xoshiro256++) seeded through `SplitMix64`; `Rng::range(lo, hi)` is below `hi` when `lo < hi`; equal bounds give `lo`.
 - Reverse-mode automatic differentiation: `Graph`, `Tape` and `Var`, and the `ParamStore` that holds parameters and their gradients. `zero_grad` marks gradients stale without writing them; `ParamStore::iter_mut` gives `None` for a gradient nothing has contributed to since. A parameter whose value was reshaped through `value_mut` panics in `iter_mut` and in the backward pass, naming the two shapes.
 - Tape operations, following PyTorch's definitions and boundary conventions:
   - arithmetic with NumPy-style broadcasting: `add`, `sub`, `mul`, `scale`;
   - `matmul` and `matmul_nt`, with gradients computed on strided views;
   - reductions: `sum`, `sum_axis`, `mean`, `mean_axis`;
-  - activations: `relu`, `leaky_relu`, `tanh`, `sigmoid`, `gelu` (exact and tanh forms, `GeluApprox`), `elu`, `selu`, `celu`, `silu`, `mish`, `softplus`, `softsign`, `hardtanh`, `relu6`, `hardsigmoid`, `hardswish`, `log_sigmoid`, `prelu`, and `glu` with a `Gate` (GLU, GeGLU, ReGLU, SwiGLU); NaN passes through every one of them;
+  - activations: `relu`, `leaky_relu`, `tanh`, `sigmoid`, `gelu` (exact and tanh forms, `GeluApprox`), `elu`, `selu`, `celu`, `silu`, `mish`, `softplus`, `softsign`, `hardtanh`, `relu6`, `hardsigmoid`, `hardswish`, `log_sigmoid`, `prelu`, and `glu` with a `Gate` (GLU, GeGLU, ReGLU, SwiGLU); NaN passes through every one of them, in the gradient too; `elu`, `selu` and `celu` keep full precision for tiny negative inputs (and the sign of `-0.0`);
   - `softmax` and `log_softmax`, and `softmax_row` and `log_softmax_row` for one row;
   - losses, each taking a `Reduction` (`Mean`, `Sum`, `None`, `BatchMean`): fused `softmax_cross_entropy` in log-sum-exp form, `nll`, `mse`, `l1`, `huber`, `smooth_l1`, `binary_cross_entropy` (with `Tape::clamped_logs`, the count of logarithms clamped to -100), `binary_cross_entropy_with_logits` and `kl_div`; NaN input gives a NaN loss;
   - `keep_where`, the select behind neuron masks, matching `torch.where(keep != 0, x, 0)`: exactly 0 and no gradient where `keep` is 0, even for an infinite or NaN value or gradient there.

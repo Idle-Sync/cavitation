@@ -100,6 +100,15 @@ pub trait Real:
     /// assert_eq!(0.0f64.ln_1p(), 0.0);
     /// ```
     fn ln_1p(self) -> Self;
+    /// `e^self - 1`, accurate for small values: `(-1e-10f64).exp_m1()` is `-1e-10` to the last
+    /// digit, where `exp(x) - 1` loses it. `-0.0` stays `-0.0`.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// assert_eq!(0.0f64.exp_m1(), 0.0);
+    /// assert_eq!((-1e-10f32).exp_m1(), -1e-10);
+    /// ```
+    fn exp_m1(self) -> Self;
     /// The hyperbolic tangent.
     ///
     /// ```
@@ -214,6 +223,9 @@ macro_rules! impl_real {
             }
             fn ln_1p(self) -> Self {
                 $t::ln_1p(self)
+            }
+            fn exp_m1(self) -> Self {
+                $t::exp_m1(self)
             }
             fn tanh(self) -> Self {
                 $t::tanh(self)
