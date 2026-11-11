@@ -737,32 +737,12 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 }
 
 /// Checks, before any training, that `model` and `loss` suit `data` (already passed by
-/// [`check_dataset`]): the inputs are as wide as each layer that names an input width
-/// expects, the kind of targets is the kind `loss` needs, every class label is below the
+/// [`check_dataset`]): the kind of targets is the kind `loss` needs, binary cross-entropy
+/// targets are in `[0, 1]` (neither needs the output width, so both run even for a model
+/// whose layers disagree), the inputs are as wide as each layer that names an input width
+/// expects, every class label is below the
 /// model's output width, and value targets are as wide as the model's output.
 fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Result<(), Error> {
-    let (rows, mut width) = (data.len(), data.features());
-    // Whether an earlier layer named an input width, so that `width` is checked against it.
-    let mut named = false;
-    for i in 0..model.len() {
-        let layer = model.layer(i);
-        if let Some(expected) = layer.input_width() {
-            if expected != width {
-                if !named {
-                    return Err(Error::ShapeMismatch {
-                        expected: vec![rows, expected],
-                        found: vec![rows, data.features()],
-                    });
-                }
-                // Two layers disagree: a model error, which the forward pass reports with
-                // both layers named. The output width is unknown, so the checks that need it
-                // are skipped.
-                return Ok(());
-            }
-            named = true;
-        }
-        width = layer.output_width(width);
-    }
     let kind = |classes: bool| if classes { "class" } else { "value" };
     let has_classes = matches!(data.targets, Targets::Classes(_));
     if loss.needs_classes() != has_classes {
@@ -785,6 +765,28 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
             i / columns,
             i % columns
         )));
+    }
+    let (rows, mut width) = (data.len(), data.features());
+    // Whether an earlier layer named an input width, so that `width` is checked against it.
+    let mut named = false;
+    for i in 0..model.len() {
+        let layer = model.layer(i);
+        if let Some(expected) = layer.input_width() {
+            if expected != width {
+                if !named {
+                    return Err(Error::ShapeMismatch {
+                        expected: vec![rows, expected],
+                        found: vec![rows, data.features()],
+                    });
+                }
+                // Two layers disagree: a model error, which the forward pass reports with
+                // both layers named. The output width is unknown, so the checks that need it
+                // (the labels and the value-target width) are skipped.
+                return Ok(());
+            }
+            named = true;
+        }
+        width = layer.output_width(width);
     }
     match &data.targets {
         Targets::Classes(labels) => match labels.iter().position(|&l| l >= width) {
@@ -1530,6 +1532,29 @@ mod tests {
             ..FitConfig::default()
         };
         let _ = fit(&net, &mut params, &data, config);
+    }
+
+    /// Binary cross-entropy targets outside `[0, 1]` are a data error even when the model's
+    /// layers disagree on a width, because that check does not need the output width.
+    #[test]
+    fn bce_target_check_runs_for_disagreeing_layers() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut rng))
+            .push(Linear::new(&mut params, 5, 1, &mut rng));
+        let data = Dataset {
+            x: Tensor::zeros(&[2, 3]),
+            targets: Targets::Values(Tensor::from_vec(vec![0.0, 3.0], &[2, 1]).unwrap()),
+        };
+        let err = fit(
+            &net,
+            &mut params,
+            &data,
+            config_for(Loss::BinaryCrossEntropy),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
     }
 
     /// Inputs of the wrong width are a data error even when an activation comes before the
