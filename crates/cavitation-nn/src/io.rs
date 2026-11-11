@@ -27,10 +27,11 @@ fn convert(path: &Path, err: SafeTensorError) -> Error {
 /// pickle stream (the legacy format, which starts with the byte `0x80`). A safetensors file
 /// starts with its header length as 8 little-endian bytes and its header, a JSON object, at
 /// byte 8; a header of 128 bytes also starts with `0x80`, so a file whose byte 8 is `{` is
-/// never taken for a pickle. A file shorter than 4 bytes is checked on the bytes it has.
+/// never taken for a pickle. A file of 8 bytes or fewer is never taken for a pickle (it cannot
+/// hold a safetensors header either, so the parser reports it as a format error).
 fn check_not_torch_save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let zip = bytes.starts_with(b"PK\x03\x04");
-    let pickle = bytes.first() == Some(&0x80) && bytes.get(8) != Some(&b'{');
+    let pickle = bytes.len() > 8 && bytes[0] == 0x80 && bytes[8] != b'{';
     if zip || pickle {
         return Err(Error::Format(format!(
             "{}: this is a torch.save file (a zip archive or a pickle), not safetensors; save \
@@ -220,6 +221,15 @@ impl Default for LoadOptions<'_> {
 impl<'a> LoadOptions<'a> {
     /// Options that remove `prefix` from the start of each key in the file; a key without
     /// the prefix is kept as it is. Strict.
+    ///
+    /// ```
+    /// use cavitation_nn::LoadOptions;
+    ///
+    /// let options = LoadOptions::strip_prefix("module.");
+    /// let rename = options.rename.unwrap();
+    /// assert_eq!(rename("module.0.weight"), "0.weight");
+    /// assert_eq!(rename("0.weight"), "0.weight"); // no prefix: kept as it is
+    /// ```
     pub fn strip_prefix(prefix: &'a str) -> LoadOptions<'a> {
         LoadOptions {
             rename: Some(Box::new(move |key| {
@@ -248,24 +258,36 @@ impl<'a> LoadOptions<'a> {
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng};
-/// use cavitation_nn::{Linear, LoadOptions, Relu, Sequential, load_with, save};
+/// use cavitation_nn::{Linear, LoadOptions, Relu, Sequential, load, load_with, save};
 ///
-/// // A model with a Linear, a ReLU and a Linear: its keys are `0.*` and `2.*`.
-/// let mut params = ParamStore::new();
-/// let net = Sequential::new()
-///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+/// // A file from a PyTorch model that has a `Dropout` after each ReLU. Relu layers stand in
+/// // for the Dropouts here, since they have no parameters either: the Linear layers sit at
+/// // indices 0, 3 and 6, so the file's keys are `0.*`, `3.*` and `6.*`.
+/// let mut file_params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let in_file = Sequential::new()
+///     .push(Linear::new(&mut file_params, 2, 3, &mut rng))
 ///     .push(Relu)
-///     .push(Linear::new(&mut params, 3, 1, &mut Rng::seed(1)));
+///     .push(Relu)
+///     .push(Linear::new(&mut file_params, 3, 3, &mut rng))
+///     .push(Relu)
+///     .push(Relu)
+///     .push(Linear::new(&mut file_params, 3, 1, &mut rng));
 /// let path = std::env::temp_dir().join(format!("cavitation-doc-load-with-{}.safetensors", std::process::id()));
-/// save(&path, &net, &params)?;
+/// save(&path, &in_file, &file_params)?;
 ///
-/// // A file saved from a `DataParallel` model has keys `module.0.weight`, ...; its prefix
-/// // is removed with `strip_prefix`. (This file has no prefix, which `strip_prefix` leaves
-/// // alone, so the same file loads.)
-/// load_with(&path, &net, &mut params, LoadOptions::strip_prefix("module."))?;
+/// // This model leaves the Dropouts out, so its Linear layers are at 0, 2 and 4.
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(1);
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 3, 3, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 3, 1, &mut rng));
+/// assert!(load(&path, &net, &mut params).is_err()); // the keys `3.*` and `6.*` do not match
 ///
-/// // A PyTorch model with Dropout layers after each ReLU has its second Linear at index 3
-/// // and its third at index 6, while this model has them at 2 and 4. A closure renumbers:
+/// // A closure renumbers: 3 becomes 2 and 6 becomes 4.
 /// let renumber = |key: &str| {
 ///     if let Some(rest) = key.strip_prefix("3.") {
 ///         format!("2.{rest}")
@@ -277,6 +299,11 @@ impl<'a> LoadOptions<'a> {
 /// };
 /// let options = LoadOptions { rename: Some(Box::new(renumber)), ..LoadOptions::default() };
 /// load_with(&path, &net, &mut params, options)?;
+///
+/// // The last Linear of the model now holds the values of the file's `6.weight`.
+/// let loaded = params.value(net.parameter_names()[4].1).data().to_vec();
+/// let saved = file_params.value(in_file.parameter_names()[4].1).data().to_vec();
+/// assert_eq!(loaded, saved);
 /// std::fs::remove_file(&path).ok();
 /// # Ok::<(), cavitation_core::Error>(())
 /// ```
@@ -781,11 +808,15 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// Empty and 3-byte files are format errors from the safetensors parser, not panics and
-    /// not the `torch.save` message.
+    /// Empty, 1-byte (a lone pickle marker) and 3-byte files are format errors from the
+    /// safetensors parser, not panics and not the `torch.save` message.
     #[test]
     fn tiny_files_are_format_errors() {
-        for (name, bytes) in [("tiny-0", vec![]), ("tiny-3", vec![b'P', b'K', 3])] {
+        for (name, bytes) in [
+            ("tiny-0", vec![]),
+            ("tiny-1", vec![0x80]),
+            ("tiny-3", vec![b'P', b'K', 3]),
+        ] {
             let err = load_error_of(name, &bytes);
             assert!(
                 matches!(&err, Error::Format(m) if !m.contains("torch.save")),
