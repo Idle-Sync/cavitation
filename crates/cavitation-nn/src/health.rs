@@ -716,43 +716,61 @@ mod tests {
         matches!(err, Error::NonFinite { step: s, location: l } if *s == step && l == location)
     }
 
-    /// A NaN in the first input row stops `fit` at step 1 with the loss named as the
-    /// location, before the optimiser applies anything.
+    /// `fit` rejects a NaN input before training, so nothing is trained or changed.
+    #[test]
+    fn fit_rejects_nan_input() {
+        let data = nan_dataset();
+        let mut params = ParamStore::new();
+        let net = classifier(&mut params);
+        let before = parameter_bits(&net, &params);
+        let err = fit(&net, &mut params, &data, FitConfig::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        assert!(err.to_string().contains("row 0, column 0"), "{err}");
+        assert_eq!(parameter_bits(&net, &params), before);
+    }
+
+    /// A NaN in the first input row (fed through `Trainer::step`, which does not check the
+    /// data) stops training at step 1 with the loss named as the location, before the
+    /// optimiser applies anything.
     #[test]
     fn nan_in_input_stops_training() {
         let data = nan_dataset();
         let mut params = ParamStore::new();
         let net = classifier(&mut params);
         let before = parameter_bits(&net, &params);
-        let config = FitConfig {
-            epochs: 2,
-            batch: 32,
-            shuffle_seed: None,
-            ..FitConfig::default()
-        };
-        let err = fit(&net, &mut params, &data, config).unwrap_err();
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 32);
+        let batcher = Batcher::new(64, 32, None);
+        let mut batch = Batch::new(&data, 32);
+        let err = trainer
+            .step(&net, &mut params, batcher.gather(&data, 0..32, &mut batch))
+            .unwrap_err();
         assert!(is_non_finite(&err, 1, "loss"), "{err:?}");
         assert_eq!(err.to_string(), "non-finite value at step 1 in loss");
         assert_eq!(parameter_bits(&net, &params), before);
     }
 
     /// With `OnNonFinite::Warn` the sink receives the non-finite loss (once per epoch) and
-    /// the non-finite gradients, and training runs every epoch.
+    /// the non-finite gradients, and a manual loop of steps runs every epoch (`Trainer::step`
+    /// does not check the data, as `fit` does).
     #[test]
     fn warn_mode_continues() {
         let data = nan_dataset();
         let mut params = ParamStore::new();
         let net = classifier(&mut params);
         let (seen, sink) = collecting_sink();
-        let config = FitConfig {
-            epochs: 2,
-            batch: 32,
-            shuffle_seed: None,
-            health: health(OnNonFinite::Warn, sink),
-            ..FitConfig::default()
-        };
-        let history = fit(&net, &mut params, &data, config).unwrap();
-        assert_eq!(history.epochs.len(), 2);
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 32);
+        trainer.set_health(health(OnNonFinite::Warn, sink));
+        let batcher = Batcher::new(64, 32, None);
+        let mut batch = Batch::new(&data, 32);
+        for epoch in 1..=2 {
+            for range in [0..32, 32..64] {
+                trainer
+                    .step(&net, &mut params, batcher.gather(&data, range, &mut batch))
+                    .unwrap();
+            }
+            trainer.end_epoch(epoch).unwrap();
+        }
+        assert_eq!(trainer.steps(), 4);
         let seen = seen.borrow();
         assert_eq!(
             seen[0],
