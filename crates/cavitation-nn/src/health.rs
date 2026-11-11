@@ -936,23 +936,9 @@ mod tests {
     /// trains the dead network for three epochs, and its standard error has one such line.
     #[test]
     fn dead_relu_prints_once_per_layer_without_a_sink() {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let out = std::process::Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                "health::tests::dead_relu_printing_child",
-            ])
-            .output()
-            .expect("the test binary runs");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let out = crate::test_child::run_alone("health::tests::dead_relu_printing_child", &[]);
+        crate::test_child::assert_passed(&out);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "the child should run the helper and pass; stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
         let dead: Vec<&str> = stderr
             .lines()
             .filter(|l| l.starts_with("cavitation: warning:") && l.contains("dead ReLU"))

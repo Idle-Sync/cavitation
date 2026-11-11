@@ -57,6 +57,8 @@ mod real;
 mod rng;
 mod shape;
 mod tensor;
+#[cfg(test)]
+mod test_child;
 
 pub use check::{GradcheckFailure, GradcheckReport, gradcheck, gradcheck_params};
 pub use error::Error;

@@ -64,6 +64,8 @@ mod linear;
 mod mask;
 mod optim;
 mod sequential;
+#[cfg(test)]
+mod test_child;
 mod train;
 
 pub use activation::{

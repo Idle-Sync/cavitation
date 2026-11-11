@@ -16,7 +16,7 @@ The state-dict fixture goes under `crates/cavitation-nn/tests/fixtures/state-dic
 `safetensors.torch.save_file` as `mlp.safetensors`, and `mlp-io.json` with five inputs and the
 network's outputs in f32 and float64. `--only state-dict` writes just these two files.
 
-`--check-rust-save` writes nothing. It checks the other direction: that a file written by the
+`--check-rust-save [PATH]` writes nothing. It checks the other direction: that a file written by the
 library's `save` loads in PyTorch. The Rust test `save_writes_the_file_pytorch_was_checked_against`
 (in `crates/cavitation-nn/src/io.rs`) keeps `from-rust.safetensors` in the same folder equal,
 byte for byte, to what `save` writes today, and `from-rust-io.json` beside it holds that model's
@@ -32,6 +32,10 @@ then this check:
 
     scripts/fixtures/.venv/bin/python -I scripts/fixtures/make_fixtures.py --out crates --check-rust-save
 
+Give a path to check another copy of the file (for example one altered on purpose, to see the
+check fail); `from-rust-io.json` is still read from the committed folder. Every check exits
+with status 1 and a message, also under `python -O`.
+
 Inputs come from `torch.manual_seed(0)` with one thread, in a fixed order, so a rerun writes
 identical files. Inputs are kept away from kinks (zero for ReLU, the clamp edges, the points
 where Huber and smooth L1 change branch) so both sides take the same branch.
@@ -42,7 +46,8 @@ dimension, and its `params` say so.
 
 Run it from the repository root, inside the virtual environment in `scripts/fixtures/.venv`
 (created with `uv venv scripts/fixtures/.venv --python 3.14` and filled from
-`scripts/fixtures/requirements.txt`):
+`scripts/fixtures/requirements.txt`, which picks the CPU build of PyTorch on Linux and the
+standard build on macOS):
 
     scripts/fixtures/.venv/bin/python -I scripts/fixtures/make_fixtures.py --out crates
 
@@ -79,6 +84,13 @@ LAYER_CASES = []
 OPTIM_CASES = []
 
 
+def check(condition, message):
+    """Exits with status 1 and `message` unless `condition` holds. Unlike `assert`, it still
+    runs under `python -O`."""
+    if not condition:
+        raise SystemExit(message)
+
+
 def rnd(*shape, scale=1.0):
     """Normal values times `scale`, as f32."""
     return torch.randn(shape) * scale
@@ -97,7 +109,7 @@ def away(x, points, margin=0.05):
         side = torch.where(x >= p, 1.0, -1.0)
         x = torch.where(near, p + side * margin * 2, x)
     for p in points:
-        assert ((x - p).abs() >= margin).all(), "an input is on a kink"
+        check(bool(((x - p).abs() >= margin).all()), "an input is on a kink")
     return x
 
 
@@ -553,21 +565,23 @@ def mlp_bound(model, x):
     return 2 * (w2.shape[1] + 3) * eps * out_terms + hidden_err @ w2.abs().T + 1e-30
 
 
-def check_rust_save(crates_dir):
-    """Loads the library-written `from-rust.safetensors` into the PyTorch network and checks its
-    values and outputs against `from-rust-io.json`; raises on any difference."""
+def check_rust_save(crates_dir, saved=None):
+    """Loads the library-written safetensors file (by default the committed
+    `from-rust.safetensors`, or the file `saved`) into the PyTorch network and checks its
+    values and outputs against the committed `from-rust-io.json`; exits with a message on any
+    difference."""
     in_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
-    state = load_file(os.path.join(in_dir, "from-rust.safetensors"))
+    state = load_file(saved or os.path.join(in_dir, "from-rust.safetensors"))
     with open(os.path.join(in_dir, "from-rust-io.json")) as f:
         io = json.load(f)
 
     def tensor(t):
         return torch.tensor(t["data"], dtype=torch.float32).reshape(t["shape"])
 
-    assert sorted(state) == sorted(io["keys"]), f"keys {sorted(state)} != {sorted(io['keys'])}"
+    check(sorted(state) == sorted(io["keys"]), f"keys {sorted(state)} != {sorted(io['keys'])}")
     for key in io["keys"]:
-        assert state[key].dtype == torch.float32, f"{key}: {state[key].dtype}"
-        assert torch.equal(state[key], tensor(io["params"][key])), f"{key}: values differ"
+        check(state[key].dtype == torch.float32, f"{key}: {state[key].dtype}")
+        check(torch.equal(state[key], tensor(io["params"][key])), f"{key}: values differ")
     model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 3))
     model.load_state_dict(state, strict=True)
     x = tensor(io["input"])
@@ -579,7 +593,7 @@ def check_rust_save(crates_dir):
     for name, out in (("PyTorch", theirs), ("the library", ours)):
         diff = (out.double() - exact).abs()
         worst = (diff / bound).max().item()
-        assert bool((diff <= bound).all()), f"{name}'s outputs are outside the bound (worst {worst:.3g} of it)"
+        check(bool((diff <= bound).all()), f"{name}'s outputs are outside the bound (worst {worst:.3g} of it)")
         print(f"{name}: every output within the bound (worst {worst:.3g} of it)", file=sys.stderr)
     largest = (theirs - ours).abs().max().item()
     print(
@@ -596,12 +610,15 @@ def main():
     parser.add_argument("--only", choices=["state-dict"], help="write only this fixture family")
     parser.add_argument(
         "--check-rust-save",
-        action="store_true",
-        help="write nothing; check that the library-written state-dict file loads and predicts in PyTorch",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="write nothing; check that the library-written state-dict file (PATH, default the committed "
+        "from-rust.safetensors under --out) loads and predicts in PyTorch",
     )
     args = parser.parse_args()
-    if args.check_rust_save:
-        check_rust_save(args.out)
+    if args.check_rust_save is not None:
+        check_rust_save(args.out, args.check_rust_save or None)
         return
     if args.only == "state-dict":
         write_state_dict(args.out)
@@ -622,10 +639,10 @@ def main():
             os.remove(os.path.join(out_dir, old))
     names = set()
     for name, body in CASES:
-        assert name not in names, f"duplicate fixture name {name}"
+        check(name not in names, f"duplicate fixture name {name}")
         names.add(name)
         for key in ("output_f64",):
-            assert all(math.isfinite(v) for v in body[key]["data"]), f"{name}: not finite"
+            check(all(math.isfinite(v) for v in body[key]["data"]), f"{name}: not finite")
         with open(os.path.join(out_dir, name + ".json"), "w") as f:
             json.dump(body, f, separators=(",", ":"))
             f.write("\n")

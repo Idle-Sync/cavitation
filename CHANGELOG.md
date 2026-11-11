@@ -9,6 +9,7 @@ The first release: a CPU neural network library for multilayer perceptrons whose
 ### Workspace
 
 - Five crates: `cavitation` (the one to depend on: re-exports the core and nn crates and gathers the everyday names in `cavitation::prelude`), `cavitation-core`, `cavitation-nn`, `cavitation-datasets` and `cavitation-bench`. Every crate is licensed `MIT OR Apache-2.0`.
+- The PyTorch fixture script's checks now fail under `python -O` too, `--check-rust-save` accepts the path of the file to check, and `scripts/fixtures/requirements.txt` installs on macOS (PyPI's `torch==2.15.0`) as well as Linux (the CPU build). The tests that re-run themselves in a child process share one helper per crate.
 
 ### Tensors and autograd (`cavitation-core`)
 

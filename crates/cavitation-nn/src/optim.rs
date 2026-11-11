@@ -1346,55 +1346,6 @@ mod tests {
             .collect()
     }
 
-    /// Runs the ignored test `name` of this test binary in a child process, alone, and fails
-    /// unless it ran and passed. Alone in its process, nothing else holds the thread pool, so
-    /// a call on several threads is never sent to the inline path because another test's call
-    /// is using the pool.
-    fn run_alone(name: &str) {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let out = std::process::Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                name,
-            ])
-            .output()
-            .expect("the test binary runs");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // A filter that matches nothing also exits 0; "1 passed" shows the test ran.
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "{name} failed or did not run; stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Fails unless the thread pool runs tasks on its workers, not only on the caller: runs
-    /// 64 short tasks on 4 threads, again for up to 10 seconds, until one runs on a worker
-    /// other than 0.
-    fn assert_pool_runs_on_workers() {
-        use cavitation_core::kernels::pool::{Task, run};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let start = std::time::Instant::now();
-        loop {
-            let highest = AtomicUsize::new(0);
-            run(4, 64, &|t: Task| {
-                let spin = std::time::Instant::now();
-                while spin.elapsed() < std::time::Duration::from_micros(20) {}
-                highest.fetch_max(t.worker, Ordering::Relaxed);
-            });
-            if highest.into_inner() > 0 {
-                return;
-            }
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(10),
-                "the pool ran every task on the caller for 10 s"
-            );
-        }
-    }
-
     /// The chunked update gives the same parameters and the same optimiser state, bit for
     /// bit, as the reference loop, for every setting, over 3 steps (the last with a NaN and
     /// an infinity in one gradient) and on 1, 2 and 4 threads. Its statistics differ from
@@ -1402,7 +1353,11 @@ mod tests {
     /// child process, so the 2- and 4-thread runs really use the pool's workers.
     #[test]
     fn chunked_update_matches_the_reference_bit_for_bit() {
-        run_alone("optim::tests::chunked_update_matches_the_reference_child");
+        let out = crate::test_child::run_alone(
+            "optim::tests::chunked_update_matches_the_reference_child",
+            &[],
+        );
+        crate::test_child::assert_passed(&out);
     }
 
     /// The body of `chunked_update_matches_the_reference_bit_for_bit`, run in a child
@@ -1410,7 +1365,7 @@ mod tests {
     #[test]
     #[ignore = "run in a child process by chunked_update_matches_the_reference_bit_for_bit"]
     fn chunked_update_matches_the_reference_child() {
-        assert_pool_runs_on_workers();
+        crate::test_child::assert_pool_runs_on_workers();
         for (name, make) in chunk_configs() {
             let (mut reference, ids) = chunk_store();
             let mut ref_opt = make();
@@ -1459,7 +1414,8 @@ mod tests {
     /// the 2- and 4-thread runs really use the pool's workers.
     #[test]
     fn chunked_statistics_do_not_depend_on_the_thread_count() {
-        run_alone("optim::tests::chunked_statistics_child");
+        let out = crate::test_child::run_alone("optim::tests::chunked_statistics_child", &[]);
+        crate::test_child::assert_passed(&out);
     }
 
     /// The body of `chunked_statistics_do_not_depend_on_the_thread_count`, run in a child
@@ -1467,7 +1423,7 @@ mod tests {
     #[test]
     #[ignore = "run in a child process by chunked_statistics_do_not_depend_on_the_thread_count"]
     fn chunked_statistics_child() {
-        assert_pool_runs_on_workers();
+        crate::test_child::assert_pool_runs_on_workers();
         for (name, make) in chunk_configs() {
             let norms: Vec<Vec<u64>> = [1, 2, 4]
                 .into_iter()
@@ -1538,6 +1494,85 @@ mod tests {
                     value_bits(&store, &[b]),
                     value_bits(&fresh, &[only_b]),
                     "{at}: b's first update"
+                );
+            }
+        }
+    }
+
+    /// A parameter that already has momentum or Adam moments keeps them, and its value, while
+    /// it has no gradient. For SGD with momentum 0.9, Adam and AdamW on both paths: both
+    /// parameters get a gradient on step 1; only `a` gets one on steps 2 and 3, and after each
+    /// of those `b`'s value bits and state bits equal what step 1 left. On step 4, when `b`
+    /// has a gradient again, it moves exactly as the second update of an optimiser that only
+    /// ever saw `b` (its own step count is 2, its state carried over from step 1).
+    #[test]
+    fn skipped_parameter_keeps_its_state() {
+        for (name, make) in chunk_configs() {
+            if !["sgd momentum", "adam", "adamw"].contains(&name) {
+                continue;
+            }
+            for path in [Path::Reference, Path::Chunked(2)] {
+                let at = format!("{name}, {path:?}");
+                let (n_a, n_b) = (40, 30);
+                let start_b = sequence(n_b, 2, &[]);
+                let mut store = ParamStore::new();
+                let a = store.add(Tensor::from_vec(sequence(n_a, 1, &[]), &[n_a]).unwrap());
+                let b = store.add(Tensor::from_vec(start_b.clone(), &[n_b]).unwrap());
+                let mut opt = make();
+                let mut stats = GradStats::new();
+                let (g1, g4) = (sequence(n_b, 20, &[]), sequence(n_b, 21, &[]));
+
+                store.zero_grad();
+                set_grad(&mut store, a, &sequence(n_a, 10, &[]));
+                set_grad(&mut store, b, &g1);
+                opt.step(&mut store, &mut stats, path);
+                let value_after_1 = value_bits(&store, &[b]);
+                let state_after_1 = opt.state_of(1);
+                assert!(
+                    state_after_1.iter().flatten().any(|&x| x != 0),
+                    "{at}: step 1 left b's state at zero"
+                );
+                assert_ne!(
+                    value_after_1,
+                    vec![start_b.iter().map(|x| x.to_bits()).collect::<Vec<u32>>()],
+                    "{at}: step 1 did not move b"
+                );
+
+                for step in 2..=3 {
+                    store.zero_grad();
+                    set_grad(&mut store, a, &sequence(n_a, 10 + step, &[]));
+                    opt.step(&mut store, &mut stats, path);
+                    assert_eq!(
+                        value_bits(&store, &[b]),
+                        value_after_1,
+                        "{at}, step {step}: value"
+                    );
+                    assert_eq!(opt.state_of(1), state_after_1, "{at}, step {step}: state");
+                }
+
+                store.zero_grad();
+                set_grad(&mut store, a, &sequence(n_a, 14, &[]));
+                set_grad(&mut store, b, &g4);
+                opt.step(&mut store, &mut stats, path);
+
+                let mut twin = ParamStore::new();
+                let only_b = twin.add(Tensor::from_vec(start_b, &[n_b]).unwrap());
+                let mut twin_opt = make();
+                let mut twin_stats = GradStats::new();
+                for g in [&g1, &g4] {
+                    twin.zero_grad();
+                    set_grad(&mut twin, only_b, g);
+                    twin_opt.step(&mut twin, &mut twin_stats, path);
+                }
+                assert_eq!(
+                    value_bits(&store, &[b]),
+                    value_bits(&twin, &[only_b]),
+                    "{at}: b's update on step 4"
+                );
+                assert_eq!(
+                    opt.state_of(1),
+                    twin_opt.state_of(0),
+                    "{at}: b's state on step 4"
                 );
             }
         }

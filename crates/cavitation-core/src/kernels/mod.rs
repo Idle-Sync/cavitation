@@ -708,7 +708,6 @@ impl<'a, T: Real> MatMut<'a, T> {
 mod tests {
     use super::*;
     use crate::Error;
-    use std::process::Command;
 
     /// Every level name parses to its level and prints back the same; unknown names are
     /// rejected with an error naming them.
@@ -763,20 +762,11 @@ mod tests {
     /// Panics if the child did not run the helper: a filter that matches no test also exits
     /// successfully, so the child's summary must report the one test passed or failed.
     fn run_child(name: &str, var: &str, value: &str) -> (bool, String) {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let out = Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                name,
-            ])
-            .env_remove("CAVITATION_THREADS")
-            .env_remove("CAVITATION_KERNEL")
-            .env(var, value)
-            .output()
-            .expect("the test binary runs");
+        let out = crate::test_child::run_alone_without(
+            name,
+            &[(var, value)],
+            &["CAVITATION_THREADS", "CAVITATION_KERNEL"],
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let ok = out.status.success();
         let summary = if ok { "1 passed" } else { "1 failed" };
