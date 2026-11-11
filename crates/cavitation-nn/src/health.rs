@@ -1147,15 +1147,16 @@ mod tests {
         assert_ne!(parameter_bits(&net, &params), before);
     }
 
-    /// A `Linear` 1 → 1 fitting `y = 2x + 1` on 8 points evenly spaced in `[-1, 1]` (full
-    /// batch, SGD with a learning rate of 0.5, mean squared error, 400 epochs) reaches a mean
-    /// loss below 1e-8, and its gradients fall below the vanishing limit only because it has
-    /// converged: the sink receives no `Vanishing`.
+    /// A `Linear` 1 → 1 fitting `y = 2x + 1` on 8 points evenly spaced in `[0, 1]` (so the
+    /// weight and the bias are coupled; full batch, SGD with a learning rate of 0.5, mean
+    /// squared error, 400 epochs) reaches a mean loss below 1e-8, and its gradients fall below
+    /// the vanishing limit only because it has converged: the sink receives no `Vanishing`
+    /// over the whole run.
     #[test]
     fn converged_regression_sends_no_vanishing() {
         let mut params = ParamStore::new();
         let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
-        let xs: Vec<f32> = (0..8).map(|i| -1.0 + 2.0 * i as f32 / 7.0).collect();
+        let xs: Vec<f32> = (0..8).map(|i| i as f32 / 7.0).collect();
         let ys: Vec<f32> = xs.iter().map(|x| 2.0 * x + 1.0).collect();
         let data = Dataset {
             x: Tensor::from_vec(xs, &[8, 1]).unwrap(),
@@ -1184,26 +1185,43 @@ mod tests {
             .filter(|w| matches!(w, Warning::Vanishing { .. }))
             .cloned()
             .collect();
-        // Each epoch is one step, so epoch `i` holds the loss of step `i`. The bias gradient
-        // is about 0 after the first update (its curvature times the learning rate is 1), so
-        // early steps may warn while the weight is still far off; none may once the loss has
-        // fallen 10000-fold.
-        let first = history.epochs[0].mean_loss;
-        let late: Vec<&Warning> = vanishing
-            .iter()
-            .filter(|w| match w {
-                Warning::Vanishing { step, .. } => {
-                    history.epochs[*step as usize - 1].mean_loss <= first * 1e-4
-                }
-                _ => false,
-            })
-            .collect();
         assert!(
-            late.is_empty(),
+            vanishing.is_empty(),
             "{} warnings, first {:?}",
-            late.len(),
-            late.first()
+            vanishing.len(),
+            vanishing.first()
         );
+    }
+
+    /// A gradient of 0 with a loss that has only fallen from 1.0 to 0.9 is a vanishing
+    /// gradient: `after_update` still sends `Vanishing` for both parameters of a `Linear`
+    /// 2 → 1.
+    #[test]
+    fn vanishing_still_fires_when_loss_has_not_fallen() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+        let names = net.parameter_names();
+        let mut graph = Graph::new();
+        let trace = crate::Trace::new();
+        let mut optimizer = Sgd::new(0.1);
+        optimizer.step(&mut params);
+        let (seen, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
+        let tape = graph.tape(&params.values);
+        for (step, loss) in [(1, 1.0), (2, 0.9)] {
+            monitor
+                .after_backward(step, loss, &tape, &trace, &net)
+                .unwrap();
+        }
+        monitor
+            .after_update(2, optimizer.last_stats(), &names)
+            .unwrap();
+        let seen = seen.borrow();
+        let vanishing = seen
+            .iter()
+            .filter(|w| matches!(w, Warning::Vanishing { .. }))
+            .count();
+        assert_eq!(vanishing, 2, "{seen:?}");
     }
 
     /// A loss that falls from 1 to exactly 0 counts as converged: zero gradients then send no
