@@ -43,7 +43,7 @@ The first release: a CPU neural network library for multilayer perceptrons whose
 
 ### Data, examples, guide and benchmark
 
-- `cavitation-datasets`: loaders for the scikit-learn 8×8 digits (included in `data/digits/`) and for MNIST (downloaded by `scripts/data/get-mnist.sh`).
+- `cavitation-datasets`: loaders for the scikit-learn 8×8 digits (included in `data/digits/`) and for MNIST (downloaded by `scripts/data/get-mnist.sh`); a malformed MNIST header, including dimensions whose product overflows `usize`, returns `Error::Format`.
 - The `xor`, `digits` and `mnist` examples, and known-result tests: XOR, 97.50% (351 of 360) on the held-out digits, and 98.63% on the MNIST test images (ignored by default, as it needs the data).
 - The guide (`book/`, built with mdBook), with its first chapter, "Backprop by hand".
 - `cavitation-bench` (`all`, `mnist`, `digits`, `latency`, `gemm`, `info`) times training and inference against a numpy baseline measured in the same run on the same network, batch, data and step count. Measured with `cargo run --release -p cavitation-bench -- all` on an Intel Celeron N5105 (4 cores, SSE4.2, no AVX), release build, kernel level `sse4.2`, 4 threads, plain SGD, numpy 2.4.4, rustc 1.99.1: an MNIST epoch of the 784 → 1024 → 256 → 10 network takes 6.17 s at batch 128 (numpy 9.35 s) and 10.19 s at batch 32 (numpy 14.61 s); the digits network trains at 116,904 samples/s (numpy 86,787); one input through the digits network in inference mode takes 6.77 µs (numpy 32.35 µs).
