@@ -31,7 +31,7 @@ jobs:
         with:
           key: ${{ matrix.kernel }}
       - name: Test
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --no-fail-fast
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
@@ -55,7 +55,7 @@ jobs:
         with:
           key: ${{ matrix.kernel }}
       - name: Test
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --no-fail-fast
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
@@ -82,7 +82,7 @@ jobs:
         with:
           key: ${{ matrix.kernel }}
       - name: Test
-        run: cargo test --workspace --release
+        run: cargo test --workspace --release --no-fail-fast
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt

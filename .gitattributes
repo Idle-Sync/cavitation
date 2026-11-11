@@ -1,0 +1,4 @@
+# Data and test fixtures are checked byte for byte (some by checksum), so git must never
+# rewrite their line endings on checkout, on any platform.
+data/** -text
+crates/*/tests/fixtures/** -text
