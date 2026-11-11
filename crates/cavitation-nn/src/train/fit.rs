@@ -718,18 +718,19 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
         return Err(Error::InvalidData("the data set has no rows".to_string()));
     }
     match &data.targets {
-        Targets::Classes(labels) if labels.len() != rows => Err(Error::ShapeMismatch {
-            expected: vec![rows],
-            found: vec![labels.len()],
-        }),
+        Targets::Classes(labels) if labels.len() != rows => Err(Error::InvalidData(format!(
+            "there are {rows} rows but {} labels",
+            labels.len()
+        ))),
         Targets::Values(t) => match t.shape().dims() {
             &[r, _] if r == rows => Ok(()),
-            &[_, outputs] => Err(Error::ShapeMismatch {
-                expected: vec![rows, outputs],
-                found: t.shape().dims().to_vec(),
-            }),
+            &[_, _] => Err(Error::InvalidData(format!(
+                "the value targets are {:?}, but the inputs are {:?}",
+                t.shape().dims(),
+                data.x.shape().dims()
+            ))),
             dims => Err(Error::InvalidData(format!(
-                "value targets must have shape [rows, outputs], found {dims:?}"
+                "the value targets must have shape [rows, outputs], found {dims:?}"
             ))),
         },
         Targets::Classes(_) => Ok(()),
@@ -774,10 +775,16 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
         if let Some(expected) = layer.input_width() {
             if expected != width {
                 if !named {
-                    return Err(Error::ShapeMismatch {
-                        expected: vec![rows, expected],
-                        found: vec![rows, data.features()],
-                    });
+                    let reach = if width == data.features() {
+                        String::new()
+                    } else {
+                        format!(" and reach layer {i} with width {width}")
+                    };
+                    return Err(Error::InvalidData(format!(
+                        "the inputs are [{rows}, {}]{reach}, but layer {i} ({}) takes {expected}",
+                        data.features(),
+                        layer.name()
+                    )));
                 }
                 // Two layers disagree: a model error, which the forward pass reports with
                 // both layers named. The output width is unknown, so the checks that need it
@@ -797,13 +804,35 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
             None => Ok(()),
         },
         Targets::Values(t) => match t.shape().dims() {
-            &[_, outputs] if outputs != width => Err(Error::ShapeMismatch {
-                expected: vec![rows, width],
-                found: t.shape().dims().to_vec(),
-            }),
+            dims @ &[_, outputs] if outputs != width => Err(Error::InvalidData(format!(
+                "the value targets are {dims:?}, but the model outputs [{rows}, {width}]"
+            ))),
             _ => Ok(()),
         },
     }
+}
+
+/// Checks that every input and every value target is finite, naming the first one that is
+/// not by tensor, row, column and value. Allocates only to build the error.
+fn check_finite(data: &Dataset) -> Result<(), Error> {
+    let scan = |values: &[f32], columns: usize, what: &str| match values
+        .iter()
+        .position(|v| !v.is_finite())
+    {
+        Some(i) => Err(Error::InvalidData(format!(
+            "row {}, column {} of {what} is {}; training needs finite values",
+            i / columns,
+            i % columns,
+            values[i]
+        ))),
+        None => Ok(()),
+    };
+    scan(data.x.data(), data.features().max(1), "the inputs")?;
+    if let Targets::Values(t) = &data.targets {
+        let columns = t.shape().dims().last().copied().unwrap_or(1).max(1);
+        scan(t.data(), columns, "the value targets")?;
+    }
+    Ok(())
 }
 
 /// Trains `model` on `train` as `config` says and returns each epoch's report.
@@ -820,10 +849,12 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
 /// `config.loss` needs (see [`Loss`]), if a class label is not below the model's output
 /// width, or, for [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`],
 /// if a target is NaN, infinite or outside `[0, 1]` (the message names its row and
-/// column); and [`Error::ShapeMismatch`] if the targets do not have one entry per row, value
-/// targets are not as wide as the model's output, or the inputs are not as wide as the
-/// first layer that names an input width expects (layers that do not, such as activations,
-/// may come before it). Two layers that disagree on a width are a model error, not a data
+/// column), if the targets do not have one entry per row, if value targets are not as wide
+/// as the model's output, if the inputs are not as wide as the first layer that names an
+/// input width expects (layers that do not, such as activations, may come before it; the
+/// message then gives the width that reaches the layer), or if any input or value target is
+/// NaN or infinite (the message names the row, the column and the value). Each message
+/// names the tensors with their shapes, such as "the inputs are [8, 5]". Two layers that disagree on a width are a model error, not a data
 /// error: the checks that need the output width are skipped and the first forward pass
 /// panics naming both layers. During training, with `config.health.on_non_finite` set to
 /// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`] at
@@ -905,6 +936,7 @@ pub fn fit_with_hooks(
 ) -> Result<History, Error> {
     check_dataset(train)?;
     check_model_and_loss(model, config.loss, train)?;
+    check_finite(train)?;
     let mut trainer =
         Trainer::with_boxed(model, config.optimizer.build(), config.loss, config.batch);
     trainer.set_health(config.health);
@@ -1033,8 +1065,8 @@ mod tests {
 
     use super::*;
     use crate::train::data::tests::classes_dataset;
-    use crate::{Layer, Linear, Sigmoid, Tanh};
-    use cavitation_core::{ParamId, Rng, Tensor};
+    use crate::{Glu, Layer, Linear, Sigmoid, Tanh};
+    use cavitation_core::{Gate, ParamId, Rng, Tensor};
 
     /// `n` rows of `features` uniform values in `[-1, 1)` from `Rng::seed(seed)`, labelled
     /// by which of `classes` equal slices of the features has the largest sum.
@@ -1356,7 +1388,10 @@ mod tests {
             targets: Targets::Classes(vec![0, 1, 0]),
         };
         let err = fit(&net, &mut params, &short, FitConfig::default()).unwrap_err();
-        assert_eq!(err.to_string(), "shape mismatch: expected [4], found [3]");
+        assert_eq!(
+            err.to_string(),
+            "invalid data: there are 4 rows but 3 labels"
+        );
         let values = Dataset {
             x: Tensor::zeros(&[4, 3]),
             targets: Targets::Values(Tensor::zeros(&[5, 2])),
@@ -1364,7 +1399,7 @@ mod tests {
         let err = fit(&net, &mut params, &values, FitConfig::default()).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "shape mismatch: expected [4, 2], found [5, 2]"
+            "invalid data: the value targets are [5, 2], but the inputs are [4, 3]"
         );
         let empty = Dataset {
             x: Tensor::zeros(&[0, 3]),
@@ -1415,7 +1450,7 @@ mod tests {
                     targets: Targets::Values(Tensor::zeros(&[4, 1])),
                 },
                 mse(),
-                "shape mismatch: expected [4, 2], found [4, 1]",
+                "invalid data: the value targets are [4, 1], but the model outputs [4, 2]",
             ),
             (
                 Dataset {
@@ -1423,7 +1458,7 @@ mod tests {
                     targets: Targets::Classes(vec![0; 4]),
                 },
                 FitConfig::default(),
-                "shape mismatch: expected [4, 3], found [4, 5]",
+                "invalid data: the inputs are [4, 5], but layer 0 (linear) takes 3",
             ),
         ];
         for (data, config, message) in cases {
@@ -1571,11 +1606,127 @@ mod tests {
             targets: Targets::Classes(vec![0; 4]),
         };
         let err = fit(&net, &mut params, &data, FitConfig::default()).unwrap_err();
-        assert!(
-            matches!(&err, Error::ShapeMismatch { expected, found }
-                if expected == &[4, 3] && found == &[4, 4]),
-            "{err:?}"
+        assert_eq!(
+            err.to_string(),
+            "invalid data: the inputs are [4, 4], but layer 1 (linear) takes 3"
         );
+    }
+
+    /// Runs `fit` on `data` with a one-layer `Linear(inputs -> outputs)` model and returns
+    /// the message of the error it must give.
+    fn fit_error(inputs: usize, outputs: usize, data: &Dataset, loss: Loss) -> String {
+        let mut params = ParamStore::new();
+        let net =
+            Sequential::new().push(Linear::new(&mut params, inputs, outputs, &mut Rng::seed(0)));
+        let err = fit(&net, &mut params, data, config_for(loss)).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        err.to_string()
+    }
+
+    /// Value targets of the wrong width name both tensors.
+    #[test]
+    fn value_target_width_names_tensors() {
+        let data = Dataset {
+            x: Tensor::zeros(&[1437, 4]),
+            targets: Targets::Values(Tensor::zeros(&[1437, 1])),
+        };
+        assert_eq!(
+            fit_error(4, 10, &data, Loss::Mse),
+            "invalid data: the value targets are [1437, 1], but the model outputs [1437, 10]"
+        );
+    }
+
+    /// Value targets with the wrong row count name both tensors; a wrong label count names
+    /// the rows and the labels.
+    #[test]
+    fn label_count_mismatch_names_tensors() {
+        let data = Dataset {
+            x: Tensor::zeros(&[100, 3]),
+            targets: Targets::Classes(vec![0; 99]),
+        };
+        let message = fit_error(3, 2, &data, Loss::CrossEntropy);
+        assert!(
+            message.contains("there are 100 rows but 99 labels"),
+            "{message}"
+        );
+        let data = Dataset {
+            x: Tensor::zeros(&[4, 3]),
+            targets: Targets::Values(Tensor::zeros(&[3, 2])),
+        };
+        let message = fit_error(3, 2, &data, Loss::Mse);
+        assert!(
+            message.contains("the value targets are [3, 2]")
+                && message.contains("the inputs are [4, 3]"),
+            "{message}"
+        );
+    }
+
+    /// Inputs of the wrong width name the inputs and the width the layer takes.
+    #[test]
+    fn input_width_names_tensors() {
+        let data = Dataset {
+            x: Tensor::zeros(&[8, 5]),
+            targets: Targets::Classes(vec![0; 8]),
+        };
+        let message = fit_error(3, 4, &data, Loss::CrossEntropy);
+        assert!(message.contains("the inputs are [8, 5]"), "{message}");
+        assert!(message.contains("takes 3"), "{message}");
+    }
+
+    /// A NaN input is rejected before training, naming its row, column and value.
+    #[test]
+    fn non_finite_input_rejected() {
+        let mut x = Tensor::zeros(&[1500, 40]);
+        x.data_mut()[1325 * 40 + 36] = f32::NAN;
+        let data = Dataset {
+            x,
+            targets: Targets::Classes(vec![0; 1500]),
+        };
+        let message = fit_error(40, 2, &data, Loss::CrossEntropy);
+        for part in ["row 1325", "column 36", "NaN", "the inputs"] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    /// An infinite value target is rejected before training, naming its row and column.
+    #[test]
+    fn infinite_value_target_rejected() {
+        let mut t = Tensor::zeros(&[4, 2]);
+        t.data_mut()[2 * 2] = f32::INFINITY;
+        let data = Dataset {
+            x: Tensor::zeros(&[4, 3]),
+            targets: Targets::Values(t),
+        };
+        let message = fit_error(3, 2, &data, Loss::Mse);
+        for part in ["row 2", "column 0", "inf", "the value targets"] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
+    }
+
+    /// Layers that change the width without naming an input width come before the first
+    /// layer that does: the message gives the width that reaches that layer.
+    #[test]
+    fn width_after_glu_names_reached_width() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Glu {
+                gate: Gate::Sigmoid,
+            })
+            .push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0)));
+        let data = Dataset {
+            x: Tensor::zeros(&[4, 8]),
+            targets: Targets::Classes(vec![0; 4]),
+        };
+        let err = fit(&net, &mut params, &data, FitConfig::default()).unwrap_err();
+        let message = err.to_string();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        for part in [
+            "the inputs are [4, 8]",
+            "reach layer 1 with width 4",
+            "takes 3",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
     }
 
     /// `fit` with an epoch count of `usize::MAX` stops at the first non-finite loss and does
