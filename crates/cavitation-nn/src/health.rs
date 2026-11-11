@@ -112,7 +112,7 @@ impl fmt::Display for Warning {
             Warning::Vanishing { step, layer, norm } => write!(
                 f,
                 "step {step}: the gradient norm of {layer} is {norm:.3e}, below the vanishing limit \
-                 (a gradient this small with a loss that has not fallen 10000-fold is a vanishing \
+                 (a gradient this small with a loss that has not fallen 10,000-fold is a vanishing \
                  gradient)"
             ),
             Warning::DeadNeurons {
@@ -157,6 +157,7 @@ pub struct Health {
     /// A gradient norm below this sends [`Warning::Vanishing`]. A gradient this small with a
     /// loss that has not fallen is a vanishing gradient; once the loss has fallen 10,000-fold
     /// from its first value (or to 0), the warning is not sent, since that is convergence.
+    /// A first loss that is not above 0 never counts, so the warning is always sent then.
     pub grad_norm_low: f64,
     /// Whether to look for dead ReLU and ReLU6 neurons (one pass over those layers' outputs
     /// each step).
@@ -319,10 +320,12 @@ impl HealthMonitor {
     }
 
     /// Whether the loss has fallen to at most [`CONVERGED_LOSS_RATIO`] of its first value.
-    /// False when no finite loss was recorded.
+    /// False when no finite loss was recorded, and false when the first loss is not above 0
+    /// (a loss such as `kl_div` on inputs that are not log-probabilities can start negative,
+    /// and a fraction of a negative loss is not a sign of convergence).
     fn converged(&self) -> bool {
         match (self.first_loss, self.latest_loss) {
-            (Some(first), Some(latest)) => latest <= first * CONVERGED_LOSS_RATIO,
+            (Some(first), Some(latest)) if first > 0.0 => latest <= first * CONVERGED_LOSS_RATIO,
             _ => false,
         }
     }
@@ -1249,6 +1252,37 @@ mod tests {
         assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
     }
 
+    /// A negative first loss (possible with `kl_div` on inputs that are not log-probabilities)
+    /// never counts as converged, so zero gradients still send `Vanishing`.
+    #[test]
+    fn negative_first_loss_never_counts_as_converged() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+        let names = net.parameter_names();
+        let mut graph = Graph::new();
+        let trace = crate::Trace::new();
+        let mut optimizer = Sgd::new(0.1);
+        optimizer.step(&mut params);
+        let (seen, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
+        let tape = graph.tape(&params.values);
+        for (step, loss) in [(1, -1.0), (2, -1.0)] {
+            monitor
+                .after_backward(step, loss, &tape, &trace, &net)
+                .unwrap();
+        }
+        monitor
+            .after_update(2, optimizer.last_stats(), &names)
+            .unwrap();
+        assert!(
+            seen.borrow()
+                .iter()
+                .any(|w| matches!(w, Warning::Vanishing { .. })),
+            "{:?}",
+            seen.borrow()
+        );
+    }
+
     /// Each warning reads as one plain-English line.
     #[test]
     fn warnings_display() {
@@ -1285,7 +1319,7 @@ mod tests {
                 "step 1: a NaN or infinite value in loss",
                 "step 2: the gradient norm of 0.weight is 2.500e4, above the exploding limit",
                 "step 2: the gradient norm of 2.bias is 0.000e0, below the vanishing limit (a gradient \
-                 this small with a loss that has not fallen 10000-fold is a vanishing gradient)",
+                 this small with a loss that has not fallen 10,000-fold is a vanishing gradient)",
                 "epoch 1: 2 neurons of layer 1 output 0 for every sample (dead ReLU): [0, 3]",
             ]
         );
