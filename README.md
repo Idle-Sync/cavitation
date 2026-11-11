@@ -27,7 +27,7 @@ The crate is not on crates.io yet. Depend on the repository:
 
 ```toml
 [dependencies]
-cavitation = { git = "https://github.com/Lazy-Coder-03/cavitation" }
+cavitation = { git = "https://github.com/Idle-Sync/cavitation" }
 ```
 
 It needs Rust 1.99 or newer.

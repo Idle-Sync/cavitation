@@ -8,7 +8,7 @@ This guide uses that to explain how networks learn. Each chapter takes a real pr
 
 ## What you need
 
-- Rust 1.99 or newer, and a clone of the repository: <https://github.com/Lazy-Coder-03/cavitation>.
+- Rust 1.99 or newer, and a clone of the repository: <https://github.com/Idle-Sync/cavitation>.
 - The chain rule from calculus, and matrix multiplication. Nothing else is assumed.
 
 ## Running the code
