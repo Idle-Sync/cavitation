@@ -75,7 +75,7 @@ pub use health::{Health, HealthMonitor, OnNonFinite, Warning};
 pub use hooks::{HookId, Hooks, LayerEvent};
 pub use inference::{InferenceLayer, InferenceModel};
 pub use init::Init;
-pub use io::{load, load_lenient, save};
+pub use io::{LoadOptions, load, load_lenient, load_with, save};
 pub use layer::Layer;
 pub use linear::Linear;
 pub use mask::NeuronMask;
