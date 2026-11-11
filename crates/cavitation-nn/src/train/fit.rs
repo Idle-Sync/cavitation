@@ -333,8 +333,8 @@ impl Trainer {
     /// and `"loss"` or the parameter, and sends the matching [`Warning::NonFinite`] to the
     /// health sink. For a non-finite loss the error's `detail` names the first NaN or infinite
     /// value in the batch's inputs or value targets (with no dataset row, as `step` does not
-    /// know one), or says that the inputs were finite and the values overflowed. A NaN or infinite loss skips the optimiser step, so the parameters stay
-    /// as they were; a NaN or infinite gradient with a finite loss is found after the update
+    /// know one), or says that the inputs were finite and the values overflowed. A NaN or
+    /// infinite loss skips the optimiser step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is found after the update
     /// has applied it. The step is counted and the gradients are marked stale either way.
     /// [`fit`] stops at this error. Under [`OnNonFinite::Warn`](crate::OnNonFinite) the step
     /// returns its loss, NaN or not.

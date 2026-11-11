@@ -29,7 +29,9 @@ pub enum OnNonFinite {
 
 /// The first non-finite value found in a step's batch, named so that a NaN or an infinity
 /// in the loss can be traced to the data. Two bad values are equal when every field is
-/// equal and the values have the same bits, so two NaNs are equal.
+/// equal and the values have the same bits. `value` is compared by its bits because NaN is
+/// not equal to itself: with a bit comparison two warnings about the same NaN compare
+/// equal, in tests and in sinks that collect warnings.
 ///
 /// # Examples
 ///
@@ -258,6 +260,10 @@ pub enum Warning {
     /// The loss was below 0 although [`Loss::non_negative`] says the trainer's loss cannot
     /// be negative on valid inputs. Sent at most once per epoch, only by a monitor that
     /// knows the loss ([`HealthMonitor::with_loss`]).
+    ///
+    /// It is sent at the first step whose loss is below 0, which can be a few steps after
+    /// the mistake starts: with [`Loss::Nll`] on raw scores, for example, the loss is
+    /// negative only once the target class's score is positive.
     NegativeLoss {
         /// The step, counting from 1.
         step: u64,
@@ -474,7 +480,7 @@ impl fmt::Display for Warning {
 ///   is printed once for each parameter, and each later epoch adds one line per kind
 ///   naming the parameters that repeated.
 /// - a negative loss that cannot be negative on valid inputs ([`Warning::NegativeLoss`]) is
-///   printed at most once per epoch.
+///   printed in full once, and each later epoch in which it happens again adds one line.
 ///
 /// A [`sink`](Health::sink) receives every warning of every epoch, and [`Health::quiet`]
 /// drops them all.
@@ -765,11 +771,15 @@ impl HealthMonitor {
                     eprintln!("cavitation: warning: {warning}");
                 }
             }
-            Warning::NonFinite { .. } | Warning::Exploding { .. } | Warning::Vanishing { .. } => {
+            Warning::NonFinite { .. }
+            | Warning::Exploding { .. }
+            | Warning::Vanishing { .. }
+            | Warning::NegativeLoss { .. } => {
                 let kind = warning.kind();
                 let name = warning.location().unwrap_or_default();
                 let norm = match warning {
                     Warning::Exploding { norm, .. } | Warning::Vanishing { norm, .. } => norm,
+                    Warning::NegativeLoss { loss, .. } => f64::from(loss),
                     _ => 0.0,
                 };
                 if self.printed.iter().any(|(k, n)| *k == kind && n == name) {
@@ -779,14 +789,15 @@ impl HealthMonitor {
                     self.printed.push((kind, name.to_string()));
                 }
             }
-            Warning::ClampedLogs { .. } | Warning::NegativeLoss { .. } => {
+            Warning::ClampedLogs { .. } => {
                 eprintln!("cavitation: warning: {warning}")
             }
         }
     }
 
     /// Prints one line per kind for the parameters whose norm or non-finite warning repeated
-    /// in epoch `epoch` after being printed once, then forgets them.
+    /// in epoch `epoch` after being printed once, and one line if the negative loss repeated,
+    /// then forgets them.
     fn print_repeats(&mut self, epoch: usize) {
         let kinds = [
             (WarningKind::NonFinite, "locations", "non-finite"),
@@ -814,6 +825,16 @@ impl HealthMonitor {
                 line.push_str(", …");
             }
             eprintln!("{line}");
+        }
+        if let Some((_, _, first)) = self
+            .repeats
+            .iter()
+            .find(|(k, _, _)| *k == WarningKind::NegativeLoss)
+        {
+            eprintln!(
+                "cavitation: warning: epoch {epoch}: the loss was negative again \
+                 (it first fell below 0 at {first:.3e})"
+            );
         }
         self.repeats.clear();
     }
@@ -2452,10 +2473,11 @@ mod tests {
         }
     }
 
-    /// Without a sink, a negative loss prints one line in each epoch that has one, however
-    /// many of its steps are negative: three steps in each of two epochs give two lines.
+    /// Without a sink, a negative loss prints its full line once for the run, then one summary
+    /// line in each later epoch where it happens again: three epochs of three steps give one
+    /// full line (step 2) and summaries for epochs 2 and 3.
     #[test]
-    fn negative_loss_prints_once_per_epoch() {
+    fn negative_loss_prints_once_then_summarises() {
         let out = crate::test_child::run_alone("health::tests::negative_loss_printing_child", &[]);
         crate::test_child::assert_passed(&out);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2463,16 +2485,23 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("cavitation: warning:"))
             .collect();
-        assert_eq!(lines.len(), 2, "stderr:\n{stderr}");
-        assert!(lines[0].contains("step 2:") && lines[1].contains("step 4:"));
-        assert!(lines[0].contains("LogSoftmax") && lines[0].contains("[0, 1]"));
+        assert_eq!(lines.len(), 3, "stderr:\n{stderr}");
+        assert!(lines[0].contains("step 2:") && lines[0].contains("LogSoftmax"));
+        for (line, epoch) in lines[1..].iter().zip([2, 3]) {
+            assert!(
+                line.starts_with(&format!(
+                    "cavitation: warning: epoch {epoch}: the loss was negative again"
+                )),
+                "{line}"
+            );
+        }
     }
 
-    /// Helper for `negative_loss_prints_once_per_epoch`: trains the zero-parameter `Nll` model
-    /// for two epochs of three steps with the default checks, which print to standard error.
+    /// Helper for `negative_loss_prints_once_then_summarises`: trains the zero-parameter `Nll` model
+    /// for three epochs of three steps with the default checks, which print to standard error.
     /// Ignored by default; it is run in a child process.
     #[test]
-    #[ignore = "run in a child process by negative_loss_prints_once_per_epoch"]
+    #[ignore = "run in a child process by negative_loss_prints_once_then_summarises"]
     fn negative_loss_printing_child() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
@@ -2487,7 +2516,7 @@ mod tests {
         let mut trainer = Trainer::new(&net, Sgd::new(0.5), Loss::Nll, 4);
         let batcher = Batcher::new(4, 4, None);
         let mut batch = Batch::new(&data, 4);
-        for epoch in 1..=2 {
+        for epoch in 1..=3 {
             for _ in 0..3 {
                 let view = batcher.gather(&data, 0..4, &mut batch);
                 trainer.step(&net, &mut params, view).unwrap();
