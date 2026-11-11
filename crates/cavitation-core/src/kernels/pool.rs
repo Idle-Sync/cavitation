@@ -379,6 +379,9 @@ fn run_on_pool(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
 /// Starts workers until there are at least `wanted`, and returns the guard holding the list
 /// with the first `wanted` (fewer if the system refuses to start more threads).
 fn grow(mut workers: MutexGuard<'static, Vec<&'static Worker>>, wanted: usize) -> WorkerList {
+    if workers.len() < wanted {
+        init_done_signal();
+    }
     while workers.len() < wanted {
         // The call number before the next call: the worker's first job is the one after it.
         let last_call = POOL.call.load(Ordering::Relaxed);
@@ -401,6 +404,18 @@ fn grow(mut workers: MutexGuard<'static, Vec<&'static Worker>>, wanted: usize) -
         guard: workers,
         len,
     }
+}
+
+/// Uses `done_lock` and `done` once, so that a later job never pays for their first use.
+///
+/// On Apple targets the standard library's `Mutex` and `Condvar` are pthread objects that
+/// allocate on first use. The caller sleeps on them only when its spin runs out, which may
+/// first happen long after warm-up, so without this a steady-state job could allocate once.
+/// Called while starting workers, which allocates anyway. Elsewhere it costs one lock.
+fn init_done_signal() {
+    let guard = lock(&POOL.done_lock);
+    let _ = POOL.done.wait_timeout(guard, Duration::ZERO);
+    POOL.done.notify_one();
 }
 
 /// Makes every later worker spawn fail, so tests can reach the path where the pool cannot
