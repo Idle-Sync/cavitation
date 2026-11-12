@@ -122,8 +122,8 @@ pub use cavitation_nn;
 
 /// The names most programs need, for `use cavitation::prelude::*;`: tensors and autograd,
 /// layers and activations (with the settings their fields take), optimisers, the training
-/// loop and its batches, evaluation, health checks, hooks, inference, saving and loading, the random
-/// generator, the gradient checks, and the traits for writing your own parts.
+/// loop and its batches, evaluation, health checks, hooks, inference, saving and loading,
+/// the random generator, the gradient checks, and the traits for writing your own parts.
 ///
 /// ```
 /// use cavitation::prelude::*;

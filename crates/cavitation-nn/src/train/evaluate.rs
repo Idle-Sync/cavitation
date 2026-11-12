@@ -31,7 +31,8 @@ pub struct Evaluation {
     pub accuracy: Option<f64>,
     /// For value targets, the coefficient of determination R² of the outputs, as
     /// scikit-learn's `r2_score` with `multioutput='uniform_average'`; `None` for class
-    /// targets.
+    /// targets. With one row every output has zero variance, so R² is 1 or 0, where
+    /// scikit-learn returns NaN.
     pub r2: Option<f64>,
 }
 
@@ -205,6 +206,10 @@ impl Evaluator {
     /// evaluator alone, and a clone keeps evaluating the weights it had. A model with a
     /// layer that has no inference form runs on the tape, with a copy of the new values.
     ///
+    /// `refresh` allocates, even in place: it builds the new weights before copying them
+    /// in. Only [`evaluate`](Self::evaluate) and [`misclassified`](Self::misclassified) are
+    /// free of allocations in steady state.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Unsupported`] if the model has no layers; the evaluator is then
@@ -265,13 +270,15 @@ impl Evaluator {
 
     /// Measures the model on `data`: the loss, and the accuracy (class targets) or R²
     /// (value targets), running the rows in order, `batch` at a time. Allocates nothing
-    /// once it has evaluated a data set with the same target kind and output count.
+    /// once it has evaluated a data set with the same target kind and output count, compiled
+    /// or on the tape.
     ///
     /// Accuracy counts a row as right when its first largest output (ignoring NaN) is at
     /// its label. R² follows scikit-learn's `r2_score` with `multioutput='uniform_average'`:
     /// for each output, `1 - Σ(y - ŷ)² / Σ(y - ȳ)²` in `f64` over every row, then the mean
     /// over the outputs; an output whose targets do not vary scores 1 when it is predicted
-    /// exactly and 0 otherwise. R² is computed on the model's outputs as they are, so for a
+    /// exactly and 0 otherwise. With one row every output has zero variance, so R² is 1 or
+    /// 0, where scikit-learn returns NaN. R² is computed on the model's outputs as they are, so for a
     /// loss on raw scores (such as [`Loss::BinaryCrossEntropyWithLogits`]) it compares
     /// scores with targets.
     ///
@@ -930,8 +937,8 @@ mod tests {
 
     /// `refresh` copies new weights and mask values in place when no clone shares the
     /// compiled model and the layout is unchanged; it recompiles when a clone shares it
-    /// (the clone keeps the old weights) or when a mask is added; a model without an
-    /// inference form moves to the tape and back. Each time the evaluation matches a fresh
+    /// (the clone keeps the old weights), when a mask is added or cleared, or when the last
+    /// layer gets wider; a model without an inference form moves to the tape and back. Each time the evaluation matches a fresh
     /// evaluator's.
     #[test]
     fn refresh_in_place_and_recompiled() {
@@ -969,6 +976,24 @@ mod tests {
         mask.set(5, false);
         net.set_mask(1, mask);
         assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::InPlace);
+        assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
+        net.clear_mask(1);
+        assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::Recompiled);
+        assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
+
+        let wide_last = Linear::new(&mut params, 8, 6, &mut Rng::seed(8));
+        let wide = Sequential::new()
+            .push(net.linear(0).unwrap().clone())
+            .push(Tanh)
+            .push(wide_last);
+        assert_eq!(
+            evaluator.reload(&wide, &params).unwrap(),
+            Reload::Recompiled
+        );
+        let widened = evaluator.evaluate(&data).unwrap();
+        assert_eq!(widened, fresh(&wide, &params));
+        assert_ne!(widened, fresh(&net, &params));
+        assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::Recompiled);
         assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
 
         let mut rng = Rng::seed(7);

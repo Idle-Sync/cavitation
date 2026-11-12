@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats, Health, Hooks, InferenceModel,
-    Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace,
-    Trainer, Warning,
+    Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats,
+    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential,
+    Sgd, Targets, TargetsView, Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -611,10 +611,31 @@ fn trace_with_capacity_allocates_nothing() -> usize {
     made
 }
 
+/// ReLU written as an activation of your own, so a network using it has no inference form
+/// and evaluates on the tape.
+struct MyRelu;
+
+impl Activation<f32> for MyRelu {
+    /// Returns `"my_relu"`.
+    fn name(&self) -> &str {
+        "my_relu"
+    }
+    /// `max(x, 0)`.
+    fn f(&self, x: f32) -> f32 {
+        x.max(0.0)
+    }
+    /// 1 above 0, else 0.
+    fn df(&self, x: f32, _y: f32) -> f32 {
+        if x > 0.0 { 1.0 } else { 0.0 }
+    }
+}
+
 /// Evaluates the 50k network on the 1,437-row set at batch 128 (a last batch of 29): with
 /// cross-entropy on class labels (`evaluate` and `misclassified`) and with mean squared error
-/// on value targets (`evaluate`, with R²). One warm-up call of each, then 100 more calls of
-/// each. Returns the allocations made after the warm-up.
+/// on value targets (`evaluate`, with R²), compiled; and the same network with its ReLUs
+/// written as an activation of your own, on the tape (`evaluate` and `misclassified` on
+/// class labels). One warm-up call of each, then 100 more calls of each. Returns the
+/// allocations made after the warm-up.
 fn evaluator_steady_state() -> usize {
     let mut params = ParamStore::new();
     let net = network_50k(&mut params);
@@ -629,7 +650,17 @@ fn evaluator_steady_state() -> usize {
     };
     let mut ce = Evaluator::new(&net, &params, Loss::CrossEntropy, 128).unwrap();
     let mut mse = Evaluator::new(&net, &params, Loss::Mse, 128).unwrap();
+    let mut own = Sequential::new();
+    for i in 0..net.len() {
+        own = match net.linear(i) {
+            Some(linear) => own.push(linear.clone()),
+            None => own.push(ActivationLayer::new(MyRelu)),
+        };
+    }
+    let mut tape = Evaluator::new(&own, &params, Loss::CrossEntropy, 128).unwrap();
+    assert!(format!("{tape:?}").contains("compiled: false"), "{tape:?}");
     let mut wrong = Vec::new();
+    let mut tape_wrong = Vec::new();
     let mut sink = 0.0;
     let mut before = 0;
     for call in 0..101 {
@@ -642,9 +673,14 @@ fn evaluator_steady_state() -> usize {
         sink += wrong.len() as f64;
         let e = mse.evaluate(&values).unwrap();
         sink += e.loss + e.r2.unwrap();
+        let e = tape.evaluate(&classes).unwrap();
+        sink += e.loss + e.accuracy.unwrap();
+        tape.misclassified(&classes, &mut tape_wrong).unwrap();
+        sink += tape_wrong.len() as f64;
     }
     let made = allocations() - before;
     assert!(sink.is_finite() && !wrong.is_empty());
+    assert_eq!(wrong, tape_wrong);
     made
 }
 
