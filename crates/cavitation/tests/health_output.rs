@@ -11,7 +11,11 @@ use cavitation::prelude::*;
 /// the child wrote, after checking that it ran and passed.
 fn run_child(name: &str) -> Output {
     let exe = std::env::current_exe().expect("the test binary's path");
+    // The printed counts depend on rounding, so the child runs the reference level on one
+    // thread, whatever level the test run itself uses.
     let out = Command::new(exe)
+        .env("CAVITATION_KERNEL", "reference")
+        .env("CAVITATION_THREADS", "1")
         .args([
             "--ignored",
             "--exact",

@@ -36,7 +36,7 @@
 
 use std::cell::RefCell;
 
-use super::{Level, MatMut, MatRef, detected_features, pool, reference, supported};
+use super::{Level, MatMut, MatRef, pool, reference, supported};
 
 /// A microkernel and the block sizes the driver uses with it.
 ///
@@ -223,8 +223,8 @@ pub fn gemm_f32_with(
     );
     assert!(
         supported(level),
-        "gemm_f32_with: this CPU cannot run kernel level {level} (detected features: {})",
-        detected_features()
+        "gemm_f32_with: {}",
+        super::cannot_run(level)
     );
     reference::check_gemm_shapes(&a, &b, &c);
     let (m, n, k) = (a.rows(), b.cols(), a.cols());

@@ -47,9 +47,10 @@ pub enum OnNonFinite {
 pub struct BadInput {
     /// The position in the batch, counting from 0.
     pub position: usize,
-    /// The row of the dataset that sat at that position, when the batch was gathered through a
-    /// [`Batcher`](crate::Batcher) order (as [`fit`](crate::fit) does); `None` when the caller gave
-    /// no rows, as with a hand-written [`Trainer::step`](crate::Trainer::step).
+    /// The row of the dataset that sat at that position, when the caller passed the batch's
+    /// rows (a hand-written loop that sets `StepInputs::rows`); `None` when it gave none.
+    /// [`fit`](crate::fit) rejects non-finite data before training, with an error that names
+    /// the row, so it never reaches this check.
     pub row: Option<usize>,
     /// The feature (the position within the row) for an input; the output index for a target.
     pub feature: usize,
@@ -200,6 +201,7 @@ pub enum WarningKind {
 /// assert!(w.to_string().starts_with("step 4:"));
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Warning {
     /// Binary cross-entropy met probabilities of exactly 0 or 1 and clamped their
     /// logarithms to -100 (see [`Tape::clamped_logs`]). Sent at most once per epoch.

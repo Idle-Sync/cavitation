@@ -46,7 +46,9 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 ///
 /// The level starts as [`detected`] (or as `CAVITATION_KERNEL`, if set) and can be changed
 /// with [`set_level`]. Every level gives results within the documented tolerance of the
-/// reference kernels; the same level and inputs give bit-identical results.
+/// reference kernels; the same level and inputs give bit-identical results, except at
+/// [`Level::Accelerate`], where that holds on one machine and one macOS version (Apple does
+/// not promise its rounding across chips or releases).
 ///
 /// # Examples
 ///
@@ -55,6 +57,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 /// assert_eq!(Level::Avx2Fma.to_string(), "avx2");
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// The plain reference loops, on every CPU.
     Reference = 0,
@@ -239,6 +242,23 @@ static LEVEL: AtomicU8 = AtomicU8::new(UNSET);
 /// The value of [`LEVEL`] before the level is first read or set.
 const UNSET: u8 = u8::MAX;
 
+/// Why this machine cannot run `level`, for the error and panic messages: the platform for a
+/// level that exists only on one (Accelerate), the CPU for the instruction-set levels. Names
+/// the detected features either way.
+pub(crate) fn cannot_run(level: Level) -> String {
+    if level == Level::Accelerate {
+        format!(
+            "accelerate runs on Apple Silicon only (detected features: {})",
+            detected_features()
+        )
+    } else {
+        format!(
+            "this CPU cannot run kernel level {level} (detected features: {})",
+            detected_features()
+        )
+    }
+}
+
 /// The level `CAVITATION_KERNEL` names, or [`detected`] if it is not set.
 ///
 /// # Panics
@@ -252,9 +272,8 @@ fn level_from_env() -> Level {
     let level = parse_level(&value).unwrap_or_else(|e| panic!("CAVITATION_KERNEL: {e}"));
     assert!(
         supported(level),
-        "CAVITATION_KERNEL=`{level}`: this CPU cannot run kernel level {level} \
-         (detected features: {})",
-        detected_features()
+        "CAVITATION_KERNEL=`{level}`: {}",
+        cannot_run(level)
     );
     level
 }
@@ -301,10 +320,7 @@ pub fn level() -> Level {
 /// ```
 pub fn set_level(level: Level) -> Result<(), Error> {
     if !supported(level) {
-        return Err(Error::Unsupported(format!(
-            "kernel level {level} on this CPU (detected features: {})",
-            detected_features()
-        )));
+        return Err(Error::Unsupported(cannot_run(level)));
     }
     LEVEL.store(level as u8, Ordering::Relaxed);
     Ok(())
@@ -437,6 +453,10 @@ fn performance_cores() -> std::io::Result<usize> {
 /// cores on Apple Silicon (where the efficiency cores slow training down) and
 /// [`std::thread::available_parallelism`] elsewhere (1 if that is unknown). Always at
 /// least 1.
+///
+/// At [`Level::Accelerate`] each matrix product is one Accelerate call, so this count does not
+/// limit the threads Accelerate starts itself (Apple's `VECLIB_MAXIMUM_THREADS` does); it
+/// still governs the optimiser update and every product at the other levels.
 ///
 /// # Panics
 ///
@@ -927,7 +947,14 @@ mod tests {
     #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
     #[test]
     fn performance_cores_read_on_apple_silicon() {
-        let n = performance_cores().expect("hw.perflevel0.physicalcpu");
+        let Ok(n) = performance_cores() else {
+            // A virtual machine's guest can lack the sysctl; the default then falls back to
+            // the available parallelism, which `default_threads_falls_back` covers.
+            println!(
+                "performance_cores_read_on_apple_silicon: skipped, hw.perflevel0.physicalcpu is not available"
+            );
+            return;
+        };
         assert!(n >= 1 && n <= available_threads(), "{n} performance cores");
         assert_eq!(default_threads(), n);
     }
@@ -1022,7 +1049,7 @@ mod tests {
         } else {
             assert!(!ok, "stderr:\n{stderr}");
             assert!(
-                stderr.contains("cannot run kernel level accelerate")
+                stderr.contains("accelerate runs on Apple Silicon only")
                     && stderr.contains("detected features"),
                 "stderr:\n{stderr}"
             );

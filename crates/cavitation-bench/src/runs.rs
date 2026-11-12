@@ -234,11 +234,11 @@ pub struct Comparison {
     pub health: String,
 }
 
-/// The health warnings of one training run, grouped by kind.
+/// The health warnings of one training run, grouped by kind and place.
 #[derive(Debug, Default)]
 pub struct HealthLog {
-    /// For each kind in order of first appearance: the layer or location of its first
-    /// warning, the epoch of that warning (0 for the untimed warm-up) and how many came.
+    /// For each kind and place (layer or location) in order of first appearance: the epoch of
+    /// its first warning (0 for the untimed warm-up) and how many came.
     groups: Vec<(WarningKind, Option<String>, usize, usize)>,
 }
 
@@ -247,15 +247,15 @@ impl HealthLog {
     /// that knows its own epoch (dead neurons) uses that one.
     pub fn record(&mut self, warning: &Warning, epoch: usize) {
         let kind = warning.kind();
-        if let Some(group) = self.groups.iter_mut().find(|g| g.0 == kind) {
-            group.3 += 1;
-            return;
-        }
         let place = match (warning.layer(), warning.location()) {
             (Some(layer), _) => Some(format!("layer {layer}")),
             (None, Some(location)) => Some(location.to_string()),
             (None, None) => None,
         };
+        if let Some(group) = self.groups.iter_mut().find(|g| g.0 == kind && g.1 == place) {
+            group.3 += 1;
+            return;
+        }
         self.groups
             .push((kind, place, warning.epoch().unwrap_or(epoch), 1));
     }
@@ -265,9 +265,9 @@ impl HealthLog {
         self.groups.iter().map(|g| g.3).sum()
     }
 
-    /// One line naming each kind with its layer (or location) and first epoch, then its
-    /// count, for example `health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x4`;
-    /// `health: no warnings` if there were none.
+    /// One line naming each kind and layer (or location) and first epoch, then its
+    /// count, for example `health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x3;
+    /// DeadNeurons (layer 5, from epoch 1) x1`; `health: no warnings` if there were none.
     pub fn summary(&self) -> String {
         if self.groups.is_empty() {
             return "health: no warnings".to_string();
@@ -594,8 +594,8 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
 mod tests {
     use super::*;
 
-    /// Warnings group by kind, keeping the first one's place and epoch, and the summary
-    /// names each kind once with its count.
+    /// Warnings group by kind and place, keeping the first one's epoch, and the summary
+    /// names each group once with its count.
     #[test]
     fn health_log_groups_by_kind() {
         let mut log = HealthLog::default();
@@ -611,7 +611,8 @@ mod tests {
         }
         assert_eq!(
             log.summary(),
-            "health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x4"
+            "health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x3; \
+             DeadNeurons (layer 5, from epoch 1) x1"
         );
         let vanishing = Warning::Vanishing {
             step: 9,
@@ -622,8 +623,8 @@ mod tests {
         assert_eq!(log.total(), 5);
         assert_eq!(
             log.summary(),
-            "health: 5 warnings: DeadNeurons (layer 3, from epoch 1) x4; \
-             Vanishing (linear_2, from the warm-up) x1"
+            "health: 5 warnings: DeadNeurons (layer 3, from epoch 1) x3; \
+             DeadNeurons (layer 5, from epoch 1) x1; Vanishing (linear_2, from the warm-up) x1"
         );
     }
 

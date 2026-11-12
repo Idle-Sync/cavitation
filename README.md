@@ -172,7 +172,7 @@ The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH
 Two environment variables change how the library runs, for the benchmark and for your own programs:
 
 - `CAVITATION_KERNEL` forces a kernel level: `reference`, `sse4.2`, `avx2`, `neon` or `accelerate`. The default is the best level the CPU supports: `accelerate` on Apple Silicon, which runs matrix products through Apple's Accelerate framework (part of macOS, so nothing to install) and everything else through the NEON kernels. Its results match NEON's within the matrix-product tolerance, not bit for bit; `neon` runs the NEON matrix product instead.
-- `CAVITATION_THREADS` sets the number of threads the threaded kernels use: the matrix products (in training and in `infer_batch`) and the optimiser update. The default is the number of performance cores on Apple Silicon (the efficiency cores slow training down) and the number of logical cores elsewhere; `infer` always runs on the calling thread.
+- `CAVITATION_THREADS` sets the number of threads the threaded kernels use: the matrix products (in training and in `infer_batch`) and the optimiser update. At the `accelerate` level each matrix product is one Accelerate call, so the variable does not limit the threads Accelerate starts itself (Apple's `VECLIB_MAXIMUM_THREADS` does); it still governs the optimiser update and, with `CAVITATION_KERNEL=neon`, every product. The default is the number of performance cores on Apple Silicon (the efficiency cores slow training down) and the number of logical cores elsewhere; `infer` always runs on the calling thread.
 
 ## Tests
 

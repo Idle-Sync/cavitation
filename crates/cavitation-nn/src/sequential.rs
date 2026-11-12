@@ -51,9 +51,10 @@ impl Trace {
     }
 
     /// An empty trace with room for `layers` layers, so tracing a network of that many layers
-    /// allocates nothing. A manual training loop that makes its trace this way and passes it to
-    /// [`Sequential::forward_traced`] each step allocates nothing for the trace, as
-    /// [`Trainer`](crate::Trainer) does not.
+    /// allocates nothing for the trace's layer list. A manual training loop that makes its trace
+    /// this way and passes it to [`Sequential::forward_traced`] each step saves the first
+    /// pass's allocation (a trace made with [`Trace::new`] and reused stops allocating after
+    /// its first pass too).
     ///
     /// ```
     /// use cavitation_nn::Trace;
