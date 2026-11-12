@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|digits|latency|gemm|subnormal|small|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -8,7 +8,13 @@
 //!   through the 50k network. Each also runs `scripts/bench/numpy_mlp.py` with the same
 //!   network, batch, data and step counts, and prints cavitation against numpy with the
 //!   ratio. The results are also written to `target/bench/results.json`.
-//! - `all` runs `info`, `mnist` at batch 128 and 32, `digits` and `latency`.
+//! - `cifar [--batch 32|128] [--steps N]` times 3 epochs of the 3072 → 1024 → 512 → 10
+//!   network (ReLU, cross-entropy, Adam lr 1e-3) on CIFAR-10's 50,000 training images, at
+//!   batch 128 and then 32 (or only the batch given), against the same numpy baseline. With
+//!   `--steps N` each timed sample is N steps instead of an epoch and the result is steps
+//!   per second, for machines on which an epoch takes minutes.
+//! - `all` runs `info`, `mnist` at batch 128 and 32, `digits` and `latency`; not `cifar`,
+//!   whose epochs take minutes on a small machine.
 //! - `gemm --shapes mnist128|digits128` times the eight matrix products of one batch-128
 //!   training step of the named network at the current kernel level and thread count
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
@@ -42,8 +48,9 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|digits|latency|gemm|subnormal|small|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH]\n\
+    \x20 cifar   [--batch 32|128] [--steps N] [--python PATH]\n\
     \x20 digits  [--python PATH]\n\
     \x20 latency [--python PATH]\n\
     \x20 all     [--python PATH]\n\
@@ -68,7 +75,7 @@ fn main() -> ExitCode {
         "gemm" => gemm(rest),
         "subnormal" => subnormal(rest),
         "small" => small(rest),
-        "mnist" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
+        "mnist" | "cifar" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
             let mut rows = Vec::new();
             if command == "all" {
                 info();
@@ -102,10 +109,12 @@ fn info() {
 
 /// The options of the training and latency commands.
 struct Options {
-    /// `--batch`: 32 or 128 (`mnist` only).
-    batch: usize,
+    /// `--batch`: 32 or 128 (`mnist` and `cifar` only).
+    batch: Option<usize>,
     /// `--adam`: time Adam instead of plain SGD (`mnist` only).
     adam: bool,
+    /// `--steps`: steps per timed sample instead of whole epochs (`cifar` only).
+    steps: Option<usize>,
     /// The Python interpreter that runs the baseline.
     python: String,
 }
@@ -115,12 +124,13 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// Returns a message for an unknown option, a missing value or a batch other than 32
-    /// or 128.
+    /// Returns a message for an unknown option, a missing value, a batch other than 32
+    /// or 128, or a `--steps` that is not a positive number.
     fn parse(args: &[String]) -> Result<Options, String> {
         let mut o = Options {
-            batch: 128,
+            batch: None,
             adam: false,
+            steps: None,
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
         };
         let mut rest = args.iter();
@@ -129,10 +139,17 @@ impl Options {
                 "--batch" => {
                     let v = rest.next().ok_or("--batch needs a value")?;
                     o.batch = match v.as_str() {
-                        "32" => 32,
-                        "128" => 128,
+                        "32" => Some(32),
+                        "128" => Some(128),
                         _ => return Err(format!("--batch must be 32 or 128, got `{v}`")),
                     };
+                }
+                "--steps" => {
+                    let v = rest.next().ok_or("--steps needs a value")?;
+                    o.steps =
+                        Some(v.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
+                            format!("--steps must be a positive number, got `{v}`")
+                        })?);
                 }
                 "--adam" => o.adam = true,
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
@@ -165,7 +182,21 @@ fn plan(command: &str, o: &Options) -> Result<Vec<Run>, String> {
             batch,
             adam,
             epochs: 3,
+            steps: None,
             unit: Unit::EpochSeconds,
+        })
+    };
+    let cifar = |batch: usize| {
+        let steps = o.steps.map_or(String::new(), |n| format!(", {n} steps"));
+        Run::Train(TrainSpec {
+            name: format!("cifar batch {batch}{steps}"),
+            data: "cifar",
+            widths: runs::CIFAR_NET,
+            batch,
+            adam: true,
+            epochs: 3,
+            steps: o.steps,
+            unit: o.steps.map_or(Unit::EpochSeconds, |_| Unit::StepsPerSecond),
         })
     };
     let digits = Run::Train(TrainSpec {
@@ -175,15 +206,26 @@ fn plan(command: &str, o: &Options) -> Result<Vec<Run>, String> {
         batch: 128,
         adam: false,
         epochs: 100,
+        steps: None,
         unit: Unit::SamplesPerSecond,
     });
-    if command != "mnist" && (o.adam || o.batch != 128) {
+    if command != "mnist" && o.adam {
+        return Err(format!("--adam applies to mnist only, not {command}"));
+    }
+    if command != "mnist" && command != "cifar" && o.batch.is_some() {
         return Err(format!(
-            "--batch and --adam apply to mnist only, not {command}"
+            "--batch applies to mnist and cifar only, not {command}"
         ));
     }
+    if command != "cifar" && o.steps.is_some() {
+        return Err(format!("--steps applies to cifar only, not {command}"));
+    }
     Ok(match command {
-        "mnist" => vec![mnist(o.batch, o.adam)],
+        "mnist" => vec![mnist(o.batch.unwrap_or(128), o.adam)],
+        "cifar" => match o.batch {
+            Some(batch) => vec![cifar(batch)],
+            None => vec![cifar(128), cifar(32)],
+        },
         "digits" => vec![digits],
         "latency" => vec![Run::Latency],
         _ => vec![mnist(128, false), mnist(32, false), digits, Run::Latency],
@@ -225,12 +267,12 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
         );
     }
     println!(
-        "{:<24} {:>12} {:>12} {:>10}  unit",
+        "{:<28} {:>12} {:>12} {:>10}  unit",
         "run", "cavitation", "numpy", "ratio"
     );
     for row in rows {
         println!(
-            "{:<24} {:>12.2} {:>12.2} {:>9.2}x  {}",
+            "{:<28} {:>12.2} {:>12.2} {:>9.2}x  {}",
             row.name,
             row.value(runs::median(&row.ours)),
             row.value(runs::median(&row.numpy)),
@@ -523,5 +565,62 @@ mod tests {
         assert_eq!((run.wall, run.cpu, run.loss_bits), (1.25, 4.5, 0x3f80_0000));
         assert!(parse_small_line("wall 1 cpu 2").is_none());
         assert!(parse_small_line("wall x cpu 2 loss 0").is_none());
+    }
+
+    /// The training specs of a command line, or its error message.
+    fn specs(command: &str, args: &[&str]) -> Result<Vec<TrainSpec>, String> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let o = Options::parse(&args)?;
+        Ok(plan(command, &o)?
+            .into_iter()
+            .filter_map(|run| match run {
+                Run::Train(spec) => Some(spec),
+                Run::Latency => None,
+            })
+            .collect())
+    }
+
+    /// `cifar` runs Adam on the CIFAR-10 network at batch 128 then 32 in seconds per epoch,
+    /// or only the batch given, and in steps per second with `--steps`.
+    #[test]
+    fn cifar_plan_runs_both_batches_or_steps() {
+        let both = specs("cifar", &[]).unwrap();
+        let batches: Vec<usize> = both.iter().map(|s| s.batch).collect();
+        assert_eq!(batches, [128, 32]);
+        assert!(both.iter().all(|s| s.adam
+            && s.data == "cifar"
+            && s.widths == runs::CIFAR_NET
+            && s.steps.is_none()
+            && s.unit == Unit::EpochSeconds));
+
+        let one = specs("cifar", &["--batch", "32", "--steps", "50"]).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].batch, one[0].steps), (32, Some(50)));
+        assert_eq!(one[0].unit, Unit::StepsPerSecond);
+        assert_eq!(one[0].name, "cifar batch 32, 50 steps");
+    }
+
+    /// `--steps` belongs to `cifar`, `--adam` to `mnist`, `--batch` to both; `all` leaves
+    /// `cifar` out.
+    #[test]
+    fn options_apply_only_where_they_mean_something() {
+        assert!(
+            specs("mnist", &["--steps", "10"])
+                .unwrap_err()
+                .contains("cifar only")
+        );
+        assert!(
+            specs("cifar", &["--adam"])
+                .unwrap_err()
+                .contains("mnist only")
+        );
+        assert!(specs("digits", &["--batch", "32"]).is_err());
+        assert!(
+            specs("cifar", &["--steps", "0"])
+                .unwrap_err()
+                .contains("positive")
+        );
+        assert_eq!(specs("mnist", &["--batch", "32"]).unwrap()[0].batch, 32);
+        assert!(specs("all", &[]).unwrap().iter().all(|s| s.data != "cifar"));
     }
 }

@@ -131,7 +131,7 @@ scripts/data/get-mnist.sh                            # downloads MNIST into data
 cargo run --release --example mnist -p cavitation    # fit on MNIST with Adam and cosine decay
 ```
 
-The digits data ships in the repository. MNIST is downloaded by the script.
+The digits data ships in the repository. MNIST is downloaded by its script, and CIFAR-10 (binary version, 50,000 training and 10,000 test images of 32 by 32 pixels in three colours) by `scripts/data/get-cifar10.sh` into `data/cifar10/`; `cavitation_datasets::cifar10::load` reads it, for the benchmark below.
 
 ## Results
 
@@ -157,10 +157,15 @@ scripts/data/get-mnist.sh                        # the MNIST runs need the data
 cargo run --release -p cavitation-bench -- info  # CPU, kernel levels and thread count
 cargo run --release -p cavitation-bench -- all   # everything above
 cargo run --release -p cavitation-bench -- mnist --batch 32          # one run; add --adam to time Adam
+scripts/data/get-cifar10.sh                                          # the cifar run needs the data
+cargo run --release -p cavitation-bench -- cifar                     # 3072 → 1024 → 512 → 10, Adam, batch 128 and 32
+cargo run --release -p cavitation-bench -- cifar --batch 128 --steps 100  # steps per second, for slow machines
 cargo run --release -p cavitation-bench -- digits
 cargo run --release -p cavitation-bench -- latency
 cargo run --release -p cavitation-bench -- gemm --shapes mnist128    # the matrix products of one step
 ```
+
+`all` leaves out `cifar`: an epoch of its network on 50,000 images takes minutes on a small machine, so it is its own command. Its matrix products are large enough that the run measures matrix-multiply throughput rather than the fixed costs of each step, which dominate the MNIST run on a fast machine.
 
 The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH`, which needs numpy; `--python <path>` or the `CAVITATION_BENCH_PYTHON` variable names another interpreter. Results are also written to `target/bench/results.json`.
 

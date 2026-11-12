@@ -10,7 +10,7 @@ use std::time::Instant;
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
 use cavitation_core::{ParamStore, Rng, Tensor};
-use cavitation_datasets::{digits, mnist};
+use cavitation_datasets::{cifar10, digits, mnist};
 use cavitation_nn::{
     Adam, Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, Optimizer,
     OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer, Warning,
@@ -176,6 +176,10 @@ pub const MNIST_NET: [usize; 4] = [784, 1024, 256, 10];
 /// The layer widths of the 50k network: 64 to 256 to 128 to 10, 50,826 parameters.
 pub const DIGITS_NET: [usize; 4] = [64, 256, 128, 10];
 
+/// The layer widths of the CIFAR-10 network: 3072 to 1024 to 512 to 10, 3,676,682
+/// parameters.
+pub const CIFAR_NET: [usize; 4] = [3072, 1024, 512, 10];
+
 /// The median of `values` (the upper middle one for an even count).
 pub fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
@@ -214,7 +218,8 @@ pub struct Comparison {
     pub ours: Vec<f64>,
     /// Seconds per epoch or per round, as numpy measured them.
     pub numpy: Vec<f64>,
-    /// Samples per epoch (training) or calls per round (latency): the work in each timed sample.
+    /// The work in each timed sample: samples per epoch or steps per timed run (training),
+    /// or calls per round (latency).
     pub work: f64,
     /// What each side's timed region includes.
     pub timing_note: String,
@@ -222,7 +227,7 @@ pub struct Comparison {
     pub numpy_version: String,
     /// The BLAS thread setting the baseline saw.
     pub blas_threads: String,
-    /// How to show a median: `epoch`, `samples/s` or `us/call`.
+    /// How to show a median: `s/epoch`, `samples/s`, `steps/s` or `us/call`.
     pub unit: Unit,
 }
 
@@ -233,6 +238,8 @@ pub enum Unit {
     EpochSeconds,
     /// Training samples per second.
     SamplesPerSecond,
+    /// Training steps per second.
+    StepsPerSecond,
     /// Microseconds per call.
     MicrosPerCall,
 }
@@ -242,7 +249,7 @@ impl Comparison {
     pub fn value(&self, seconds: f64) -> f64 {
         match self.unit {
             Unit::EpochSeconds => seconds,
-            Unit::SamplesPerSecond => self.work / seconds,
+            Unit::SamplesPerSecond | Unit::StepsPerSecond => self.work / seconds,
             Unit::MicrosPerCall => seconds / self.work * 1e6,
         }
     }
@@ -252,6 +259,7 @@ impl Comparison {
         match self.unit {
             Unit::EpochSeconds => "s/epoch",
             Unit::SamplesPerSecond => "samples/s",
+            Unit::StepsPerSecond => "steps/s",
             Unit::MicrosPerCall => "us/call",
         }
     }
@@ -267,7 +275,7 @@ impl Comparison {
 pub struct TrainSpec {
     /// The label of the run.
     pub name: String,
-    /// `mnist` or `digits`.
+    /// `mnist`, `digits` or `cifar`.
     pub data: &'static str,
     /// Layer widths, input first.
     pub widths: [usize; 4],
@@ -275,15 +283,18 @@ pub struct TrainSpec {
     pub batch: usize,
     /// Adam with learning rate 1e-3 if true, plain SGD with 0.01 if false.
     pub adam: bool,
-    /// Timed epochs.
+    /// Timed epochs, or timed runs of `steps` steps.
     pub epochs: usize,
+    /// `Some(n)`: each timed sample is `n` steps instead of a whole epoch, for machines on
+    /// which an epoch is slow. The steps go through the batches in order, wrapping round.
+    pub steps: Option<usize>,
     /// How to show the median.
     pub unit: Unit,
 }
 
-/// Times `spec.epochs` epochs of training through the public path (`Trainer`, `Batcher`,
-/// the default health checks on) after [`TRAIN_WARMUP`] untimed steps, and returns the seconds of
-/// each epoch.
+/// Times `spec.epochs` epochs (or runs of `spec.steps` steps) of training through the public
+/// path (`Trainer`, `Batcher`, the default health checks on) after [`TRAIN_WARMUP`] untimed
+/// steps, and returns the seconds of each, with the count of health warnings.
 ///
 /// # Errors
 ///
@@ -322,12 +333,16 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
                 .map_err(|e| e.to_string())?,
         );
     }
+    // Step k of a timed sample uses batch k modulo the batch count; a whole epoch is every
+    // batch once, in order.
+    let count = spec.steps.unwrap_or(ranges.len());
     let mut seconds = Vec::with_capacity(spec.epochs);
     for epoch in 1..=spec.epochs {
+        let first = (epoch - 1) * count;
         let start = Instant::now();
         batcher.epoch();
-        for range in &ranges {
-            let view = batcher.gather(data, range.clone(), &mut buffer);
+        for k in first..first + count {
+            let view = batcher.gather(data, ranges[k % ranges.len()].clone(), &mut buffer);
             black_box(
                 trainer
                     .step(&net, &mut params, view)
@@ -340,14 +355,14 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
     Ok((seconds, warnings.get()))
 }
 
-/// Loads the training data a run needs: MNIST's 60,000 images from `data/mnist/` or the
-/// 1,437 training digits.
+/// Loads the training data a run needs: MNIST's 60,000 images from `data/mnist/`,
+/// CIFAR-10's 50,000 from `data/cifar10/`, or the 1,437 training digits.
 fn load_training_data(name: &str) -> Result<Dataset, String> {
-    let loaded = if name == "mnist" {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/mnist");
-        mnist::load(&dir)
-    } else {
-        digits::load()
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let loaded = match name {
+        "mnist" => mnist::load(&data.join("mnist")),
+        "cifar" => cifar10::load(&data.join("cifar10")),
+        _ => digits::load(),
     };
     loaded.map(|(train, _)| train).map_err(|e| e.to_string())
 }
@@ -362,7 +377,7 @@ fn net_arg(widths: &[usize]) -> String {
 }
 
 /// Runs a training comparison: cavitation first, then the numpy script with the same
-/// network, batch, data, optimiser, warm-up and epoch count.
+/// network, batch, data, optimiser, warm-up, epoch count and steps per timed sample.
 ///
 /// # Errors
 ///
@@ -370,7 +385,12 @@ fn net_arg(widths: &[usize]) -> String {
 pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, String> {
     let data = load_training_data(spec.data)?;
     let (ours, warnings) = train_ours(spec, &data)?;
-    let args: Vec<String> = [
+    let rows = data.len();
+    let epoch_steps = rows.div_ceil(spec.batch);
+    let steps = spec.steps.unwrap_or(epoch_steps);
+    // The numpy child loads its own copy; CIFAR-10's is 614 MB as f32.
+    drop(data);
+    let mut args: Vec<String> = [
         "--mode",
         "train",
         "--net",
@@ -388,17 +408,22 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
     ]
     .map(String::from)
     .to_vec();
+    if let Some(n) = spec.steps {
+        args.extend(["--steps".to_string(), n.to_string()]);
+    }
     let theirs = numpy::run(python, &args)?;
-    let steps = data.len().div_ceil(spec.batch);
     theirs.check("train", steps, spec.epochs)?;
+    let timed = match spec.steps {
+        Some(n) => format!("runs of {n} steps ({epoch_steps} steps per epoch)"),
+        None => format!("epochs of {epoch_steps} steps"),
+    };
     Ok(Comparison {
         name: spec.name.clone(),
         detail: format!(
-            "{} network, batch {}, {} steps per epoch, {}, {} untimed warm-up steps, \
-             {} timed epochs, Health::default() on ({} warnings counted)",
+            "{} network, batch {}, {}, {} untimed warm-up steps, \
+             {} timed {timed}, Health::default() on ({} warnings counted)",
             net_arg(&spec.widths),
             spec.batch,
-            steps,
             if spec.adam {
                 "Adam lr 0.001"
             } else {
@@ -415,7 +440,11 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
             .to_string(),
         numpy_version: theirs.numpy_version,
         blas_threads: theirs.blas_threads,
-        work: data.len() as f64,
+        work: if spec.unit == Unit::StepsPerSecond {
+            steps as f64
+        } else {
+            rows as f64
+        },
         unit: spec.unit,
     })
 }

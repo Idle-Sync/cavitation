@@ -4,16 +4,21 @@
 #
 #   python3 -I scripts/bench/numpy_mlp.py --mode train --net 784,1024,256,10 --batch 128 \
 #       --data mnist --epochs 3 --warmup 20
+#   python3 -I scripts/bench/numpy_mlp.py --mode train --net 3072,1024,512,10 --batch 128 \
+#       --data cifar --optimizer adam --epochs 3 --steps 100 --warmup 20
 #   python3 -I scripts/bench/numpy_mlp.py --mode infer --net 64,256,128,10 \
 #       --calls 10000 --rounds 10 --warmup 1000
 #
 # Training is plain SGD (learning rate --lr, default 0.01) or Adam (--optimizer adam, default
 # learning rate 1e-3), softmax cross-entropy, He normal weights and zero biases, and no input
 # gradient for the first layer. The data is read from --data-dir (default: data/ at the
-# repository root): the four MNIST IDX files, or the digits CSV (first 1,437 rows). Batches
-# are consecutive slices of the data; the last batch of an epoch is the remainder. The JSON
-# line has "kind", "units" (steps per epoch, or calls per round), "samples" (seconds per
-# epoch, or per round), "median", "numpy_version" and "blas_threads" (the BLAS libraries and
+# repository root): the four MNIST IDX files, the five CIFAR-10 training batches of the
+# binary version (pixel bytes in file order, divided by 255 in float32), or the digits CSV
+# (first 1,437 rows). Batches are consecutive slices of the data; the last batch of an epoch
+# is the remainder. With --steps N each timed sample is N steps instead of an epoch, step k
+# using batch k modulo the batch count. The JSON line has "kind", "units" (steps per epoch or
+# per timed sample, or calls per round), "samples" (seconds per epoch or timed sample, or per
+# round), "median", "numpy_version" and "blas_threads" (the BLAS libraries and
 # their thread counts when threadpoolctl is installed, otherwise the thread environment
 # variables). The timed region is the gradient step only (no data copy, loss value or checks).
 import argparse
@@ -34,6 +39,18 @@ def load_mnist(directory):
     return x, labels.astype(np.int64)
 
 
+def load_cifar(directory):
+    """Reads the 50,000 CIFAR-10 training images (scaled to 0..1) and labels from the batches."""
+    parts = []
+    for i in range(1, 6):
+        with open(os.path.join(directory, "cifar10", f"data_batch_{i}.bin"), "rb") as f:
+            parts.append(np.frombuffer(f.read(), dtype=np.uint8).reshape(-1, 3073))
+    records = np.concatenate(parts)
+    x = records[:, 1:].astype(np.float32)
+    x /= np.float32(255.0)
+    return x, records[:, 0].astype(np.int64)
+
+
 def load_digits(directory):
     """Reads the first 1,437 rows of the digits CSV: 64 pixel counts (scaled by 1/16), a label."""
     rows = np.loadtxt(os.path.join(directory, "digits", "digits.csv"), delimiter=",")
@@ -52,8 +69,9 @@ def init_weights(sizes, rng):
 
 
 def train(args, sizes, rng):
-    """Times whole epochs of training and returns (steps per epoch, seconds per epoch)."""
-    x_all, y_all = (load_mnist if args.data == "mnist" else load_digits)(args.data_dir)
+    """Times epochs (or runs of --steps steps); returns (steps per sample, seconds per sample)."""
+    loaders = {"mnist": load_mnist, "cifar": load_cifar, "digits": load_digits}
+    x_all, y_all = loaders[args.data](args.data_dir)
     n = len(y_all)
     w, b = init_weights(sizes, rng)
     lr = args.lr if args.lr is not None else (1e-3 if args.optimizer == "adam" else 0.01)
@@ -99,13 +117,15 @@ def train(args, sizes, rng):
     for k in range(args.warmup):
         lo, hi = batches[k % len(batches)]
         step(x_all[lo:hi], y_all[lo:hi])
+    count = args.steps if args.steps is not None else len(batches)
     samples = []
-    for _ in range(args.epochs):
+    for e in range(args.epochs):
         start = time.perf_counter()
-        for lo, hi in batches:
+        for k in range(e * count, (e + 1) * count):
+            lo, hi = batches[k % len(batches)]
             step(x_all[lo:hi], y_all[lo:hi])
         samples.append(time.perf_counter() - start)
-    return len(batches), samples
+    return count, samples
 
 
 def infer(args, sizes, rng):
@@ -155,11 +175,12 @@ def main():
     p.add_argument("--mode", choices=["train", "infer"], required=True)
     p.add_argument("--net", required=True, help="layer widths, input first: 784,1024,256,10")
     p.add_argument("--batch", type=int, default=128)
-    p.add_argument("--data", choices=["mnist", "digits"], default="mnist")
+    p.add_argument("--data", choices=["mnist", "cifar", "digits"], default="mnist")
     p.add_argument("--data-dir", default=root)
     p.add_argument("--optimizer", choices=["sgd", "adam"], default="sgd")
     p.add_argument("--lr", type=float, default=None)
-    p.add_argument("--epochs", type=int, default=3, help="timed epochs (train)")
+    p.add_argument("--epochs", type=int, default=3, help="timed epochs or runs (train)")
+    p.add_argument("--steps", type=int, default=None, help="steps per timed run (train)")
     p.add_argument("--rounds", type=int, default=10, help="timed rounds (infer)")
     p.add_argument("--calls", type=int, default=10000, help="calls per round (infer)")
     p.add_argument("--warmup", type=int, default=20, help="untimed steps (train) or calls (infer)")
