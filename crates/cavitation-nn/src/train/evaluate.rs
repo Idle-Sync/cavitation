@@ -289,7 +289,10 @@ impl Evaluator {
     /// values [`set_neuron_mask`](Self::set_neuron_mask) gave them, on either engine (and
     /// when the evaluator moves between the two), unless `model` has a neuron mask of its
     /// own on that `Linear`, which then replaces them; an added mask whose `Linear` changed
-    /// width starts again with every neuron on.
+    /// width starts again with every neuron on. When the layer that holds a listed
+    /// `Linear`'s neurons changes (an element-wise layer was added after it, say), the mask
+    /// moves there with its values, and the model is compiled afresh so that no mask is
+    /// left on the old layer.
     ///
     /// `refresh` allocates, even in place: it builds the new weights before copying them
     /// in. Only [`evaluate`](Self::evaluate) and [`misclassified`](Self::misclassified) are
@@ -351,7 +354,7 @@ impl Evaluator {
             carried.push((linear, mask));
         }
         let listed: Vec<usize> = carried.iter().map(|(l, _)| *l).collect();
-        let reload = match &mut self.engine {
+        let mut reload = match &mut self.engine {
             Engine::Compiled(compiled) => match compiled.refresh(model, params) {
                 Ok(true) => Reload::InPlace,
                 Ok(false) => Reload::Recompiled,
@@ -370,9 +373,23 @@ impl Evaluator {
         match &mut self.engine {
             Engine::Compiled(compiled) if reload != Reload::Tape => {
                 // A step `refresh` kept has these values already; a fresh one gets them
-                // here. A `Linear` whose step is gone (its neurons moved) has none to set.
-                for (linear, mask) in &carried {
-                    let _ = compiled.set_neuron_mask(*linear, mask);
+                // here. If a listed `Linear`'s neurons moved to a layer the kept steps do
+                // not cover (an element-wise layer was added after it), the old step would
+                // still mask a layer the copy does not: compile afresh with steps where the
+                // neurons are now, so the compiled model and the copy agree.
+                let moved = carried
+                    .iter()
+                    .any(|(linear, mask)| compiled.set_neuron_mask(*linear, mask).is_err());
+                if moved {
+                    let mut fresh =
+                        InferenceModel::compile_with_neuron_masks(model, params, &listed)?;
+                    for (linear, mask) in &carried {
+                        fresh
+                            .set_neuron_mask(*linear, mask)
+                            .expect("the listed Linear has a mask step of its width");
+                    }
+                    *compiled = fresh;
+                    reload = Reload::Recompiled;
                 }
             }
             Engine::Tape(values) => values.clone_from(&params.values),
@@ -1222,6 +1239,39 @@ mod tests {
             evaluator.evaluate(&data).unwrap(),
             want(&builtin, &params, &other)
         );
+    }
+
+    /// When a refresh adds a `Sigmoid` after the `Tanh`, the listed `Linear`'s neurons move
+    /// from layer 1 to layer 2: the mask moves with its values, the model is compiled
+    /// afresh (no step is left masking the `Tanh`), the evaluation equals `evaluate` on the
+    /// new network with that neuron mask, and `set_neuron_mask` keeps working.
+    #[test]
+    fn refresh_moves_a_neuron_mask_with_its_layer() {
+        let (net, params, data) = case(Loss::CrossEntropy, 200, 41);
+        let loss = Loss::CrossEntropy;
+        let off = NeuronMask::from_off(8, &[0, 5]);
+        let mut evaluator = Evaluator::with_neuron_masks(&net, &params, loss, 64, &[0]).unwrap();
+        evaluator.set_neuron_mask(0, &off).unwrap();
+        let longer = Sequential::new()
+            .push(net.linear(0).unwrap().clone())
+            .push(Tanh)
+            .push(Sigmoid)
+            .push(net.linear(2).unwrap().clone());
+        let want = |mask: &NeuronMask| {
+            let mut masked = longer.clone();
+            masked.set_neuron_mask(0, mask.clone());
+            evaluate(&masked, &params, &data, loss, 64).unwrap()
+        };
+        assert_eq!(
+            evaluator.reload(&longer, &params).unwrap(),
+            Reload::Recompiled
+        );
+        assert!(matches!(evaluator.engine, Engine::Compiled(_)));
+        assert_eq!(evaluator.evaluate(&data).unwrap(), want(&off));
+        let other = NeuronMask::from_off(8, &[3]);
+        evaluator.set_neuron_mask(0, &other).unwrap();
+        assert_eq!(evaluator.evaluate(&data).unwrap(), want(&other));
+        assert_eq!(evaluator.model.neuron_mask(0), Some(&other));
     }
 
     /// `with_neuron_masks` with an index that is not a `Linear` is `InvalidData`; on each

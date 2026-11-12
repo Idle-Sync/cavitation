@@ -133,10 +133,10 @@ pub trait Layer<T: Real>: Send + Sync {
     /// Whether each output value depends only on the input value at the same position, so
     /// that a neuron mask on this layer's output switches off exactly the neuron that feeds
     /// it. [`Sequential::neuron_layer`](crate::Sequential::neuron_layer) puts a `Linear`'s
-    /// neuron mask on the last layer of the run of element-wise layers after it. The default is whether the layer has
-    /// an [`activation`](Self::activation); `Prelu` overrides it to `true`. A layer of your
-    /// own that is element-wise but has no `activation()` should override this, so that
-    /// neuron masks land after it.
+    /// neuron mask on the last layer of the run of element-wise layers after it. The
+    /// default is whether the layer has an [`activation`](Self::activation); `Prelu`
+    /// overrides it to `true`. A layer of your own that is element-wise but has no
+    /// `activation()` should override this, so that neuron masks land after it.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};

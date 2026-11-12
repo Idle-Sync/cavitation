@@ -329,8 +329,8 @@ impl InferenceModel {
     /// has a mask takes that mask's values, copied in place whether or not the weights were;
     /// each one `model` has no mask for (a step added by `compile_with_masks` or
     /// `compile_with_neuron_masks`) keeps the values [`set_mask`](Self::set_mask) or
-    /// [`set_neuron_mask`](Self::set_neuron_mask) gave it. Otherwise the masks are compiled afresh,
-    /// the added steps with every neuron on.
+    /// [`set_neuron_mask`](Self::set_neuron_mask) gave it. Otherwise the masks are compiled
+    /// afresh, the added steps with every neuron on.
     ///
     /// # Errors
     ///

@@ -486,9 +486,9 @@ impl<T: Real> Sequential<T> {
     /// Panics if layer `linear` is not a `Linear` (the message names the index and the
     /// layer's kind); if `mask`'s width is not the `Linear`'s output width (the message
     /// names the `Linear`, the mask's width and the output width); or if the `Linear`
-    /// itself carries a mask set with [`set_mask`](Self::set_mask) while its neurons are
-    /// read at another layer, so that one neuron set never carries two masks (clear that
-    /// one with [`clear_mask`](Self::clear_mask) first).
+    /// itself, or an element-wise layer between it and the layer that holds its neurons,
+    /// carries a mask set with [`set_mask`](Self::set_mask), so that one neuron set never
+    /// carries two masks (clear that one with [`clear_mask`](Self::clear_mask) first).
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -601,9 +601,10 @@ impl<T: Real> Sequential<T> {
     /// Panics if layer `linear` is not a `Linear` (the message names the index and the
     /// layer's kind); if `neuron` is not below the `Linear`'s output width, or a mask
     /// already there has another width (each message names the `Linear` and the widths);
-    /// or if the `Linear` itself carries a mask set with [`set_mask`](Self::set_mask) while
-    /// its neurons are read at another layer, so that one neuron set never carries two masks
-    /// (clear that one with [`clear_mask`](Self::clear_mask) first).
+    /// or if the `Linear` itself, or an element-wise layer between it and the layer that
+    /// holds its neurons, carries a mask set with [`set_mask`](Self::set_mask), so that one
+    /// neuron set never carries two masks (clear that one with
+    /// [`clear_mask`](Self::clear_mask) first).
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -651,15 +652,17 @@ impl<T: Real> Sequential<T> {
         );
     }
 
-    /// Panics if the `Linear` at layer `linear`, whose neurons are read at layer `layer`,
-    /// carries a mask of its own on another layer, naming both layers.
+    /// Panics if a layer from the `Linear` at layer `linear` up to, but not including, the
+    /// layer `layer` that holds its neurons (the `Linear` itself or an element-wise layer of
+    /// the run after it) carries a mask, naming the `Linear`, that layer and `layer`.
     fn check_no_linear_mask(&self, linear: usize, layer: usize) {
-        assert!(
-            layer == linear || self.masks[linear].is_none(),
-            "sequential: the linear layer {linear} has a mask set with set_mask on the linear \
-             layer itself, but its neurons are masked at layer {layer}; clear it with \
-             clear_mask({linear}) first, so that one neuron set carries one mask"
-        );
+        if let Some(other) = (linear..layer).find(|&l| self.masks[l].is_some()) {
+            panic!(
+                "sequential: the neurons of the linear layer {linear} are masked at layer \
+                 {layer}, but layer {other} has a mask set with set_mask; clear it with \
+                 clear_mask({other}) first, so that one neuron set carries one mask"
+            );
+        }
     }
 
     /// Panics, naming the index and the layer's kind, if layer `linear` is not a `Linear`.
@@ -1110,6 +1113,38 @@ mod tests {
         net.clear_mask(0);
         net.set_neuron(0, 2, false);
         assert_eq!(net.neuron_mask(0).unwrap().off().collect::<Vec<_>>(), [2]);
+    }
+
+    /// On `Linear → Tanh → Sigmoid → Linear`, a mask set by layer on the `Tanh`, inside the
+    /// run before the `Sigmoid` that holds the neurons, is refused the same way: neither
+    /// `set_neuron` nor `set_neuron_mask` adds a second mask, and each message names the
+    /// `Tanh`'s layer. Once it is cleared, the neuron mask goes on the `Sigmoid`.
+    #[test]
+    fn mask_inside_the_run_is_refused() {
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut Rng::seed(5)))
+            .push(Tanh)
+            .push(Sigmoid)
+            .push(Linear::new(&mut params, 4, 2, &mut Rng::seed(6)));
+        net.set_mask(1, NeuronMask::from_off(4, &[0]));
+        assert!(net.neuron_mask(0).is_none());
+        let calls: [fn(&mut Sequential); 2] = [
+            |n| n.set_neuron(0, 2, false),
+            |n| n.set_neuron_mask(0, NeuronMask::all_on(4)),
+        ];
+        for call in calls {
+            let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&mut net)));
+            let msg = *hit.unwrap_err().downcast::<String>().unwrap();
+            assert!(
+                msg.contains("layer 1 has a mask") && msg.contains("clear_mask(1)"),
+                "{msg}"
+            );
+        }
+        assert!(net.mask(2).is_none());
+        net.clear_mask(1);
+        net.set_neuron(0, 2, false);
+        assert!(net.mask(2).is_some() && net.mask(1).is_none());
     }
 
     /// On `Linear → Tanh → Sigmoid → Linear` the neurons of the first `Linear` are read at
