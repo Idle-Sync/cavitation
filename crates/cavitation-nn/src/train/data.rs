@@ -91,6 +91,95 @@ impl<T: Real> Dataset<T> {
         self.matrix_dims().1
     }
 
+    /// Splits the data at row `n`: a copy of rows `0..n` and a copy of rows `n..len`, with
+    /// their targets. A held-out set is the second part of a shuffled data set, or of one
+    /// whose rows are already in no particular order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n` is above [`len`](Self::len), and as [`subset`](Self::subset) does.
+    ///
+    /// ```
+    /// use cavitation_core::Tensor;
+    /// use cavitation_nn::{Dataset, Targets};
+    /// let data = Dataset {
+    ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0, 4.0], &[5, 1]).unwrap(),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 1, 0]),
+    /// };
+    /// let (train, test) = data.split_at(3);
+    /// assert_eq!((train.len(), test.len()), (3, 2));
+    /// assert_eq!(test.x.data(), &[3.0, 4.0]);
+    /// assert_eq!(test.targets, Targets::Classes(vec![1, 0]));
+    /// ```
+    pub fn split_at(&self, n: usize) -> (Dataset<T>, Dataset<T>) {
+        let rows = self.len();
+        assert!(
+            n <= rows,
+            "Dataset::split_at: cannot split {rows} rows at row {n}"
+        );
+        (self.subset(0..n), self.subset(n..rows))
+    }
+
+    /// A copy of the rows `rows` (start included, end excluded), with their targets.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the range and the row count, if `rows` starts after it ends or ends
+    /// past [`len`](Self::len); panics if `x` or value targets are not matrices, or if the
+    /// targets do not have one entry per row.
+    ///
+    /// ```
+    /// use cavitation_core::Tensor;
+    /// use cavitation_nn::{Dataset, Targets};
+    /// let data = Dataset {
+    ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0], &[3, 2]).unwrap(),
+    ///     targets: Targets::Values(Tensor::from_vec(vec![10.0f32, 20.0, 30.0], &[3, 1]).unwrap()),
+    /// };
+    /// let middle = data.subset(1..2);
+    /// assert_eq!(middle.x.data(), &[2.0, 3.0]);
+    /// assert_eq!(middle.targets, Targets::Values(Tensor::from_vec(vec![20.0f32], &[1, 1]).unwrap()));
+    /// ```
+    pub fn subset(&self, rows: Range<usize>) -> Dataset<T> {
+        let (n, features) = self.matrix_dims();
+        assert!(
+            rows.start <= rows.end && rows.end <= n,
+            "Dataset::subset: rows {}..{} are outside the {n} rows",
+            rows.start,
+            rows.end
+        );
+        let count = rows.len();
+        let x = Tensor::from_vec(
+            self.x.data()[rows.start * features..rows.end * features].to_vec(),
+            &[count, features],
+        )
+        .expect("whole rows of x have the subset's shape");
+        let targets = match &self.targets {
+            Targets::Classes(labels) => {
+                assert_eq!(
+                    labels.len(),
+                    n,
+                    "Dataset::subset: there are {n} rows but {} labels",
+                    labels.len()
+                );
+                Targets::Classes(labels[rows].to_vec())
+            }
+            Targets::Values(t) => match t.shape().dims() {
+                &[r, outputs] if r == n => Targets::Values(
+                    Tensor::from_vec(
+                        t.data()[rows.start * outputs..rows.end * outputs].to_vec(),
+                        &[count, outputs],
+                    )
+                    .expect("whole rows of the targets have the subset's shape"),
+                ),
+                dims => panic!(
+                    "Dataset::subset: the value targets are {dims:?}, but the inputs are \
+                     [{n}, {features}]"
+                ),
+            },
+        };
+        Dataset { x, targets }
+    }
+
     /// The `(rows, features)` of `x`, panicking if it is not a matrix.
     fn matrix_dims(&self) -> (usize, usize) {
         match self.x.shape().dims() {
@@ -498,6 +587,48 @@ pub(super) mod tests {
             }
             TargetsView::Classes(_) => panic!("expected value targets"),
         }
+    }
+
+    /// `split_at` and `subset` copy whole rows with their targets, class or value; splitting
+    /// at 0 or at the row count gives an empty part.
+    #[test]
+    fn split_at_and_subset() {
+        let data = classes_dataset(10);
+        let (a, b) = data.split_at(7);
+        assert_eq!((a.len(), b.len()), (7, 3));
+        assert_eq!(&b.x.data()[..3], &[7.0, 7.25, 7.5]);
+        assert_eq!(b.targets, Targets::Classes(vec![7, 8, 9]));
+        assert_eq!(a, data.subset(0..7));
+        let (empty, all) = data.split_at(0);
+        assert!(empty.is_empty() && all == data);
+        assert!(data.split_at(10).1.is_empty());
+        let values = Dataset {
+            x: Tensor::from_vec((0..12).map(|i| i as f32).collect(), &[4, 3]).unwrap(),
+            targets: Targets::Values(
+                Tensor::from_vec((0..8).map(|i| i as f32 * 10.0).collect(), &[4, 2]).unwrap(),
+            ),
+        };
+        let middle = values.subset(1..3);
+        assert_eq!(middle.x.shape().dims(), &[2, 3]);
+        assert_eq!(middle.x.data(), &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            middle.targets,
+            Targets::Values(Tensor::from_vec(vec![20.0, 30.0, 40.0, 50.0], &[2, 2]).unwrap())
+        );
+    }
+
+    /// Splitting past the row count panics naming both.
+    #[test]
+    #[should_panic(expected = "cannot split 10 rows at row 11")]
+    fn split_at_past_the_end_panics() {
+        let _ = classes_dataset(10).split_at(11);
+    }
+
+    /// A subset reaching past the rows panics naming the range.
+    #[test]
+    #[should_panic(expected = "rows 8..12 are outside the 10 rows")]
+    fn subset_past_the_end_panics() {
+        let _ = classes_dataset(10).subset(8..12);
     }
 
     /// A range past the end of the data panics with a message naming it.

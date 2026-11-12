@@ -1,18 +1,19 @@
 //! Known results: real data sets that a correct library must learn to a stated accuracy.
 
-use cavitation_core::{ParamStore, Rng};
+use cavitation_core::{Graph, ParamStore, Reduction, Rng, TensorView};
 use std::cell::RefCell;
 use std::path::Path;
 use std::rc::Rc;
 
 use cavitation_nn::{
     EpochReport, FitConfig, Health, Init, Linear, Loss, LrSchedule, OptimizerConfig, Relu,
-    Sequential, Warning, accuracy, fit,
+    Sequential, Targets, Warning, accuracy, evaluate, fit,
 };
 
 /// The 64 → 256 → 128 → 10 ReLU network (He uniform weights, zero biases, `Rng::seed(1)`),
 /// trained with Adam at learning rate 0.002 in batches of 32 for 20 epochs, shuffled with
-/// seed 7, reaches at least 97.5% on the 360 held-out scikit-learn digits.
+/// seed 7, reaches at least 97.5% on the 360 held-out scikit-learn digits; `evaluate` on
+/// them gives that accuracy and the loss a loop over the batches on the tape gives.
 #[test]
 fn digits_known_result() {
     let (train, test) = cavitation_datasets::digits::load().unwrap();
@@ -59,6 +60,31 @@ fn digits_known_result() {
     let acc = accuracy(&net, &params, &test, 128);
     println!("digits test accuracy: {:.2}%", acc * 100.0);
     assert!(acc >= 0.975, "digits test accuracy {acc} is below 0.975");
+    let evaluation = evaluate(&net, &params, &test, Loss::CrossEntropy, 128).unwrap();
+    assert_eq!(evaluation.accuracy, Some(acc));
+    let labels = match &test.targets {
+        Targets::Classes(labels) => labels,
+        Targets::Values(_) => unreachable!("the digits have class labels"),
+    };
+    let mut graph = Graph::new();
+    let mut total = 0.0;
+    for start in (0..test.len()).step_by(128) {
+        let end = (start + 128).min(test.len());
+        let x = TensorView::from_slice(&test.x.data()[start * 64..end * 64], &[end - start, 64])
+            .unwrap();
+        let mut tape = graph.tape(&params.values);
+        let input = tape.input(x);
+        let out = net.forward(&mut tape, input);
+        let loss = tape.softmax_cross_entropy(out, &labels[start..end], Reduction::Mean);
+        total += f64::from(tape.value(loss).data()[0]) * (end - start) as f64;
+    }
+    let manual = total / test.len() as f64;
+    println!("digits test loss: {:.6}", evaluation.loss);
+    assert!(
+        (evaluation.loss - manual).abs() <= 1e-6 * manual,
+        "evaluate's loss {} against the manual loop's {manual}",
+        evaluation.loss
+    );
 }
 
 /// The 784 → 1024 → 256 → 10 ReLU network (He uniform weights, zero biases, `Rng::seed(1)`),

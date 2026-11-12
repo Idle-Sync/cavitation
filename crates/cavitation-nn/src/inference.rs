@@ -166,118 +166,56 @@ impl InferenceModel {
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
     ) -> Result<InferenceModel, Error> {
-        if model.is_empty() {
-            return Err(Error::Unsupported(
-                "inference of a model with no layers".to_string(),
-            ));
-        }
-        let mut forms = Vec::with_capacity(model.len());
-        for i in 0..model.len() {
-            let layer = model.layer(i);
-            let form = layer.inference(&params.values).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "inference: layer {i} ({}) has no inference form",
-                    layer.name()
-                ))
-            })?;
-            forms.push(form);
-        }
-        let input_width = input_width(&forms, model)?;
-        let mut steps: Vec<Step> = Vec::with_capacity(2 * forms.len());
-        let (mut width, mut max_width) = (input_width, input_width);
-        for (i, form) in forms.into_iter().enumerate() {
-            let layer = model.layer(i);
-            let name = layer.name();
-            if let Some(expected) = layer.input_width().or(declared_width(&form)) {
-                assert!(
-                    expected == width,
-                    "InferenceModel::compile: layer {i} ({name}) expects input width \
-                     {expected}, but its input has width {width}"
-                );
-            }
-            let produced = match &form {
-                InferenceLayer::Linear {
-                    w_t,
-                    bias,
-                    inputs,
-                    outputs,
-                } => {
-                    assert!(
-                        w_t.len() == inputs * outputs && bias.len() == *outputs,
-                        "InferenceModel::compile: layer {i} ({name}) is {inputs} -> {outputs} \
-                         but has {} weights and {} biases",
-                        w_t.len(),
-                        bias.len()
-                    );
-                    *outputs
-                }
-                InferenceLayer::Prelu(slopes) => {
-                    assert!(
-                        slopes.len() == 1 || slopes.len() == width,
-                        "InferenceModel::compile: layer {i} ({name}) has {} slopes for width \
-                         {width}",
-                        slopes.len()
-                    );
-                    width
-                }
-                InferenceLayer::Glu(_) => {
-                    assert!(
-                        width % 2 == 0,
-                        "InferenceModel::compile: layer {i} ({name}) needs an even width, got \
-                         {width}"
-                    );
-                    width / 2
-                }
-                _ => width,
-            };
-            let reported = layer.output_width(width);
-            assert!(
-                produced == reported,
-                "InferenceModel::compile: layer {i} ({name}) produces output width {produced}, \
-                 but reports {reported} for input width {width}"
-            );
-            let fuses = form == InferenceLayer::Activation(ActivationKind::Relu)
-                && steps
-                    .last()
-                    .is_some_and(|s| matches!(s.form, InferenceLayer::Linear { .. }) && !s.relu);
-            match steps.last_mut() {
-                Some(last) if fuses => last.relu = true,
-                _ => steps.push(Step {
-                    form,
-                    relu: false,
-                    inputs: width,
-                    outputs: produced,
-                }),
-            }
-            if let Some(mask) = model.mask(i) {
-                assert!(
-                    mask.width() == produced,
-                    "InferenceModel::compile: the mask on layer {i} ({name}) has width {}, but \
-                     the layer outputs width {produced}",
-                    mask.width()
-                );
-                let keep = (0..produced)
-                    .map(|j| if mask.is_on(j) { 1.0 } else { 0.0 })
-                    .collect();
-                steps.push(Step {
-                    form: InferenceLayer::Mask(keep),
-                    relu: false,
-                    inputs: produced,
-                    outputs: produced,
-                });
-            }
-            width = produced;
-            max_width = max_width.max(width);
-        }
+        let compiled = Compiled::build(model, params)?;
+        let max_width = compiled.max_width;
         Ok(InferenceModel {
-            shared: Arc::new(Compiled {
-                steps,
-                input_width,
-                output_width: width,
-                max_width,
-            }),
+            shared: Arc::new(compiled),
             bufs: [vec![0.0; max_width], vec![0.0; max_width]],
         })
+    }
+
+    /// Picks up new weights and masks from `model` and `params`, as [`compile`](Self::compile)
+    /// would. When no clone shares this model's compiled steps and the new steps have the
+    /// same layout (the same steps with the same widths, fused ReLUs and parameter counts),
+    /// the new values replace the old ones in place and the buffers are kept; returns
+    /// `true`. Otherwise this model alone gets a freshly compiled copy, leaving any clone
+    /// with the old weights; returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`compile`](Self::compile) returns; the model is then unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`compile`](Self::compile) does.
+    pub(crate) fn refresh(
+        &mut self,
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+    ) -> Result<bool, Error> {
+        let fresh = Compiled::build(model, params)?;
+        if let Some(current) = Arc::get_mut(&mut self.shared)
+            && current.same_layout(&fresh)
+        {
+            for (old, new) in current.steps.iter_mut().zip(fresh.steps) {
+                old.form = new.form;
+            }
+            return Ok(true);
+        }
+        for buf in &mut self.bufs {
+            if buf.len() < fresh.max_width {
+                buf.resize(fresh.max_width, 0.0);
+            }
+        }
+        self.shared = Arc::new(fresh);
+        Ok(false)
+    }
+
+    /// Whether this model and `other` share their compiled steps (one is a clone of the
+    /// other and neither has been recompiled since).
+    #[cfg(test)]
+    pub(crate) fn shares_steps(&self, other: &InferenceModel) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
     }
 
     /// The width of one input.
@@ -393,6 +331,152 @@ impl InferenceModel {
         let out = &self.bufs[at][..rows * shared.output_width];
         TensorView::from_slice(out, &[rows, shared.output_width])
             .expect("the output buffer holds batch × output_width values")
+    }
+}
+
+impl Compiled {
+    /// Compiles `model` with the values in `params`: the work of
+    /// [`InferenceModel::compile`], without the buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`InferenceModel::compile`] returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`InferenceModel::compile`] does.
+    fn build(model: &Sequential<f32>, params: &ParamStore<f32>) -> Result<Compiled, Error> {
+        if model.is_empty() {
+            return Err(Error::Unsupported(
+                "inference of a model with no layers".to_string(),
+            ));
+        }
+        let mut forms = Vec::with_capacity(model.len());
+        for i in 0..model.len() {
+            let layer = model.layer(i);
+            let form = layer.inference(&params.values).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "inference: layer {i} ({}) has no inference form",
+                    layer.name()
+                ))
+            })?;
+            forms.push(form);
+        }
+        let input_width = input_width(&forms, model)?;
+        let mut steps: Vec<Step> = Vec::with_capacity(2 * forms.len());
+        let (mut width, mut max_width) = (input_width, input_width);
+        for (i, form) in forms.into_iter().enumerate() {
+            let layer = model.layer(i);
+            let name = layer.name();
+            if let Some(expected) = layer.input_width().or(declared_width(&form)) {
+                assert!(
+                    expected == width,
+                    "InferenceModel::compile: layer {i} ({name}) expects input width \
+                     {expected}, but its input has width {width}"
+                );
+            }
+            let produced = match &form {
+                InferenceLayer::Linear {
+                    w_t,
+                    bias,
+                    inputs,
+                    outputs,
+                } => {
+                    assert!(
+                        w_t.len() == inputs * outputs && bias.len() == *outputs,
+                        "InferenceModel::compile: layer {i} ({name}) is {inputs} -> {outputs} \
+                         but has {} weights and {} biases",
+                        w_t.len(),
+                        bias.len()
+                    );
+                    *outputs
+                }
+                InferenceLayer::Prelu(slopes) => {
+                    assert!(
+                        slopes.len() == 1 || slopes.len() == width,
+                        "InferenceModel::compile: layer {i} ({name}) has {} slopes for width \
+                         {width}",
+                        slopes.len()
+                    );
+                    width
+                }
+                InferenceLayer::Glu(_) => {
+                    assert!(
+                        width % 2 == 0,
+                        "InferenceModel::compile: layer {i} ({name}) needs an even width, got \
+                         {width}"
+                    );
+                    width / 2
+                }
+                _ => width,
+            };
+            let reported = layer.output_width(width);
+            assert!(
+                produced == reported,
+                "InferenceModel::compile: layer {i} ({name}) produces output width {produced}, \
+                 but reports {reported} for input width {width}"
+            );
+            let fuses = form == InferenceLayer::Activation(ActivationKind::Relu)
+                && steps
+                    .last()
+                    .is_some_and(|s| matches!(s.form, InferenceLayer::Linear { .. }) && !s.relu);
+            match steps.last_mut() {
+                Some(last) if fuses => last.relu = true,
+                _ => steps.push(Step {
+                    form,
+                    relu: false,
+                    inputs: width,
+                    outputs: produced,
+                }),
+            }
+            if let Some(mask) = model.mask(i) {
+                assert!(
+                    mask.width() == produced,
+                    "InferenceModel::compile: the mask on layer {i} ({name}) has width {}, but \
+                     the layer outputs width {produced}",
+                    mask.width()
+                );
+                let keep = (0..produced)
+                    .map(|j| if mask.is_on(j) { 1.0 } else { 0.0 })
+                    .collect();
+                steps.push(Step {
+                    form: InferenceLayer::Mask(keep),
+                    relu: false,
+                    inputs: produced,
+                    outputs: produced,
+                });
+            }
+            width = produced;
+            max_width = max_width.max(width);
+        }
+        Ok(Compiled {
+            steps,
+            input_width,
+            output_width: width,
+            max_width,
+        })
+    }
+
+    /// Whether `other` has the same steps as `self`, in the same order, with the same
+    /// widths, fused ReLUs and parameter counts, so that its values can replace these in
+    /// place.
+    fn same_layout(&self, other: &Compiled) -> bool {
+        let params = |form: &InferenceLayer| match form {
+            InferenceLayer::Linear { w_t, bias, .. } => (w_t.len(), bias.len()),
+            InferenceLayer::Prelu(v) | InferenceLayer::Mask(v) => (v.len(), 0),
+            _ => (0, 0),
+        };
+        self.input_width == other.input_width
+            && self.output_width == other.output_width
+            && self.max_width == other.max_width
+            && self.steps.len() == other.steps.len()
+            && self.steps.iter().zip(&other.steps).all(|(a, b)| {
+                std::mem::discriminant(&a.form) == std::mem::discriminant(&b.form)
+                    && a.relu == b.relu
+                    && a.inputs == b.inputs
+                    && a.outputs == b.outputs
+                    && params(&a.form) == params(&b.form)
+            })
     }
 }
 

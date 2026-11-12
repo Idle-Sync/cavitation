@@ -101,7 +101,12 @@ impl Loss {
     ///
     /// Panics as [`check_targets`](Loss::check_targets) does, and as the tape operation
     /// does on shapes it rejects.
-    fn record(self, tape: &mut Tape<'_, f32>, out: Var, targets: TargetsView<'_, f32>) -> Var {
+    pub(super) fn record(
+        self,
+        tape: &mut Tape<'_, f32>,
+        out: Var,
+        targets: TargetsView<'_, f32>,
+    ) -> Var {
         self.check_targets(targets);
         let mean = Reduction::Mean;
         match targets {
@@ -753,7 +758,7 @@ impl fmt::Debug for FitConfig {
 
 /// Checks that `data` can be trained on: `x` a matrix with at least one row, and one target
 /// per row.
-fn check_dataset(data: &Dataset) -> Result<(), Error> {
+pub(super) fn check_dataset(data: &Dataset) -> Result<(), Error> {
     let &[rows, _] = data.x.shape().dims() else {
         return Err(Error::InvalidData(format!(
             "the inputs must have shape [rows, features], found {:?}",
@@ -789,7 +794,11 @@ fn check_dataset(data: &Dataset) -> Result<(), Error> {
 /// whose layers disagree), the inputs are as wide as each layer that names an input width
 /// expects, every class label is below the
 /// model's output width, and value targets are as wide as the model's output.
-fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Result<(), Error> {
+pub(super) fn check_model_and_loss(
+    model: &Sequential,
+    loss: Loss,
+    data: &Dataset,
+) -> Result<(), Error> {
     let kind = |classes: bool| if classes { "class" } else { "value" };
     let has_classes = matches!(data.targets, Targets::Classes(_));
     if loss.needs_classes() != has_classes {
@@ -813,6 +822,15 @@ fn check_model_and_loss(model: &Sequential, loss: Loss, data: &Dataset) -> Resul
             i % columns
         )));
     }
+    check_widths(model, data)
+}
+
+/// Checks, before any work, that `data` (already passed by [`check_dataset`]) suits the
+/// widths of `model`: the inputs are as wide as each layer that names an input width
+/// expects, every class label is below the model's output width, and value targets are as
+/// wide as the model's output. Two layers that disagree skip the checks that need the output
+/// width.
+pub(super) fn check_widths(model: &Sequential, data: &Dataset) -> Result<(), Error> {
     let (rows, mut width) = (data.len(), data.features());
     // Whether an earlier layer named an input width, so that `width` is checked against it.
     let mut named = false;
@@ -1091,7 +1109,7 @@ pub fn accuracy(model: &Sequential, params: &ParamStore, data: &Dataset, batch: 
 
 /// The index of the first largest value of `row`, ignoring NaN; `None` if every value is
 /// NaN.
-fn argmax(row: &[f32]) -> Option<usize> {
+pub(super) fn argmax(row: &[f32]) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (i, &v) in row.iter().enumerate() {
         if !v.is_nan() && best.is_none_or(|(_, b)| v > b) {

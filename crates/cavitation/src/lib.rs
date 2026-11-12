@@ -122,7 +122,7 @@ pub use cavitation_nn;
 
 /// The names most programs need, for `use cavitation::prelude::*;`: tensors and autograd,
 /// layers and activations (with the settings their fields take), optimisers, the training
-/// loop and its batches, health checks, hooks, inference, saving and loading, the random
+/// loop and its batches, evaluation, health checks, hooks, inference, saving and loading, the random
 /// generator, the gradient checks, and the traits for writing your own parts.
 ///
 /// ```
@@ -151,13 +151,13 @@ pub mod prelude {
     };
     pub use cavitation_nn::{
         Activation, ActivationLayer, Adam, AdamW, BadInput, Batch, BatchView, Batcher, Celu,
-        Dataset, Elu, EpochReport, FitConfig, Gelu, Glu, GradStats, Hardsigmoid, Hardswish,
-        Hardtanh, Health, HealthMonitor, History, Hooks, InferenceModel, Init, Layer, LayerEvent,
-        LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss, LrSchedule, Mish, NeuronMask,
-        OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu, Relu6, Selu, Sequential, Sgd,
-        Sigmoid, Silu, Softmax, Softplus, Softsign, StepInputs, Tanh, Targets, TargetsView, Trace,
-        Trainer, Warning, WarningKind, accuracy, fit, fit_with_hooks, load, load_lenient,
-        load_with, save,
+        Dataset, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Gelu, Glu, GradStats,
+        Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks, InferenceModel,
+        Init, Layer, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss,
+        LrSchedule, Mish, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu, Relu6,
+        Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, StepInputs, Tanh,
+        Targets, TargetsView, Trace, Trainer, Warning, WarningKind, accuracy, evaluate, fit,
+        fit_with_hooks, load, load_lenient, load_with, save,
     };
 }
 

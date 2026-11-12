@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Health, Hooks, InferenceModel, Init, Linear,
-    Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace, Trainer,
-    Warning,
+    Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats, Health, Hooks, InferenceModel,
+    Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace,
+    Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -611,9 +611,46 @@ fn trace_with_capacity_allocates_nothing() -> usize {
     made
 }
 
+/// Evaluates the 50k network on the 1,437-row set at batch 128 (a last batch of 29): with
+/// cross-entropy on class labels (`evaluate` and `misclassified`) and with mean squared error
+/// on value targets (`evaluate`, with R²). One warm-up call of each, then 100 more calls of
+/// each. Returns the allocations made after the warm-up.
+fn evaluator_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let classes = synthetic_1437();
+    let mut rng = Rng::seed(3);
+    let y: Vec<f32> = (0..1437 * 10)
+        .map(|_| rng.range(-1.0, 1.0) as f32)
+        .collect();
+    let values = Dataset {
+        x: classes.x.clone(),
+        targets: Targets::Values(Tensor::from_vec(y, &[1437, 10]).unwrap()),
+    };
+    let mut ce = Evaluator::new(&net, &params, Loss::CrossEntropy, 128).unwrap();
+    let mut mse = Evaluator::new(&net, &params, Loss::Mse, 128).unwrap();
+    let mut wrong = Vec::new();
+    let mut sink = 0.0;
+    let mut before = 0;
+    for call in 0..101 {
+        if call == 1 {
+            before = allocations();
+        }
+        let e = ce.evaluate(&classes).unwrap();
+        sink += e.loss + e.accuracy.unwrap();
+        ce.misclassified(&classes, &mut wrong).unwrap();
+        sink += wrong.len() as f64;
+        let e = mse.evaluate(&values).unwrap();
+        sink += e.loss + e.r2.unwrap();
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite() && !wrong.is_empty());
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 14] = [
+    let scenarios: [Scenario; 15] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -627,6 +664,7 @@ fn main() -> ExitCode {
         ("health_steady_state", health_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),
+        ("evaluator_steady_state", evaluator_steady_state),
         (
             "trace_with_capacity_allocates_nothing",
             trace_with_capacity_allocates_nothing,
