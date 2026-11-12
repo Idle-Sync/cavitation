@@ -645,6 +645,20 @@ pub struct EpochReport {
     /// The epoch's number, counting from 1.
     pub epoch: usize,
     /// The mean loss over the epoch's rows: each batch's loss weighted by its row count.
+    ///
+    /// A PyTorch loop that averages the batch means gives a slightly different figure when the
+    /// last batch is short, because it counts that batch as much as a full one. This loop
+    /// gives the same figure as `mean_loss`:
+    ///
+    /// ```python
+    /// total, rows = 0.0, 0
+    /// for x, y in loader:
+    ///     loss = criterion(model(x), y)  # mean over the batch's rows
+    ///     total += loss.item() * len(x)
+    ///     rows += len(x)
+    ///     # ... backward and step ...
+    /// mean_loss = total / rows
+    /// ```
     pub mean_loss: f64,
     /// The epoch's wall-clock time in seconds.
     pub seconds: f64,

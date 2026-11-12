@@ -1061,6 +1061,10 @@ impl<T: Real> Optimizer<T> for Adam<T> {
 /// weight decay is decoupled, `p ← p·(1 − lr·wd)` before the Adam update, and the default
 /// weight decay is 0.01.
 ///
+/// The default decay pulls every parameter towards 0 on every step, so with a constant rate it
+/// can keep a run from settling on a minimum away from 0; set `with_weight_decay(0.0)` when
+/// the minimum is not near 0.
+///
 /// # Examples
 ///
 /// ```

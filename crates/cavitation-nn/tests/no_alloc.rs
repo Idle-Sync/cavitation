@@ -10,7 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 use cavitation_nn::{
     Adam, AdamW, Batch, Batcher, Dataset, GradStats, Health, Hooks, InferenceModel, Init, Linear,
-    Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trainer, Warning,
+    Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace, Trainer,
+    Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -495,9 +496,36 @@ fn infer_batch_steady_state() -> usize {
     made
 }
 
+/// Traces the 5-layer 50k network (three `Linear` and two `Relu`) into a trace made with
+/// `Trace::with_capacity(5)`: one warm-up pass (which starts the tape's buffers), then 100
+/// more passes through `forward_traced` with the same trace and graph. Returns the allocations
+/// made after the warm-up.
+fn trace_with_capacity_allocates_nothing() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    let mut graph = Graph::new();
+    let mut trace = Trace::with_capacity(net.len());
+    let mut sink = 0usize;
+    let mut before = 0;
+    for pass in 0..101 {
+        if pass == 1 {
+            before = allocations();
+        }
+        let mut tape = graph.tape(&params.values);
+        let x = tape.input(TensorView::from_slice(&rows[..128 * 64], &[128, 64]).unwrap());
+        net.forward_traced(&mut tape, x, &mut trace);
+        sink += trace.len();
+    }
+    let made = allocations() - before;
+    assert_eq!(sink, 101 * 5);
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 10] = [
+    let scenarios: [Scenario; 11] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -508,6 +536,10 @@ fn main() -> ExitCode {
         ("health_steady_state", health_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),
+        (
+            "trace_with_capacity_allocates_nothing",
+            trace_with_capacity_allocates_nothing,
+        ),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

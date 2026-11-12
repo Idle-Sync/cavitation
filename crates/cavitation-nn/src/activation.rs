@@ -734,6 +734,18 @@ builtin_layer!(
     LeakyRelu { slope: 0.01 },
     |s| ActivationKind::LeakyRelu(s.slope)
 );
+
+impl Default for LeakyRelu {
+    /// PyTorch's `nn.LeakyReLU()` default: negative slope 0.01.
+    ///
+    /// ```
+    /// use cavitation_nn::LeakyRelu;
+    /// assert_eq!(LeakyRelu::default().slope, 0.01);
+    /// ```
+    fn default() -> LeakyRelu {
+        LeakyRelu { slope: 0.01 }
+    }
+}
 builtin_layer!(
     /// The hyperbolic tangent.
     Tanh, Tanh, |_s| ActivationKind::Tanh
@@ -751,6 +763,20 @@ builtin_layer!(
     Gelu { approx: cavitation_core::GeluApprox::Exact },
     |s| ActivationKind::Gelu(s.approx)
 );
+
+impl Default for Gelu {
+    /// PyTorch's `nn.GELU()` default: the exact (erf) form, `approximate='none'`.
+    ///
+    /// ```
+    /// use cavitation_nn::Gelu;
+    /// assert_eq!(Gelu::default().approx, cavitation_core::GeluApprox::Exact);
+    /// ```
+    fn default() -> Gelu {
+        Gelu {
+            approx: cavitation_core::GeluApprox::Exact,
+        }
+    }
+}
 builtin_layer!(
     /// ELU: `x` above 0, `alpha · (eˣ - 1)` elsewhere.
     Elu {
@@ -760,6 +786,18 @@ builtin_layer!(
     Elu { alpha: 1.0 },
     |s| ActivationKind::Elu(s.alpha)
 );
+
+impl Default for Elu {
+    /// PyTorch's `nn.ELU()` default: `alpha` 1.0.
+    ///
+    /// ```
+    /// use cavitation_nn::Elu;
+    /// assert_eq!(Elu::default().alpha, 1.0);
+    /// ```
+    fn default() -> Elu {
+        Elu { alpha: 1.0 }
+    }
+}
 builtin_layer!(
     /// SELU, the scaled ELU of self-normalising networks.
     Selu, Selu, |_s| ActivationKind::Selu
@@ -773,6 +811,18 @@ builtin_layer!(
     Celu { alpha: 1.0 },
     |s| ActivationKind::Celu(s.alpha)
 );
+
+impl Default for Celu {
+    /// PyTorch's `nn.CELU()` default: `alpha` 1.0.
+    ///
+    /// ```
+    /// use cavitation_nn::Celu;
+    /// assert_eq!(Celu::default().alpha, 1.0);
+    /// ```
+    fn default() -> Celu {
+        Celu { alpha: 1.0 }
+    }
+}
 builtin_layer!(
     /// SiLU (swish): `x · σ(x)`.
     Silu, Silu, |_s| ActivationKind::Silu
@@ -792,6 +842,22 @@ builtin_layer!(
     Softplus { beta: 1.0, threshold: 20.0 },
     |s| ActivationKind::Softplus { beta: s.beta, threshold: s.threshold }
 );
+
+impl Default for Softplus {
+    /// PyTorch's `nn.Softplus()` defaults: `beta` 1 and `threshold` 20.
+    ///
+    /// ```
+    /// use cavitation_nn::Softplus;
+    /// let softplus = Softplus::default();
+    /// assert_eq!((softplus.beta, softplus.threshold), (1.0, 20.0));
+    /// ```
+    fn default() -> Softplus {
+        Softplus {
+            beta: 1.0,
+            threshold: 20.0,
+        }
+    }
+}
 builtin_layer!(
     /// Softsign: `x / (1 + |x|)`.
     Softsign, Softsign, |_s| ActivationKind::Softsign
@@ -807,6 +873,22 @@ builtin_layer!(
     Hardtanh { min: -1.0, max: 1.0 },
     |s| ActivationKind::Hardtanh { min: s.min, max: s.max }
 );
+
+impl Default for Hardtanh {
+    /// PyTorch's `nn.Hardtanh()` defaults: `min_val` -1 and `max_val` 1.
+    ///
+    /// ```
+    /// use cavitation_nn::Hardtanh;
+    /// let hardtanh = Hardtanh::default();
+    /// assert_eq!((hardtanh.min, hardtanh.max), (-1.0, 1.0));
+    /// ```
+    fn default() -> Hardtanh {
+        Hardtanh {
+            min: -1.0,
+            max: 1.0,
+        }
+    }
+}
 builtin_layer!(
     /// ReLU6: `min(max(x, 0), 6)`.
     Relu6, Relu6, |_s| ActivationKind::Relu6

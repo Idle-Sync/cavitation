@@ -51,8 +51,16 @@ impl Trace {
     }
 
     /// An empty trace with room for `layers` layers, so tracing a network of that many layers
-    /// allocates nothing.
-    pub(crate) fn with_capacity(layers: usize) -> Trace {
+    /// allocates nothing. A manual training loop that makes its trace this way and passes it to
+    /// [`Sequential::forward_traced`] each step allocates nothing for the trace, as
+    /// [`Trainer`](crate::Trainer) does not.
+    ///
+    /// ```
+    /// use cavitation_nn::Trace;
+    /// let trace = Trace::with_capacity(5);
+    /// assert!(trace.is_empty());
+    /// ```
+    pub fn with_capacity(layers: usize) -> Trace {
         Trace {
             inputs: Vec::with_capacity(layers),
             outputs: Vec::with_capacity(layers),

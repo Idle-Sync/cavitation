@@ -34,6 +34,12 @@ fn split_order(n: usize) -> Vec<usize> {
 /// Loads the digits data set from `data/digits/digits.csv`, shuffled with
 /// [`Mulberry32`] (seed 42) and split into 1,437 training rows and 360 test rows.
 ///
+/// The split can be reproduced outside this repository. Start from the rows of `digits.csv` in
+/// file order, numbered 0 to 1,796. Draw numbers `r` in `[0, 1)` from mulberry32 with seed 42
+/// (see [`Mulberry32`]). Then for `i` from 1,796 down to 1, let `k = floor(r · (i + 1))`, with
+/// a fresh `r` each time, and swap entries `i` and `k` of the order. The first 1,437 entries
+/// of the order are the training rows, in that order, and the other 360 are the test rows.
+///
 /// Each row has 64 features, the 8 by 8 pixel counts divided by 16 (so in 0 to 1), and a
 /// class label 0 to 9 ([`Targets::Classes`]). The file is found relative to this crate's
 /// source directory, so the function works from a checkout of the repository.

@@ -7,6 +7,33 @@ as the last column. There is no header.
 
 SHA-256 of `digits.csv`: `6ebb3d2fee246a4e99363262ddf8a00a3c41bee6014c373ed9d9216ba7f651b8`
 
+## The train and test split
+
+The library's loader shuffles the 1,797 rows and takes the first 1,437 as the training set and
+the other 360 as the test set. To rebuild the split elsewhere: number the rows of `digits.csv`
+0 to 1,796 in file order; draw numbers `r` in `[0, 1)` from the mulberry32 generator with seed
+42 (the 32-bit output divided by 2^32); then for `i` from 1,796 down to 1, let
+`k = floor(r * (i + 1))` with a fresh `r` each time, and swap entries `i` and `k` of the order.
+Entries 0 to 1,436 of the order are the training rows, in that order, and entries 1,437 to
+1,796 are the test rows. The first five entries are 1784, 96, 434, 1205 and 1703.
+
+```python
+def mulberry32(seed):
+    state = seed & 0xFFFFFFFF
+    while True:
+        state = (state + 0x6D2B79F5) & 0xFFFFFFFF
+        t = ((state ^ (state >> 15)) * (1 | state)) & 0xFFFFFFFF
+        t = ((t + (((t ^ (t >> 7)) * (61 | t)) & 0xFFFFFFFF)) & 0xFFFFFFFF) ^ t
+        yield (t ^ (t >> 14)) / 4294967296
+
+rng = mulberry32(42)
+order = list(range(1797))
+for i in range(1796, 0, -1):
+    k = int(next(rng) * (i + 1))
+    order[i], order[k] = order[k], order[i]
+train, test = order[:1437], order[1437:]
+```
+
 ## Source and citation
 
 The data is the test set of the UCI "Optical Recognition of Handwritten Digits" data set,

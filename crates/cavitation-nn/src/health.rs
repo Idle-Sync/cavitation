@@ -246,7 +246,9 @@ pub enum Warning {
     /// Neurons turned off by a [`NeuronMask`](crate::NeuronMask), on the activation layer or
     /// on the layer before it, are not counted. Sent to the sink every epoch; without a sink,
     /// printed when the layer's share of dead neurons passes 25%, 50% or 90% for the first
-    /// time.
+    /// time. "Dead" is measured per epoch and on the data the epoch ran over: a neuron that is
+    /// silent on every training row of one epoch can fire in a later epoch, once the layers
+    /// before it change, or on rows it was not counted on.
     DeadNeurons {
         /// The epoch, as passed to [`HealthMonitor::end_epoch`].
         epoch: usize,
