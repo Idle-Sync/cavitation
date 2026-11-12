@@ -1,7 +1,7 @@
 //! Timed runs: the matrix products of one training step, each timed on its own, and the
 //! training and inference runs that are compared with the numpy baseline.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::path::Path;
 use std::rc::Rc;
@@ -13,7 +13,7 @@ use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_datasets::{cifar10, digits, mnist};
 use cavitation_nn::{
     Adam, Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, Optimizer,
-    OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer, Warning,
+    OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer, Warning, WarningKind,
 };
 
 use crate::numpy;
@@ -229,6 +229,68 @@ pub struct Comparison {
     pub blas_threads: String,
     /// How to show a median: `s/epoch`, `samples/s`, `steps/s` or `us/call`.
     pub unit: Unit,
+    /// The health warnings the run raised, by kind (see [`HealthLog::summary`]); empty for
+    /// runs that do not train.
+    pub health: String,
+}
+
+/// The health warnings of one training run, grouped by kind.
+#[derive(Debug, Default)]
+pub struct HealthLog {
+    /// For each kind in order of first appearance: the layer or location of its first
+    /// warning, the epoch of that warning (0 for the untimed warm-up) and how many came.
+    groups: Vec<(WarningKind, Option<String>, usize, usize)>,
+}
+
+impl HealthLog {
+    /// Records `warning`, raised during `epoch` (0 for the untimed warm-up steps). A warning
+    /// that knows its own epoch (dead neurons) uses that one.
+    pub fn record(&mut self, warning: &Warning, epoch: usize) {
+        let kind = warning.kind();
+        if let Some(group) = self.groups.iter_mut().find(|g| g.0 == kind) {
+            group.3 += 1;
+            return;
+        }
+        let place = match (warning.layer(), warning.location()) {
+            (Some(layer), _) => Some(format!("layer {layer}")),
+            (None, Some(location)) => Some(location.to_string()),
+            (None, None) => None,
+        };
+        self.groups
+            .push((kind, place, warning.epoch().unwrap_or(epoch), 1));
+    }
+
+    /// How many warnings were recorded in all.
+    pub fn total(&self) -> usize {
+        self.groups.iter().map(|g| g.3).sum()
+    }
+
+    /// One line naming each kind with its layer (or location) and first epoch, then its
+    /// count, for example `health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x4`;
+    /// `health: no warnings` if there were none.
+    pub fn summary(&self) -> String {
+        if self.groups.is_empty() {
+            return "health: no warnings".to_string();
+        }
+        let kinds: Vec<String> = self
+            .groups
+            .iter()
+            .map(|(kind, place, epoch, count)| {
+                let from = if *epoch == 0 {
+                    "from the warm-up".to_string()
+                } else {
+                    format!("from epoch {epoch}")
+                };
+                match place {
+                    Some(place) => format!("{kind:?} ({place}, {from}) x{count}"),
+                    None => format!("{kind:?} ({from}) x{count}"),
+                }
+            })
+            .collect();
+        let total = self.total();
+        let noun = if total == 1 { "warning" } else { "warnings" };
+        format!("health: {total} {noun}: {}", kinds.join("; "))
+    }
 }
 
 /// How a median time is shown.
@@ -294,12 +356,12 @@ pub struct TrainSpec {
 
 /// Times `spec.epochs` epochs (or runs of `spec.steps` steps) of training through the public
 /// path (`Trainer`, `Batcher`, the default health checks on) after [`TRAIN_WARMUP`] untimed
-/// steps, and returns the seconds of each, with the count of health warnings.
+/// steps, and returns the seconds of each, with the health warnings raised.
 ///
 /// # Errors
 ///
 /// Returns a message if the training stops (a non-finite value) or the data is missing.
-fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), String> {
+fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, HealthLog), String> {
     let mut params = ParamStore::new();
     let net = build_net(&mut params, &spec.widths);
     let optimizer = if spec.adam {
@@ -315,11 +377,16 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
         }
     };
     let mut trainer = Trainer::new(&net, optimizer.build(), Loss::CrossEntropy, spec.batch);
-    // The default checks, with the warnings counted instead of printed to standard error.
-    let warnings = Rc::new(Cell::new(0usize));
-    let counter = Rc::clone(&warnings);
+    // The default checks, with the warnings recorded instead of printed to standard error:
+    // the sink adds to a count (the first of each kind also keeps its place), and the
+    // summary is formatted after the timing.
+    let warnings = Rc::new(RefCell::new(HealthLog::default()));
+    let epoch_now = Rc::new(Cell::new(0usize));
+    let (log, now) = (Rc::clone(&warnings), Rc::clone(&epoch_now));
     trainer.set_health(Health {
-        sink: Some(Box::new(move |_: &Warning| counter.set(counter.get() + 1))),
+        sink: Some(Box::new(move |w: &Warning| {
+            log.borrow_mut().record(w, now.get());
+        })),
         ..Health::default()
     });
     let mut batcher = Batcher::new(data.len(), spec.batch, None);
@@ -338,6 +405,7 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
     let count = spec.steps.unwrap_or(ranges.len());
     let mut seconds = Vec::with_capacity(spec.epochs);
     for epoch in 1..=spec.epochs {
+        epoch_now.set(epoch);
         let first = (epoch - 1) * count;
         let start = Instant::now();
         batcher.epoch();
@@ -352,7 +420,7 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
         trainer.end_epoch(epoch).map_err(|e| e.to_string())?;
         seconds.push(start.elapsed().as_secs_f64());
     }
-    Ok((seconds, warnings.get()))
+    Ok((seconds, warnings.take()))
 }
 
 /// Loads the training data a run needs: MNIST's 60,000 images from `data/mnist/`,
@@ -384,7 +452,7 @@ fn net_arg(widths: &[usize]) -> String {
 /// Returns a message if either side fails.
 pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, String> {
     let data = load_training_data(spec.data)?;
-    let (ours, warnings) = train_ours(spec, &data)?;
+    let (ours, health) = train_ours(spec, &data)?;
     let rows = data.len();
     let epoch_steps = rows.div_ceil(spec.batch);
     let steps = spec.steps.unwrap_or(epoch_steps);
@@ -431,7 +499,7 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
             },
             TRAIN_WARMUP,
             spec.epochs,
-            warnings
+            health.total()
         ),
         ours,
         numpy: theirs.samples,
@@ -446,6 +514,7 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
             rows as f64
         },
         unit: spec.unit,
+        health: health.summary(),
     })
 }
 
@@ -516,6 +585,7 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
         blas_threads: theirs.blas_threads,
         work: LATENCY_CALLS as f64,
         unit: Unit::MicrosPerCall,
+        health: String::new(),
     })
 }
 
@@ -523,6 +593,39 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Warnings group by kind, keeping the first one's place and epoch, and the summary
+    /// names each kind once with its count.
+    #[test]
+    fn health_log_groups_by_kind() {
+        let mut log = HealthLog::default();
+        assert_eq!(log.summary(), "health: no warnings");
+        let dead = |layer| Warning::DeadNeurons {
+            epoch: 1,
+            layer,
+            width: 8,
+            neurons: vec![0],
+        };
+        for layer in [3, 3, 5, 3] {
+            log.record(&dead(layer), 1);
+        }
+        assert_eq!(
+            log.summary(),
+            "health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x4"
+        );
+        let vanishing = Warning::Vanishing {
+            step: 9,
+            layer: "linear_2".to_string(),
+            norm: 1e-9,
+        };
+        log.record(&vanishing, 0);
+        assert_eq!(log.total(), 5);
+        assert_eq!(
+            log.summary(),
+            "health: 5 warnings: DeadNeurons (layer 3, from epoch 1) x4; \
+             Vanishing (linear_2, from the warm-up) x1"
+        );
+    }
 
     /// The 1M network's eight products do 4,799,488 FLOPs per sample (6 × weights minus the
     /// first layer's input gradient), and the digits network's 269,824.

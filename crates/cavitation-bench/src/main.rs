@@ -282,6 +282,9 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
     for row in rows {
         println!("{}: {}; {}", row.name, row.detail, row.timing_note);
     }
+    for row in rows.iter().filter(|r| !r.health.is_empty()) {
+        println!("{}: {}", row.name, row.health);
+    }
     write_results(rows, &load)
 }
 
@@ -303,11 +306,12 @@ fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
         .iter()
         .map(|r| {
             format!(
-                "    {{\"name\": \"{}\", \"detail\": \"{}\", \"timing\": \"{}\", \"unit\": \"{}\", \
+                "    {{\"name\": \"{}\", \"detail\": \"{}\", \"health\": \"{}\", \"timing\": \"{}\", \"unit\": \"{}\", \
                  \"cavitation\": {:e}, \"numpy\": {:e}, \"ratio\": {:e},\n     \
                  \"cavitation_seconds\": {}, \"numpy_seconds\": {}}}",
                 escape(&r.name),
                 escape(&r.detail),
+                escape(&r.health),
                 escape(&r.timing_note),
                 r.unit_label(),
                 r.value(runs::median(&r.ours)),
