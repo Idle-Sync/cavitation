@@ -464,8 +464,9 @@ fn run_to_run_identical() {
     }
 }
 
-/// The reported thread count is the one the call runs on: never more than its tasks. Each
-/// level runs its own kernel: one of its tiles is one task, two side by side are two.
+/// The reported thread count is the one the call runs on: never more than its tasks, and 1
+/// for a product under the single-thread threshold. Each level runs its own kernel: one of
+/// its tiles is one task, two side by side are two.
 #[test]
 fn threads_used_matches_the_work() {
     for (level, mr, nr) in fast_levels("threads_used_matches_the_work") {
@@ -477,6 +478,13 @@ fn threads_used_matches_the_work() {
         );
         assert_eq!(threads_used(level, 4, 128, 1024, 784), 4, "{level}");
         assert_eq!(threads_used(level, 4, 0, 1024, 784), 1, "{level}");
+        // Under 2¹⁸ floating-point operations a product runs on the caller alone (64·32·32
+        // is 2¹⁷); at 2¹⁸ (64·64·32) it is split again.
+        assert_eq!(threads_used(level, 4, 64, 32, 32), 1, "{level}: 2^17 FLOPs");
+        assert!(
+            threads_used(level, 4, 64, 64, 32) > 1,
+            "{level}: 2^18 FLOPs"
+        );
         assert!(
             threads_used(level, 1000, 1024, 1024, 1024) <= 256,
             "{level}"

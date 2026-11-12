@@ -141,9 +141,10 @@ thread_local! {
 
 #[cfg(test)]
 thread_local! {
-    /// How many times this thread has handed a job to a worker, for the tests. Kept per
-    /// thread so that pool calls from tests running at the same time do not count.
-    static WAKE_UPS: Cell<usize> = const { Cell::new(0) };
+    /// How many times this thread has posted a job to a worker, for the tests: every post
+    /// counts, whether the worker was spinning or parked (this is not a count of unparks).
+    /// Kept per thread so that pool calls from tests running at the same time do not count.
+    static POSTS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// Locks `m`, ignoring poisoning: nothing panics while these locks are held.
@@ -369,7 +370,7 @@ fn run_on_pool(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
         // worker sees this call, or we see that it is parked and unpark it.
         w.posted.store(call, Ordering::SeqCst);
         #[cfg(test)]
-        WAKE_UPS.set(WAKE_UPS.get() + 1);
+        POSTS.set(POSTS.get() + 1);
         if w.parked.load(Ordering::SeqCst)
             && let Some(t) = w.thread.get()
         {
@@ -825,16 +826,28 @@ mod tests {
     }
 
     /// A job of one task, or a job given one thread, runs on the calling thread as worker 0
-    /// and wakes no worker: this thread's wake-up count stays the same over 1,000 such
-    /// calls of each kind, while a 4-task job on 4 threads does wake workers.
+    /// and wakes no worker: this thread's count of posts to workers stays the same over 1,000
+    /// such calls of each kind, while a 4-task job on 4 threads does post to workers.
     #[test]
     fn single_task_job_wakes_no_worker() {
         let _serial = serial();
         let me = std::thread::current().id();
-        // Start the workers, so a call that wrongly used them would find them ready.
-        assert!(counts(4, 4).iter().all(|&c| c == 1));
-        let before = WAKE_UPS.get();
-        assert!(before > 0, "a 4-task job on 4 threads wakes workers");
+        // Start the workers, so a call that wrongly used them would find them ready. A call
+        // runs inline while another module's test holds the pool, so retry until one posts.
+        let start = POSTS.get();
+        let mut attempts = 0;
+        while POSTS.get() == start {
+            attempts += 1;
+            assert!(
+                attempts <= 10_000,
+                "no 4-task job on 4 threads reached the pool"
+            );
+            assert!(counts(4, 4).iter().all(|&c| c == 1));
+            if POSTS.get() == start {
+                std::thread::yield_now();
+            }
+        }
+        let before = POSTS.get();
         let ran = AtomicUsize::new(0);
         let on_caller = |t: Task| {
             assert_eq!((t.worker, std::thread::current().id()), (0, me));
@@ -846,7 +859,7 @@ mod tests {
         }
         assert_eq!(ran.into_inner(), 5_000);
         assert_eq!(
-            WAKE_UPS.get(),
+            POSTS.get(),
             before,
             "a one-task or one-thread job woke a worker"
         );

@@ -24,7 +24,8 @@
 //!   `CAVITATION_THREADS` set. It prints each run's wall-clock and CPU seconds, then the
 //!   medians and the 4-thread figures over the 1-thread ones, and checks that every run
 //!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
-//!   only. `small --child` is the child's side: one run at the current thread count.
+//!   only; its ticks are taken as 1/100 s (`USER_HZ` = 100, as on x86 and Arm Linux).
+//!   `small --child` is the child's side: one run at the current thread count.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
