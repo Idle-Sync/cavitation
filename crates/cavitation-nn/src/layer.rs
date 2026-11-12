@@ -6,7 +6,7 @@ use crate::{Activation, InferenceLayer};
 
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
-/// The trait is object safe, so a network can hold its layers as `Box<dyn Layer<T>>`.
+/// The trait is object safe, so a network can hold its layers as `Box<dyn Layer<T>>` or an `Arc<dyn Layer<T>>`.
 /// Layers keep only [`ParamId`]s, never values: the values live in the
 /// [`ParamStore`](cavitation_core::ParamStore).
 ///
