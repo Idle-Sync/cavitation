@@ -406,6 +406,94 @@ fn masked_training_step() -> usize {
     made
 }
 
+/// Looks up parameters of the 50k network by name 1,000 times (each of its six names, one
+/// after another) and returns the allocations made.
+fn param_lookup() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let names = [
+        "0.weight", "0.bias", "2.weight", "2.bias", "4.weight", "4.bias",
+    ];
+    let mut found = 0;
+    let before = allocations();
+    for i in 0..1000 {
+        if net.param(names[i % names.len()]).is_some() {
+            found += 1;
+        }
+        if net.param("9.weight").is_some() || net.param("x").is_some() {
+            found += 1;
+        }
+    }
+    let made = allocations() - before;
+    assert_eq!(found, 1000);
+    made
+}
+
+/// Switches neurons of a masked 50k network 1,000 times, on the first and the last `Linear`,
+/// and returns the allocations made (the masks exist before counting starts).
+fn set_neuron_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let mut net = network_50k(&mut params);
+    net.set_neuron_mask(0, NeuronMask::all_on(256));
+    net.set_neuron_mask(4, NeuronMask::all_on(10));
+    let before = allocations();
+    for i in 0..1000 {
+        let (linear, width) = if i % 2 == 0 { (0, 256) } else { (4, 10) };
+        net.set_neuron(linear, i % width, i % 3 == 0);
+    }
+    let made = allocations() - before;
+    assert!(net.neuron_mask(0).unwrap().count_on() < 256);
+    made
+}
+
+/// Trains the 50k network with neuron masks on both ReLU layers, set with `set_neuron`, with
+/// one forward and one backward hook on the first ReLU layer, SGD and Adam, batch 128: one
+/// whole warm-up epoch, then counts the allocations of a second whole epoch.
+fn masked_hooks_steady_state() -> usize {
+    let data = synthetic_1437();
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let mut net = network_50k(&mut params);
+        for (linear, width, every) in [(0, 256, 3), (2, 128, 5)] {
+            net.set_neuron_mask(linear, NeuronMask::all_on(width));
+            for neuron in (0..width).step_by(every) {
+                net.set_neuron(linear, neuron, false);
+            }
+        }
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+        let mut seen = 0.0f32;
+        let mut grads = 0.0f32;
+        {
+            let mut hooks = Hooks::new();
+            hooks.on_forward(1, |e| seen += e.output.data()[1]);
+            hooks.on_backward(1, |e| grads += e.grad_output.unwrap().data()[1]);
+            let mut before = 0;
+            for epoch in 0..2 {
+                if epoch == 1 {
+                    before = allocations();
+                }
+                sink += hooked_epoch(
+                    &mut trainer,
+                    &net,
+                    &mut params,
+                    &data,
+                    &mut batcher,
+                    &mut batch,
+                    &mut hooks,
+                );
+            }
+            made += allocations() - before;
+        }
+        assert!(sink.is_finite() && sink > 0.0);
+        assert!(seen.is_finite() && grads.is_finite());
+    }
+    made
+}
+
 /// Trains the 50k network with `Trainer::step` on the centred 1,437-row set at batch 128,
 /// with SGD and with Adam, with every health check on (non-finite values, gradient norms, dead ReLU
 /// neurons) and a sink that counts warnings, calling `Trainer::end_epoch` after each epoch:
@@ -525,7 +613,7 @@ fn trace_with_capacity_allocates_nothing() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 11] = [
+    let scenarios: [Scenario; 14] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -533,6 +621,9 @@ fn main() -> ExitCode {
         ("manual_loop", manual_loop),
         ("no_hooks_no_cost", no_hooks_no_cost),
         ("masked_training_step", masked_training_step),
+        ("param_lookup", param_lookup),
+        ("set_neuron_steady_state", set_neuron_steady_state),
+        ("masked_hooks_steady_state", masked_hooks_steady_state),
         ("health_steady_state", health_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),

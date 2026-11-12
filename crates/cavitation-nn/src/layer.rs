@@ -2,7 +2,7 @@
 
 use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
-use crate::{Activation, InferenceLayer};
+use crate::{Activation, InferenceLayer, Linear};
 
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
@@ -111,6 +111,37 @@ pub trait Layer<T: Real>: Send + Sync {
     /// assert_eq!(names, ["weight", "bias"]);
     /// ```
     fn parameters(&self) -> Vec<(&'static str, ParamId)>;
+
+    /// The parameter with local name `local` (for example `"weight"`), if the layer has one.
+    /// The default searches [`parameters`](Self::parameters), which allocates; `Linear` and
+    /// `Prelu` answer without allocating.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear};
+    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
+    /// assert_eq!(Layer::<f32>::parameter(&layer, "bias"), Some(layer.bias()));
+    /// assert_eq!(Layer::<f32>::parameter(&layer, "scale"), None);
+    /// ```
+    fn parameter(&self, local: &str) -> Option<ParamId> {
+        self.parameters()
+            .into_iter()
+            .find(|(name, _)| *name == local)
+            .map(|(_, id)| id)
+    }
+
+    /// This layer as a [`Linear`], if it is one. The default is `None`.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear, Relu};
+    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
+    /// assert!(Layer::<f32>::as_linear(&layer).is_some());
+    /// assert!(Layer::<f32>::as_linear(&Relu).is_none());
+    /// ```
+    fn as_linear(&self) -> Option<&Linear> {
+        None
+    }
 
     /// The width of input the layer requires, if it requires one. [`Sequential`](crate::Sequential)
     /// checks it against the width of the previous layer's output. The default is `None`

@@ -1154,6 +1154,12 @@ impl<T: Real> Layer<T> for Prelu {
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         vec![("weight", self.weight)]
     }
+
+    /// `weight`, without allocating.
+    fn parameter(&self, local: &str) -> Option<ParamId> {
+        (local == "weight").then_some(self.weight)
+    }
+
     /// [`InferenceLayer::Prelu`] with the slopes copied from `params`.
     ///
     /// # Panics

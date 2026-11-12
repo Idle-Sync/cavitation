@@ -7,7 +7,7 @@ use cavitation_core::{ParamId, Real, Tape, Var};
 
 use crate::activation::last_dim;
 use crate::mask::LayerMask;
-use crate::{Layer, NeuronMask};
+use crate::{Layer, Linear, NeuronMask};
 
 /// Each layer's input and output [`Var`] from one forward pass. A masked layer's output is
 /// the masked value.
@@ -363,6 +363,213 @@ impl<T: Real> Sequential<T> {
         self.masks[layer].as_ref().map(|m| &m.mask)
     }
 
+    /// Layer `i` as a [`Linear`], or `None` if it is another kind of layer or there is no
+    /// layer `i`.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Relu);
+    /// assert_eq!(net.linear(0).unwrap().outputs(), 3);
+    /// assert!(net.linear(1).is_none() && net.linear(9).is_none());
+    /// ```
+    pub fn linear(&self, i: usize) -> Option<&Linear> {
+        self.layers.get(i)?.as_linear()
+    }
+
+    /// Every [`Linear`] layer with its layer index, in order.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 3, 1, &mut Rng::seed(1)));
+    /// let at: Vec<usize> = net.linears().map(|(i, _)| i).collect();
+    /// assert_eq!(at, [0, 2]);
+    /// ```
+    pub fn linears(&self) -> impl Iterator<Item = (usize, &Linear)> + '_ {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter_map(|(i, layer)| layer.as_linear().map(|linear| (i, linear)))
+    }
+
+    /// The parameter named `name` in the form of [`parameter_names`](Self::parameter_names),
+    /// `"{layer index}.{local name}"` such as `"2.bias"`, or `None` if there is no such
+    /// parameter. It does not allocate.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let layer = Linear::new(&mut params, 2, 3, &mut Rng::seed(0));
+    /// let bias = layer.bias();
+    /// let net = Sequential::new().push(layer);
+    /// assert_eq!(net.param("0.bias"), Some(bias));
+    /// assert_eq!(net.param("1.bias"), None);
+    /// ```
+    pub fn param(&self, name: &str) -> Option<ParamId> {
+        let (index, local) = name.split_once('.')?;
+        let digits = !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit());
+        if !digits || (index.len() > 1 && index.starts_with('0')) {
+            return None;
+        }
+        self.layers
+            .get(index.parse::<usize>().ok()?)?
+            .parameter(local)
+    }
+
+    /// The index of the layer whose output holds the neurons of the `Linear` at layer
+    /// `linear`: the layer after it if that one is element-wise (it has an
+    /// [`activation`](Layer::activation), or it is a `Prelu`), else the `Linear` itself.
+    /// Masks on a hidden neuron go on that layer, so that the neuron's output is 0 whatever
+    /// the activation gives at 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear`; the message names the index and the
+    /// layer's kind.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 3, 1, &mut Rng::seed(1)));
+    /// assert_eq!((net.neuron_layer(0), net.neuron_layer(2)), (1, 2));
+    /// ```
+    pub fn neuron_layer(&self, linear: usize) -> usize {
+        self.check_linear(linear);
+        match self.layers.get(linear + 1) {
+            Some(next) if next.activation().is_some() || next.name() == "prelu" => linear + 1,
+            _ => linear,
+        }
+    }
+
+    /// Puts `mask` on the neurons of the `Linear` at layer `linear`, on the layer
+    /// [`neuron_layer`](Self::neuron_layer) names, replacing any mask there.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear`; the message names the index and the
+    /// layer's kind.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Relu);
+    /// net.set_neuron_mask(0, NeuronMask::from_off(3, &[1]));
+    /// assert!(net.mask(1).is_some() && net.mask(0).is_none());
+    /// ```
+    pub fn set_neuron_mask(&mut self, linear: usize, mask: NeuronMask) {
+        let layer = self.neuron_layer(linear);
+        self.masks[layer] = Some(LayerMask::new(mask));
+    }
+
+    /// The mask on the neurons of the `Linear` at layer `linear`, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear`; the message names the index and the
+    /// layer's kind.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, NeuronMask, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// assert!(net.neuron_mask(0).is_none());
+    /// net.set_neuron_mask(0, NeuronMask::all_on(3));
+    /// assert_eq!(net.neuron_mask(0).unwrap().width(), 3);
+    /// ```
+    pub fn neuron_mask(&self, linear: usize) -> Option<&NeuronMask> {
+        self.masks[self.neuron_layer(linear)]
+            .as_ref()
+            .map(|m| &m.mask)
+    }
+
+    /// Removes the mask from the neurons of the `Linear` at layer `linear`, if it has one.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear`; the message names the index and the
+    /// layer's kind.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, NeuronMask, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// net.set_neuron_mask(0, NeuronMask::all_on(3));
+    /// net.clear_neuron_mask(0);
+    /// assert!(net.neuron_mask(0).is_none());
+    /// ```
+    pub fn clear_neuron_mask(&mut self, linear: usize) {
+        let layer = self.neuron_layer(linear);
+        self.masks[layer] = None;
+    }
+
+    /// Switches neuron `neuron` of the `Linear` at layer `linear` on or off. With a mask
+    /// already there it changes that one neuron in place, without allocating; without one it
+    /// first creates a mask with every neuron on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear` (the message names the index and the
+    /// layer's kind), or if `neuron` is not below the mask's width (the message names the
+    /// neuron and the width).
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Relu);
+    /// net.set_neuron(0, 2, false);
+    /// assert_eq!(net.neuron_mask(0).unwrap().off().collect::<Vec<_>>(), [2]);
+    /// ```
+    pub fn set_neuron(&mut self, linear: usize, neuron: usize, on: bool) {
+        let layer = self.neuron_layer(linear);
+        let slot = &mut self.masks[layer];
+        if slot.is_none() {
+            let width = self.layers[linear]
+                .as_linear()
+                .expect("check_linear passed")
+                .outputs();
+            *slot = Some(LayerMask::new(NeuronMask::all_on(width)));
+        }
+        let mask = slot.as_mut().expect("the mask was just created");
+        let width = mask.mask.width();
+        assert!(
+            neuron < width,
+            "sequential: neuron {neuron} is out of range for width {width} (layer {linear})"
+        );
+        mask.set(neuron, on);
+    }
+
+    /// Panics, naming the index and the layer's kind, if layer `linear` is not a `Linear`.
+    fn check_linear(&self, linear: usize) {
+        self.check_layer(linear, "address neurons of");
+        let layer = &self.layers[linear];
+        assert!(
+            layer.as_linear().is_some(),
+            "sequential: layer {linear} is a {} layer, not a linear layer",
+            layer.name()
+        );
+    }
+
     /// Panics, naming `action`, the index and the valid range, if `layer` is not a layer.
     fn check_layer(&self, layer: usize, action: &str) {
         let layers = self.layers.len();
@@ -510,7 +717,9 @@ mod tests {
 
     use cavitation_core::{Graph, ParamId, ParamStore, Real, Reduction, Rng, Tape, Tensor, Var};
 
-    use crate::{Init, Layer, Linear, NeuronMask, Optimizer, Relu, Sequential, Sgd};
+    use crate::{
+        Init, Layer, Linear, NeuronMask, Optimizer, Prelu, Relu, Sequential, Sgd, Sigmoid, Trace,
+    };
 
     /// The digits-shaped network, 64 → 32 → 10, with its parameters in `params`.
     fn digits_net(params: &mut ParamStore) -> Sequential {
@@ -574,6 +783,127 @@ mod tests {
         }
         assert_eq!(output(&net, &params, &x), before);
         assert_ne!(output(&copy, &copy_params, &x), before);
+    }
+
+    /// Layers `Linear, Relu, Linear` as a network.
+    fn lrl(params: &mut ParamStore) -> Sequential {
+        Sequential::new()
+            .push(Linear::new(params, 3, 4, &mut Rng::seed(1)))
+            .push(Relu)
+            .push(Linear::new(params, 4, 2, &mut Rng::seed(2)))
+    }
+
+    /// `linear` and `linears` find the `Linear` layers only.
+    #[test]
+    fn linear_by_index() {
+        let net = lrl(&mut ParamStore::new());
+        assert!(net.linear(0).is_some() && net.linear(2).is_some());
+        assert!(net.linear(1).is_none() && net.linear(3).is_none());
+        assert_eq!(net.linears().map(|(i, _)| i).collect::<Vec<_>>(), [0, 2]);
+    }
+
+    /// `"2.bias"` is layer 2's bias; unknown layers, locals and malformed names are `None`.
+    #[test]
+    fn param_by_name() {
+        let mut params = ParamStore::new();
+        let net = lrl(&mut params);
+        assert_eq!(net.param("2.bias"), Some(net.linear(2).unwrap().bias()));
+        assert_eq!(net.param("0.weight"), Some(net.linear(0).unwrap().weight()));
+        for bad in [
+            "7.weight", "x", "", ".", "1.weight", "2.scale", "02.bias", "+2.bias", "2",
+        ] {
+            assert_eq!(net.param(bad), None, "{bad:?}");
+        }
+        for (name, id) in net.parameter_names() {
+            assert_eq!(net.param(&name), Some(id));
+        }
+    }
+
+    /// The neuron mask of a hidden `Linear` goes on the activation after it; the output
+    /// `Linear` has none after it, so it takes the mask itself.
+    #[test]
+    fn neuron_mask_goes_after_activation() {
+        let mut net = lrl(&mut ParamStore::new());
+        net.set_neuron_mask(0, NeuronMask::from_off(4, &[1]));
+        assert!(net.mask(1).is_some() && net.mask(0).is_none());
+        net.set_neuron_mask(2, NeuronMask::from_off(2, &[0]));
+        assert!(net.mask(2).is_some());
+        assert_eq!((net.neuron_layer(0), net.neuron_layer(2)), (1, 2));
+        assert_eq!(net.neuron_mask(0).unwrap().width(), 4);
+        net.clear_neuron_mask(0);
+        assert!(net.mask(1).is_none() && net.neuron_mask(0).is_none());
+    }
+
+    /// A `Prelu` after a `Linear` carries its mask too.
+    #[test]
+    fn neuron_mask_goes_after_prelu() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+            .push(Prelu::new(&mut params, 1));
+        assert_eq!(net.neuron_layer(0), 1);
+    }
+
+    /// A masked sigmoid neuron outputs exactly 0, not 0.5.
+    #[test]
+    fn neuron_mask_on_sigmoid_outputs_zero() {
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut Rng::seed(5)))
+            .push(Sigmoid)
+            .push(Linear::new(&mut params, 4, 2, &mut Rng::seed(6)));
+        net.set_neuron(0, 1, false);
+        let x = Tensor::from_vec(vec![0.3f32, -0.8, 1.2, -0.5, 0.9, 0.1], &[2, 3]).unwrap();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let xi = tape.input(x.view());
+        let mut trace = Trace::new();
+        net.forward_traced(&mut tape, xi, &mut trace);
+        let out = tape.value(trace.output(1)).data();
+        for row in 0..2 {
+            assert_eq!(out[row * 4 + 1].to_bits(), 0.0f32.to_bits());
+            assert!(out[row * 4] > 0.0 && out[row * 4 + 2] > 0.0);
+        }
+    }
+
+    /// Addressing neurons of a layer that is not a `Linear` panics, naming the index and kind.
+    #[test]
+    #[should_panic(expected = "sequential: layer 1 is a relu layer, not a linear layer")]
+    fn neuron_mask_on_non_linear_panics() {
+        let mut net = lrl(&mut ParamStore::new());
+        net.set_neuron_mask(1, NeuronMask::all_on(4));
+    }
+
+    /// A neuron past the width panics, naming the neuron and the width.
+    #[test]
+    #[should_panic(expected = "neuron 4 is out of range for width 4")]
+    fn set_neuron_out_of_range_panics() {
+        let mut net = lrl(&mut ParamStore::new());
+        net.set_neuron(0, 4, false);
+    }
+
+    /// Switching neurons one at a time gives the same network as setting the whole mask,
+    /// including the stored 1/0 tensor (seen through the outputs).
+    #[test]
+    fn set_neuron_matches_set_neuron_mask() {
+        let mut params = ParamStore::new();
+        let mut a = lrl(&mut params);
+        let mut b = a.clone();
+        a.set_neuron(0, 1, false);
+        a.set_neuron(0, 3, false);
+        a.set_neuron(0, 3, true);
+        a.set_neuron(0, 0, false);
+        b.set_neuron_mask(0, NeuronMask::from_off(4, &[0, 1]));
+        assert_eq!(a.neuron_mask(0), b.neuron_mask(0));
+        let x = Tensor::from_vec(vec![0.3f32, -0.8, 1.2], &[1, 3]).unwrap();
+        let run = |net: &Sequential| {
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&params.values);
+            let xi = tape.input(x.view());
+            let y = net.forward(&mut tape, xi);
+            tape.value(y).data().to_vec()
+        };
+        assert_eq!(run(&a), run(&b));
     }
 
     /// A mask set before cloning is on both networks with the same contents; a mask set on

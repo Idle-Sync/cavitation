@@ -38,6 +38,91 @@ impl NeuronMask {
         }
     }
 
+    /// A mask of `width` neurons, every one off.
+    ///
+    /// ```
+    /// use cavitation_nn::NeuronMask;
+    /// let mask = NeuronMask::all_off(3);
+    /// assert_eq!((mask.width(), mask.count_on()), (3, 0));
+    /// ```
+    pub fn all_off(width: usize) -> NeuronMask {
+        NeuronMask {
+            on: vec![false; width],
+        }
+    }
+
+    /// A mask of `width` neurons with the neurons in `off` switched off and the rest on.
+    /// Listing a neuron twice is the same as listing it once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a neuron in `off` is `>= width`; the message names the neuron and the width.
+    ///
+    /// ```
+    /// use cavitation_nn::NeuronMask;
+    /// let mask = NeuronMask::from_off(5, &[1, 3]);
+    /// assert_eq!(mask.on().collect::<Vec<_>>(), [0, 2, 4]);
+    /// ```
+    pub fn from_off(width: usize, off: &[usize]) -> NeuronMask {
+        let mut mask = NeuronMask::all_on(width);
+        for &neuron in off {
+            mask.check(neuron, "from_off");
+            mask.on[neuron] = false;
+        }
+        mask
+    }
+
+    /// A mask of `width` neurons with only the neurons in `on` switched on.
+    /// Listing a neuron twice is the same as listing it once.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a neuron in `on` is `>= width`; the message names the neuron and the width.
+    ///
+    /// ```
+    /// use cavitation_nn::NeuronMask;
+    /// let mask = NeuronMask::from_on(5, &[0, 2, 4]);
+    /// assert_eq!(mask.off().collect::<Vec<_>>(), [1, 3]);
+    /// ```
+    pub fn from_on(width: usize, on: &[usize]) -> NeuronMask {
+        let mut mask = NeuronMask::all_off(width);
+        for &neuron in on {
+            mask.check(neuron, "from_on");
+            mask.on[neuron] = true;
+        }
+        mask
+    }
+
+    /// The positions of the neurons that are on, in increasing order.
+    ///
+    /// ```
+    /// use cavitation_nn::NeuronMask;
+    /// let mask = NeuronMask::from_off(4, &[0]);
+    /// assert_eq!(mask.on().collect::<Vec<_>>(), [1, 2, 3]);
+    /// ```
+    pub fn on(&self) -> impl Iterator<Item = usize> + '_ {
+        self.on
+            .iter()
+            .enumerate()
+            .filter(|(_, on)| **on)
+            .map(|(i, _)| i)
+    }
+
+    /// The positions of the neurons that are off, in increasing order.
+    ///
+    /// ```
+    /// use cavitation_nn::NeuronMask;
+    /// let mask = NeuronMask::from_off(4, &[0, 3]);
+    /// assert_eq!(mask.off().collect::<Vec<_>>(), [0, 3]);
+    /// ```
+    pub fn off(&self) -> impl Iterator<Item = usize> + '_ {
+        self.on
+            .iter()
+            .enumerate()
+            .filter(|(_, on)| !**on)
+            .map(|(i, _)| i)
+    }
+
     /// Turns neuron `neuron` on (`true`) or off (`false`).
     ///
     /// # Panics
@@ -105,6 +190,21 @@ impl NeuronMask {
     }
 }
 
+impl FromIterator<bool> for NeuronMask {
+    /// Collects one flag per neuron, `true` for on, so the mask's width is the number of flags.
+    ///
+    /// ```
+    /// use cavitation_nn::NeuronMask;
+    /// let mask: NeuronMask = [true, false, true].into_iter().collect();
+    /// assert_eq!(mask.on().collect::<Vec<_>>(), [0, 2]);
+    /// ```
+    fn from_iter<I: IntoIterator<Item = bool>>(flags: I) -> NeuronMask {
+        NeuronMask {
+            on: flags.into_iter().collect(),
+        }
+    }
+}
+
 /// A mask stored on a layer of a [`Sequential`](crate::Sequential): the mask, and the same as
 /// a `[width]` tensor of 1 (on) and 0 (off) that the forward pass records as the condition of
 /// [`Tape::keep_where`](cavitation_core::Tape::keep_where).
@@ -128,6 +228,16 @@ impl<T: Real> LayerMask<T> {
             Tensor::from_vec(values, &[mask.width()]).expect("a [width] tensor holds width values");
         LayerMask { mask, keep }
     }
+
+    /// Turns neuron `neuron` on or off in the mask and in the tensor, in place.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `neuron` is out of range for the mask's width.
+    pub(crate) fn set(&mut self, neuron: usize, on: bool) {
+        self.mask.set(neuron, on);
+        self.keep.data_mut()[neuron] = if on { T::ONE } else { T::ZERO };
+    }
 }
 
 #[cfg(test)]
@@ -148,6 +258,32 @@ mod tests {
         assert_eq!(mask.width(), 5);
         assert_eq!(mask.count_on(), 5);
         assert!((0..5).all(|i| mask.is_on(i)));
+    }
+
+    /// `from_off`, `from_on`, `all_off` and `collect` build the masks they name.
+    #[test]
+    fn mask_constructors() {
+        let off = NeuronMask::from_off(5, &[1, 3]);
+        assert_eq!(off.on().collect::<Vec<_>>(), [0, 2, 4]);
+        assert_eq!(off.off().collect::<Vec<_>>(), [1, 3]);
+        assert_eq!(
+            NeuronMask::from_on(5, &[1, 3]).on().collect::<Vec<_>>(),
+            [1, 3]
+        );
+        assert_eq!(
+            NeuronMask::from_on(5, &[1, 3]),
+            NeuronMask::from_off(5, &[0, 2, 4])
+        );
+        assert_eq!(NeuronMask::all_off(3).count_on(), 0);
+        let collected: NeuronMask = [true, false, false, true].into_iter().collect();
+        assert_eq!(collected, NeuronMask::from_off(4, &[1, 2]));
+    }
+
+    /// A neuron past the width panics in `from_off`, naming both.
+    #[test]
+    #[should_panic(expected = "NeuronMask::from_off: neuron 5 is out of range for width 5")]
+    fn from_off_out_of_range_panics() {
+        NeuronMask::from_off(5, &[5]);
     }
 
     /// `set` turns single neurons off and back on.
