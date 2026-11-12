@@ -14,6 +14,9 @@ pub const RECORD: usize = 1 + FEATURES;
 /// The number of classes; every label is below it.
 pub const CLASSES: usize = 10;
 
+/// Records in each of the six published batch files; [`load`] requires exactly this many.
+pub const RECORDS_PER_FILE: usize = 10_000;
+
 /// The five training batch files, in the order their records are loaded.
 const TRAIN_FILES: [&str; 5] = [
     "data_batch_1.bin",
@@ -77,11 +80,21 @@ fn parse_batch(
     Ok(())
 }
 
-/// Reads the batch files at `paths`, in order, into one dataset.
-fn load_files(paths: &[&Path]) -> Result<Dataset, Error> {
+/// Reads the batch files at `paths`, in order, into one dataset. With `per_file` set, each
+/// file must hold exactly that many records, or it is a `Format` error naming the file and
+/// the count found.
+fn load_files(paths: &[&Path], per_file: Option<usize>) -> Result<Dataset, Error> {
     let (mut pixels, mut labels) = (Vec::new(), Vec::new());
     for path in paths {
+        let before = labels.len();
         parse_batch(path, &read(path)?, &mut pixels, &mut labels)?;
+        let found = labels.len() - before;
+        if let Some(expected) = per_file.filter(|&n| n != found) {
+            return Err(Error::Format(format!(
+                "{}: {found} records, expected {expected}",
+                path.display()
+            )));
+        }
     }
     Ok(Dataset {
         x: Tensor::from_vec(pixels, &[labels.len(), FEATURES])?,
@@ -100,7 +113,8 @@ fn load_files(paths: &[&Path]) -> Result<Dataset, Error> {
 /// Returns [`Error::Io`] naming the file if it cannot be read; for a missing file the message
 /// points to `scripts/data/get-cifar10.sh`. Returns [`Error::Format`] naming the file if it
 /// is empty or not a whole number of [`RECORD`] (3,073) bytes long, or if a label is 10 or
-/// more.
+/// more. Any whole number of records is accepted; [`load`], which reads the published files,
+/// also requires [`RECORDS_PER_FILE`] in each.
 ///
 /// # Examples
 ///
@@ -120,20 +134,22 @@ fn load_files(paths: &[&Path]) -> Result<Dataset, Error> {
 /// assert!(matches!(&batch.targets, Targets::Classes(labels) if labels == &[3]));
 /// ```
 pub fn load_batch(path: &Path) -> Result<Dataset, Error> {
-    load_files(&[path])
+    load_files(&[path], None)
 }
 
 /// Loads CIFAR-10 from the binary version's batch files in `dir` (`data_batch_1.bin` to
 /// `data_batch_5.bin` and `test_batch.bin`), as `(train, test)`.
 ///
-/// The training set is the five training batches in order (50,000 images in the published
-/// files) and the test set is the test batch (10,000). Each image is a row of [`FEATURES`]
+/// The training set is the five training batches in order (50,000 images) and the test set
+/// is the test batch (10,000). Each image is a row of [`FEATURES`]
 /// (3,072) features, as [`load_batch`] reads it. `scripts/data/get-cifar10.sh` downloads and
 /// unpacks the files into `data/cifar10/`.
 ///
 /// # Errors
 ///
-/// Returns the first error of [`load_batch`] on any of the six files.
+/// Returns the first error of [`load_batch`] on any of the six files, or [`Error::Format`]
+/// naming the file and the count it holds if a file does not hold exactly
+/// [`RECORDS_PER_FILE`] (10,000) records.
 ///
 /// # Examples
 ///
@@ -143,10 +159,18 @@ pub fn load_batch(path: &Path) -> Result<Dataset, Error> {
 /// assert!(cavitation_datasets::cifar10::load(Path::new("no-such-directory")).is_err());
 /// ```
 pub fn load(dir: &Path) -> Result<(Dataset, Dataset), Error> {
+    load_dir(dir, RECORDS_PER_FILE)
+}
+
+/// [`load`] with `per_file` records required in each file, so tests can use small files.
+fn load_dir(dir: &Path, per_file: usize) -> Result<(Dataset, Dataset), Error> {
     let train: Vec<_> = TRAIN_FILES.iter().map(|name| dir.join(name)).collect();
     let train: Vec<&Path> = train.iter().map(|p| p.as_path()).collect();
     let test = dir.join(TEST_FILE);
-    Ok((load_files(&train)?, load_files(&[&test])?))
+    Ok((
+        load_files(&train, Some(per_file))?,
+        load_files(&[&test], Some(per_file))?,
+    ))
 }
 
 #[cfg(test)]
@@ -238,7 +262,7 @@ mod tests {
         let mut bytes = record(4, 0);
         bytes.extend(record(10, 0));
         std::fs::write(dir.join("data_batch_3.bin"), &bytes).unwrap();
-        let err = load(&dir).unwrap_err();
+        let err = load_dir(&dir, 2).unwrap_err();
         assert!(matches!(err, Error::Format(_)), "{err:?}");
         let text = err.to_string();
         assert!(text.contains("data_batch_3.bin"), "{text}");
@@ -250,9 +274,9 @@ mod tests {
     #[test]
     fn cifar_loads_train_and_test() {
         let dir = temp_dir("set");
-        write_set(&dir, 2, 3);
-        let (train, test) = load(&dir).unwrap();
-        assert_eq!((train.len(), test.len()), (10, 3));
+        write_set(&dir, 2, 2);
+        let (train, test) = load_dir(&dir, 2).unwrap();
+        assert_eq!((train.len(), test.len()), (10, 2));
         assert_eq!(train.features(), FEATURES);
         let Targets::Classes(labels) = &train.targets else {
             panic!("CIFAR-10 targets must be class labels");
@@ -260,6 +284,30 @@ mod tests {
         assert_eq!(labels, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
         // The first pixel of the fourth record (data_batch_2.bin's second) has seed 4.
         assert_eq!(train.x.data()[3 * FEATURES], 4.0 / 255.0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file with one record fewer than required (9,999 of 10,000, here 2 of 3) is a
+    /// `Format` error naming the file and the count found, while `load_batch` reads it.
+    #[test]
+    fn cifar_load_rejects_short_file() {
+        let dir = temp_dir("count");
+        write_set(&dir, 3, 3);
+        let short: Vec<u8> = (0..2).flat_map(|i| record(i, 0)).collect();
+        std::fs::write(dir.join("data_batch_4.bin"), &short).unwrap();
+        let err = load_dir(&dir, 3).unwrap_err();
+        assert!(matches!(err, Error::Format(_)), "{err:?}");
+        let text = err.to_string();
+        assert!(text.contains("data_batch_4.bin"), "{text}");
+        assert!(text.contains("2 records, expected 3"), "{text}");
+        assert_eq!(load_batch(&dir.join("data_batch_4.bin")).unwrap().len(), 2);
+
+        write_set(&dir, 3, 3);
+        std::fs::write(dir.join(TEST_FILE), &short).unwrap();
+        assert!(matches!(load_dir(&dir, 3), Err(Error::Format(_))));
+        // The published count: the small files fail through `load` itself.
+        let text = load(&dir).unwrap_err().to_string();
+        assert!(text.contains("3 records, expected 10000"), "{text}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

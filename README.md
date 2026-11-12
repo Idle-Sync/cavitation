@@ -165,7 +165,7 @@ cargo run --release -p cavitation-bench -- latency
 cargo run --release -p cavitation-bench -- gemm --shapes mnist128    # the matrix products of one step
 ```
 
-`all` leaves out `cifar`: an epoch of its network on 50,000 images takes minutes on a small machine, so it is its own command. Its matrix products are large enough that the run measures matrix-multiply throughput rather than the fixed costs of each step, which dominate the MNIST run on a fast machine.
+`all` leaves out `cifar`: an epoch of its network on 50,000 images takes minutes on a small machine, so it is its own command. It is sized so that matrix products, not per-step overheads, take most of the time, which the MNIST run is too short for on a fast machine.
 
 The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH`, which needs numpy; `--python <path>` or the `CAVITATION_BENCH_PYTHON` variable names another interpreter. Results are also written to `target/bench/results.json`.
 
