@@ -153,11 +153,11 @@ pub mod prelude {
         Activation, ActivationLayer, Adam, AdamW, BadInput, Batch, BatchView, Batcher, Celu,
         Dataset, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Gelu, Glu, GradStats,
         Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks, InferenceModel,
-        Init, Layer, LayerActivity, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid,
-        LogSoftmax, Loss, LrSchedule, Mish, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig,
-        Prelu, Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign,
-        StepInputs, Tanh, Targets, TargetsView, Trace, Trainer, Warning, WarningKind, accuracy,
-        activity, evaluate, fit, fit_with_hooks, load, load_lenient, load_with, save,
+        Init, Layer, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss,
+        LrSchedule, Mish, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu, Relu6,
+        Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, StepInputs, Tanh,
+        Targets, TargetsView, Trace, Trainer, Warning, WarningKind, accuracy, evaluate, fit,
+        fit_with_hooks, load, load_lenient, load_with, save,
     };
 }
 

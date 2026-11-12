@@ -1001,10 +1001,17 @@ impl HealthMonitor {
                     }
                 }
             }
-            // A neuron masked on the layer's own output, or on the layer before it (the
-            // `Linear` that feeds the ReLU), is off on purpose, not dead.
-            let before = i.checked_sub(1).and_then(|p| model.mask(p));
-            for mask in [model.mask(i), before].into_iter().flatten() {
+            // A neuron masked on the layer's own output, on the layer before it (the
+            // `Linear` that feeds the ReLU), or on an element-wise layer in the run right
+            // after it (where `Sequential::neuron_layer` puts the mask) is off on purpose,
+            // not dead.
+            let first = i.saturating_sub(1);
+            let mut last = i;
+            while last + 1 < model.len() && model.layer(last + 1).is_elementwise() {
+                last += 1;
+            }
+            for p in first..=last {
+                let Some(mask) = model.mask(p) else { continue };
                 if mask.width() == width {
                     for (j, a) in alive.iter_mut().enumerate() {
                         *a |= !mask.is_on(j);

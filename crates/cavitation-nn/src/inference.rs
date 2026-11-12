@@ -7,7 +7,8 @@
 //! runs through the matvec kernel on the calling thread; a batch runs through the GEMM.
 //!
 //! The weights are shared by every clone of a compiled model; the masks' keep values are
-//! each instance's own, so [`InferenceModel::set_mask`] changes one instance in place.
+//! each instance's own, so [`InferenceModel::set_neuron_mask`] (by `Linear`) and
+//! [`InferenceModel::set_mask`] (by layer) change one instance in place.
 //! [`InferenceModel::infer_batch_observed`] reports each layer's output as it is computed.
 
 use std::fmt;
@@ -113,6 +114,9 @@ struct Compiled {
     /// The layers given a mask step whether or not the model has a mask there: the `layers`
     /// of [`InferenceModel::compile_with_masks`].
     extra: Vec<usize>,
+    /// Every `Linear` of the model, in order, with the layer that holds its neurons
+    /// ([`Sequential::neuron_layer`]): `(linear, layer)`.
+    neurons: Vec<(usize, usize)>,
 }
 
 /// A [`Sequential`] compiled for inference: it answers one input or a batch without
@@ -127,8 +131,9 @@ struct Compiled {
 /// The compiled weights are copied out of the store, so training the network further does
 /// not change them; compile again to pick up new weights. A clone shares the weights (they
 /// sit behind an [`Arc`]) and has buffers and neuron masks of its own, so give each thread
-/// its own clone, and change one clone's masks with [`set_mask`](Self::set_mask) without
-/// touching the others'.
+/// its own clone, and change one clone's masks with
+/// [`set_neuron_mask`](Self::set_neuron_mask) (by `Linear`) or [`set_mask`](Self::set_mask)
+/// (by layer index) without touching the others'.
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng};
@@ -212,10 +217,14 @@ impl InferenceModel {
     /// neuron mask a mask step with every neuron on, so that [`set_mask`](Self::set_mask)
     /// can turn its neurons off later. A layer that already has a mask keeps it.
     ///
-    /// To mask the neurons of a `Linear`, list [`Sequential::neuron_layer`] of it (the
-    /// activation after it, if any), as masks set in training are placed. A mask step on a
-    /// `Linear` itself stops it from running fused with a ReLU that follows, so the ReLU
-    /// then runs as a step of its own and is observed on its own.
+    /// `layers` are layer indices, not `Linear`s. To switch the neurons of a `Linear`, use
+    /// [`compile_with_neuron_masks`](Self::compile_with_neuron_masks) and
+    /// [`set_neuron_mask`](Self::set_neuron_mask), which put the mask step after the
+    /// activations that follow it ([`Sequential::neuron_layer`]). Listing the `Linear`'s own
+    /// index here masks its pre-activation instead: on a sigmoid an off neuron then sends
+    /// `sigmoid(0) = 0.5` to the next layer, not 0. A mask step on a `Linear` itself also
+    /// stops it from running fused with a ReLU that follows, so the ReLU then runs as a step
+    /// of its own and is observed on its own.
     ///
     /// # Errors
     ///
@@ -259,6 +268,52 @@ impl InferenceModel {
         })
     }
 
+    /// Like [`compile`](Self::compile), and gives the neurons of each `Linear` listed in
+    /// `linears` (by layer index) a mask step with every neuron on, at
+    /// [`Sequential::neuron_layer`] of it, so that [`set_neuron_mask`](Self::set_neuron_mask)
+    /// can turn them off later. A `Linear` whose neurons already have a mask keeps it. This
+    /// is [`compile_with_masks`](Self::compile_with_masks) with each `Linear` mapped to the
+    /// layer that holds its neurons.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if an entry of `linears` is not the index of a
+    /// `Linear` layer (the message names it), and the errors [`compile`](Self::compile)
+    /// returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`compile`](Self::compile) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, NeuronMask, Sequential, Sigmoid};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Sigmoid);
+    /// let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+    /// model.set_neuron_mask(0, &NeuronMask::from_off(3, &[1])).unwrap();
+    /// // The mask sits after the sigmoid, so the off neuron gives exactly 0.
+    /// assert_eq!(model.infer(&[1.0, -1.0])[1], 0.0);
+    /// ```
+    pub fn compile_with_neuron_masks(
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+        linears: &[usize],
+    ) -> Result<InferenceModel, Error> {
+        let mut layers = Vec::with_capacity(linears.len());
+        for &linear in linears {
+            if model.linear(linear).is_none() {
+                return Err(Error::InvalidData(format!(
+                    "inference: layer {linear} is not a Linear layer"
+                )));
+            }
+            layers.push(model.neuron_layer(linear));
+        }
+        InferenceModel::compile_with_masks(model, params, &layers)
+    }
+
     /// Picks up new weights and masks from `model` and `params`, as
     /// [`compile_with_masks`](Self::compile_with_masks) would with the layers this model was
     /// compiled with (those still below `model.len()`), so a mask step added there is kept.
@@ -272,8 +327,9 @@ impl InferenceModel {
     /// The masks are this instance's own, and a clone's never change. When the new mask
     /// steps sit on the same layers with the same widths, each one on a layer where `model`
     /// has a mask takes that mask's values, copied in place whether or not the weights were;
-    /// each one `model` has no mask for (a step added by `compile_with_masks`) keeps the
-    /// values [`set_mask`](Self::set_mask) gave it. Otherwise the masks are compiled afresh,
+    /// each one `model` has no mask for (a step added by `compile_with_masks` or
+    /// `compile_with_neuron_masks`) keeps the values [`set_mask`](Self::set_mask) or
+    /// [`set_neuron_mask`](Self::set_neuron_mask) gave it. Otherwise the masks are compiled afresh,
     /// the added steps with every neuron on.
     ///
     /// # Errors
@@ -337,6 +393,10 @@ impl InferenceModel {
     /// `mask` turns off is set to exactly 0 from the next call on. Only this instance
     /// changes; its clones keep their own masks. Allocates nothing.
     ///
+    /// `layer` is a layer index, not a `Linear`. To switch the neurons of a `Linear`, use
+    /// [`set_neuron_mask`](Self::set_neuron_mask), which finds the layer that holds them
+    /// ([`Sequential::neuron_layer`]).
+    ///
     /// The layer must have a mask step: a mask on it when the model was compiled, or a
     /// place in the `layers` given to [`compile_with_masks`](Self::compile_with_masks).
     ///
@@ -365,10 +425,66 @@ impl InferenceModel {
                  list it in compile_with_masks"
             )));
         };
+        self.copy_mask(slot, mask, &format_args!("layer {layer}"))
+    }
+
+    /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
+    /// neuron `mask` turns off outputs exactly 0 from the next call on, after the
+    /// activations that follow the `Linear` (at [`Sequential::neuron_layer`]), so an off
+    /// neuron sends 0 to the next layer whatever the activations give at 0. Only this
+    /// instance changes; its clones keep their own masks. Allocates nothing.
+    ///
+    /// The neurons must have a mask step: a mask on them when the model was compiled (set
+    /// with [`Sequential::set_neuron_mask`], say), or a place in the `linears` given to
+    /// [`compile_with_neuron_masks`](Self::compile_with_neuron_masks).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if layer `linear` is not a `Linear` or `mask`'s width
+    /// differs from its output width, and [`Error::Unsupported`] if its neurons have no mask
+    /// step (each message names the `Linear`); the model is then unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{Error, ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let layer = Linear::new(&mut params, 1, 2, &mut Rng::seed(0));
+    /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[1.0, 2.0]);
+    /// let net = Sequential::new().push(layer).push(Relu);
+    /// let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+    /// model.set_neuron_mask(0, &NeuronMask::from_off(2, &[1])).unwrap();
+    /// assert_eq!(model.infer(&[1.0]), &[1.0, 0.0]);
+    /// assert!(matches!(model.set_neuron_mask(1, &NeuronMask::all_on(2)), Err(Error::InvalidData(_))));
+    /// ```
+    pub fn set_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> Result<(), Error> {
+        let Some(&(_, layer)) = self.shared.neurons.iter().find(|(l, _)| *l == linear) else {
+            return Err(Error::InvalidData(format!(
+                "inference: layer {linear} is not a Linear layer"
+            )));
+        };
+        let Some(slot) = self.shared.mask_layers.iter().position(|&l| l == layer) else {
+            return Err(Error::Unsupported(format!(
+                "inference: the neurons of the linear layer {linear} (at layer {layer}) have \
+                 no mask step; compile with a neuron mask on it, or list it in \
+                 compile_with_neuron_masks"
+            )));
+        };
+        self.copy_mask(slot, mask, &format_args!("the linear layer {linear}"))
+    }
+
+    /// Copies `mask` into the keep values of mask step `slot`, or returns
+    /// [`Error::InvalidData`] naming `what` if the widths differ. Allocates nothing unless
+    /// it fails.
+    fn copy_mask(
+        &mut self,
+        slot: usize,
+        mask: &NeuronMask,
+        what: &dyn fmt::Display,
+    ) -> Result<(), Error> {
         let keep = &mut self.masks[slot];
         if mask.width() != keep.len() {
             return Err(Error::InvalidData(format!(
-                "inference: a mask of width {} for layer {layer}, which outputs width {}",
+                "inference: a mask of width {} for {what}, which outputs width {}",
                 mask.width(),
                 keep.len()
             )));
@@ -683,6 +799,10 @@ impl Compiled {
             width = produced;
             max_width = max_width.max(width);
         }
+        let neurons = model
+            .linears()
+            .map(|(linear, _)| (linear, model.neuron_layer(linear)))
+            .collect();
         let compiled = Compiled {
             steps,
             input_width,
@@ -690,6 +810,7 @@ impl Compiled {
             max_width,
             mask_layers,
             extra: extra.to_vec(),
+            neurons,
         };
         Ok((compiled, masks))
     }
@@ -712,6 +833,7 @@ impl Compiled {
             && self.output_width == other.output_width
             && self.max_width == other.max_width
             && self.mask_layers == other.mask_layers
+            && self.neurons == other.neurons
             && self.steps.len() == other.steps.len()
             && self.steps.iter().zip(&other.steps).all(|(a, b)| {
                 kind(&a.op) == kind(&b.op)
@@ -1767,6 +1889,114 @@ pub(crate) mod tests {
         assert!(got.chunks(10).all(|row| row[7].to_bits() == 0));
         assert_same(copy.infer_batch(view).data(), &copy_before, "the clone");
         model.set_mask(1, &NeuronMask::all_on(32)).unwrap();
+    }
+
+    /// Linear(3 → 4) → Sigmoid → Linear(4 → 2), with weights from `Rng::seed(seed)`.
+    fn sigmoid_net(params: &mut ParamStore, seed: u64) -> Sequential {
+        let mut rng = Rng::seed(seed);
+        Sequential::new()
+            .push(Linear::new(params, 3, 4, &mut rng))
+            .push(Sigmoid)
+            .push(Linear::new(params, 4, 2, &mut rng))
+    }
+
+    /// On Linear → Sigmoid → Linear, `set_neuron_mask` on a model compiled with
+    /// `compile_with_neuron_masks` puts the mask after the sigmoid: the off neuron reads
+    /// exactly 0 at layer 1, the output is bit for bit that of compiling the network masked
+    /// with `Sequential::set_neuron_mask`, and both differ from masking the `Linear`'s own
+    /// output by layer (where the neuron reads `sigmoid(0) = 0.5`). Changing it back gives
+    /// the plain model's bits.
+    #[test]
+    fn set_neuron_mask_after_sigmoid_is_zero() {
+        let mut params = ParamStore::new();
+        let net = sigmoid_net(&mut params, 31);
+        let x = inputs(5, 3, 32);
+        let off = NeuronMask::from_off(4, &[1]);
+        let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+        model.set_neuron_mask(0, &off).unwrap();
+        let (seen, out) = observe_all(&mut model, &x, 5);
+        let hidden = &seen.iter().find(|s| s.0 == 1).expect("layer 1 observed").2;
+        for row in hidden.chunks(4) {
+            assert_eq!(row[1].to_bits(), 0.0f32.to_bits(), "{row:?}");
+            assert!(row[0] > 0.0 && row[2] > 0.0);
+        }
+        let mut masked = net.clone();
+        masked.set_neuron_mask(0, off.clone());
+        let mut want = InferenceModel::compile(&masked, &params).unwrap();
+        assert_models_agree(&mut model, &mut want, &x, "by Linear");
+
+        let mut by_layer = InferenceModel::compile_with_masks(&net, &params, &[0]).unwrap();
+        by_layer.set_mask(0, &off).unwrap();
+        let (seen, wrong) = observe_all(&mut by_layer, &x, 5);
+        let hidden = &seen.iter().find(|s| s.0 == 1).expect("layer 1 observed").2;
+        assert!(hidden.chunks(4).all(|row| row[1] == 0.5), "{hidden:?}");
+        assert_ne!(wrong, out);
+
+        model.set_neuron_mask(0, &NeuronMask::all_on(4)).unwrap();
+        let mut plain = InferenceModel::compile(&net, &params).unwrap();
+        assert_models_agree(&mut model, &mut plain, &x, "all on again");
+    }
+
+    /// On Linear → Tanh → Sigmoid → Linear the mask step of the first `Linear`'s neurons
+    /// sits after the `Sigmoid`, so an off neuron reads exactly 0 at layer 2.
+    #[test]
+    fn neuron_mask_step_after_chained_activations() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(33);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut rng))
+            .push(Tanh)
+            .push(Sigmoid)
+            .push(Linear::new(&mut params, 4, 2, &mut rng));
+        let x = inputs(4, 3, 34);
+        let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+        model
+            .set_neuron_mask(0, &NeuronMask::from_off(4, &[2]))
+            .unwrap();
+        let (seen, _) = observe_all(&mut model, &x, 4);
+        let layers: Vec<usize> = seen.iter().map(|s| s.0).collect();
+        assert_eq!(layers, [0, 1, 2, 3]);
+        for row in seen[2].2.chunks(4) {
+            assert_eq!(row[2].to_bits(), 0.0f32.to_bits(), "{row:?}");
+            assert!(row[1] > 0.0);
+        }
+        assert!(seen[1].2.chunks(4).all(|row| row[2] != 0.0));
+    }
+
+    /// `compile_with_neuron_masks` with an index that is not a `Linear` is `InvalidData`;
+    /// `set_neuron_mask` on a layer that is not a `Linear` or with the wrong width is
+    /// `InvalidData`, and on a `Linear` without a mask step `Unsupported`, each naming the
+    /// `Linear` and leaving the model unchanged. A neuron mask set on the network before
+    /// compiling has a mask step without being listed.
+    #[test]
+    fn set_neuron_mask_errors() {
+        let mut params = ParamStore::new();
+        let mut net = sigmoid_net(&mut params, 35);
+        match InferenceModel::compile_with_neuron_masks(&net, &params, &[0, 1]) {
+            Err(Error::InvalidData(msg)) => assert!(msg.contains("layer 1"), "{msg}"),
+            other => panic!("expected InvalidData, got {:?}", other.map(|_| ())),
+        }
+        let x = inputs(1, 3, 36);
+        let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+        let before = model.infer(&x).to_vec();
+        let cases: [(usize, NeuronMask, &str); 3] = [
+            (1, NeuronMask::all_off(4), "layer 1 is not a Linear"),
+            (0, NeuronMask::all_off(3), "the linear layer 0"),
+            (2, NeuronMask::all_off(2), "the linear layer 2"),
+        ];
+        for (linear, mask, want) in cases {
+            let got = model.set_neuron_mask(linear, &mask);
+            let msg = match (&got, linear) {
+                (Err(Error::Unsupported(msg)), 2) | (Err(Error::InvalidData(msg)), 0 | 1) => msg,
+                _ => panic!("linear {linear}: {got:?}"),
+            };
+            assert!(msg.contains(want), "{msg}");
+        }
+        assert_same(model.infer(&x), &before, "after the failed calls");
+        net.set_neuron_mask(2, NeuronMask::all_on(2));
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        model.set_neuron_mask(2, &NeuronMask::all_off(2)).unwrap();
+        assert_eq!(model.infer(&x), &[0.0, 0.0]);
     }
 
     /// `set_mask` on a layer with no mask step is `Unsupported`, and a mask of the wrong

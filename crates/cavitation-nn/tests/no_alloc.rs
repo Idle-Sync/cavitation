@@ -697,12 +697,62 @@ impl Activation<f32> for MyRelu {
     }
 }
 
+/// For each row of `data`, whether the two largest outputs of `net` (a chain of `Linear`
+/// and `Relu` layers) lie within twice the inference bound of each other, so that two
+/// calculation paths may rank them differently. The outputs are computed in `f64`, and the
+/// bound is the one the inference tests use: each `Linear` adds
+/// `2·(k + 2)·1.19e-7·(Σᵢ |hᵢ|·|wᵢⱼ| + |bⱼ|)` and carries the bound of its input through
+/// `Σᵢ boundᵢ·|wᵢⱼ|`; a ReLU carries it unchanged.
+fn near_ties(net: &Sequential, params: &ParamStore, data: &Dataset) -> Vec<bool> {
+    let features = data.features();
+    data.x
+        .data()
+        .chunks(features)
+        .map(|row| {
+            let mut h: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+            let mut bound = vec![0.0f64; h.len()];
+            for i in 0..net.len() {
+                let Some(linear) = net.linear(i) else {
+                    h.iter_mut().for_each(|v| *v = v.max(0.0));
+                    continue;
+                };
+                let w = params.value(linear.weight()).data();
+                let b = params.value(linear.bias()).data();
+                let k = h.len();
+                let (mut next, mut carried) = (Vec::new(), Vec::new());
+                for j in 0..linear.outputs() {
+                    let (mut v, mut s, mut c) = (f64::from(b[j]), 0.0f64, 0.0f64);
+                    for p in 0..k {
+                        let wv = f64::from(w[j * k + p]);
+                        v += h[p] * wv;
+                        s += h[p].abs() * wv.abs();
+                        c += bound[p] * wv.abs();
+                    }
+                    next.push(v);
+                    let own = 2.0 * (k as f64 + 2.0) * 1.19e-7 * (s + f64::from(b[j]).abs());
+                    carried.push(own + c);
+                }
+                h = next;
+                bound = carried;
+            }
+            let mut order: Vec<usize> = (0..h.len()).collect();
+            order.sort_by(|&i, &j| h[j].total_cmp(&h[i]));
+            let (top, second) = (order[0], order[1]);
+            h[top] - h[second] <= 2.0 * (bound[top] + bound[second])
+        })
+        .collect()
+}
+
 /// Evaluates the 50k network on the 1,437-row set at batch 128 (a last batch of 29): with
 /// cross-entropy on class labels (`evaluate` and `misclassified`) and with mean squared error
 /// on value targets (`evaluate`, with R²), compiled; and the same network with its ReLUs
 /// written as an activation of your own, on the tape (`evaluate` and `misclassified` on
 /// class labels). One warm-up call of each, then 100 more calls of each. Returns the
 /// allocations made after the warm-up.
+///
+/// The two paths' misclassified rows are compared after the count, leaving out the rows
+/// whose two largest outputs are within the calculation bound of each other
+/// ([`near_ties`]), where the compiled GEMM and the tape may rank them differently.
 fn evaluator_steady_state() -> usize {
     let mut params = ParamStore::new();
     let net = network_50k(&mut params);
@@ -747,13 +797,61 @@ fn evaluator_steady_state() -> usize {
     }
     let made = allocations() - before;
     assert!(sink.is_finite() && !wrong.is_empty());
+    let ties = near_ties(&net, &params, &classes);
+    wrong.retain(|&r| !ties[r]);
+    tape_wrong.retain(|&r| !ties[r]);
     assert_eq!(wrong, tape_wrong);
+    made
+}
+
+/// The 50k network as `Evaluator::with_neuron_masks` on both hidden `Linear`s, compiled,
+/// and the same network with its ReLUs written as an activation of your own, on the tape:
+/// each switches one neuron of each hidden layer off with `set_neuron_mask` (masks prepared
+/// beforehand) and evaluates the 1,437-row set at batch 128 with cross-entropy, 100 times
+/// after one warm-up round. Returns the allocations made after the warm-up.
+fn evaluator_neuron_mask_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut own = Sequential::new();
+    for i in 0..net.len() {
+        own = match net.linear(i) {
+            Some(linear) => own.push(linear.clone()),
+            None => own.push(ActivationLayer::new(MyRelu)),
+        };
+    }
+    let data = synthetic_1437();
+    let first: Vec<NeuronMask> = (0..7)
+        .map(|n| NeuronMask::from_off(256, &[n * 31]))
+        .collect();
+    let second: Vec<NeuronMask> = (0..5)
+        .map(|n| NeuronMask::from_off(128, &[n * 17]))
+        .collect();
+    let mut compiled =
+        Evaluator::with_neuron_masks(&net, &params, Loss::CrossEntropy, 128, &[0, 2]).unwrap();
+    let mut tape =
+        Evaluator::with_neuron_masks(&own, &params, Loss::CrossEntropy, 128, &[0, 2]).unwrap();
+    assert!(format!("{tape:?}").contains("compiled: false"), "{tape:?}");
+    let mut sink = 0.0;
+    let mut before = 0;
+    for call in 0..101 {
+        if call == 1 {
+            before = allocations();
+        }
+        for evaluator in [&mut compiled, &mut tape] {
+            evaluator.set_neuron_mask(0, &first[call % 7]).unwrap();
+            evaluator.set_neuron_mask(2, &second[call % 5]).unwrap();
+            let e = evaluator.evaluate(&data).unwrap();
+            sink += e.loss + e.accuracy.unwrap();
+        }
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
     made
 }
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 17] = [
+    let scenarios: [Scenario; 18] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -770,6 +868,10 @@ fn main() -> ExitCode {
         ("observed_steady_state", observed_steady_state),
         ("set_mask_steady_state", set_mask_steady_state),
         ("evaluator_steady_state", evaluator_steady_state),
+        (
+            "evaluator_neuron_mask_steady_state",
+            evaluator_neuron_mask_steady_state,
+        ),
         (
             "trace_with_capacity_allocates_nothing",
             trace_with_capacity_allocates_nothing,

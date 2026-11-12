@@ -296,8 +296,16 @@ impl<T: Real> Sequential<T> {
     /// Puts `mask` on layer `layer`'s output, replacing any mask already there. From the next
     /// forward pass on, each off neuron's output (its position on the output's last axis) is
     /// exactly 0, even where the layer gives infinity or NaN, and its gradient is 0, so
-    /// nothing flows back through it. To turn off a hidden neuron, mask the activation layer
-    /// that follows its `Linear`.
+    /// nothing flows back through it.
+    ///
+    /// This addresses a mask by layer index. To turn off the neurons of a `Linear`, address
+    /// them by the `Linear` instead, with [`set_neuron_mask`](Self::set_neuron_mask) or
+    /// [`set_neuron`](Self::set_neuron): they put the mask on
+    /// [`neuron_layer`](Self::neuron_layer), after the activations that follow the `Linear`,
+    /// so the neuron outputs 0 whatever the activation gives at 0. A compiled model has the
+    /// same two routes, [`InferenceModel::set_mask`](crate::InferenceModel::set_mask) by layer
+    /// and [`InferenceModel::set_neuron_mask`](crate::InferenceModel::set_neuron_mask) by
+    /// `Linear`.
     ///
     /// The mask's width is checked against the layer's output at the next forward pass.
     ///
@@ -427,10 +435,13 @@ impl<T: Real> Sequential<T> {
     }
 
     /// The index of the layer whose output holds the neurons of the `Linear` at layer
-    /// `linear`: the layer after it if that one is element-wise (it has an
-    /// [`Layer::is_elementwise`]: it has an activation, or it is a `Prelu`), else the `Linear` itself.
-    /// Masks on a hidden neuron go on that layer, so that the neuron's output is 0 whatever
-    /// the activation gives at 0.
+    /// `linear`, as the next layer receives them: the last layer of the run of element-wise
+    /// layers right after it (each one whose [`Layer::is_elementwise`] is true: an
+    /// activation, a `Prelu`, or a layer of your own that says so), or the `Linear` itself
+    /// when the layer after it is not element-wise. Masks on a hidden neuron go on that
+    /// layer, so that the neuron's output is 0 whatever the activations give at 0: on
+    /// `Linear → Tanh → Sigmoid` it is the `Sigmoid`, so an off neuron sends 0, not
+    /// `sigmoid(0) = 0.5`.
     ///
     /// # Panics
     ///
@@ -449,19 +460,35 @@ impl<T: Real> Sequential<T> {
     /// ```
     pub fn neuron_layer(&self, linear: usize) -> usize {
         self.check_linear(linear);
-        match self.layers.get(linear + 1) {
-            Some(next) if next.is_elementwise() => linear + 1,
-            _ => linear,
+        let mut layer = linear;
+        while self
+            .layers
+            .get(layer + 1)
+            .is_some_and(|next| next.is_elementwise())
+        {
+            layer += 1;
         }
+        layer
     }
 
     /// Puts `mask` on the neurons of the `Linear` at layer `linear`, on the layer
     /// [`neuron_layer`](Self::neuron_layer) names, replacing any mask there.
     ///
+    /// Masks have three routes, one story: by layer index with
+    /// [`set_mask`](Self::set_mask); by `Linear` with this method and
+    /// [`set_neuron`](Self::set_neuron), which find the layer for you; and on a compiled
+    /// model, [`InferenceModel::set_neuron_mask`](crate::InferenceModel::set_neuron_mask)
+    /// (and [`Evaluator::set_neuron_mask`](crate::Evaluator::set_neuron_mask)), which change
+    /// a mask per instance without allocating.
+    ///
     /// # Panics
     ///
-    /// Panics if layer `linear` is not a `Linear`; the message names the index and the
-    /// layer's kind.
+    /// Panics if layer `linear` is not a `Linear` (the message names the index and the
+    /// layer's kind); if `mask`'s width is not the `Linear`'s output width (the message
+    /// names the `Linear`, the mask's width and the output width); or if the `Linear`
+    /// itself carries a mask set with [`set_mask`](Self::set_mask) while its neurons are
+    /// read at another layer, so that one neuron set never carries two masks (clear that
+    /// one with [`clear_mask`](Self::clear_mask) first).
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -475,10 +502,51 @@ impl<T: Real> Sequential<T> {
     /// ```
     pub fn set_neuron_mask(&mut self, linear: usize, mask: NeuronMask) {
         let layer = self.neuron_layer(linear);
+        self.check_neuron_width(linear, mask.width());
+        self.check_no_linear_mask(linear, layer);
         self.masks[layer] = Some(LayerMask::new(mask));
     }
 
-    /// The mask on the neurons of the `Linear` at layer `linear`, if it has one.
+    /// Copies `mask` into the existing mask on the neurons of the `Linear` at layer
+    /// `linear`, without allocating. Returns `false`, changing nothing, if there is no mask
+    /// there or its width differs from `mask`'s.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear`, as [`neuron_layer`](Self::neuron_layer)
+    /// does.
+    pub(crate) fn copy_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> bool {
+        let layer = self.neuron_layer(linear);
+        match &mut self.masks[layer] {
+            Some(existing) if existing.mask.width() == mask.width() => {
+                for j in 0..mask.width() {
+                    if existing.mask.is_on(j) != mask.is_on(j) {
+                        existing.set(j, mask.is_on(j));
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Puts `mask` on the neurons of the `Linear` at layer `linear`, as
+    /// [`set_neuron_mask`](Self::set_neuron_mask) does but without its checks: for a copy
+    /// that carries masks over from another model.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `linear` is not a `Linear`, as [`neuron_layer`](Self::neuron_layer)
+    /// does.
+    pub(crate) fn put_neuron_mask(&mut self, linear: usize, mask: NeuronMask) {
+        let layer = self.neuron_layer(linear);
+        self.masks[layer] = Some(LayerMask::new(mask));
+    }
+
+    /// The mask on the neurons of the `Linear` at layer `linear`, if it has one: the mask on
+    /// [`neuron_layer`](Self::neuron_layer). A mask put on the `Linear` itself with
+    /// [`set_mask`](Self::set_mask), when its neurons are read at a later layer, is not the
+    /// neuron mask and is not returned here; read it with [`mask`](Self::mask).
     ///
     /// # Panics
     ///
@@ -500,7 +568,10 @@ impl<T: Real> Sequential<T> {
             .map(|m| &m.mask)
     }
 
-    /// Removes the mask from the neurons of the `Linear` at layer `linear`, if it has one.
+    /// Removes the mask from the neurons of the `Linear` at layer `linear`, if it has one:
+    /// the mask on [`neuron_layer`](Self::neuron_layer). A mask put on the `Linear` itself
+    /// with [`set_mask`](Self::set_mask), when its neurons are read at a later layer, is not
+    /// the neuron mask and stays; remove it with [`clear_mask`](Self::clear_mask).
     ///
     /// # Panics
     ///
@@ -528,8 +599,11 @@ impl<T: Real> Sequential<T> {
     /// # Panics
     ///
     /// Panics if layer `linear` is not a `Linear` (the message names the index and the
-    /// layer's kind), or if `neuron` is not below the mask's width (the message names the
-    /// neuron and the width).
+    /// layer's kind); if `neuron` is not below the `Linear`'s output width, or a mask
+    /// already there has another width (each message names the `Linear` and the widths);
+    /// or if the `Linear` itself carries a mask set with [`set_mask`](Self::set_mask) while
+    /// its neurons are read at another layer, so that one neuron set never carries two masks
+    /// (clear that one with [`clear_mask`](Self::clear_mask) first).
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -543,20 +617,49 @@ impl<T: Real> Sequential<T> {
     /// ```
     pub fn set_neuron(&mut self, linear: usize, neuron: usize, on: bool) {
         let layer = self.neuron_layer(linear);
-        let width = match &self.masks[layer] {
-            Some(mask) => mask.mask.width(),
-            None => self.layers[linear]
-                .as_linear()
-                .expect("check_linear passed")
-                .outputs(),
-        };
+        let width = self.linear_outputs(linear);
         assert!(
             neuron < width,
-            "sequential: neuron {neuron} is out of range for width {width} (layer {linear})"
+            "sequential: neuron {neuron} is out of range for the linear layer {linear}, which \
+             outputs width {width}"
         );
+        if let Some(mask) = &self.masks[layer] {
+            self.check_neuron_width(linear, mask.mask.width());
+        }
+        self.check_no_linear_mask(linear, layer);
         let mask =
             self.masks[layer].get_or_insert_with(|| LayerMask::new(NeuronMask::all_on(width)));
         mask.set(neuron, on);
+    }
+
+    /// The output width of the `Linear` at layer `linear`, which must be one.
+    fn linear_outputs(&self, linear: usize) -> usize {
+        self.layers[linear]
+            .as_linear()
+            .expect("the caller checked that the layer is a Linear")
+            .outputs()
+    }
+
+    /// Panics, naming the `Linear`, `width` and the output width, if a neuron mask of
+    /// `width` does not fit the `Linear` at layer `linear`.
+    fn check_neuron_width(&self, linear: usize, width: usize) {
+        let outputs = self.linear_outputs(linear);
+        assert!(
+            width == outputs,
+            "sequential: a neuron mask of width {width} for the linear layer {linear}, which \
+             outputs width {outputs}"
+        );
+    }
+
+    /// Panics if the `Linear` at layer `linear`, whose neurons are read at layer `layer`,
+    /// carries a mask of its own on another layer, naming both layers.
+    fn check_no_linear_mask(&self, linear: usize, layer: usize) {
+        assert!(
+            layer == linear || self.masks[linear].is_none(),
+            "sequential: the linear layer {linear} has a mask set with set_mask on the linear \
+             layer itself, but its neurons are masked at layer {layer}; clear it with \
+             clear_mask({linear}) first, so that one neuron set carries one mask"
+        );
     }
 
     /// Panics, naming the index and the layer's kind, if layer `linear` is not a `Linear`.
@@ -718,7 +821,8 @@ mod tests {
     use cavitation_core::{Graph, ParamId, ParamStore, Real, Reduction, Rng, Tape, Tensor, Var};
 
     use crate::{
-        Init, Layer, Linear, NeuronMask, Optimizer, Prelu, Relu, Sequential, Sgd, Sigmoid, Trace,
+        Init, Layer, Linear, NeuronMask, Optimizer, Prelu, Relu, Sequential, Sgd, Sigmoid, Tanh,
+        Trace,
     };
 
     /// The digits-shaped network, 64 → 32 → 10, with its parameters in `params`.
@@ -945,12 +1049,94 @@ mod tests {
         net.set_neuron_mask(1, NeuronMask::all_on(4));
     }
 
-    /// A neuron past the width panics, naming the neuron and the width.
+    /// A neuron past the width panics, naming the neuron, the `Linear` and its width.
     #[test]
-    #[should_panic(expected = "neuron 4 is out of range for width 4")]
+    #[should_panic(
+        expected = "neuron 4 is out of range for the linear layer 0, which outputs \
+                               width 4"
+    )]
     fn set_neuron_out_of_range_panics() {
         let mut net = lrl(&mut ParamStore::new());
         net.set_neuron(0, 4, false);
+    }
+
+    /// `set_neuron_mask` with a mask wider than the `Linear`'s output panics at once,
+    /// naming the `Linear`, the mask's width and the output width, and sets nothing.
+    #[test]
+    fn set_neuron_mask_checks_the_width() {
+        let mut net = lrl(&mut ParamStore::new());
+        let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            net.set_neuron_mask(0, NeuronMask::all_on(5));
+        }));
+        let msg = *hit.unwrap_err().downcast::<String>().unwrap();
+        assert!(
+            msg.contains("width 5 for the linear layer 0, which outputs width 4"),
+            "{msg}"
+        );
+        assert!(net.mask(1).is_none());
+    }
+
+    /// `set_neuron` on a neuron mask of the wrong width (put there by layer with `set_mask`)
+    /// panics, naming the `Linear` and both widths, even for a neuron below both widths.
+    #[test]
+    #[should_panic(expected = "width 5 for the linear layer 0, which outputs width 4")]
+    fn set_neuron_checks_an_existing_mask() {
+        let mut net = lrl(&mut ParamStore::new());
+        net.set_mask(1, NeuronMask::all_on(5));
+        net.set_neuron(0, 1, false);
+    }
+
+    /// A mask set on the `Linear` itself, whose neurons are read at the ReLU after it, is
+    /// not the neuron mask: `neuron_mask` does not return it, `clear_neuron_mask` leaves
+    /// it, and `set_neuron` and `set_neuron_mask` refuse to add a second mask, naming the
+    /// `Linear`.
+    #[test]
+    fn mask_on_the_linear_is_not_the_neuron_mask() {
+        let mut net = lrl(&mut ParamStore::new());
+        net.set_mask(0, NeuronMask::from_off(4, &[1]));
+        assert!(net.neuron_mask(0).is_none());
+        net.clear_neuron_mask(0);
+        assert!(net.mask(0).is_some());
+        let calls: [fn(&mut Sequential); 2] = [
+            |n| n.set_neuron(0, 2, false),
+            |n| n.set_neuron_mask(0, NeuronMask::all_on(4)),
+        ];
+        for call in calls {
+            let hit = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| call(&mut net)));
+            let msg = *hit.unwrap_err().downcast::<String>().unwrap();
+            assert!(msg.contains("clear_mask(0)"), "{msg}");
+        }
+        assert!(net.mask(1).is_none());
+        net.clear_mask(0);
+        net.set_neuron(0, 2, false);
+        assert_eq!(net.neuron_mask(0).unwrap().off().collect::<Vec<_>>(), [2]);
+    }
+
+    /// On `Linear → Tanh → Sigmoid → Linear` the neurons of the first `Linear` are read at
+    /// the `Sigmoid`, the last of the element-wise run, so an off neuron sends exactly 0 to
+    /// the next `Linear`, not `sigmoid(0) = 0.5`.
+    #[test]
+    fn neuron_mask_goes_after_chained_activations() {
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut Rng::seed(5)))
+            .push(Tanh)
+            .push(Sigmoid)
+            .push(Linear::new(&mut params, 4, 2, &mut Rng::seed(6)));
+        assert_eq!((net.neuron_layer(0), net.neuron_layer(3)), (2, 3));
+        net.set_neuron(0, 1, false);
+        assert!(net.mask(2).is_some() && net.mask(1).is_none());
+        let x = Tensor::from_vec(vec![0.3f32, -0.8, 1.2, -0.5, 0.9, 0.1], &[2, 3]).unwrap();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let xi = tape.input(x.view());
+        let mut trace = Trace::new();
+        net.forward_traced(&mut tape, xi, &mut trace);
+        let out = tape.value(trace.output(2)).data();
+        for row in 0..2 {
+            assert_eq!(out[row * 4 + 1].to_bits(), 0.0f32.to_bits());
+            assert!(out[row * 4] > 0.0 && out[row * 4 + 2] > 0.0);
+        }
     }
 
     /// Switching neurons one at a time gives the same network as setting the whole mask,

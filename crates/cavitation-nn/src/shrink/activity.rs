@@ -1,27 +1,34 @@
 //! Per-neuron activity statistics over a data set: [`activity`] runs the data through the
-//! compiled model in batches and returns a [`LayerActivity`] for each chosen `Linear`.
+//! compiled model in batches (or on the tape, for a model with a layer that has no
+//! inference form) and returns a [`LayerActivity`] for each chosen `Linear`.
 
-use cavitation_core::{Error, ParamStore, TensorView};
+use cavitation_core::{Error, Graph, ParamStore, TensorView};
 
-use crate::{Dataset, InferenceModel, Sequential};
+use crate::train::check_widths;
+use crate::{Dataset, InferenceModel, Sequential, Trace};
 
 /// How the neurons of one `Linear` layer behaved over a data set, from [`activity`]: one
-/// value per neuron in each list, read where the neuron's output is final (after the
-/// activation that follows the `Linear`, and after any mask there).
+/// value per neuron in each list, read where the neuron's output is final, as the next
+/// layer receives it (after the run of element-wise layers that follows the `Linear`, at
+/// [`Sequential::neuron_layer`], and after any mask there).
+///
+/// It is `#[non_exhaustive]`, so a later release can add a statistic without breaking your
+/// code: read its fields, and get one from [`activity`].
 ///
 /// ```
-/// use cavitation_nn::LayerActivity;
-/// let a = LayerActivity {
-///     linear: 0,
-///     layer: 1,
-///     mean: vec![0.5],
-///     mean_abs: vec![0.5],
-///     firing: vec![0.25],
-///     max: vec![2.0],
-/// };
-/// assert_eq!(a.firing[0], 0.25);
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::shrink::{LayerActivity, activity};
+/// use cavitation_nn::{Dataset, Linear, Relu, Sequential, Targets};
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+///     .push(Relu);
+/// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0; 4]) };
+/// let stats: Vec<LayerActivity> = activity(&net, &params, &data, &[0], 4).unwrap();
+/// assert_eq!((stats[0].linear, stats[0].layer, stats[0].mean.len()), (0, 1, 3));
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct LayerActivity {
     /// The index of the `Linear` layer whose neurons these are.
     pub linear: usize,
@@ -42,26 +49,30 @@ pub struct LayerActivity {
 
 /// Measures the neurons of each `Linear` listed in `linears` over every row of `data`, run
 /// `batch` rows at a time through `model` compiled with `params` (the batched inference
-/// path, [`InferenceModel::infer_batch_observed`]). Each `Linear`'s neurons are read at
-/// [`Sequential::neuron_layer`]: after the element-wise activation that follows it, masked
-/// as the next layer sees them. The sums are kept in `f64`; the targets of `data` are not
-/// used. The result has one [`LayerActivity`] per entry of `linears`, in that order.
+/// path, [`InferenceModel::infer_batch_observed`]). A model with a layer that has no
+/// inference form (an activation of your own, say) runs on the tape instead, as an
+/// [`Evaluator`](crate::Evaluator) does, with the same results within rounding. Each
+/// `Linear`'s neurons are read at [`Sequential::neuron_layer`]: after the run of
+/// element-wise layers that follows it, masked as the next layer sees them. The sums are
+/// kept in `f64`; the targets of `data` are not used. The result has one [`LayerActivity`]
+/// per entry of `linears`, in that order; with no entries it is empty, and the data is not
+/// run.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidData`] if `batch` is 0, if `data.x` is not a matrix with at
 /// least one row, if its width is not the model's input width, or if an entry of
-/// `linears` is not the index of a `Linear` layer (the message names it), and the errors
-/// [`InferenceModel::compile`] returns.
+/// `linears` is not the index of a `Linear` layer (the message names it).
 ///
 /// # Panics
 ///
-/// Panics as [`InferenceModel::compile`] does when the layers' widths do not fit one
-/// another.
+/// Panics as [`InferenceModel::compile`] (or [`Sequential::forward`]) does when the
+/// layers' widths do not fit one another.
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Dataset, Linear, Relu, Sequential, Targets, activity};
+/// use cavitation_nn::shrink::activity;
+/// use cavitation_nn::{Dataset, Linear, Relu, Sequential, Targets};
 /// let mut params = ParamStore::new();
 /// let layer = Linear::new(&mut params, 1, 2, &mut Rng::seed(0));
 /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[1.0, -1.0]);
@@ -101,6 +112,9 @@ pub fn activity(
             "activity: the data set has no rows".to_string(),
         ));
     }
+    if linears.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut stats = Vec::with_capacity(linears.len());
     for &linear in linears {
         let Some(layer) = model.linear(linear) else {
@@ -118,26 +132,50 @@ pub fn activity(
             max: vec![f64::NEG_INFINITY; width],
         });
     }
-    let mut compiled = InferenceModel::compile(model, params)?;
-    if features != compiled.input_width() {
-        return Err(Error::InvalidData(format!(
-            "activity: the inputs are [{rows}, {features}], but the model takes width {}",
-            compiled.input_width()
-        )));
-    }
     let x = data.x.data();
-    for start in (0..rows).step_by(batch) {
+    let rows_of = |start: usize| {
         let end = (start + batch).min(rows);
-        let view = TensorView::from_slice(
+        TensorView::from_slice(
             &x[start * features..end * features],
             &[end - start, features],
         )
-        .expect("the rows hold (end - start) × features values");
-        compiled.infer_batch_observed(view, &mut |layer, out| {
-            for s in stats.iter_mut().filter(|s| s.layer == layer) {
-                accumulate(s, out);
+        .expect("the rows hold (end - start) × features values")
+    };
+    match InferenceModel::compile(model, params) {
+        Ok(mut compiled) => {
+            if features != compiled.input_width() {
+                return Err(Error::InvalidData(format!(
+                    "activity: the inputs are [{rows}, {features}], but the model takes width {}",
+                    compiled.input_width()
+                )));
             }
-        });
+            for start in (0..rows).step_by(batch) {
+                compiled.infer_batch_observed(rows_of(start), &mut |layer, out| {
+                    for s in stats.iter_mut().filter(|s| s.layer == layer) {
+                        accumulate(s, out);
+                    }
+                });
+            }
+        }
+        // A layer with no inference form, or an input width only the data can tell: run
+        // on the tape, reading each layer's output from the trace.
+        Err(Error::Unsupported(_)) => {
+            check_widths(model, data).map_err(|e| match e {
+                Error::InvalidData(msg) => Error::InvalidData(format!("activity: {msg}")),
+                other => other,
+            })?;
+            let mut graph = Graph::new();
+            let mut trace = Trace::with_capacity(model.len());
+            for start in (0..rows).step_by(batch) {
+                let mut tape = graph.tape(&params.values);
+                let input = tape.input(rows_of(start));
+                model.forward_traced(&mut tape, input, &mut trace);
+                for s in &mut stats {
+                    accumulate(s, tape.value(trace.output(s.layer)));
+                }
+            }
+        }
+        Err(e) => return Err(e),
     }
     let n = rows as f64;
     for s in &mut stats {
@@ -180,7 +218,7 @@ mod tests {
 
     use super::*;
     use crate::inference::tests::digits;
-    use crate::{Hooks, NeuronMask, Targets, Trace};
+    use crate::{Activation, ActivationLayer, Hooks, NeuronMask, Targets, Trace};
     use cavitation_core::{Graph, Rng, Tensor};
 
     /// `rows` rows of 64 values uniform in `[0, 1)` from `Rng::seed(seed)`, with labels 0.
@@ -330,6 +368,70 @@ mod tests {
             );
         }
         assert!(s.firing.iter().filter(|&&f| f > 0.0).count() > 20);
+    }
+
+    /// ReLU written as an activation of your own, so a network using it has no inference
+    /// form.
+    struct MyRelu;
+
+    impl Activation<f32> for MyRelu {
+        /// Returns `"my_relu"`.
+        fn name(&self) -> &str {
+            "my_relu"
+        }
+        /// `max(x, 0)`.
+        fn f(&self, x: f32) -> f32 {
+            x.max(0.0)
+        }
+        /// 1 above 0, else 0.
+        fn df(&self, x: f32, _y: f32) -> f32 {
+            if x > 0.0 { 1.0 } else { 0.0 }
+        }
+    }
+
+    /// The dyadic digits-shaped network with its ReLU written as an activation of your own
+    /// runs on the tape, and gives exactly the statistics of the built-in network compiled
+    /// (every sum is exact on both paths), masked neuron included; a data set of the wrong
+    /// width is `InvalidData` there too.
+    #[test]
+    fn activity_falls_back_to_the_tape() {
+        let mut params = ParamStore::new();
+        let (mut net, data) = dyadic(&mut params, 30, 27);
+        net.set_neuron_mask(0, NeuronMask::from_off(32, &[4]));
+        let mut own = Sequential::new()
+            .push(net.linear(0).unwrap().clone())
+            .push(ActivationLayer::new(MyRelu))
+            .push(net.linear(2).unwrap().clone());
+        own.set_neuron_mask(0, NeuronMask::from_off(32, &[4]));
+        assert!(matches!(
+            InferenceModel::compile(&own, &params),
+            Err(Error::Unsupported(_))
+        ));
+        let want = activity(&net, &params, &data, &[2, 0], 8).unwrap();
+        let got = activity(&own, &params, &data, &[2, 0], 8).unwrap();
+        assert_eq!(got, want);
+        assert_eq!(got[1].max[4], 0.0);
+        let narrow = Dataset {
+            x: Tensor::zeros(&[2, 63]),
+            targets: Targets::Classes(vec![0; 2]),
+        };
+        match activity(&own, &params, &narrow, &[0], 4) {
+            Err(Error::InvalidData(msg)) => assert!(msg.starts_with("activity: "), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+    }
+
+    /// With no `Linear` listed the result is empty and the data is not run: a data set of
+    /// the wrong width, which running would reject, gives an empty list.
+    #[test]
+    fn no_linears_reads_no_data() {
+        let mut params = ParamStore::new();
+        let net = digits(&mut params, 29);
+        let narrow = Dataset {
+            x: Tensor::zeros(&[2, 63]),
+            targets: Targets::Classes(vec![0; 2]),
+        };
+        assert_eq!(activity(&net, &params, &narrow, &[], 4).unwrap(), []);
     }
 
     /// A zero batch, a data set with no rows or the wrong width, and an index that is not a

@@ -7,18 +7,26 @@ use cavitation_core::{Error, Graph, ParamStore, ParamValues, TensorView};
 
 use super::fit::{argmax, check_dataset, check_model_and_loss, check_widths};
 use super::{Dataset, Loss, Targets, TargetsView};
-use crate::{InferenceModel, Sequential};
+use crate::{InferenceModel, NeuronMask, Sequential};
 
 /// What [`Evaluator::evaluate`] measures on a data set.
+///
+/// It is `#[non_exhaustive]`, so a later release can add a measure without breaking your
+/// code: read its fields, and get one from [`evaluate`] or [`Evaluator::evaluate`].
 ///
 /// # Examples
 ///
 /// ```
-/// use cavitation_nn::Evaluation;
-/// let e = Evaluation { loss: 0.25, accuracy: Some(0.9), r2: None };
-/// assert_eq!(e.accuracy, Some(0.9));
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::{Dataset, Evaluation, Linear, Loss, Sequential, Targets, evaluate};
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
+/// let data = Dataset { x: Tensor::zeros(&[2, 2]), targets: Targets::Classes(vec![0, 0]) };
+/// let e: Evaluation = evaluate(&net, &params, &data, Loss::CrossEntropy, 2).unwrap();
+/// assert_eq!((e.accuracy, e.r2), (Some(1.0), None));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Evaluation {
     /// The mean loss over the rows, defined as [`EpochReport::mean_loss`] is: each batch's
     /// loss (as [`Trainer::step`] computes it) weighted by its row count.
@@ -70,8 +78,12 @@ enum Reload {
 /// [`EpochReport::mean_loss`](crate::EpochReport::mean_loss) is.
 ///
 /// The evaluator copies the weights when it is made: call [`refresh`](Self::refresh) after
-/// training to pick up new ones. A clone shares the compiled weights and has buffers of its
-/// own, so each thread can evaluate with its own clone.
+/// training to pick up new ones. A clone shares the compiled weights and has buffers and
+/// neuron masks of its own, so each thread can evaluate with its own clone.
+///
+/// To measure the network with neurons switched off, again and again (an ablation sweep),
+/// make it with [`with_neuron_masks`](Self::with_neuron_masks) and switch them with
+/// [`set_neuron_mask`](Self::set_neuron_mask), which allocates nothing on either engine.
 ///
 /// # Examples
 ///
@@ -94,8 +106,13 @@ enum Reload {
 /// assert!(e.accuracy.is_none() && e.r2.unwrap() > 0.8);
 /// ```
 pub struct Evaluator {
-    /// The model, sharing its layers with the caller's.
+    /// The model, sharing its layers with the caller's, with the neuron masks this
+    /// evaluator runs: the tape engine runs it, and both engines keep its masks equal to
+    /// the ones in use, so that [`refresh`](Self::refresh) can carry them over.
     model: Sequential,
+    /// The `Linear` layers given a neuron mask by
+    /// [`with_neuron_masks`](Self::with_neuron_masks).
+    linears: Vec<usize>,
     /// The loss to measure.
     loss: Loss,
     /// The number of rows run at a time.
@@ -120,6 +137,7 @@ impl Clone for Evaluator {
     fn clone(&self) -> Evaluator {
         Evaluator {
             model: self.model.clone(),
+            linears: self.linears.clone(),
             loss: self.loss,
             batch: self.batch,
             engine: self.engine.clone(),
@@ -172,18 +190,77 @@ impl Evaluator {
         loss: Loss,
         batch: usize,
     ) -> Result<Evaluator, Error> {
+        Evaluator::with_neuron_masks(model, params, loss, batch, &[])
+    }
+
+    /// Like [`new`](Self::new), and gives the neurons of each `Linear` listed in `linears`
+    /// (by layer index) a mask with every neuron on, at [`Sequential::neuron_layer`] of it,
+    /// so that [`set_neuron_mask`](Self::set_neuron_mask) can switch them later without
+    /// allocating. A `Linear` whose neurons already have a mask in `model` keeps it.
+    ///
+    /// On the compiled engine the masks are mask steps of the compiled model
+    /// ([`InferenceModel::compile_with_neuron_masks`]); on the tape they are masks on the
+    /// evaluator's own copy of the model. Either way the caller's model is not changed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if `batch` is 0 or an entry of `linears` is not the
+    /// index of a `Linear` layer (the message names it), and [`Error::Unsupported`] if the
+    /// model has no layers.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`InferenceModel::compile`] does when the layers' widths do not fit one
+    /// another.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, NeuronMask, Relu, Sequential, Targets};
+    /// let mut params = ParamStore::new();
+    /// let mut rng = Rng::seed(0);
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 4, &mut rng))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 4, 1, &mut rng));
+    /// let data = Dataset {
+    ///     x: Tensor::from_vec(vec![1.0f32, -1.0, 0.5, 2.0], &[2, 2]).unwrap(),
+    ///     targets: Targets::Values(Tensor::zeros(&[2, 1])),
+    /// };
+    /// let mut evaluator = Evaluator::with_neuron_masks(&net, &params, Loss::Mse, 2, &[0]).unwrap();
+    /// evaluator.set_neuron_mask(0, &NeuronMask::all_off(4)).unwrap();
+    /// // With every hidden neuron off the output is the last bias, the same for each row.
+    /// let off = evaluator.evaluate(&data).unwrap();
+    /// let bias = params.value(net.linear(2).unwrap().bias()).data()[0] as f64;
+    /// assert!((off.loss - bias * bias).abs() < 1e-6);
+    /// ```
+    pub fn with_neuron_masks(
+        model: &Sequential,
+        params: &ParamStore,
+        loss: Loss,
+        batch: usize,
+        linears: &[usize],
+    ) -> Result<Evaluator, Error> {
         if batch == 0 {
             return Err(Error::InvalidData(
                 "the batch size must be at least 1".to_string(),
             ));
         }
         check_layers(model)?;
-        let engine = match InferenceModel::compile(model, params) {
+        check_linears(model, linears)?;
+        let engine = match InferenceModel::compile_with_neuron_masks(model, params, linears) {
             Ok(compiled) => Engine::Compiled(compiled),
             Err(_) => Engine::Tape(params.values.clone()),
         };
+        let mut copy = model.clone();
+        for &linear in linears {
+            if copy.neuron_mask(linear).is_none() {
+                let width = copy.linear(linear).expect("checked above").outputs();
+                copy.put_neuron_mask(linear, NeuronMask::all_on(width));
+            }
+        }
         Ok(Evaluator {
-            model: model.clone(),
+            model: copy,
+            linears: linears.to_vec(),
             loss,
             batch,
             engine,
@@ -207,6 +284,12 @@ impl Evaluator {
     /// evaluator's own, never shared with a clone: with masks on the same layers they are
     /// copied in place either way. A model with a layer that has no inference form runs on
     /// the tape, with a copy of the new values.
+    ///
+    /// The neuron masks [`with_neuron_masks`](Self::with_neuron_masks) added stay, with the
+    /// values [`set_neuron_mask`](Self::set_neuron_mask) gave them, on either engine (and
+    /// when the evaluator moves between the two), unless `model` has a neuron mask of its
+    /// own on that `Linear`, which then replaces them; an added mask whose `Linear` changed
+    /// width starts again with every neuron on.
     ///
     /// `refresh` allocates, even in place: it builds the new weights before copying them
     /// in. Only [`evaluate`](Self::evaluate) and [`misclassified`](Self::misclassified) are
@@ -246,28 +329,122 @@ impl Evaluator {
     /// The work of [`refresh`](Self::refresh), saying which way it went.
     fn reload(&mut self, model: &Sequential, params: &ParamStore) -> Result<Reload, Error> {
         check_layers(model)?;
+        // The evaluator's own copy of `model`: each listed `Linear` without a neuron mask
+        // in `model` gets the mask in use now (or every neuron on, if its width changed).
+        let mut copy = model.clone();
+        let mut carried = Vec::new();
+        for &linear in &self.linears {
+            let Some(layer) = model.linear(linear) else {
+                continue;
+            };
+            if model.neuron_mask(linear).is_some() {
+                continue;
+            }
+            let width = layer.outputs();
+            let mask = (self.model.linear(linear).is_some())
+                .then(|| self.model.neuron_mask(linear))
+                .flatten()
+                .filter(|m| m.width() == width)
+                .cloned()
+                .unwrap_or_else(|| NeuronMask::all_on(width));
+            copy.put_neuron_mask(linear, mask.clone());
+            carried.push((linear, mask));
+        }
+        let listed: Vec<usize> = carried.iter().map(|(l, _)| *l).collect();
         let reload = match &mut self.engine {
             Engine::Compiled(compiled) => match compiled.refresh(model, params) {
                 Ok(true) => Reload::InPlace,
                 Ok(false) => Reload::Recompiled,
                 Err(_) => Reload::Tape,
             },
-            Engine::Tape(_) => match InferenceModel::compile(model, params) {
-                Ok(compiled) => {
-                    self.engine = Engine::Compiled(compiled);
-                    Reload::Recompiled
+            Engine::Tape(_) => {
+                match InferenceModel::compile_with_neuron_masks(model, params, &listed) {
+                    Ok(compiled) => {
+                        self.engine = Engine::Compiled(compiled);
+                        Reload::Recompiled
+                    }
+                    Err(_) => Reload::Tape,
                 }
-                Err(_) => Reload::Tape,
-            },
+            }
         };
-        if reload == Reload::Tape {
-            match &mut self.engine {
-                Engine::Tape(values) => values.clone_from(&params.values),
-                Engine::Compiled(_) => self.engine = Engine::Tape(params.values.clone()),
+        match &mut self.engine {
+            Engine::Compiled(compiled) if reload != Reload::Tape => {
+                // A step `refresh` kept has these values already; a fresh one gets them
+                // here. A `Linear` whose step is gone (its neurons moved) has none to set.
+                for (linear, mask) in &carried {
+                    let _ = compiled.set_neuron_mask(*linear, mask);
+                }
+            }
+            Engine::Tape(values) => values.clone_from(&params.values),
+            Engine::Compiled(_) => self.engine = Engine::Tape(params.values.clone()),
+        }
+        self.model = copy;
+        Ok(reload)
+    }
+
+    /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
+    /// neuron `mask` turns off outputs exactly 0, after the activations that follow the
+    /// `Linear` (at [`Sequential::neuron_layer`]), from the next
+    /// [`evaluate`](Self::evaluate) on. Only this evaluator changes; its clones keep their
+    /// own masks. Allocates nothing, on the compiled engine and on the tape.
+    ///
+    /// The neurons must have a mask: one listed in
+    /// [`with_neuron_masks`](Self::with_neuron_masks), or one the model had when the
+    /// evaluator was made or refreshed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if layer `linear` is not a `Linear` or `mask`'s width
+    /// differs from its output width, and [`Error::Unsupported`] if its neurons have no mask
+    /// (each message names the `Linear`); the evaluator is then unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{Error, ParamStore, Rng};
+    /// use cavitation_nn::{Evaluator, Linear, Loss, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut rng = Rng::seed(0);
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 4, &mut rng))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 4, 3, &mut rng));
+    /// let mut evaluator =
+    ///     Evaluator::with_neuron_masks(&net, &params, Loss::CrossEntropy, 32, &[0]).unwrap();
+    /// assert!(evaluator.set_neuron_mask(0, &NeuronMask::from_off(4, &[2])).is_ok());
+    /// let wrong_width = evaluator.set_neuron_mask(0, &NeuronMask::all_on(3));
+    /// assert!(matches!(wrong_width, Err(Error::InvalidData(_))));
+    /// let not_listed = evaluator.set_neuron_mask(2, &NeuronMask::all_on(3));
+    /// assert!(matches!(not_listed, Err(Error::Unsupported(_))));
+    /// ```
+    pub fn set_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> Result<(), Error> {
+        let Some(layer) = self.model.linear(linear) else {
+            return Err(Error::InvalidData(format!(
+                "evaluator: layer {linear} is not a Linear layer"
+            )));
+        };
+        let width = layer.outputs();
+        if mask.width() != width {
+            return Err(Error::InvalidData(format!(
+                "evaluator: a mask of width {} for the linear layer {linear}, which outputs \
+                 width {width}",
+                mask.width()
+            )));
+        }
+        match &mut self.engine {
+            Engine::Compiled(compiled) => {
+                compiled.set_neuron_mask(linear, mask)?;
+                // Keep the copy's masks equal to the ones in use, for `refresh`.
+                self.model.copy_neuron_mask(linear, mask);
+            }
+            Engine::Tape(_) => {
+                if !self.model.copy_neuron_mask(linear, mask) {
+                    return Err(Error::Unsupported(format!(
+                        "evaluator: the neurons of the linear layer {linear} have no mask; \
+                         list it in with_neuron_masks"
+                    )));
+                }
             }
         }
-        self.model = model.clone();
-        Ok(reload)
+        Ok(())
     }
 
     /// Measures the model on `data`: the loss, and the accuracy (class targets) or R²
@@ -533,6 +710,17 @@ pub fn evaluate(
     Evaluator::new(model, params, loss, batch)?.evaluate(data)
 }
 
+/// Returns [`Error::InvalidData`], naming the index, if an entry of `linears` is not the
+/// index of a `Linear` layer of `model`.
+fn check_linears(model: &Sequential, linears: &[usize]) -> Result<(), Error> {
+    match linears.iter().find(|&&l| model.linear(l).is_none()) {
+        Some(linear) => Err(Error::InvalidData(format!(
+            "evaluator: layer {linear} is not a Linear layer"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// Returns [`Error::Unsupported`] if `model` has no layers.
 fn check_layers(model: &Sequential) -> Result<(), Error> {
     if model.is_empty() {
@@ -623,7 +811,8 @@ mod tests {
     //! label checks, the tape fallback, `misclassified` and both ways `refresh` works.
 
     use super::*;
-    use crate::{Activation, ActivationLayer, Linear, LogSoftmax, NeuronMask, Sigmoid, Tanh};
+    use crate::inference::tests::layer_bounds;
+    use crate::{Activation, ActivationLayer, Linear, LogSoftmax, Sigmoid, Tanh};
     use cavitation_core::{Rng, Tensor};
 
     /// Every [`Loss`], with settings for the ones that take them.
@@ -867,9 +1056,32 @@ mod tests {
         }
     }
 
+    /// The rows of `data` whose two largest outputs of `net` on the tape lie within twice
+    /// the inference bound of each other ([`layer_bounds`], the matvec and GEMM bound
+    /// carried through the layers), so that the compiled path may rank them the other way.
+    fn near_ties(net: &Sequential, params: &ParamStore, data: &Dataset) -> Vec<bool> {
+        let (out, bound) = layer_bounds(net, params, data.x.data(), data.len())
+            .pop()
+            .unwrap();
+        let width = out.len() / data.len();
+        out.chunks(width)
+            .zip(bound.chunks(width))
+            .map(|(row, b)| {
+                let mut order: Vec<usize> = (0..width).collect();
+                order.sort_by(|&i, &j| row[j].total_cmp(&row[i]));
+                let (top, next) = (order[0], order[1]);
+                f64::from(row[top] - row[next]) <= 2.0 * (b[top] + b[next])
+            })
+            .collect()
+    }
+
     /// A model with an activation of your own runs on the tape and evaluates as the same
-    /// model with the built-in `Tanh` does compiled, within 1e-6, for class and value
-    /// targets.
+    /// model with the built-in `Tanh` does compiled: the loss and R² within 1e-6. The tape
+    /// gives the same outputs on both models, and the compiled path stays within the
+    /// matvec and GEMM bound of them, so the argmax can differ only on a row whose two
+    /// largest outputs are within that bound of each other: such near ties are left out of
+    /// the comparison of `misclassified`, and the accuracies may differ by at most their
+    /// share of the rows.
     #[test]
     fn tape_fallback_matches_compiled() {
         for loss in [Loss::CrossEntropy, Loss::Mse] {
@@ -894,16 +1106,155 @@ mod tests {
             let close = |x: f64, y: f64| (x - y).abs() <= 1e-6 * x.abs().max(1.0);
             assert!(close(c.loss, t.loss), "{loss:?}: {c:?} against {t:?}");
             match (c.accuracy, t.accuracy, c.r2, t.r2) {
-                (Some(x), Some(y), None, None) => assert!(close(x, y), "{c:?} against {t:?}"),
+                (Some(x), Some(y), None, None) => {
+                    let ties = near_ties(&builtin, &params, &data);
+                    let n = ties.iter().filter(|&&t| t).count();
+                    assert!(
+                        (x - y).abs() <= n as f64 / 300.0 + 1e-12,
+                        "{c:?} against {t:?}"
+                    );
+                    let (mut x, mut y) = (Vec::new(), Vec::new());
+                    compiled.misclassified(&data, &mut x).unwrap();
+                    tape.misclassified(&data, &mut y).unwrap();
+                    x.retain(|&r| !ties[r]);
+                    y.retain(|&r| !ties[r]);
+                    assert_eq!(x, y, "{n} near ties left out");
+                }
                 (None, None, Some(x), Some(y)) => assert!(close(x, y), "{c:?} against {t:?}"),
                 _ => panic!("{loss:?}: {c:?} against {t:?}"),
             }
-            if loss == Loss::CrossEntropy {
-                let (mut x, mut y) = (Vec::new(), Vec::new());
-                compiled.misclassified(&data, &mut x).unwrap();
-                tape.misclassified(&data, &mut y).unwrap();
-                assert_eq!(x, y);
+        }
+    }
+
+    /// The same 6 → 8 → 4 network as `builtin` (built-in `Tanh`) and as `own` (`MyTanh`,
+    /// so it runs on the tape), with 300 rows of class data.
+    fn both_engines() -> (Sequential, Sequential, ParamStore, Dataset) {
+        let (builtin, params, data) = case(Loss::CrossEntropy, 300, 40);
+        let own = Sequential::new()
+            .push(builtin.linear(0).unwrap().clone())
+            .push(ActivationLayer::new(MyTanh))
+            .push(builtin.linear(2).unwrap().clone());
+        (builtin, own, params, data)
+    }
+
+    /// On each engine, an evaluator made with `with_neuron_masks` and switched with
+    /// `set_neuron_mask` gives exactly the `evaluate` of the network with that neuron
+    /// masked through `Sequential::set_neuron`, for every hidden neuron, then with all of
+    /// them on again; the caller's network keeps no mask, and a clone keeps its own masks.
+    #[test]
+    fn neuron_masked_evaluator_matches_masked_evaluate() {
+        let (builtin, own, params, data) = both_engines();
+        let loss = Loss::CrossEntropy;
+        for (net, compiled) in [(&builtin, true), (&own, false)] {
+            let mut evaluator = Evaluator::with_neuron_masks(net, &params, loss, 64, &[0]).unwrap();
+            assert_eq!(matches!(evaluator.engine, Engine::Compiled(_)), compiled);
+            let plain = evaluate(net, &params, &data, loss, 64).unwrap();
+            assert_eq!(evaluator.evaluate(&data).unwrap(), plain);
+            for neuron in 0..8 {
+                evaluator
+                    .set_neuron_mask(0, &NeuronMask::from_off(8, &[neuron]))
+                    .unwrap();
+                let mut masked = net.clone();
+                masked.set_neuron(0, neuron, false);
+                let want = evaluate(&masked, &params, &data, loss, 64).unwrap();
+                let got = evaluator.evaluate(&data).unwrap();
+                assert_eq!(got, want, "compiled {compiled}, neuron {neuron}");
+                assert_ne!(got, plain, "compiled {compiled}, neuron {neuron}");
             }
+            assert!(net.mask(1).is_none());
+            let mut copy = evaluator.clone();
+            copy.set_neuron_mask(0, &NeuronMask::all_on(8)).unwrap();
+            assert_eq!(copy.evaluate(&data).unwrap(), plain);
+            assert_ne!(evaluator.evaluate(&data).unwrap(), plain);
+        }
+    }
+
+    /// `refresh` keeps the masks `set_neuron_mask` gave, on either engine and when the
+    /// evaluator moves from one to the other; a neuron mask on the refreshed network
+    /// replaces them.
+    #[test]
+    fn refresh_keeps_neuron_masks() {
+        let (builtin, own, mut params, data) = both_engines();
+        let loss = Loss::CrossEntropy;
+        let off = NeuronMask::from_off(8, &[1, 6]);
+        let mut evaluator =
+            Evaluator::with_neuron_masks(&builtin, &params, loss, 64, &[0]).unwrap();
+        evaluator.set_neuron_mask(0, &off).unwrap();
+        let w = builtin.param("0.weight").unwrap();
+        let want = |net: &Sequential, params: &ParamStore, mask: &NeuronMask| {
+            let mut masked = net.clone();
+            masked.set_neuron_mask(0, mask.clone());
+            evaluate(&masked, params, &data, loss, 64).unwrap()
+        };
+        params.value_mut(w).data_mut()[0] += 0.5;
+        assert_eq!(
+            evaluator.reload(&builtin, &params).unwrap(),
+            Reload::InPlace
+        );
+        assert_eq!(
+            evaluator.evaluate(&data).unwrap(),
+            want(&builtin, &params, &off)
+        );
+        assert_eq!(evaluator.reload(&own, &params).unwrap(), Reload::Tape);
+        assert_eq!(
+            evaluator.evaluate(&data).unwrap(),
+            want(&own, &params, &off)
+        );
+        params.value_mut(w).data_mut()[1] -= 0.5;
+        assert_eq!(evaluator.reload(&own, &params).unwrap(), Reload::Tape);
+        assert_eq!(
+            evaluator.evaluate(&data).unwrap(),
+            want(&own, &params, &off)
+        );
+        assert_eq!(
+            evaluator.reload(&builtin, &params).unwrap(),
+            Reload::Recompiled
+        );
+        assert_eq!(
+            evaluator.evaluate(&data).unwrap(),
+            want(&builtin, &params, &off)
+        );
+        let mut masked = builtin.clone();
+        let other = NeuronMask::from_off(8, &[3]);
+        masked.set_neuron_mask(0, other.clone());
+        evaluator.refresh(&masked, &params).unwrap();
+        assert_eq!(
+            evaluator.evaluate(&data).unwrap(),
+            want(&builtin, &params, &other)
+        );
+    }
+
+    /// `with_neuron_masks` with an index that is not a `Linear` is `InvalidData`; on each
+    /// engine `set_neuron_mask` on a layer that is not a `Linear` or with the wrong width is
+    /// `InvalidData`, and on a `Linear` that was not listed `Unsupported`, each naming the
+    /// layer, and the evaluation is unchanged.
+    #[test]
+    fn set_neuron_mask_errors_on_each_engine() {
+        let (builtin, own, params, data) = both_engines();
+        let loss = Loss::CrossEntropy;
+        for net in [&builtin, &own] {
+            match Evaluator::with_neuron_masks(net, &params, loss, 64, &[1]) {
+                Err(Error::InvalidData(msg)) => assert!(msg.contains("layer 1"), "{msg}"),
+                other => panic!("expected InvalidData, got {other:?}"),
+            }
+            let mut evaluator = Evaluator::with_neuron_masks(net, &params, loss, 64, &[0]).unwrap();
+            let before = evaluator.evaluate(&data).unwrap();
+            let cases: [(usize, NeuronMask); 3] = [
+                (1, NeuronMask::all_off(8)),
+                (0, NeuronMask::all_off(7)),
+                (2, NeuronMask::all_off(4)),
+            ];
+            for (linear, mask) in cases {
+                let got = evaluator.set_neuron_mask(linear, &mask);
+                let msg = match (&got, linear) {
+                    (Err(Error::Unsupported(msg)), 2) | (Err(Error::InvalidData(msg)), 0 | 1) => {
+                        msg
+                    }
+                    _ => panic!("linear {linear}: {got:?}"),
+                };
+                assert!(msg.contains(&format!("layer {linear}")), "{msg}");
+            }
+            assert_eq!(evaluator.evaluate(&data).unwrap(), before);
         }
     }
 

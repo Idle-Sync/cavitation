@@ -7,9 +7,22 @@ use cavitation_core::{Real, Tensor};
 /// [`set_mask`](crate::Sequential::set_mask) turns its off neurons' outputs to exactly 0 and
 /// stops their gradient, in training and in every forward pass.
 ///
-/// To turn off a hidden neuron, mask the activation layer after its `Linear`: the neuron's
-/// output is then 0 whatever the activation gives at 0, and nothing flows back into the
-/// weights that feed it.
+/// A mask reaches a network by one of three routes:
+///
+/// - By layer index: [`Sequential::set_mask`](crate::Sequential::set_mask) puts it on the
+///   output of the layer you name.
+/// - By `Linear`: [`Sequential::set_neuron_mask`](crate::Sequential::set_neuron_mask) and
+///   [`Sequential::set_neuron`](crate::Sequential::set_neuron) turn off a hidden neuron by
+///   naming its `Linear`, and put the mask on
+///   [`Sequential::neuron_layer`](crate::Sequential::neuron_layer), after the activations
+///   that follow it. The neuron's output is then 0 whatever the activations give at 0, and
+///   nothing flows back into the weights that feed it. This is the route to use for
+///   neurons.
+/// - Compiled: [`InferenceModel::set_neuron_mask`](crate::InferenceModel::set_neuron_mask)
+///   (by `Linear`) and [`InferenceModel::set_mask`](crate::InferenceModel::set_mask) (by
+///   layer index), and [`Evaluator::set_neuron_mask`](crate::Evaluator::set_neuron_mask),
+///   change one instance's mask in place without allocating, for a sweep that switches
+///   neurons again and again.
 ///
 /// ```
 /// use cavitation_nn::NeuronMask;

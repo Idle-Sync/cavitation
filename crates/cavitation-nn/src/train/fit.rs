@@ -830,7 +830,7 @@ pub(super) fn check_model_and_loss(
 /// expects, every class label is below the model's output width, and value targets are as
 /// wide as the model's output. Two layers that disagree skip the checks that need the output
 /// width.
-pub(super) fn check_widths(model: &Sequential, data: &Dataset) -> Result<(), Error> {
+pub(crate) fn check_widths(model: &Sequential, data: &Dataset) -> Result<(), Error> {
     let (rows, mut width) = (data.len(), data.features());
     // Whether an earlier layer named an input width, so that `width` is checked against it.
     let mut named = false;
@@ -1038,6 +1038,11 @@ pub fn fit_with_hooks(
 /// The model is compiled once into an [`InferenceModel`] and each batch runs through
 /// [`InferenceModel::infer_batch`]. A model that cannot be compiled (a layer of your own
 /// without an inference form) runs through the training graph's forward pass instead.
+///
+/// [`evaluate`](crate::evaluate) measures the same accuracy together with the loss, and
+/// returns [`Error::InvalidData`](cavitation_core::Error::InvalidData) for unsuitable data
+/// where this function panics; an [`Evaluator`](crate::Evaluator) measures again without
+/// compiling again.
 ///
 /// # Panics
 ///
