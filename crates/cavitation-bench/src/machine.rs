@@ -74,6 +74,30 @@ pub fn detect() -> MachineInfo {
     })
 }
 
+/// The three load averages (1, 5 and 15 minutes) from the text of `/proc/loadavg`
+/// (`0.52 0.58 0.59 1/467 1234`) or of `sysctl -n vm.loadavg` (`{ 1.79 2.10 2.30 }`), joined
+/// by single spaces. Returns `None` if the text does not start with three numbers.
+pub fn parse_load_average(text: &str) -> Option<String> {
+    let values: Vec<&str> = text
+        .split_whitespace()
+        .filter(|word| *word != "{" && *word != "}")
+        .take(3)
+        .collect();
+    (values.len() == 3 && values.iter().all(|v| v.parse::<f64>().is_ok())).then(|| values.join(" "))
+}
+
+/// The load average now: `/proc/loadavg` on Linux, `sysctl -n vm.loadavg` on macOS; `unknown`
+/// where neither can be read.
+pub fn load_average() -> String {
+    let text = if cfg!(target_os = "macos") {
+        sysctl("vm.loadavg")
+    } else {
+        std::fs::read_to_string("/proc/loadavg").ok()
+    };
+    text.and_then(|t| parse_load_average(&t))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// The version line of the compiler on `PATH` (`rustc --version`), or `unknown`.
 pub fn rustc_version() -> String {
     Command::new("rustc")
@@ -140,6 +164,16 @@ mod tests {
         assert_eq!(info.logical_cores, 10);
         assert!(parse_sysctl("Apple M4", "ten").is_none());
         assert!(parse_sysctl("", "10").is_none());
+    }
+
+    /// Both load-average formats give the three numbers.
+    #[test]
+    fn load_average_parses_both_formats() {
+        let expected = Some("1.79 2.10 2.30".to_string());
+        assert_eq!(parse_load_average("{ 1.79 2.10 2.30 }\n"), expected);
+        assert_eq!(parse_load_average("1.79 2.10 2.30 1/467 1234"), expected);
+        assert_eq!(parse_load_average("{ 1.79 2.10 }"), None);
+        assert_eq!(parse_load_average("{ a b c }"), None);
     }
 
     /// The CPU time is `utime + stime` in ticks of 10 ms, found after the command name even

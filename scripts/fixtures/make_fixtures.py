@@ -28,9 +28,9 @@ values, runs the network and requires both PyTorch's f32 outputs and the library
 included, and the first layer's bound carried through the second layer's weights). To rewrite
 the two files after a deliberate change to `save`, run
 `CAVITATION_WRITE_FIXTURES=1 cargo test --release -p cavitation-nn --lib save_writes_the_file`,
-then this check:
+then this check, run from the repository root (`--out` defaults to `crates`):
 
-    scripts/fixtures/.venv/bin/python -I scripts/fixtures/make_fixtures.py --out crates --check-rust-save
+    scripts/fixtures/.venv/bin/python -I scripts/fixtures/make_fixtures.py --check-rust-save
 
 Give a path to check another copy of the file (for example one altered on purpose, to see the
 check fail); `from-rust-io.json` is still read from the committed folder. Every check exits
@@ -606,7 +606,12 @@ def check_rust_save(crates_dir, saved=None):
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
-    parser.add_argument("--out", required=True, help="the crates directory (files go under cavitation-core/tests/fixtures/ops)")
+    parser.add_argument(
+        "--out",
+        default="crates",
+        help="the crates directory (default: crates, relative to the working directory; files go under "
+        "cavitation-core/tests/fixtures/ops, and --check-rust-save reads under cavitation-nn/tests/fixtures)",
+    )
     parser.add_argument("--only", choices=["state-dict"], help="write only this fixture family")
     parser.add_argument(
         "--check-rust-save",

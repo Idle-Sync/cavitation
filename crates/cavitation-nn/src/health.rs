@@ -47,9 +47,9 @@ pub enum OnNonFinite {
 pub struct BadInput {
     /// The position in the batch, counting from 0.
     pub position: usize,
-    /// The row of the dataset that sat at that position, when the batch was gathered
-    /// through a [`Batcher`](crate::Batcher) order (as [`fit`](crate::fit) does); `None`
-    /// when the caller gave no rows, as with a hand-written [`Trainer::step`](crate::Trainer::step).
+    /// The row of the dataset that sat at that position, when the batch was gathered through a
+    /// [`Batcher`](crate::Batcher) order (as [`fit`](crate::fit) does); `None` when the caller gave
+    /// no rows, as with a hand-written [`Trainer::step`](crate::Trainer::step).
     pub row: Option<usize>,
     /// The feature (the position within the row) for an input; the output index for a target.
     pub feature: usize,
@@ -835,7 +835,7 @@ impl HealthMonitor {
         {
             eprintln!(
                 "cavitation: warning: epoch {epoch}: the loss was negative again \
-                 (it first fell below 0 at {first:.3e})"
+                 (first negative loss this epoch: {first:.3e})"
             );
         }
         self.repeats.clear();
@@ -2499,9 +2499,9 @@ mod tests {
         }
     }
 
-    /// Helper for `negative_loss_prints_once_then_summarises`: trains the zero-parameter `Nll` model
-    /// for three epochs of three steps with the default checks, which print to standard error.
-    /// Ignored by default; it is run in a child process.
+    /// Helper for `negative_loss_prints_once_then_summarises`: trains the zero-parameter `Nll`
+    /// model for three epochs of three steps with the default checks, which print to standard
+    /// error. Ignored by default; it is run in a child process.
     #[test]
     #[ignore = "run in a child process by negative_loss_prints_once_then_summarises"]
     fn negative_loss_printing_child() {

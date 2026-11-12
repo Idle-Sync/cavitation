@@ -471,11 +471,11 @@ fn product_bits(
     c.into_iter().map(f32::to_bits).collect()
 }
 
-/// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the
-/// training shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and
-/// 32 x 256 x 1024, at every fast level and Accelerate. The test binary re-runs itself as a child that runs
-/// only `threads_bit_identical_child`, so nothing else holds the thread pool and the
-/// multi-threaded products really use its workers.
+/// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the training
+/// shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and 32 x 256 x 1024, at every fast
+/// level and Accelerate. The test binary re-runs itself as a child that runs only
+/// `threads_bit_identical_child`, so nothing else holds the thread pool and the multi-threaded
+/// products really use its workers.
 #[test]
 fn threads_bit_identical() {
     let out = crate::test_child::run_alone("kernels::twin_tests::threads_bit_identical_child", &[]);
@@ -700,11 +700,11 @@ fn matvec_bounds(w_t: &[f32], x: &[f32], bias: Option<&[f32]>, n: usize) -> Vec<
         .collect()
 }
 
-/// The fast matvec at every supported level matches the reference (followed by ReLU when
-/// asked) within the matvec tolerance, and the SSE4.2 one bit for bit, for input widths 1, 3, 7, 64, 785 and 1023 by output
-/// widths 1, 5, 10, 256 and 1024, with and without a bias and ReLU. The weights are stored
-/// with 3 NaN values of padding after each row, so reading past a row shows up as NaN; the
-/// output starts as NaN, so an element left unwritten shows up too.
+/// The fast matvec at every supported level matches the reference (followed by ReLU when asked)
+/// within the matvec tolerance, and the SSE4.2 one bit for bit, for input widths 1, 3, 7, 64, 785
+/// and 1023 by output widths 1, 5, 10, 256 and 1024, with and without a bias and ReLU. The weights
+/// are stored with 3 NaN values of padding after each row, so reading past a row shows up as NaN;
+/// the output starts as NaN, so an element left unwritten shows up too.
 #[test]
 fn matvec_levels_match_reference() {
     let mut rng = Rng::seed(17);

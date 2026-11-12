@@ -252,9 +252,7 @@ fn execute(run: Run, python: &str) -> Result<Comparison, String> {
 ///
 /// Returns a message if the results file cannot be written.
 fn report(rows: &[Comparison]) -> Result<(), String> {
-    let load = std::fs::read_to_string("/proc/loadavg")
-        .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let load = machine::load_average();
     println!(
         "kernel {}, {} threads, load average at the end {load}",
         level(),

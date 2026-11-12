@@ -175,10 +175,10 @@ fn chunked<T: Real, const M: usize>(
 /// What the optimiser saw in the gradients during a step: for every parameter the sum of the
 /// squares of its gradient (in `f64`) and whether every value was finite.
 ///
-/// The optimiser fills it in the same pass that updates the parameters, so reading the
-/// gradients costs no extra pass. A parameter whose gradient is stale (nothing contributed to
-/// it since [`ParamStore::zero_grad`]) is not updated and counts as zeros here. A `GradStats` can be reused from step to step;
-/// after the first step it allocates nothing.
+/// The optimiser fills it in the same pass that updates the parameters, so reading the gradients
+/// costs no extra pass. A parameter whose gradient is stale (nothing contributed to it since
+/// [`ParamStore::zero_grad`]) is not updated and counts as zeros here. A `GradStats` can be reused
+/// from step to step; after the first step it allocates nothing.
 ///
 /// # Examples
 ///
@@ -293,12 +293,12 @@ impl GradStats {
 
 /// Changes parameters from their gradients.
 ///
-/// An optimiser keeps its state (momentum, moment estimates) in buffers it allocates on the
-/// first step and reuses afterwards. A parameter whose gradient is stale (nothing has
-/// contributed to it since [`ParamStore::zero_grad`]) is skipped, as PyTorch skips a
-/// parameter whose `grad` is `None`: its value and its state stay as they are, and Adam's
-/// bias correction counts only the steps that updated it. The parameter store must not change its number or the
-/// sizes of its parameters after that: a later step panics if it does.
+/// An optimiser keeps its state (momentum, moment estimates) in buffers it allocates on the first
+/// step and reuses afterwards. A parameter whose gradient is stale (nothing has contributed to it
+/// since [`ParamStore::zero_grad`]) is skipped, as PyTorch skips a parameter whose `grad` is
+/// `None`: its value and its state stay as they are, and Adam's bias correction counts only the
+/// steps that updated it. The parameter store must not change its number or the sizes of its
+/// parameters after that: a later step panics if it does.
 ///
 /// # Examples
 ///
@@ -336,8 +336,8 @@ pub trait Optimizer<T: Real>: Send {
     fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats);
 
     /// Updates every parameter that has a gradient, as
-    /// [`step_with_stats`](Optimizer::step_with_stats) does. The statistics go into a [`GradStats`] the
-    /// optimiser owns, allocated on the first step and reused, so after the first step this
+    /// [`step_with_stats`](Optimizer::step_with_stats) does. The statistics go into a [`GradStats`]
+    /// the optimiser owns, allocated on the first step and reused, so after the first step this
     /// allocates nothing; read them with [`last_stats`](Optimizer::last_stats).
     ///
     /// # Panics

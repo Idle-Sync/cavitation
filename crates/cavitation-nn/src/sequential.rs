@@ -575,18 +575,21 @@ mod tests {
         assert_ne!(output(&copy, &copy_params, &x), before);
     }
 
-    /// A mask set before cloning is on both networks; one set on the clone afterwards is on
-    /// the clone only.
+    /// A mask set before cloning is on both networks with the same contents; a mask set on
+    /// either network afterwards is on that network only.
     #[test]
     fn clone_keeps_masks() {
         let mut net = Sequential::new().push(Relu).push(Relu);
-        net.set_mask(0, NeuronMask::all_on(4));
+        let mask = NeuronMask::all_on(4);
+        net.set_mask(0, mask.clone());
         let mut copy = net.clone();
-        assert_eq!(net.mask(0).unwrap().width(), 4);
-        assert_eq!(copy.mask(0).unwrap().width(), 4);
+        assert_eq!(net.mask(0), Some(&mask));
+        assert_eq!(copy.mask(0), Some(&mask));
         copy.set_mask(1, NeuronMask::all_on(2));
         assert!(copy.mask(1).is_some());
         assert!(net.mask(1).is_none());
+        net.set_mask(1, NeuronMask::all_on(3));
+        assert_eq!(copy.mask(1), Some(&NeuronMask::all_on(2)));
     }
 
     /// A layer that is not `Clone` works inside a cloned network, and both copies share it.

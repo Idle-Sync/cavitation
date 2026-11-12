@@ -298,9 +298,9 @@ impl<'a> LoadOptions<'a> {
 ///
 /// # Errors
 ///
-/// The errors of [`load`] (the keys in [`Error::Keys`] are the renamed ones), and
-/// [`Error::Format`] when two keys of the file rename to the same key; the message names both. For two keys that collide, the first in alphabetical order is
-/// named first.
+/// The errors of [`load`] (the keys in [`Error::Keys`] are the renamed ones), and [`Error::Format`]
+/// when two keys of the file rename to the same key; the message names both. For two keys that
+/// collide, the first in alphabetical order is named first.
 ///
 /// # Panics
 ///

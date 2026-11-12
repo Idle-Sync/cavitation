@@ -328,16 +328,16 @@ impl Trainer {
     ///
     /// # Errors
     ///
-    /// Under [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns
-    /// [`Error::NonFinite`] when the loss or a gradient is NaN or infinite, naming the step
-    /// and `"loss"` or the parameter, and sends the matching [`Warning::NonFinite`] to the
-    /// health sink. For a non-finite loss the error's `detail` names the first NaN or infinite
-    /// value in the batch's inputs or value targets (with no dataset row, as `step` does not
-    /// know one), or says that the inputs were finite and the values overflowed. A NaN or
-    /// infinite loss skips the optimiser step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is found after the update
-    /// has applied it. The step is counted and the gradients are marked stale either way.
-    /// [`fit`] stops at this error. Under [`OnNonFinite::Warn`](crate::OnNonFinite) the step
-    /// returns its loss, NaN or not.
+    /// Under [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`]
+    /// when the loss or a gradient is NaN or infinite, naming the step and `"loss"` or the
+    /// parameter, and sends the matching [`Warning::NonFinite`] to the health sink. For a
+    /// non-finite loss the error's `detail` names the first NaN or infinite value in the batch's
+    /// inputs or value targets (with no dataset row, as `step` does not know one), or says that the
+    /// inputs were finite and the values overflowed. A NaN or infinite loss skips the optimiser
+    /// step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is
+    /// found after the update has applied it. The step is counted and the gradients are marked
+    /// stale either way. [`fit`] stops at this error. Under
+    /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not.
     ///
     /// [`Warning::NonFinite`]: crate::Warning::NonFinite
     ///
@@ -883,30 +883,30 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 
 /// Trains `model` on `train` as `config` says and returns each epoch's report.
 ///
-/// Each epoch sets the optimiser's learning rate from `config.schedule`, reshuffles the rows
-/// (with `config.shuffle_seed`), takes one [`Trainer::step`] per batch, ends the epoch of the
-/// health checks ([`Trainer::end_epoch`]) and then calls `config.on_epoch`. The same seeds give bit-identical parameters on every run on the same
-/// machine and kernel level, for any thread count.
+/// Each epoch sets the optimiser's learning rate from `config.schedule`, reshuffles the rows (with
+/// `config.shuffle_seed`), takes one [`Trainer::step`] per batch, ends the epoch of the health
+/// checks ([`Trainer::end_epoch`]) and then calls `config.on_epoch`. The same seeds give
+/// bit-identical parameters on every run on the same machine and kernel level, for any thread
+/// count.
 ///
 /// # Errors
 ///
-/// Returns, before training, [`Error::InvalidData`] if `train.x` is not a matrix or has no
-/// rows, if value targets are not a matrix, if the kind of targets is not the kind
-/// `config.loss` needs (see [`Loss`]), if a class label is not below the model's output
-/// width, or, for [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`],
-/// if a target is NaN, infinite or outside `[0, 1]` (the message names its row and
-/// column), if the targets do not have one entry per row, if value targets are not as wide
-/// as the model's output, if the inputs are not as wide as the first layer that names an
-/// input width expects (layers that do not, such as activations, may come before it; the
-/// message then gives the width that reaches the layer), or if any input or value target is
-/// NaN or infinite (the message names the row, the column and the value). Each message
-/// names the tensors with their shapes, such as "the inputs are [8, 5]". Two layers that disagree on a width are a model error, not a data
-/// error: the checks that need the output width are skipped and the first forward pass
-/// panics naming both layers. During training, with `config.health.on_non_finite` set to
-/// [`OnNonFinite::Stop`](crate::OnNonFinite) (the default), returns [`Error::NonFinite`] at
-/// the first step whose loss or gradient is NaN or infinite, naming the step and `"loss"` or
-/// the parameter (for example `"0.weight"`), after sending the matching warning to the
-/// health sink. A non-finite loss stops before the optimiser
+/// Returns, before training, [`Error::InvalidData`] if `train.x` is not a matrix or has no rows, if
+/// value targets are not a matrix, if the kind of targets is not the kind `config.loss` needs (see
+/// [`Loss`]), if a class label is not below the model's output width, or, for
+/// [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`], if a target is NaN,
+/// infinite or outside `[0, 1]` (the message names its row and column), if the targets do not have
+/// one entry per row, if value targets are not as wide as the model's output, if the inputs are not
+/// as wide as the first layer that names an input width expects (layers that do not, such as
+/// activations, may come before it; the message then gives the width that reaches the layer), or if
+/// any input or value target is NaN or infinite (the message names the row, the column and the
+/// value). Each message names the tensors with their shapes, such as "the inputs are [8, 5]". Two
+/// layers that disagree on a width are a model error, not a data error: the checks that need the
+/// output width are skipped and the first forward pass panics naming both layers. During training,
+/// with `config.health.on_non_finite` set to [`OnNonFinite::Stop`](crate::OnNonFinite) (the
+/// default), returns [`Error::NonFinite`] at the first step whose loss or gradient is NaN or
+/// infinite, naming the step and `"loss"` or the parameter (for example `"0.weight"`), after
+/// sending the matching warning to the health sink. A non-finite loss stops before the optimiser
 /// step; a non-finite gradient with a finite loss is found after the update applied it.
 ///
 /// # Panics

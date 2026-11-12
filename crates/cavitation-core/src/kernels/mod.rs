@@ -348,8 +348,20 @@ fn available_threads() -> usize {
 /// let n = cavitation_core::kernels::threads();
 /// assert!(n >= 1);
 /// if std::env::var_os("CAVITATION_THREADS").is_none() {
-///     // Never more threads than the machine runs at once.
-///     assert!(n <= std::thread::available_parallelism().map_or(1, |n| n.get()));
+///     let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+///     // On Apple systems the performance-core count, when the sysctl reports one.
+///     let performance_cores = std::process::Command::new("sysctl")
+///         .args(["-n", "hw.perflevel0.physicalcpu"])
+///         .output()
+///         .ok()
+///         .filter(|out| out.status.success())
+///         .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse::<usize>().ok())
+///         .filter(|&cores| cores > 0);
+///     let expected = match performance_cores {
+///         Some(cores) if cfg!(target_vendor = "apple") => cores.min(available),
+///         _ => available,
+///     };
+///     assert_eq!(n, expected);
 /// }
 /// ```
 fn default_threads() -> usize {
@@ -417,10 +429,7 @@ fn performance_cores() -> std::io::Result<usize> {
 /// thread count falls back to the available parallelism.
 #[cfg(not(target_vendor = "apple"))]
 fn performance_cores() -> std::io::Result<usize> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "performance cores are only read on Apple systems",
-    ))
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// The number of threads the threaded kernels use: the last value passed to
@@ -491,9 +500,10 @@ fn required_len(rows: usize, cols: usize, row_stride: usize, col_stride: usize) 
 
 /// Whether no two distinct elements of a `rows` by `cols` view can share an offset.
 ///
-/// An empty view (no rows or no columns) always passes. Otherwise only dimensions with
-/// extent above 1 count. A single such dimension needs a stride of at least 1. Two need, with the smaller stride `s` and its extent `e`, `s >= 1` and
-/// `e * s <= ` the larger stride. This is sufficient, not necessary.
+/// An empty view (no rows or no columns) always passes. Otherwise only dimensions with extent above
+/// 1 count. A single such dimension needs a stride of at least 1. Two need, with the smaller stride
+/// `s` and its extent `e`, `s >= 1` and `e * s <= ` the larger stride. This is sufficient, not
+/// necessary.
 fn is_non_aliasing(rows: usize, cols: usize, row_stride: usize, col_stride: usize) -> bool {
     if rows == 0 || cols == 0 {
         // No elements, so none can share an offset.

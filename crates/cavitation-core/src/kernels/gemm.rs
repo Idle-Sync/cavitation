@@ -172,16 +172,16 @@ pub fn gemm_f32(alpha: f32, a: MatRef<f32>, b: MatRef<f32>, beta: f32, c: MatMut
 /// [`gemm_f32`] with the kernel level and the thread count given explicitly, instead of
 /// the process-wide settings.
 ///
-/// [`Level::Sse42`] runs the packed SSE4.2 kernel (6 by 8 tiles), [`Level::Avx2Fma`] the
-/// packed AVX2 kernel (6 by 16 tiles, fused multiply-add) and [`Level::Neon`] the packed
-/// NEON kernel (8 by 12 tiles, fused multiply-add). [`Level::Accelerate`] (Apple Silicon)
-/// calls Accelerate's `cblas_sgemm` once, on the calling thread, when every view is
-/// row-major or column-major with rows (or columns) that do not overlap, padded or not, and
-/// fits in `i32` indices; any other layout, or `alpha = 0`, runs the NEON kernel instead. [`Level::Reference`] runs
-/// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one
-/// thread; [`threads_used`] tells how many a call uses. Each level rounds differently (fused
-/// multiply-add rounds once per step, and each kernel blocks the sum differently), so
-/// results are bit-identical across thread counts within one level, not across levels.
+/// [`Level::Sse42`] runs the packed SSE4.2 kernel (6 by 8 tiles), [`Level::Avx2Fma`] the packed
+/// AVX2 kernel (6 by 16 tiles, fused multiply-add) and [`Level::Neon`] the packed NEON kernel (8 by
+/// 12 tiles, fused multiply-add). [`Level::Accelerate`] (Apple Silicon) calls Accelerate's
+/// `cblas_sgemm` once, on the calling thread, when every view is row-major or column-major with
+/// rows (or columns) that do not overlap, padded or not, and fits in `i32` indices; any other
+/// layout, or `alpha = 0`, runs the NEON kernel instead. [`Level::Reference`] runs
+/// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one thread;
+/// [`threads_used`] tells how many a call uses. Each level rounds differently (fused multiply-add
+/// rounds once per step, and each kernel blocks the sum differently), so results are bit-identical
+/// across thread counts within one level, not across levels.
 ///
 /// # Panics
 ///
