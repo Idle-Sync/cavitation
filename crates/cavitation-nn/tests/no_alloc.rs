@@ -584,6 +584,73 @@ fn infer_batch_steady_state() -> usize {
     made
 }
 
+/// Compiles the 50k network with a mask on its second ReLU and runs one batch of 128 rows
+/// through `infer_batch_observed` as a warm-up, then 2,000 more batches, alternating 128 and
+/// 29 rows, summing every observed output. Returns the allocations made after the warm-up.
+fn observed_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let mut net = network_50k(&mut params);
+    net.set_neuron_mask(2, NeuronMask::from_off(128, &[3, 70]));
+    let mut model = InferenceModel::compile(&net, &params).unwrap();
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    let batch = |start: usize, n: usize| {
+        TensorView::from_slice(&rows[start * 64..(start + n) * 64], &[n, 64]).unwrap()
+    };
+    let mut sink = 0.0f64;
+    let mut layers = 0usize;
+    let mut observe = |layer: usize, out: TensorView<'_, f32>| {
+        layers += layer;
+        sink += f64::from(out.data()[0]);
+    };
+    model.infer_batch_observed(batch(0, 128), &mut observe);
+    let before = allocations();
+    for i in 0..2_000 {
+        let n = if i % 2 == 0 { 128 } else { 29 };
+        let start = (i * 37) % (1437 - 128);
+        model.infer_batch_observed(batch(start, n), &mut observe);
+    }
+    let made = allocations() - before;
+    // Layers 1, 3 and 4 are reported on each of the 2,001 calls.
+    assert_eq!(layers, 2_001 * 8);
+    assert!(sink.is_finite());
+    made
+}
+
+/// Compiles the 50k network with mask steps on both ReLU layers, then alternates
+/// `set_mask` (three prepared masks per layer) with `infer` 1,000 times after one warm-up
+/// round. Returns the allocations made after the warm-up.
+fn set_mask_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut model = InferenceModel::compile_with_masks(&net, &params, &[1, 3]).unwrap();
+    let first = [
+        NeuronMask::all_on(256),
+        NeuronMask::from_off(256, &[0, 9, 255]),
+        NeuronMask::from_on(256, &[4]),
+    ];
+    let second = [
+        NeuronMask::from_off(128, &[1]),
+        NeuronMask::all_off(128),
+        NeuronMask::all_on(128),
+    ];
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    model.set_mask(1, &first[0]).unwrap();
+    model.set_mask(3, &second[0]).unwrap();
+    let mut sink = model.infer(&rows[..64])[0];
+    let before = allocations();
+    for i in 0..1_000 {
+        model.set_mask(1, &first[i % 3]).unwrap();
+        model.set_mask(3, &second[(i / 3) % 3]).unwrap();
+        let at = (i % 1437) * 64;
+        sink += model.infer(&rows[at..at + 64])[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// Traces the 5-layer 50k network (three `Linear` and two `Relu`) into a trace made with
 /// `Trace::with_capacity(5)`: one warm-up pass (which starts the tape's buffers), then 100
 /// more passes through `forward_traced` with the same trace and graph. Returns the allocations
@@ -686,7 +753,7 @@ fn evaluator_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 15] = [
+    let scenarios: [Scenario; 17] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -700,6 +767,8 @@ fn main() -> ExitCode {
         ("health_steady_state", health_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),
+        ("observed_steady_state", observed_steady_state),
+        ("set_mask_steady_state", set_mask_steady_state),
         ("evaluator_steady_state", evaluator_steady_state),
         (
             "trace_with_capacity_allocates_nothing",

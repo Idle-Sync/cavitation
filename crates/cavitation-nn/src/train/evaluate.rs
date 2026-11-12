@@ -198,13 +198,15 @@ impl Evaluator {
     /// Picks up new weights and masks: `model` and `params` replace the ones the evaluator
     /// was made or last refreshed with.
     ///
-    /// When no clone of this evaluator shares its compiled model and the new model compiles
-    /// to the same layout (the same layers with the same widths, and masks on the same
-    /// layers), the new weights and masks are copied into the compiled model in place, and
-    /// its buffers are kept. Otherwise (a clone shares the compiled model, or a width
-    /// changed, or a mask was added or removed) the model is compiled afresh for this
-    /// evaluator alone, and a clone keeps evaluating the weights it had. A model with a
-    /// layer that has no inference form runs on the tape, with a copy of the new values.
+    /// When no clone of this evaluator shares its compiled weights and the new model
+    /// compiles to the same layout (the same layers with the same widths, and masks on the
+    /// same layers), the new weights are copied into the compiled model in place, and its
+    /// buffers are kept. Otherwise (a clone shares the compiled weights, or a width changed,
+    /// or a mask was added or removed) the model is compiled afresh for this evaluator
+    /// alone, and a clone keeps evaluating the weights it had. The mask values are each
+    /// evaluator's own, never shared with a clone: with masks on the same layers they are
+    /// copied in place either way. A model with a layer that has no inference form runs on
+    /// the tape, with a copy of the new values.
     ///
     /// `refresh` allocates, even in place: it builds the new weights before copying them
     /// in. Only [`evaluate`](Self::evaluate) and [`misclassified`](Self::misclassified) are
@@ -936,10 +938,10 @@ mod tests {
     }
 
     /// `refresh` copies new weights and mask values in place when no clone shares the
-    /// compiled model and the layout is unchanged; it recompiles when a clone shares it
+    /// compiled weights and the layout is unchanged; it recompiles when a clone shares them
     /// (the clone keeps the old weights), when a mask is added or cleared, or when the last
-    /// layer gets wider; a model without an inference form moves to the tape and back. Each time the evaluation matches a fresh
-    /// evaluator's.
+    /// layer gets wider; a model without an inference form moves to the tape and back. Each
+    /// time the evaluation matches a fresh evaluator's.
     #[test]
     fn refresh_in_place_and_recompiled() {
         let loss = Loss::CrossEntropy;
