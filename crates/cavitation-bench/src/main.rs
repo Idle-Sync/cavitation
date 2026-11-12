@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|digits|latency|gemm|subnormal|info>`:
+//! `cavitation-bench <all|mnist|digits|latency|gemm|subnormal|small|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -18,6 +18,13 @@
 //!   SGD with momentum 0.9 and Adam (lr 1e-3), so their state decays through the subnormal
 //!   range. It prints the median update time of each block of 100 steps, and the ratio of
 //!   the blocks from step 901 on to the blocks of steps 1 to 700.
+//! - `small [--rounds N]` (default 3) trains a small network (4 → 32 → tanh → 32 → tanh →
+//!   1, mean squared error, Adam lr 1e-3, batch 64, 20,000 seeded rows, 10 timed epochs) at
+//!   1 and at 4 threads, in interleaved rounds, each run in a child process with
+//!   `CAVITATION_THREADS` set. It prints each run's wall-clock and CPU seconds, then the
+//!   medians and the 4-thread figures over the 1-thread ones, and checks that every run
+//!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
+//!   only. `small --child` is the child's side: one run at the current thread count.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
@@ -34,13 +41,14 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|digits|latency|gemm|subnormal|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|digits|latency|gemm|subnormal|small|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH]\n\
     \x20 digits  [--python PATH]\n\
     \x20 latency [--python PATH]\n\
     \x20 all     [--python PATH]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 subnormal [--steps N]\n\
+    \x20 small   [--rounds N]\n\
     \x20 info";
 
 /// Entry point of the benchmark runner.
@@ -58,6 +66,7 @@ fn main() -> ExitCode {
             .ok_or_else(|| "info takes no arguments".to_string()),
         "gemm" => gemm(rest),
         "subnormal" => subnormal(rest),
+        "small" => small(rest),
         "mnist" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
             let mut rows = Vec::new();
             if command == "all" {
@@ -378,4 +387,140 @@ fn subnormal(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The thread counts the `small` run compares; the first is the baseline.
+const SMALL_THREADS: [usize; 2] = [1, 4];
+
+/// Runs the `small` subcommand with its arguments (after `small`).
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument, a `--rounds` that is not a positive number,
+/// a child run that fails, or runs that ended on different losses.
+fn small(args: &[String]) -> Result<(), String> {
+    let mut rounds = 3usize;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--child" => {
+                let run = runs::small_once()?;
+                println!(
+                    "wall {:e} cpu {:e} loss {:08x}",
+                    run.wall, run.cpu, run.loss_bits
+                );
+                return Ok(());
+            }
+            "--rounds" => {
+                let v = rest.next().ok_or("--rounds needs a value")?;
+                rounds = v
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("--rounds must be a positive number, got `{v}`"))?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    let net = runs::SMALL_NET.map(|w| w.to_string()).join(" → ");
+    println!(
+        "small: {net} with tanh, MSE, Adam lr 1e-3, batch {}, {} rows, {} timed epochs, \
+         kernel {}, {rounds} interleaved rounds",
+        runs::SMALL_BATCH,
+        runs::SMALL_ROWS,
+        runs::SMALL_EPOCHS,
+        level()
+    );
+    let mut results: Vec<Vec<runs::SmallRun>> = vec![Vec::new(); SMALL_THREADS.len()];
+    for round in 1..=rounds {
+        for (i, &threads) in SMALL_THREADS.iter().enumerate() {
+            let run = small_child(threads)?;
+            println!(
+                "round {round}, {threads} thread{}: wall {:.3} s, cpu {:.2} s, loss bits {:08x}",
+                if threads == 1 { "" } else { "s" },
+                run.wall,
+                run.cpu,
+                run.loss_bits
+            );
+            results[i].push(run);
+        }
+    }
+    let medians: Vec<(f64, f64)> = results
+        .iter()
+        .map(|r| {
+            let wall: Vec<f64> = r.iter().map(|x| x.wall).collect();
+            let cpu: Vec<f64> = r.iter().map(|x| x.cpu).collect();
+            (runs::median(&wall), runs::median(&cpu))
+        })
+        .collect();
+    for (&threads, &(wall, cpu)) in SMALL_THREADS.iter().zip(&medians) {
+        let s = if threads == 1 { "" } else { "s" };
+        println!("median, {threads} thread{s}: wall {wall:.3} s, cpu {cpu:.2} s");
+    }
+    let (base_wall, base_cpu) = medians[0];
+    for (&threads, &(wall, cpu)) in SMALL_THREADS.iter().zip(&medians).skip(1) {
+        println!(
+            "{threads} threads over 1: wall {:.3}x, cpu {:.3}x",
+            wall / base_wall,
+            cpu / base_cpu
+        );
+    }
+    let first = results[0][0].loss_bits;
+    if results.iter().flatten().any(|r| r.loss_bits != first) {
+        return Err("the runs ended on different losses".to_string());
+    }
+    println!("every run ended on the same loss");
+    Ok(())
+}
+
+/// Runs `small --child` in a new process of this program with `CAVITATION_THREADS` set to
+/// `threads`, and reads back its result line.
+///
+/// # Errors
+///
+/// Returns a message if the child cannot start, fails, or prints something unexpected.
+fn small_child(threads: usize) -> Result<runs::SmallRun, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
+    let out = std::process::Command::new(exe)
+        .args(["small", "--child"])
+        .env("CAVITATION_THREADS", threads.to_string())
+        .output()
+        .map_err(|e| format!("starting the {threads}-thread run: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        return Err(format!(
+            "the {threads}-thread run failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_small_line(text.trim())
+        .ok_or_else(|| format!("the {threads}-thread run printed `{}`", text.trim()))
+}
+
+/// Reads the line `small --child` prints: `wall <seconds> cpu <seconds> loss <hex bits>`.
+fn parse_small_line(line: &str) -> Option<runs::SmallRun> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        ["wall", wall, "cpu", cpu, "loss", loss] => Some(runs::SmallRun {
+            wall: wall.parse().ok()?,
+            cpu: cpu.parse().ok()?,
+            loss_bits: u32::from_str_radix(loss, 16).ok()?,
+        }),
+        _ => None,
+    }
+}
+
+/// Tests for the command-line side of the runner.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The child's result line reads back into the numbers it was printed from.
+    #[test]
+    fn small_child_line_round_trips() {
+        let run = parse_small_line("wall 1.25e0 cpu 4.5e0 loss 3f800000").unwrap();
+        assert_eq!((run.wall, run.cpu, run.loss_bits), (1.25, 4.5, 0x3f80_0000));
+        assert!(parse_small_line("wall 1 cpu 2").is_none());
+        assert!(parse_small_line("wall x cpu 2 loss 0").is_none());
+    }
 }

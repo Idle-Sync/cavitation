@@ -1,4 +1,5 @@
-//! The machine a benchmark ran on: CPU model, logical cores, compiler version.
+//! The machine a benchmark ran on: CPU model, logical cores, compiler version, and the CPU
+//! time this process has used.
 
 use std::process::Command;
 
@@ -84,6 +85,31 @@ pub fn rustc_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Clock ticks per second in `/proc/<pid>/stat`'s time fields (`USER_HZ`), which Linux
+/// fixes at 100 for user space on x86 and Arm.
+const TICKS_PER_SECOND: f64 = 100.0;
+
+/// The user plus system CPU seconds in the text of `/proc/<pid>/stat`: fields 14 (`utime`)
+/// and 15 (`stime`), counted after the parenthesised command name (which may hold spaces).
+/// Returns `None` if the text does not have them.
+pub fn parse_proc_stat(text: &str) -> Option<f64> {
+    let (_, after_name) = text.rsplit_once(')')?;
+    // After the name come field 3 (the state) onwards, so `utime` is the 12th value.
+    let mut fields = after_name.split_whitespace().skip(11);
+    let user: u64 = fields.next()?.parse().ok()?;
+    let system: u64 = fields.next()?.parse().ok()?;
+    Some((user + system) as f64 / TICKS_PER_SECOND)
+}
+
+/// The CPU seconds (user plus system, all threads) this process has used so far, read from
+/// `/proc/self/stat` to the nearest 10 ms; `None` where that file does not exist (anything
+/// but Linux) or cannot be parsed.
+pub fn process_cpu_seconds() -> Option<f64> {
+    std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|text| parse_proc_stat(&text))
+}
+
 /// Tests for the machine description parsers.
 #[cfg(test)]
 mod tests {
@@ -114,5 +140,19 @@ mod tests {
         assert_eq!(info.logical_cores, 10);
         assert!(parse_sysctl("Apple M4", "ten").is_none());
         assert!(parse_sysctl("", "10").is_none());
+    }
+
+    /// The CPU time is `utime + stime` in ticks of 10 ms, found after the command name even
+    /// when the name holds spaces and parentheses.
+    #[test]
+    fn process_cpu_seconds_parses_proc_stat() {
+        let stat = "4242 (my (odd) bench) R 1 4242 4242 0 -1 4194304 120 0 0 0 \
+                    250 37 0 0 20 0 5 0 100 1000 200 18446744073709551615";
+        assert_eq!(parse_proc_stat(stat), Some(2.87));
+        assert_eq!(parse_proc_stat("4242 (short) R 1 2"), None);
+        assert_eq!(parse_proc_stat("no name here"), None);
+        if cfg!(target_os = "linux") {
+            assert!(process_cpu_seconds().is_some_and(|s| s >= 0.0));
+        }
     }
 }

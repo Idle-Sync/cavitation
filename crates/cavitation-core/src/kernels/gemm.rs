@@ -109,9 +109,13 @@ pub(super) struct Dest {
 
 /// Products of fewer floating-point operations than this (`2 · m · n · k`) run on the
 /// calling thread alone, with the same blocking: about the size below which two thread-pool
-/// round trips per block cost more than splitting the work saves. Timing whole training
-/// steps on an idle 4-core Intel Celeron N5105 with 2¹⁵, 2¹⁹ and 2²⁰ found none faster.
-const SINGLE_THREAD_FLOPS: usize = 1 << 17;
+/// round trips per block, and the workers kept spinning between them, cost more than
+/// splitting the work saves. 2¹⁸ keeps a 64-row product with 32 on the other two sides
+/// (2¹⁷) on one thread; at 2¹⁷ such a network's training used 4 times the CPU on 4 threads
+/// for no gain in wall time. Measured on a 4-core Intel Celeron N5105 with
+/// `cavitation-bench small`, `digits` and `mnist` (batch 128 and 32) at 2¹⁷, 2¹⁸, 2¹⁹ and
+/// 2²⁰: 2¹⁸ left `digits` and `mnist` unchanged, 2¹⁹ and 2²⁰ made `digits` slower.
+const SINGLE_THREAD_FLOPS: usize = 1 << 18;
 
 /// Compute tasks per thread the driver aims for. More tasks balance uneven work better but
 /// pack each row of `A` more often. One was chosen with `cavitation-bench gemm` and

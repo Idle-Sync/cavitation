@@ -139,6 +139,13 @@ thread_local! {
     static IS_WORKER: Cell<bool> = const { Cell::new(false) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread has handed a job to a worker, for the tests. Kept per
+    /// thread so that pool calls from tests running at the same time do not count.
+    static WAKE_UPS: Cell<usize> = const { Cell::new(0) };
+}
+
 /// Locks `m`, ignoring poisoning: nothing panics while these locks are held.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -147,8 +154,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Runs `job` once for every task number in `0..tasks`, on at most `threads` threads
 /// including the calling one, and returns when every task has finished.
 ///
-/// The pool's workers are started the first time a call needs them and then reused; a call
-/// with more threads than there are workers starts the missing ones. A call made while
+/// A call with one task, or with `threads` of 1, runs on the calling thread and wakes no
+/// worker. The pool's workers are started the first time a call needs them and then reused;
+/// a call with more threads than there are workers starts the missing ones. A call made while
 /// another thread's call is using the pool, or from inside a task (a nested call), runs all
 /// of its tasks on the calling thread as worker 0. Calls allocate nothing once the pool has
 /// enough workers.
@@ -360,6 +368,8 @@ fn run_on_pool(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
         // SeqCst pairs with the worker's store to `parked` and load of `posted`: either the
         // worker sees this call, or we see that it is parked and unpark it.
         w.posted.store(call, Ordering::SeqCst);
+        #[cfg(test)]
+        WAKE_UPS.set(WAKE_UPS.get() + 1);
         if w.parked.load(Ordering::SeqCst)
             && let Some(t) = w.thread.get()
         {
@@ -811,6 +821,34 @@ mod tests {
         assert!(
             message.contains("4 chunks need 4 output slots, got 2"),
             "{message}"
+        );
+    }
+
+    /// A job of one task, or a job given one thread, runs on the calling thread as worker 0
+    /// and wakes no worker: this thread's wake-up count stays the same over 1,000 such
+    /// calls of each kind, while a 4-task job on 4 threads does wake workers.
+    #[test]
+    fn single_task_job_wakes_no_worker() {
+        let _serial = serial();
+        let me = std::thread::current().id();
+        // Start the workers, so a call that wrongly used them would find them ready.
+        assert!(counts(4, 4).iter().all(|&c| c == 1));
+        let before = WAKE_UPS.get();
+        assert!(before > 0, "a 4-task job on 4 threads wakes workers");
+        let ran = AtomicUsize::new(0);
+        let on_caller = |t: Task| {
+            assert_eq!((t.worker, std::thread::current().id()), (0, me));
+            ran.fetch_add(1, Ordering::Relaxed);
+        };
+        for _ in 0..1_000 {
+            run(4, 1, &on_caller);
+            run(1, 4, &on_caller);
+        }
+        assert_eq!(ran.into_inner(), 5_000);
+        assert_eq!(
+            WAKE_UPS.get(),
+            before,
+            "a one-task or one-thread job woke a worker"
         );
     }
 

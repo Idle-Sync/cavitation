@@ -13,7 +13,7 @@ use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_datasets::{digits, mnist};
 use cavitation_nn::{
     Adam, Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, Optimizer,
-    OptimizerConfig, Relu, Sequential, Sgd, Trainer, Warning,
+    OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer, Warning,
 };
 
 use crate::numpy;
@@ -564,4 +564,114 @@ pub fn subnormal(steps: usize) -> Vec<SubnormalRun> {
         time_decay("sgd momentum 0.9", Sgd::new(0.01).with_momentum(0.9), steps),
         time_decay("adam lr 1e-3", Adam::new(1e-3), steps),
     ]
+}
+
+/// The layer widths of the `small` run's network: 4 to 32 to 32 to 1, tanh between layers,
+/// 1,249 parameters.
+pub const SMALL_NET: [usize; 4] = [4, 32, 32, 1];
+
+/// Rows of the `small` run's training data.
+pub const SMALL_ROWS: usize = 20_000;
+
+/// The batch size of the `small` run.
+pub const SMALL_BATCH: usize = 64;
+
+/// Timed epochs of the `small` run.
+pub const SMALL_EPOCHS: usize = 10;
+
+/// What one `small` training run measured.
+#[derive(Clone, Copy, Debug)]
+pub struct SmallRun {
+    /// Wall-clock seconds of the timed epochs.
+    pub wall: f64,
+    /// CPU seconds (all threads, user plus system) the process used in the timed epochs.
+    pub cpu: f64,
+    /// The bits of the last step's loss, which must be the same for every thread count.
+    pub loss_bits: u32,
+}
+
+/// The `small` run's data: [`SMALL_ROWS`] rows of 4 inputs uniform in `[-1, 1)` from seed
+/// 3, each with the target `sin(π·x₀)·x₁ + x₂·x₃`.
+fn small_data() -> Result<Dataset, String> {
+    let mut rng = Rng::seed(3);
+    let x: Vec<f32> = (0..SMALL_ROWS * SMALL_NET[0])
+        .map(|_| rng.range(-1.0, 1.0) as f32)
+        .collect();
+    let y: Vec<f32> = x
+        .as_chunks::<{ SMALL_NET[0] }>()
+        .0
+        .iter()
+        .map(|&[a, b, c, d]| (std::f32::consts::PI * a).sin() * b + c * d)
+        .collect();
+    Ok(Dataset {
+        x: Tensor::from_vec(x, &[SMALL_ROWS, SMALL_NET[0]]).map_err(|e| e.to_string())?,
+        targets: Targets::Values(Tensor::from_vec(y, &[SMALL_ROWS, 1]).map_err(|e| e.to_string())?),
+    })
+}
+
+/// Trains the `small` network (4 → 32 → tanh → 32 → tanh → 1, Xavier uniform weights from
+/// seed 1, zero biases) with mean squared error and Adam (lr 1e-3) in batches of
+/// [`SMALL_BATCH`], shuffled with seed 7, through the public path with the default health
+/// checks on, at the current thread count: [`TRAIN_WARMUP`] untimed steps, then
+/// [`SMALL_EPOCHS`] timed epochs, whose wall and CPU time it returns.
+///
+/// # Errors
+///
+/// Returns a message if the training stops or the CPU time cannot be read (only Linux
+/// reports it).
+pub fn small_once() -> Result<SmallRun, String> {
+    let data = small_data()?;
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(1);
+    let mut net = Sequential::new();
+    for (i, pair) in SMALL_NET.windows(2).enumerate() {
+        net = net.push(Linear::with_init(
+            &mut params,
+            pair[0],
+            pair[1],
+            Init::XavierUniform,
+            Init::Zeros,
+            &mut rng,
+        ));
+        if i + 2 < SMALL_NET.len() {
+            net = net.push(Tanh);
+        }
+    }
+    let optimizer = OptimizerConfig::Adam {
+        lr: 1e-3,
+        weight_decay: 0.0,
+    };
+    let mut trainer = Trainer::new(&net, optimizer.build(), Loss::Mse, SMALL_BATCH);
+    trainer.set_health(Health {
+        sink: Some(Box::new(|_: &Warning| {})),
+        ..Health::default()
+    });
+    let mut batcher = Batcher::new(data.len(), SMALL_BATCH, Some(7));
+    let mut buffer = Batch::new(&data, SMALL_BATCH);
+    let ranges: Vec<_> = batcher.batches().collect();
+    let mut loss = 0.0f32;
+    for k in 0..TRAIN_WARMUP {
+        let view = batcher.gather(&data, ranges[k % ranges.len()].clone(), &mut buffer);
+        loss = trainer
+            .step(&net, &mut params, view)
+            .map_err(|e| e.to_string())?;
+    }
+    let cpu = || crate::machine::process_cpu_seconds().ok_or("no CPU time on this system");
+    let (cpu0, start) = (cpu()?, Instant::now());
+    for epoch in 1..=SMALL_EPOCHS {
+        batcher.epoch();
+        for range in &ranges {
+            let view = batcher.gather(&data, range.clone(), &mut buffer);
+            loss = trainer
+                .step(&net, &mut params, view)
+                .map_err(|e| e.to_string())?;
+        }
+        trainer.end_epoch(epoch).map_err(|e| e.to_string())?;
+    }
+    let wall = start.elapsed().as_secs_f64();
+    Ok(SmallRun {
+        wall,
+        cpu: cpu()? - cpu0,
+        loss_bits: black_box(loss).to_bits(),
+    })
 }
