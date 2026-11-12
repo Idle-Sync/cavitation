@@ -8,7 +8,7 @@ Cavitation trains and runs small and medium neural networks on the CPU, inside a
 
 - **Glass box.** A training step is a tape of recorded operations you can read. Hooks on any layer show its input z, its output a, the local derivative f′(z), and the gradients ∂L/∂a and ∂L/∂z. Neuron masks turn single neurons off in both the forward and the backward pass.
 - **Checked.** Every operation passes a numerical gradient check (central differences in `f64`) and a comparison with PyTorch on stored fixtures. Every fast kernel has a plain reference version, and tests check that the two agree. Known-result tests train real networks with fixed seeds and check the accuracy.
-- **Fast on ordinary CPUs.** The kernel level (SSE4.2, AVX2 with FMA, NEON, or Apple's Accelerate framework for matrix products on Apple Silicon) is chosen at run time, matrix products are split across threads, and a training step allocates nothing after a warm-up epoch.
+- **Fast on ordinary CPUs.** The kernel level (SSE4.2, AVX2 with FMA, NEON, or Apple's Accelerate framework for matrix products on Apple Silicon) is chosen at run time, matrix products are split across threads (on Apple Silicon each one is a single call into Accelerate), and a training step allocates nothing after a warm-up epoch.
 - **Compatible with PyTorch.** Operations follow PyTorch's definitions. `Linear` stores its weight as `[outputs, inputs]`, and weights save and load as safetensors named like a PyTorch `state_dict` (`0.weight`, `2.bias`).
 
 What v0.1 contains:

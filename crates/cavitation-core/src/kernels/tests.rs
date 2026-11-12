@@ -95,6 +95,23 @@ impl Stored {
         .unwrap()
     }
 
+    /// Asserts that every stored value outside the view (the padding, which `Stored` fills
+    /// with NaN) is still NaN, naming `what` and the first position that changed.
+    fn assert_padding_untouched(&self, what: &str) {
+        let mut inside = vec![false; self.data.len()];
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                inside[i * self.row_stride + j * self.col_stride] = true;
+            }
+        }
+        for (at, (v, inside)) in self.data.iter().zip(&inside).enumerate() {
+            assert!(
+                *inside || v.is_nan(),
+                "{what}: padding at position {at} was overwritten with {v}"
+            );
+        }
+    }
+
     /// The logical values, row-major.
     fn logical(&self) -> Vec<f32> {
         let v = self.view();
@@ -232,6 +249,7 @@ fn check_case(
                      {threads} threads"
                 );
                 assert_within(&sc.logical(), &want, &bound, n, &what);
+                sc.assert_padding_untouched(&what);
             }
         }
     }
@@ -343,9 +361,10 @@ fn fast_matches_reference() {
 
 /// On Apple Silicon, Accelerate matches the reference within the GEMM tolerance on every
 /// shape the packed kernels' twin tests use: the 400 sampled shapes, a 512 x 512 x 512
-/// product and the vector shapes, each for all four transpose combinations (through
-/// Accelerate), general strides (through the NEON fallback), a transposed C, and padded
-/// rows. Skipped, with a message, anywhere else.
+/// product and the vector shapes, each for all four transpose combinations, general strides,
+/// a transposed C, and padded rows. Most cases run through Accelerate; general strides run
+/// the NEON fallback, except where a dimension of 1 leaves a view BLAS can still read. C's
+/// padding is checked to stay untouched. Skipped, with a message, anywhere else.
 #[test]
 fn accelerate_matches_reference() {
     if !supported(Level::Accelerate) {
@@ -813,6 +832,59 @@ fn accelerate_matvec_is_neon() {
             "bias {}, relu {relu}: not NEON's bits",
             bias.is_some()
         );
+    }
+}
+
+/// A NaN or an infinity in A or B reaches C as it does in the reference, also where it meets
+/// zeros (NaN · 0 and ∞ · 0 are NaN): every element the reference makes NaN is NaN, and the
+/// others match it. At the reference level, every fast level and Accelerate, for row-major
+/// operands and for B transposed (the training layouts, which Accelerate runs itself), with
+/// beta 0 and 1.
+#[test]
+fn non_finite_inputs_reach_c() {
+    let (m, n, k) = (9, 13, 7);
+    let mut a = vec![0.5f32; m * k];
+    let mut b = vec![0.0f32; k * n];
+    a[2 * k + 3] = f32::NAN; // row 2 of C meets B's zero row 3
+    a[5 * k] = f32::INFINITY; // row 5 of C: ∞ · 0
+    b[4 * n + 6] = f32::NAN; // column 6 of C, against A's 0.5s
+    b[6 * n + 11] = 2.0; // one ordinary non-zero value
+    let c0 = vec![1.0f32; m * n];
+    let levels = std::iter::once(Level::Reference).chain(gemm_levels("non_finite_inputs_reach_c"));
+    for level in levels {
+        for b_transposed in [false, true] {
+            let sb = Stored::new(&b, k, n, b_transposed, 0);
+            for beta in [0.0f32, 1.0] {
+                let mut want = c0.clone();
+                reference::gemm(
+                    1.0,
+                    rm(&a, m, k),
+                    rm(&b, k, n),
+                    beta,
+                    rm_mut(&mut want, m, n),
+                );
+                assert!(want[2 * n].is_nan() && want[5 * n + 1].is_nan() && want[6].is_nan());
+                let mut got = c0.clone();
+                gemm_f32_with(
+                    level,
+                    4,
+                    1.0,
+                    rm(&a, m, k),
+                    sb.view(),
+                    beta,
+                    rm_mut(&mut got, m, n),
+                );
+                for (x, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        g.is_nan() == w.is_nan() && (w.is_nan() || g == w),
+                        "{level}, B transposed {b_transposed}, beta {beta}: element ({}, {}) \
+                         is {g}, reference {w}",
+                        x / n,
+                        x % n
+                    );
+                }
+            }
+        }
     }
 }
 

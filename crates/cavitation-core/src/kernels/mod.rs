@@ -66,7 +66,8 @@ pub enum Level {
     Neon = 3,
     /// Apple Silicon: matrix products through Apple's Accelerate framework (`cblas_sgemm`),
     /// everything else through the NEON kernels. Products whose layout BLAS cannot express
-    /// (neither stride 1) run the NEON GEMM. Results match the reference within the GEMM
+    /// (neither stride 1, overlapping or broadcast rows, sizes beyond `i32`) and products
+    /// with `alpha = 0` run the NEON GEMM. Results match the reference within the GEMM
     /// tolerance, as every level does, and differ from NEON's in the last bits.
     Accelerate = 4,
 }
