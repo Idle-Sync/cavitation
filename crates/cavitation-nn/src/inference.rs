@@ -110,6 +110,9 @@ struct Compiled {
     /// For each mask slot, the [`Sequential`] layer whose output the mask applies to, in
     /// increasing order.
     mask_layers: Vec<usize>,
+    /// The layers given a mask step whether or not the model has a mask there: the `layers`
+    /// of [`InferenceModel::compile_with_masks`].
+    extra: Vec<usize>,
 }
 
 /// A [`Sequential`] compiled for inference: it answers one input or a batch without
@@ -209,6 +212,11 @@ impl InferenceModel {
     /// neuron mask a mask step with every neuron on, so that [`set_mask`](Self::set_mask)
     /// can turn its neurons off later. A layer that already has a mask keeps it.
     ///
+    /// To mask the neurons of a `Linear`, list [`Sequential::neuron_layer`] of it (the
+    /// activation after it, if any), as masks set in training are placed. A mask step on a
+    /// `Linear` itself stops it from running fused with a ReLU that follows, so the ReLU
+    /// then runs as a step of its own and is observed on its own.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidData`] if a listed layer is not below the model's length
@@ -251,8 +259,9 @@ impl InferenceModel {
         })
     }
 
-    /// Picks up new weights and masks from `model` and `params`, as [`compile`](Self::compile)
-    /// would (masks only where `model` has them).
+    /// Picks up new weights and masks from `model` and `params`, as
+    /// [`compile_with_masks`](Self::compile_with_masks) would with the layers this model was
+    /// compiled with (those still below `model.len()`), so a mask step added there is kept.
     ///
     /// The weights: when no clone shares this model's compiled steps and the new steps have
     /// the same layout (the same steps with the same widths, fused ReLUs, parameter counts
@@ -260,9 +269,12 @@ impl InferenceModel {
     /// kept; returns `true`. Otherwise this model alone gets a freshly compiled copy,
     /// leaving any clone with the old weights; returns `false`.
     ///
-    /// The masks are this instance's own, so whenever the new masks sit on the same layers
-    /// with the same widths their values are copied into the old ones in place, whether or
-    /// not the weights were; a clone's masks never change.
+    /// The masks are this instance's own, and a clone's never change. When the new mask
+    /// steps sit on the same layers with the same widths, each one on a layer where `model`
+    /// has a mask takes that mask's values, copied in place whether or not the weights were;
+    /// each one `model` has no mask for (a step added by `compile_with_masks`) keeps the
+    /// values [`set_mask`](Self::set_mask) gave it. Otherwise the masks are compiled afresh,
+    /// the added steps with every neuron on.
     ///
     /// # Errors
     ///
@@ -276,16 +288,22 @@ impl InferenceModel {
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
     ) -> Result<bool, Error> {
-        let (fresh, masks) = Compiled::build(model, params, &[])?;
-        let same_masks = self.masks.len() == masks.len()
+        let extra: Vec<usize> = (self.shared.extra.iter())
+            .copied()
+            .filter(|&l| l < model.len())
+            .collect();
+        let (fresh, masks) = Compiled::build(model, params, &extra)?;
+        let same_masks = self.shared.mask_layers == fresh.mask_layers
             && self
                 .masks
                 .iter()
                 .zip(&masks)
                 .all(|(a, b)| a.len() == b.len());
         if same_masks {
-            for (old, new) in self.masks.iter_mut().zip(&masks) {
-                old.copy_from_slice(new);
+            for ((old, new), &layer) in self.masks.iter_mut().zip(&masks).zip(&fresh.mask_layers) {
+                if model.mask(layer).is_some() {
+                    old.copy_from_slice(new);
+                }
             }
         } else {
             self.masks = masks;
@@ -671,6 +689,7 @@ impl Compiled {
             output_width: width,
             max_width,
             mask_layers,
+            extra: extra.to_vec(),
         };
         Ok((compiled, masks))
     }
@@ -1691,20 +1710,63 @@ pub(crate) mod tests {
         let view = TensorView::from_slice(&x, &[9, 64]).unwrap();
         let mut original = InferenceModel::compile_with_masks(&net, &params, &[1]).unwrap();
         let before = original.infer_batch(view).data().to_vec();
+        let rows_before: Vec<Vec<f32>> = x
+            .chunks(64)
+            .map(|row| original.infer(row).to_vec())
+            .collect();
         let mut copy = original.clone();
         copy.set_mask(1, &NeuronMask::all_off(32)).unwrap();
         assert!(copy.shares_steps(&original));
         let changed = copy.infer_batch(view).data().to_vec();
         assert_ne!(changed, before);
         assert_same(original.infer_batch(view).data(), &before, "original batch");
-        for (r, row) in x.chunks(64).enumerate() {
+        for (r, (row, want)) in x.chunks(64).zip(&rows_before).enumerate() {
             let got = original.infer(row).to_vec();
-            assert_same(
-                &got,
-                &before[r * 10..(r + 1) * 10],
-                &format!("original input {r}"),
-            );
+            assert_same(&got, want, &format!("original input {r}"));
         }
+    }
+
+    /// `refresh` keeps the mask steps `compile_with_masks` added, with the values
+    /// `set_mask` gave them, whether the weights go in place or are recompiled (a clone
+    /// shares them); masks the model has take the model's values in this instance only, and
+    /// the clone's outputs stay the same bit for bit.
+    #[test]
+    fn refresh_keeps_added_mask_steps() {
+        let mut params = ParamStore::new();
+        let mut net = digits(&mut params, 27);
+        net.set_mask(2, NeuronMask::all_on(10));
+        let x = inputs(6, 64, 28);
+        let view = TensorView::from_slice(&x, &[6, 64]).unwrap();
+        let mut model = InferenceModel::compile_with_masks(&net, &params, &[1]).unwrap();
+        let hidden = NeuronMask::from_off(32, &[2, 3, 30]);
+        model.set_mask(1, &hidden).unwrap();
+        let w = net.param("0.weight").unwrap();
+        let want = |net: &Sequential, params: &ParamStore| {
+            let mut masked = net.clone();
+            masked.set_mask(1, hidden.clone());
+            let mut m = InferenceModel::compile(&masked, params).unwrap();
+            m.infer_batch(view).data().to_vec()
+        };
+
+        params.value_mut(w).data_mut()[0] += 0.5;
+        assert!(model.refresh(&net, &params).unwrap());
+        assert_same(
+            model.infer_batch(view).data(),
+            &want(&net, &params),
+            "in place",
+        );
+
+        let mut copy = model.clone();
+        let copy_before = copy.infer_batch(view).data().to_vec();
+        params.value_mut(w).data_mut()[1] -= 0.5;
+        net.set_mask(2, NeuronMask::from_off(10, &[7]));
+        assert!(!model.refresh(&net, &params).unwrap());
+        assert!(!model.shares_steps(&copy));
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &want(&net, &params), "recompiled");
+        assert!(got.chunks(10).all(|row| row[7].to_bits() == 0));
+        assert_same(copy.infer_batch(view).data(), &copy_before, "the clone");
+        model.set_mask(1, &NeuronMask::all_on(32)).unwrap();
     }
 
     /// `set_mask` on a layer with no mask step is `Unsupported`, and a mask of the wrong

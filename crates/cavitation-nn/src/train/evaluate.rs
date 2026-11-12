@@ -939,9 +939,10 @@ mod tests {
 
     /// `refresh` copies new weights and mask values in place when no clone shares the
     /// compiled weights and the layout is unchanged; it recompiles when a clone shares them
-    /// (the clone keeps the old weights), when a mask is added or cleared, or when the last
-    /// layer gets wider; a model without an inference form moves to the tape and back. Each
-    /// time the evaluation matches a fresh evaluator's.
+    /// (the clone keeps the old weights, and its own masks when this evaluator's change),
+    /// when a mask is added or cleared, or when the last layer gets wider; a model without
+    /// an inference form moves to the tape and back. Each time the evaluation matches a
+    /// fresh evaluator's.
     #[test]
     fn refresh_in_place_and_recompiled() {
         let loss = Loss::CrossEntropy;
@@ -976,9 +977,20 @@ mod tests {
         assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::Recompiled);
         assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
         mask.set(5, false);
-        net.set_mask(1, mask);
+        net.set_mask(1, mask.clone());
         assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::InPlace);
+        let masked = evaluator.evaluate(&data).unwrap();
+        assert_eq!(masked, fresh(&net, &params));
+
+        // A clone shares the weights but not the masks: new mask values reach this
+        // evaluator (its weights recompiled) and leave the clone as it was.
+        let mut copy = evaluator.clone();
+        mask.set(0, false);
+        net.set_mask(1, mask);
+        assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::Recompiled);
         assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
+        assert_ne!(evaluator.evaluate(&data).unwrap(), masked);
+        assert_eq!(copy.evaluate(&data).unwrap(), masked);
         net.clear_mask(1);
         assert_eq!(evaluator.reload(&net, &params).unwrap(), Reload::Recompiled);
         assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));

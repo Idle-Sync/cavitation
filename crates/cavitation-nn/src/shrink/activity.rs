@@ -179,7 +179,7 @@ mod tests {
     //! the tape, a dead neuron, and the errors.
 
     use super::*;
-    use crate::inference::tests::{digits, layer_bounds};
+    use crate::inference::tests::digits;
     use crate::{Hooks, NeuronMask, Targets, Trace};
     use cavitation_core::{Graph, Rng, Tensor};
 
@@ -227,20 +227,52 @@ mod tests {
         (outputs, pre)
     }
 
-    /// On the digits-shaped network over 50 rows in batches of 16, `activity` for both
-    /// `Linear` layers gives the means, mean absolute values and maxima of the hooked
-    /// outputs within the GEMM bound, and exactly their firing shares: no pre-activation of
-    /// the seeded set lies within 1e-4 of 0, nor within its own GEMM bound of 0, so the sign
-    /// of each output is the tape's.
+    /// An integer uniform in `lo..hi` from `rng`.
+    fn int(rng: &mut Rng, lo: i32, hi: i32) -> f32 {
+        rng.range(f64::from(lo), f64::from(hi)).floor() as f32
+    }
+
+    /// The digits-shaped network with dyadic values from `Rng::seed(seed)`, and `rows` rows
+    /// of inputs, chosen so that every sum is exact in `f32` on every kernel level (any
+    /// order, fused or not) and no pre-activation is 0: inputs `k/8` with `k` in `0..8`,
+    /// weights `m/16` with `m` in `-8..9`, first-layer biases odd multiples of `1/256` and
+    /// last-layer biases odd multiples of `1/8192`. A first-layer pre-activation is then an
+    /// odd multiple of `1/256` (at most 28 in size), and a last-layer one an odd multiple of
+    /// `1/8192` (at most 448), so each lies at least `1/8192 ≈ 1.2e-4` from 0.
+    fn dyadic(params: &mut ParamStore, rows: usize, seed: u64) -> (Sequential, Dataset) {
+        let net = digits(params, seed);
+        let mut rng = Rng::seed(seed);
+        for (name, unit) in [("0.bias", 256.0f32), ("2.bias", 8192.0)] {
+            let id = net.param(name).unwrap();
+            for b in params.value_mut(id).data_mut() {
+                *b = (2.0 * int(&mut rng, -8, 8) + 1.0) / unit;
+            }
+        }
+        for name in ["0.weight", "2.weight"] {
+            let id = net.param(name).unwrap();
+            for w in params.value_mut(id).data_mut() {
+                *w = int(&mut rng, -8, 9) / 16.0;
+            }
+        }
+        let x: Vec<f32> = (0..rows * 64).map(|_| int(&mut rng, 0, 8) / 8.0).collect();
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[rows, 64]).unwrap(),
+            targets: Targets::Classes(vec![0; rows]),
+        };
+        (net, data)
+    }
+
+    /// On the digits-shaped network with dyadic values over 50 rows in batches of 16,
+    /// `activity` for both `Linear` layers gives exactly the means, mean absolute values,
+    /// firing shares and maxima of the outputs hooked on the tape: every sum is exact, so
+    /// the GEMM bound is 0, and no pre-activation lies within 1e-4 of 0 (asserted).
     #[test]
     fn activity_matches_hooks() {
         let mut params = ParamStore::new();
-        let net = digits(&mut params, 21);
-        let data = data(50, 28);
+        let (net, data) = dyadic(&mut params, 50, 21);
         let linears = [0, 2];
         let stats = activity(&net, &params, &data, &linears, 16).unwrap();
         let (outputs, pre) = hooked(&net, &params, &data, &linears, 16);
-        let layers = layer_bounds(&net, &params, data.x.data(), 50);
         assert_eq!(stats.len(), 2);
         for (k, s) in stats.iter().enumerate() {
             assert_eq!((s.linear, s.layer), ([0, 2][k], [1, 2][k]));
@@ -252,17 +284,6 @@ mod tests {
                 "linear {}: pre-activations within 1e-4 of 0",
                 s.linear
             );
-            let pre_bound = &layers[s.linear].1;
-            let sign_known = pre[k]
-                .iter()
-                .zip(pre_bound)
-                .all(|(&v, &b)| f64::from(v).abs() > b);
-            assert!(
-                sign_known,
-                "linear {}: a pre-activation within its bound",
-                s.linear
-            );
-            let bound = &layers[s.layer].1;
             let fired = s.firing.iter().filter(|&&f| f > 0.0 && f < 1.0).count();
             assert!(
                 fired > 0,
@@ -276,25 +297,16 @@ mod tests {
                     .step_by(width)
                     .map(|&v| f64::from(v))
                     .collect();
-                let b: Vec<f64> = bound.iter().skip(j).step_by(width).copied().collect();
                 assert_eq!(col.len(), 50);
-                let mean_bound = b.iter().sum::<f64>() / 50.0;
-                let max_bound = b.iter().copied().fold(0.0, f64::max);
                 let mean = col.iter().sum::<f64>() / 50.0;
                 let mean_abs = col.iter().map(|v| v.abs()).sum::<f64>() / 50.0;
                 let firing = col.iter().filter(|&&v| v > 0.0).count() as f64 / 50.0;
                 let max = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let what = format!("linear {}, neuron {j}", s.linear);
-                assert!(
-                    (s.mean[j] - mean).abs() <= mean_bound + 1e-12,
-                    "{what}: mean"
-                );
-                assert!(
-                    (s.mean_abs[j] - mean_abs).abs() <= mean_bound + 1e-12,
-                    "{what}: mean |a|"
-                );
-                assert!((s.max[j] - max).abs() <= max_bound, "{what}: max");
+                assert_eq!(s.mean[j], mean, "{what}: mean");
+                assert_eq!(s.mean_abs[j], mean_abs, "{what}: mean |a|");
                 assert_eq!(s.firing[j], firing, "{what}: firing");
+                assert_eq!(s.max[j], max, "{what}: max");
             }
         }
     }
