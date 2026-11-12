@@ -130,6 +130,27 @@ pub trait Layer<T: Real>: Send + Sync {
             .map(|(_, id)| id)
     }
 
+    /// Whether each output value depends only on the input value at the same position, so
+    /// that a neuron mask on this layer's output switches off exactly the neuron that feeds
+    /// it. [`Sequential::neuron_layer`](crate::Sequential::neuron_layer) puts a `Linear`'s
+    /// neuron mask on the element-wise layer after it. The default is whether the layer has
+    /// an [`activation`](Self::activation); `Prelu` overrides it to `true`. A layer of your
+    /// own that is element-wise but has no `activation()` should override this, so that
+    /// neuron masks land after it.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear, Prelu, Relu};
+    /// let mut params = ParamStore::new();
+    /// assert!(Layer::<f32>::is_elementwise(&Relu));
+    /// assert!(Layer::<f32>::is_elementwise(&Prelu::new(&mut params, 1)));
+    /// let linear = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
+    /// assert!(!Layer::<f32>::is_elementwise(&linear));
+    /// ```
+    fn is_elementwise(&self) -> bool {
+        self.activation().is_some()
+    }
+
     /// This layer as a [`Linear`], if it is one. The default is `None`.
     ///
     /// ```

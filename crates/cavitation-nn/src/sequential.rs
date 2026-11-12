@@ -402,7 +402,8 @@ impl<T: Real> Sequential<T> {
 
     /// The parameter named `name` in the form of [`parameter_names`](Self::parameter_names),
     /// `"{layer index}.{local name}"` such as `"2.bias"`, or `None` if there is no such
-    /// parameter. It does not allocate.
+    /// parameter. It does not allocate for the built-in layers; a layer of your own that keeps
+    /// the default [`Layer::parameter`] may.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -427,7 +428,7 @@ impl<T: Real> Sequential<T> {
 
     /// The index of the layer whose output holds the neurons of the `Linear` at layer
     /// `linear`: the layer after it if that one is element-wise (it has an
-    /// [`activation`](Layer::activation), or it is a `Prelu`), else the `Linear` itself.
+    /// [`Layer::is_elementwise`]: it has an activation, or it is a `Prelu`), else the `Linear` itself.
     /// Masks on a hidden neuron go on that layer, so that the neuron's output is 0 whatever
     /// the activation gives at 0.
     ///
@@ -449,7 +450,7 @@ impl<T: Real> Sequential<T> {
     pub fn neuron_layer(&self, linear: usize) -> usize {
         self.check_linear(linear);
         match self.layers.get(linear + 1) {
-            Some(next) if next.activation().is_some() || next.name() == "prelu" => linear + 1,
+            Some(next) if next.is_elementwise() => linear + 1,
             _ => linear,
         }
     }
@@ -542,20 +543,19 @@ impl<T: Real> Sequential<T> {
     /// ```
     pub fn set_neuron(&mut self, linear: usize, neuron: usize, on: bool) {
         let layer = self.neuron_layer(linear);
-        let slot = &mut self.masks[layer];
-        if slot.is_none() {
-            let width = self.layers[linear]
+        let width = match &self.masks[layer] {
+            Some(mask) => mask.mask.width(),
+            None => self.layers[linear]
                 .as_linear()
                 .expect("check_linear passed")
-                .outputs();
-            *slot = Some(LayerMask::new(NeuronMask::all_on(width)));
-        }
-        let mask = slot.as_mut().expect("the mask was just created");
-        let width = mask.mask.width();
+                .outputs(),
+        };
         assert!(
             neuron < width,
             "sequential: neuron {neuron} is out of range for width {width} (layer {linear})"
         );
+        let mask =
+            self.masks[layer].get_or_insert_with(|| LayerMask::new(NeuronMask::all_on(width)));
         mask.set(neuron, on);
     }
 
@@ -842,6 +842,77 @@ mod tests {
             .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
             .push(Prelu::new(&mut params, 1));
         assert_eq!(net.neuron_layer(0), 1);
+        let mut net = net;
+        net.set_neuron_mask(0, NeuronMask::all_on(3));
+        assert!(net.mask(1).is_some() && net.mask(0).is_none());
+    }
+
+    /// A user layer with the given name, element-wise or not as `elementwise` says.
+    struct Custom {
+        /// The layer's name.
+        name: &'static str,
+        /// What `is_elementwise` answers; `None` keeps the default.
+        elementwise: Option<bool>,
+    }
+
+    impl<T: Real> Layer<T> for Custom {
+        /// The configured name.
+        fn name(&self) -> &str {
+            self.name
+        }
+        /// Unchanged.
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        /// Passes the input through.
+        fn forward(&self, _tape: &mut Tape<'_, T>, x: Var) -> Var {
+            x
+        }
+        /// None.
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+        /// The configured answer, or the default.
+        fn is_elementwise(&self) -> bool {
+            self.elementwise.unwrap_or(false)
+        }
+    }
+
+    /// A user layer named "prelu" that is not element-wise does not take the mask.
+    #[test]
+    fn layer_named_prelu_is_not_assumed_elementwise() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+            .push(Custom {
+                name: "prelu",
+                elementwise: None,
+            });
+        assert_eq!(net.neuron_layer(0), 0);
+    }
+
+    /// A user element-wise layer that overrides `is_elementwise` takes the mask.
+    #[test]
+    fn user_elementwise_layer_takes_the_mask() {
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+            .push(Custom {
+                name: "scale",
+                elementwise: Some(true),
+            });
+        net.set_neuron(0, 1, false);
+        assert!(net.mask(1).is_some() && net.mask(0).is_none());
+    }
+
+    /// A panic in `set_neuron` leaves the network without a mask.
+    #[test]
+    fn set_neuron_out_of_range_leaves_no_mask() {
+        let mut net = lrl(&mut ParamStore::new());
+        let hit =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| net.set_neuron(0, 4, false)));
+        assert!(hit.is_err());
+        assert!(net.mask(1).is_none());
     }
 
     /// A masked sigmoid neuron outputs exactly 0, not 0.5.
