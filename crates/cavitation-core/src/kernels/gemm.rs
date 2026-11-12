@@ -117,9 +117,15 @@ pub(super) struct Dest {
 /// 2²⁰: 2¹⁸ left `digits` and `mnist` unchanged, 2¹⁹ and 2²⁰ made `digits` slower.
 const SINGLE_THREAD_FLOPS: usize = 1 << 18;
 
-/// Compute tasks per thread the driver aims for. More tasks balance uneven work better but
-/// pack each row of `A` more often. One was chosen with `cavitation-bench gemm` and
-/// re-checked by timing whole training steps (see the SSE kernel's notes in `x86.rs`).
+/// Compute tasks per thread the driver aims for. Threads take tasks in order as they finish,
+/// so more tasks would let fast cores take over work from slow ones, but each task packs
+/// its rows of `A` again and the products get narrower. One was chosen with
+/// `cavitation-bench gemm` and re-checked by timing whole training steps (see the SSE
+/// kernel's notes in `x86.rs`), then again against 2 and 4 with `cavitation-bench all`
+/// (medians of 3 interleaved runs, measured on an Intel Celeron N5105, 4 cores): 2 and 4
+/// cost MNIST at batch 128 1.8% and 9.1% and digits training 12.1% and 28.5%; on an
+/// Apple M4 at its default 4 threads, 2 gave no gain (0.96 against 0.97 s per MNIST epoch)
+/// and cost digits 16%.
 const TASKS_PER_THREAD: usize = 1;
 
 /// General matrix multiply in f32, `C = alpha · A · B + beta · C`, with the kernel for the

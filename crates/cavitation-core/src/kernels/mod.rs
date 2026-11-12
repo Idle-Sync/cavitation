@@ -286,8 +286,7 @@ pub fn set_level(level: Level) -> Result<(), Error> {
 /// The current thread count, or 0 before the first use.
 static THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// The thread count `CAVITATION_THREADS` gives, or the available parallelism (1 if unknown)
-/// if it is not set.
+/// The thread count `CAVITATION_THREADS` gives, or [`default_threads`] if it is not set.
 ///
 /// # Panics
 ///
@@ -296,13 +295,112 @@ fn threads_from_env() -> usize {
     match std::env::var_os("CAVITATION_THREADS") {
         Some(value) => parse_threads(&value.to_string_lossy())
             .unwrap_or_else(|e| panic!("CAVITATION_THREADS: {e}")),
-        None => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        None => default_threads(),
     }
 }
 
+/// [`std::thread::available_parallelism`], or 1 if it is unknown.
+fn available_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// The thread count used when neither [`set_threads`] nor `CAVITATION_THREADS` gives one:
+/// the number of performance cores where the system reports it (Apple Silicon), else
+/// [`std::thread::available_parallelism`] (1 if that is unknown). [`threads`] calls it once,
+/// on first use, and keeps the answer.
+///
+/// On an Apple M4 (4 performance and 6 efficiency cores) training at 10 threads was slower
+/// than at 4: 1.14 against 0.97 s per MNIST epoch at batch 128, and 392k against 677k digits
+/// samples per second (measured with `cavitation-bench all`, NEON kernels, medians of 3 runs).
+///
+/// # Examples
+///
+/// The function is private; its answer is what [`threads`] returns when nothing overrides it:
+///
+/// ```
+/// let n = cavitation_core::kernels::threads();
+/// assert!(n >= 1);
+/// if std::env::var_os("CAVITATION_THREADS").is_none() {
+///     // Never more threads than the machine runs at once.
+///     assert!(n <= std::thread::available_parallelism().map_or(1, |n| n.get()));
+/// }
+/// ```
+fn default_threads() -> usize {
+    default_threads_from(performance_cores)
+}
+
+/// [`default_threads`] with the performance-core count read by `read`, so tests can stand in
+/// for the system: `read`'s count if it gives a positive one (at most the available
+/// parallelism), else the available parallelism (1 if that is unknown).
+fn default_threads_from(read: impl FnOnce() -> std::io::Result<usize>) -> usize {
+    let available = available_threads();
+    match read() {
+        Ok(n) if n > 0 => n.min(available),
+        _ => available,
+    }
+}
+
+/// The number of performance cores, from `sysctl hw.perflevel0.physicalcpu`. Fails on a Mac
+/// without performance levels (Intel), and the error says why.
+#[cfg(target_vendor = "apple")]
+fn performance_cores() -> std::io::Result<usize> {
+    use std::ffi::{c_char, c_int, c_void};
+    // SAFETY: the declaration matches `sysctlbyname` in the system's `<sys/sysctl.h>`
+    // (`size_t` is `usize` on every Apple target), and the C library exports it.
+    unsafe extern "C" {
+        /// Reads (or, with `newp` non-null, writes) the system value named `name` into the
+        /// `*oldlenp` bytes at `oldp`, storing the length written in `*oldlenp`. Returns 0
+        /// on success, or -1 with `errno` set.
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+    let mut value: i32 = 0;
+    let mut len = size_of::<i32>();
+    // SAFETY: the name is a NUL-terminated C string; `oldp` points at `len` writable bytes
+    // (an `i32` this function owns), and `oldlenp` at `len`; nothing is written (`newp` null,
+    // `newlen` 0). All three pointers outlive the call.
+    let status = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if len != size_of::<i32>() {
+        return Err(std::io::Error::other(format!(
+            "hw.perflevel0.physicalcpu: expected 4 bytes, got {len}"
+        )));
+    }
+    usize::try_from(value).map_err(|_| {
+        std::io::Error::other(format!("hw.perflevel0.physicalcpu: negative count {value}"))
+    })
+}
+
+/// The number of performance cores: unknown on systems other than Apple's, so the default
+/// thread count falls back to the available parallelism.
+#[cfg(not(target_vendor = "apple"))]
+fn performance_cores() -> std::io::Result<usize> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "performance cores are only read on Apple systems",
+    ))
+}
+
 /// The number of threads the threaded kernels use: the last value passed to
-/// [`set_threads`], else `CAVITATION_THREADS` if it is set, else
-/// [`std::thread::available_parallelism`] (1 if that is unknown). Always at least 1.
+/// [`set_threads`], else `CAVITATION_THREADS` if it is set, else the number of performance
+/// cores on Apple Silicon (where the efficiency cores slow training down) and
+/// [`std::thread::available_parallelism`] elsewhere (1 if that is unknown). Always at
+/// least 1.
 ///
 /// # Panics
 ///
@@ -752,6 +850,31 @@ mod tests {
         }
         assert_eq!(parse_threads("1"), Ok(1));
         assert_eq!(parse_threads("16"), Ok(16));
+    }
+
+    /// The default thread count takes a positive performance-core count (capped at the
+    /// available parallelism) and falls back to the available parallelism when the read
+    /// fails or reports 0.
+    #[test]
+    fn default_threads_falls_back() {
+        let available = available_threads();
+        let missing = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(default_threads_from(missing), available);
+        assert_eq!(default_threads_from(|| Ok(0)), available);
+        assert_eq!(default_threads_from(|| Ok(1)), 1);
+        assert_eq!(default_threads_from(|| Ok(available + 1)), available);
+        #[cfg(not(target_vendor = "apple"))]
+        assert_eq!(default_threads(), available);
+    }
+
+    /// On Apple Silicon the sysctl reports at least one performance core, no more than the
+    /// logical cores, and that count is the default.
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    #[test]
+    fn performance_cores_read_on_apple_silicon() {
+        let n = performance_cores().expect("hw.perflevel0.physicalcpu");
+        assert!(n >= 1 && n <= available_threads(), "{n} performance cores");
+        assert_eq!(default_threads(), n);
     }
 
     /// Re-runs this test binary with `name` (an ignored helper test) and one environment
