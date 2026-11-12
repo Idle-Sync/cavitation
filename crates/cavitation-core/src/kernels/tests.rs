@@ -95,6 +95,23 @@ impl Stored {
         .unwrap()
     }
 
+    /// Asserts that every stored value outside the view (the padding, which `Stored` fills
+    /// with NaN) is still NaN, naming `what` and the first position that changed.
+    fn assert_padding_untouched(&self, what: &str) {
+        let mut inside = vec![false; self.data.len()];
+        for i in 0..self.rows {
+            for j in 0..self.cols {
+                inside[i * self.row_stride + j * self.col_stride] = true;
+            }
+        }
+        for (at, (v, inside)) in self.data.iter().zip(&inside).enumerate() {
+            assert!(
+                *inside || v.is_nan(),
+                "{what}: padding at position {at} was overwritten with {v}"
+            );
+        }
+    }
+
     /// The logical values, row-major.
     fn logical(&self) -> Vec<f32> {
         let v = self.view();
@@ -232,6 +249,7 @@ fn check_case(
                      {threads} threads"
                 );
                 assert_within(&sc.logical(), &want, &bound, n, &what);
+                sc.assert_padding_untouched(&what);
             }
         }
     }
@@ -258,11 +276,22 @@ fn fast_levels(test: &str) -> Vec<(Level, usize, usize)> {
         .collect()
 }
 
-/// Every fast kernel matches the reference within the GEMM tolerance on 400 shapes sampled
+/// Every level whose matrix product is not the reference loop: the packed kernels this CPU
+/// runs and, on Apple Silicon, Accelerate. Prints each level it skips.
+fn gemm_levels(test: &str) -> Vec<Level> {
+    let mut levels: Vec<Level> = fast_levels(test).into_iter().map(|(l, ..)| l).collect();
+    if supported(Level::Accelerate) {
+        levels.push(Level::Accelerate);
+    } else {
+        println!("{test}: skipped kernel level accelerate, not supported by this CPU");
+    }
+    levels
+}
+
+/// Checks `level` against the reference within the GEMM tolerance on 400 shapes sampled
 /// (seed 3) from every combination of sizes around the tile edges, for all four transpose
-/// combinations, alpha in {1, -0.5} and beta in {0, 1, 0.25}.
-#[test]
-fn fast_matches_reference() {
+/// combinations and general strides, alpha in {1, -0.5} and beta in {0, 1, 0.25}.
+fn check_sampled_shapes(level: Level) {
     let sizes = [
         1usize, 2, 3, 5, 7, 8, 9, 11, 12, 13, 15, 16, 17, 31, 33, 64, 65, 127, 129, 255, 257,
     ];
@@ -274,23 +303,88 @@ fn fast_matches_reference() {
             }
         }
     }
-    for (level, ..) in fast_levels("fast_matches_reference") {
-        let mut cases = cases.clone();
-        let mut rng = Rng::seed(3);
-        rng.shuffle(&mut cases);
-        for (i, &shape) in cases[..400].iter().enumerate() {
-            check_case(
-                &mut rng,
-                level,
-                1 + i % 4,
-                shape,
-                &[1.0, -0.5],
-                &[0.0, 1.0, 0.25],
-                i % 3,
-                i % 2 == 1,
-            );
-        }
+    let mut rng = Rng::seed(3);
+    rng.shuffle(&mut cases);
+    for (i, &shape) in cases[..400].iter().enumerate() {
+        check_case(
+            &mut rng,
+            level,
+            1 + i % 4,
+            shape,
+            &[1.0, -0.5],
+            &[0.0, 1.0, 0.25],
+            i % 3,
+            i % 2 == 1,
+        );
     }
+}
+
+/// The shapes with one dimension of 1 (a row, a column, an outer product) and 1 x 1 x 1.
+const VECTOR_SHAPES: [(usize, usize, usize); 9] = [
+    (1, 1, 1),
+    (1, 300, 77),
+    (300, 1, 77),
+    (37, 300, 1),
+    (1, 1, 500),
+    (1, 9, 1),
+    (9, 1, 1),
+    (1, 13, 1),
+    (13, 1, 1),
+];
+
+/// Checks `level` against the reference on [`VECTOR_SHAPES`], alpha in {1, -0.5} and beta in
+/// {0, 1}, for all four transpose combinations and general strides.
+fn check_vector_shapes(level: Level) {
+    let mut rng = Rng::seed(7);
+    for (i, &shape) in VECTOR_SHAPES.iter().enumerate() {
+        check_case(
+            &mut rng,
+            level,
+            1 + i % 4,
+            shape,
+            &[1.0, -0.5],
+            &[0.0, 1.0],
+            i % 2,
+            i % 2 == 0,
+        );
+    }
+}
+
+/// Every fast kernel matches the reference within the GEMM tolerance on the 400 sampled
+/// shapes of [`check_sampled_shapes`].
+#[test]
+fn fast_matches_reference() {
+    for (level, ..) in fast_levels("fast_matches_reference") {
+        check_sampled_shapes(level);
+    }
+}
+
+/// On Apple Silicon, Accelerate matches the reference within the GEMM tolerance on every
+/// shape the packed kernels' twin tests use: the 400 sampled shapes, a 512 x 512 x 512
+/// product and the vector shapes, each for all four transpose combinations, general strides,
+/// a transposed C, and padded rows. Most cases run through Accelerate; general strides run
+/// the NEON fallback, except where a dimension of 1 leaves a view BLAS can still read. C's
+/// padding is checked to stay untouched. Skipped, with a message, anywhere else.
+#[test]
+fn accelerate_matches_reference() {
+    if !supported(Level::Accelerate) {
+        println!("accelerate_matches_reference: skipped, kernel level accelerate not supported");
+        return;
+    }
+    check_sampled_shapes(Level::Accelerate);
+    check_case(
+        &mut Rng::seed(5),
+        Level::Accelerate,
+        4,
+        (512, 512, 512),
+        &[1.0],
+        &[0.0, 0.25],
+        0,
+        false,
+    );
+    check_vector_shapes(Level::Accelerate);
+    // Each product is one call on the calling thread, whatever the thread count.
+    assert_eq!(threads_used(Level::Accelerate, 4, 128, 1024, 784), 1);
 }
 
 /// A 512 x 512 x 512 product on 4 threads matches the reference within the tolerance, at
@@ -312,43 +406,19 @@ fn fast_large_square() {
     }
 }
 
-/// Shapes with one dimension of 1 (a row, a column, an outer product) and 1 x 1 x 1 match
-/// the reference, at every fast level.
+/// The vector shapes of [`VECTOR_SHAPES`] match the reference, at every fast level.
 #[test]
 fn fast_vector_shapes() {
-    let shapes = [
-        (1, 1, 1),
-        (1, 300, 77),
-        (300, 1, 77),
-        (37, 300, 1),
-        (1, 1, 500),
-        (1, 9, 1),
-        (9, 1, 1),
-        (1, 13, 1),
-        (13, 1, 1),
-    ];
     for (level, ..) in fast_levels("fast_vector_shapes") {
-        let mut rng = Rng::seed(7);
-        for (i, &shape) in shapes.iter().enumerate() {
-            check_case(
-                &mut rng,
-                level,
-                1 + i % 4,
-                shape,
-                &[1.0, -0.5],
-                &[0.0, 1.0],
-                i % 2,
-                i % 2 == 0,
-            );
-        }
+        check_vector_shapes(level);
     }
 }
 
 /// With m or n zero nothing is written; with k zero, C becomes beta·C (zeros for beta 0,
-/// even over NaN). At every fast level.
+/// even over NaN). At every fast level and Accelerate.
 #[test]
 fn fast_empty_dims() {
-    for (level, ..) in fast_levels("fast_empty_dims") {
+    for level in gemm_levels("fast_empty_dims") {
         let a = [1.0f32; 12];
         let b = [1.0f32; 12];
         // m = 0 and n = 0: C's storage is untouched.
@@ -401,54 +471,16 @@ fn product_bits(
     c.into_iter().map(f32::to_bits).collect()
 }
 
-/// Fails unless the thread pool runs tasks on its workers, not only on the caller: runs 64
-/// short tasks on 4 threads, again for up to 10 seconds, until one runs on a worker other
-/// than 0.
-fn assert_pool_runs_on_workers() {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    let start = std::time::Instant::now();
-    loop {
-        let highest = AtomicUsize::new(0);
-        super::pool::run(4, 64, &|t: super::pool::Task| {
-            let spin = std::time::Instant::now();
-            while spin.elapsed() < std::time::Duration::from_micros(20) {}
-            highest.fetch_max(t.worker, Ordering::Relaxed);
-        });
-        if highest.into_inner() > 0 {
-            return;
-        }
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(10),
-            "the pool ran every task on the caller for 10 s"
-        );
-    }
-}
-
-/// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the
-/// training shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and
-/// 32 x 256 x 1024, at every fast level. The test binary re-runs itself as a child that runs
-/// only `threads_bit_identical_child`, so nothing else holds the thread pool and the
-/// multi-threaded products really use its workers.
+/// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the training
+/// shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and 32 x 256 x 1024, at every fast
+/// level and Accelerate. The test binary re-runs itself as a child that runs only
+/// `threads_bit_identical_child`, so nothing else holds the thread pool and the multi-threaded
+/// products really use its workers.
 #[test]
 fn threads_bit_identical() {
-    let exe = std::env::current_exe().expect("the test binary's path");
-    let out = std::process::Command::new(exe)
-        .args([
-            "--ignored",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-            "kernels::twin_tests::threads_bit_identical_child",
-        ])
-        .output()
-        .expect("the test binary runs");
+    let out = crate::test_child::run_alone("kernels::twin_tests::threads_bit_identical_child", &[]);
+    crate::test_child::assert_passed(&out);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // A filter that matches nothing also exits 0; "1 passed" shows the helper ran.
-    assert!(
-        out.status.success() && stdout.contains("1 passed"),
-        "the child should run the helper and pass; stdout:\n{stdout}\nstderr:\n{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     print!("{stdout}");
 }
 
@@ -457,8 +489,8 @@ fn threads_bit_identical() {
 #[test]
 #[ignore = "run in a child process by threads_bit_identical"]
 fn threads_bit_identical_child() {
-    assert_pool_runs_on_workers();
-    for (level, ..) in fast_levels("threads_bit_identical") {
+    crate::test_child::assert_pool_runs_on_workers();
+    for level in gemm_levels("threads_bit_identical") {
         let mut rng = Rng::seed(11);
         for (m, n, k, b_transposed) in [
             (300, 700, 500, false),
@@ -482,10 +514,10 @@ fn threads_bit_identical_child() {
     }
 }
 
-/// The same call twice gives the same bits, at every fast level.
+/// The same call twice gives the same bits, at every fast level and Accelerate.
 #[test]
 fn run_to_run_identical() {
-    for (level, ..) in fast_levels("run_to_run_identical") {
+    for level in gemm_levels("run_to_run_identical") {
         let mut rng = Rng::seed(13);
         let (m, n, k) = (200, 300, 400);
         let a = random(&mut rng, m * k);
@@ -502,8 +534,9 @@ fn run_to_run_identical() {
     }
 }
 
-/// The reported thread count is the one the call runs on: never more than its tasks. Each
-/// level runs its own kernel: one of its tiles is one task, two side by side are two.
+/// The reported thread count is the one the call runs on: never more than its tasks, and 1
+/// for a product under the single-thread threshold. Each level runs its own kernel: one of
+/// its tiles is one task, two side by side are two.
 #[test]
 fn threads_used_matches_the_work() {
     for (level, mr, nr) in fast_levels("threads_used_matches_the_work") {
@@ -515,6 +548,13 @@ fn threads_used_matches_the_work() {
         );
         assert_eq!(threads_used(level, 4, 128, 1024, 784), 4, "{level}");
         assert_eq!(threads_used(level, 4, 0, 1024, 784), 1, "{level}");
+        // Under 2¹⁸ floating-point operations a product runs on the caller alone (64·32·32
+        // is 2¹⁷); at 2¹⁸ (64·64·32) it is split again.
+        assert_eq!(threads_used(level, 4, 64, 32, 32), 1, "{level}: 2^17 FLOPs");
+        assert!(
+            threads_used(level, 4, 64, 64, 32) > 1,
+            "{level}: 2^18 FLOPs"
+        );
         assert!(
             threads_used(level, 1000, 1024, 1024, 1024) <= 256,
             "{level}"
@@ -561,19 +601,11 @@ fn forced_unsupported_level_panics_cleanly() {
         println!("forced_unsupported_level_panics_cleanly: skipped, this CPU supports avx2");
         return;
     }
-    let exe = std::env::current_exe().expect("the test binary's path");
-    let out = std::process::Command::new(exe)
-        .args([
-            "--ignored",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-            "kernels::twin_tests::forced_level_child",
-        ])
-        .env_remove("CAVITATION_THREADS")
-        .env("CAVITATION_KERNEL", "avx2")
-        .output()
-        .expect("the test binary runs");
+    let out = crate::test_child::run_alone_without(
+        "kernels::twin_tests::forced_level_child",
+        &[("CAVITATION_KERNEL", "avx2")],
+        &["CAVITATION_THREADS"],
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     // A filter that matches nothing also exits 0; "1 failed" shows the helper ran.
@@ -645,11 +677,11 @@ fn gemm_f32_uses_a_supported_level() {
     assert_eq!(c, [19.0, 22.0, 43.0, 50.0]);
 }
 
-/// Every level this CPU runs: the reference loops and each supported fast level. Prints each
-/// fast level it skips.
+/// Every level this CPU runs: the reference loops, each supported fast level and, on Apple
+/// Silicon, Accelerate (whose matvec is NEON's). Prints each level it skips.
 fn every_level(test: &str) -> Vec<Level> {
     std::iter::once(Level::Reference)
-        .chain(fast_levels(test).into_iter().map(|(level, ..)| level))
+        .chain(gemm_levels(test))
         .collect()
 }
 
@@ -668,11 +700,11 @@ fn matvec_bounds(w_t: &[f32], x: &[f32], bias: Option<&[f32]>, n: usize) -> Vec<
         .collect()
 }
 
-/// The fast matvec at every supported level matches the reference (followed by ReLU when
-/// asked) within the matvec tolerance, and the SSE4.2 one bit for bit, for input widths 1, 3, 7, 64, 785 and 1023 by output
-/// widths 1, 5, 10, 256 and 1024, with and without a bias and ReLU. The weights are stored
-/// with 3 NaN values of padding after each row, so reading past a row shows up as NaN; the
-/// output starts as NaN, so an element left unwritten shows up too.
+/// The fast matvec at every supported level matches the reference (followed by ReLU when asked)
+/// within the matvec tolerance, and the SSE4.2 one bit for bit, for input widths 1, 3, 7, 64, 785
+/// and 1023 by output widths 1, 5, 10, 256 and 1024, with and without a bias and ReLU. The weights
+/// are stored with 3 NaN values of padding after each row, so reading past a row shows up as NaN;
+/// the output starts as NaN, so an element left unwritten shows up too.
 #[test]
 fn matvec_levels_match_reference() {
     let mut rng = Rng::seed(17);
@@ -771,6 +803,88 @@ fn matvec_relu_edges_and_repeats() {
                 .all(|(a, b)| a.to_bits() == b.to_bits()),
             "{level}"
         );
+    }
+}
+
+/// On Apple Silicon the matvec at Accelerate is the NEON kernel: the same bits as at NEON,
+/// with and without a bias and ReLU. Skipped, with a message, anywhere else.
+#[test]
+fn accelerate_matvec_is_neon() {
+    if !supported(Level::Accelerate) {
+        println!("accelerate_matvec_is_neon: skipped, kernel level accelerate not supported");
+        return;
+    }
+    let mut rng = Rng::seed(31);
+    let (k, n) = (785, 256);
+    let w = random(&mut rng, k * n);
+    let x = random(&mut rng, k);
+    let b = random(&mut rng, n);
+    for (bias, relu) in [(None, false), (Some(&b[..]), true)] {
+        let (mut neon, mut accel) = (vec![0.0f32; n], vec![0.0f32; n]);
+        matvec_f32_with(Level::Neon, rm(&w, k, n), &x, bias, relu, &mut neon);
+        matvec_f32_with(Level::Accelerate, rm(&w, k, n), &x, bias, relu, &mut accel);
+        let same = neon
+            .iter()
+            .zip(&accel)
+            .all(|(p, q)| p.to_bits() == q.to_bits());
+        assert!(
+            same,
+            "bias {}, relu {relu}: not NEON's bits",
+            bias.is_some()
+        );
+    }
+}
+
+/// A NaN or an infinity in A or B reaches C as it does in the reference, also where it meets
+/// zeros (NaN · 0 and ∞ · 0 are NaN): every element the reference makes NaN is NaN, and the
+/// others match it. At the reference level, every fast level and Accelerate, for row-major
+/// operands and for B transposed (the training layouts, which Accelerate runs itself), with
+/// beta 0 and 1.
+#[test]
+fn non_finite_inputs_reach_c() {
+    let (m, n, k) = (9, 13, 7);
+    let mut a = vec![0.5f32; m * k];
+    let mut b = vec![0.0f32; k * n];
+    a[2 * k + 3] = f32::NAN; // row 2 of C meets B's zero row 3
+    a[5 * k] = f32::INFINITY; // row 5 of C: ∞ · 0
+    b[4 * n + 6] = f32::NAN; // column 6 of C, against A's 0.5s
+    b[6 * n + 11] = 2.0; // one ordinary non-zero value
+    let c0 = vec![1.0f32; m * n];
+    let levels = std::iter::once(Level::Reference).chain(gemm_levels("non_finite_inputs_reach_c"));
+    for level in levels {
+        for b_transposed in [false, true] {
+            let sb = Stored::new(&b, k, n, b_transposed, 0);
+            for beta in [0.0f32, 1.0] {
+                let mut want = c0.clone();
+                reference::gemm(
+                    1.0,
+                    rm(&a, m, k),
+                    rm(&b, k, n),
+                    beta,
+                    rm_mut(&mut want, m, n),
+                );
+                assert!(want[2 * n].is_nan() && want[5 * n + 1].is_nan() && want[6].is_nan());
+                let mut got = c0.clone();
+                gemm_f32_with(
+                    level,
+                    4,
+                    1.0,
+                    rm(&a, m, k),
+                    sb.view(),
+                    beta,
+                    rm_mut(&mut got, m, n),
+                );
+                for (x, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        g.is_nan() == w.is_nan() && (w.is_nan() || g == w),
+                        "{level}, B transposed {b_transposed}, beta {beta}: element ({}, {}) \
+                         is {g}, reference {w}",
+                        x / n,
+                        x % n
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 //! Timed runs: the matrix products of one training step, each timed on its own, and the
 //! training and inference runs that are compared with the numpy baseline.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::path::Path;
 use std::rc::Rc;
@@ -9,11 +9,11 @@ use std::time::Instant;
 
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
-use cavitation_core::{ParamStore, Rng};
-use cavitation_datasets::{digits, mnist};
+use cavitation_core::{ParamStore, Rng, Tensor};
+use cavitation_datasets::{cifar10, digits, mnist};
 use cavitation_nn::{
-    Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, OptimizerConfig, Relu,
-    Sequential, Trainer, Warning,
+    Adam, Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, Optimizer,
+    OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer, Warning, WarningKind,
 };
 
 use crate::numpy;
@@ -176,6 +176,10 @@ pub const MNIST_NET: [usize; 4] = [784, 1024, 256, 10];
 /// The layer widths of the 50k network: 64 to 256 to 128 to 10, 50,826 parameters.
 pub const DIGITS_NET: [usize; 4] = [64, 256, 128, 10];
 
+/// The layer widths of the CIFAR-10 network: 3072 to 1024 to 512 to 10, 3,676,682
+/// parameters.
+pub const CIFAR_NET: [usize; 4] = [3072, 1024, 512, 10];
+
 /// The median of `values` (the upper middle one for an even count).
 pub fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
@@ -214,7 +218,8 @@ pub struct Comparison {
     pub ours: Vec<f64>,
     /// Seconds per epoch or per round, as numpy measured them.
     pub numpy: Vec<f64>,
-    /// Samples per epoch (training) or calls per round (latency): the work in each timed sample.
+    /// The work in each timed sample: samples per epoch or steps per timed run (training),
+    /// or calls per round (latency).
     pub work: f64,
     /// What each side's timed region includes.
     pub timing_note: String,
@@ -222,8 +227,70 @@ pub struct Comparison {
     pub numpy_version: String,
     /// The BLAS thread setting the baseline saw.
     pub blas_threads: String,
-    /// How to show a median: `epoch`, `samples/s` or `us/call`.
+    /// How to show a median: `s/epoch`, `samples/s`, `steps/s` or `us/call`.
     pub unit: Unit,
+    /// The health warnings the run raised, by kind (see [`HealthLog::summary`]); empty for
+    /// runs that do not train.
+    pub health: String,
+}
+
+/// The health warnings of one training run, grouped by kind and place.
+#[derive(Debug, Default)]
+pub struct HealthLog {
+    /// For each kind and place (layer or location) in order of first appearance: the epoch of
+    /// its first warning (0 for the untimed warm-up) and how many came.
+    groups: Vec<(WarningKind, Option<String>, usize, usize)>,
+}
+
+impl HealthLog {
+    /// Records `warning`, raised during `epoch` (0 for the untimed warm-up steps). A warning
+    /// that knows its own epoch (dead neurons) uses that one.
+    pub fn record(&mut self, warning: &Warning, epoch: usize) {
+        let kind = warning.kind();
+        let place = match (warning.layer(), warning.location()) {
+            (Some(layer), _) => Some(format!("layer {layer}")),
+            (None, Some(location)) => Some(location.to_string()),
+            (None, None) => None,
+        };
+        if let Some(group) = self.groups.iter_mut().find(|g| g.0 == kind && g.1 == place) {
+            group.3 += 1;
+            return;
+        }
+        self.groups
+            .push((kind, place, warning.epoch().unwrap_or(epoch), 1));
+    }
+
+    /// How many warnings were recorded in all.
+    pub fn total(&self) -> usize {
+        self.groups.iter().map(|g| g.3).sum()
+    }
+
+    /// One line naming each kind and layer (or location) and first epoch, then its
+    /// count, for example `health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x3;
+    /// DeadNeurons (layer 5, from epoch 1) x1`; `health: no warnings` if there were none.
+    pub fn summary(&self) -> String {
+        if self.groups.is_empty() {
+            return "health: no warnings".to_string();
+        }
+        let kinds: Vec<String> = self
+            .groups
+            .iter()
+            .map(|(kind, place, epoch, count)| {
+                let from = if *epoch == 0 {
+                    "from the warm-up".to_string()
+                } else {
+                    format!("from epoch {epoch}")
+                };
+                match place {
+                    Some(place) => format!("{kind:?} ({place}, {from}) x{count}"),
+                    None => format!("{kind:?} ({from}) x{count}"),
+                }
+            })
+            .collect();
+        let total = self.total();
+        let noun = if total == 1 { "warning" } else { "warnings" };
+        format!("health: {total} {noun}: {}", kinds.join("; "))
+    }
 }
 
 /// How a median time is shown.
@@ -233,6 +300,8 @@ pub enum Unit {
     EpochSeconds,
     /// Training samples per second.
     SamplesPerSecond,
+    /// Training steps per second.
+    StepsPerSecond,
     /// Microseconds per call.
     MicrosPerCall,
 }
@@ -242,7 +311,7 @@ impl Comparison {
     pub fn value(&self, seconds: f64) -> f64 {
         match self.unit {
             Unit::EpochSeconds => seconds,
-            Unit::SamplesPerSecond => self.work / seconds,
+            Unit::SamplesPerSecond | Unit::StepsPerSecond => self.work / seconds,
             Unit::MicrosPerCall => seconds / self.work * 1e6,
         }
     }
@@ -252,6 +321,7 @@ impl Comparison {
         match self.unit {
             Unit::EpochSeconds => "s/epoch",
             Unit::SamplesPerSecond => "samples/s",
+            Unit::StepsPerSecond => "steps/s",
             Unit::MicrosPerCall => "us/call",
         }
     }
@@ -267,7 +337,7 @@ impl Comparison {
 pub struct TrainSpec {
     /// The label of the run.
     pub name: String,
-    /// `mnist` or `digits`.
+    /// `mnist`, `digits` or `cifar`.
     pub data: &'static str,
     /// Layer widths, input first.
     pub widths: [usize; 4],
@@ -275,20 +345,23 @@ pub struct TrainSpec {
     pub batch: usize,
     /// Adam with learning rate 1e-3 if true, plain SGD with 0.01 if false.
     pub adam: bool,
-    /// Timed epochs.
+    /// Timed epochs, or timed runs of `steps` steps.
     pub epochs: usize,
+    /// `Some(n)`: each timed sample is `n` steps instead of a whole epoch, for machines on
+    /// which an epoch is slow. The steps go through the batches in order, wrapping round.
+    pub steps: Option<usize>,
     /// How to show the median.
     pub unit: Unit,
 }
 
-/// Times `spec.epochs` epochs of training through the public path (`Trainer`, `Batcher`,
-/// the default health checks on) after [`TRAIN_WARMUP`] untimed steps, and returns the seconds of
-/// each epoch.
+/// Times `spec.epochs` epochs (or runs of `spec.steps` steps) of training through the public
+/// path (`Trainer`, `Batcher`, the default health checks on) after [`TRAIN_WARMUP`] untimed
+/// steps, and returns the seconds of each, with the health warnings raised.
 ///
 /// # Errors
 ///
 /// Returns a message if the training stops (a non-finite value) or the data is missing.
-fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), String> {
+fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, HealthLog), String> {
     let mut params = ParamStore::new();
     let net = build_net(&mut params, &spec.widths);
     let optimizer = if spec.adam {
@@ -304,11 +377,16 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
         }
     };
     let mut trainer = Trainer::new(&net, optimizer.build(), Loss::CrossEntropy, spec.batch);
-    // The default checks, with the warnings counted instead of printed to standard error.
-    let warnings = Rc::new(Cell::new(0usize));
-    let counter = Rc::clone(&warnings);
+    // The default checks, with the warnings recorded instead of printed to standard error:
+    // the sink adds to a count (the first of each kind also keeps its place), and the
+    // summary is formatted after the timing.
+    let warnings = Rc::new(RefCell::new(HealthLog::default()));
+    let epoch_now = Rc::new(Cell::new(0usize));
+    let (log, now) = (Rc::clone(&warnings), Rc::clone(&epoch_now));
     trainer.set_health(Health {
-        sink: Some(Box::new(move |_: &Warning| counter.set(counter.get() + 1))),
+        sink: Some(Box::new(move |w: &Warning| {
+            log.borrow_mut().record(w, now.get());
+        })),
         ..Health::default()
     });
     let mut batcher = Batcher::new(data.len(), spec.batch, None);
@@ -322,12 +400,17 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
                 .map_err(|e| e.to_string())?,
         );
     }
+    // Step k of a timed sample uses batch k modulo the batch count; a whole epoch is every
+    // batch once, in order.
+    let count = spec.steps.unwrap_or(ranges.len());
     let mut seconds = Vec::with_capacity(spec.epochs);
     for epoch in 1..=spec.epochs {
+        epoch_now.set(epoch);
+        let first = (epoch - 1) * count;
         let start = Instant::now();
         batcher.epoch();
-        for range in &ranges {
-            let view = batcher.gather(data, range.clone(), &mut buffer);
+        for k in first..first + count {
+            let view = batcher.gather(data, ranges[k % ranges.len()].clone(), &mut buffer);
             black_box(
                 trainer
                     .step(&net, &mut params, view)
@@ -337,17 +420,17 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, usize), Str
         trainer.end_epoch(epoch).map_err(|e| e.to_string())?;
         seconds.push(start.elapsed().as_secs_f64());
     }
-    Ok((seconds, warnings.get()))
+    Ok((seconds, warnings.take()))
 }
 
-/// Loads the training data a run needs: MNIST's 60,000 images from `data/mnist/` or the
-/// 1,437 training digits.
+/// Loads the training data a run needs: MNIST's 60,000 images from `data/mnist/`,
+/// CIFAR-10's 50,000 from `data/cifar10/`, or the 1,437 training digits.
 fn load_training_data(name: &str) -> Result<Dataset, String> {
-    let loaded = if name == "mnist" {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/mnist");
-        mnist::load(&dir)
-    } else {
-        digits::load()
+    let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data");
+    let loaded = match name {
+        "mnist" => mnist::load(&data.join("mnist")),
+        "cifar" => cifar10::load(&data.join("cifar10")),
+        _ => digits::load(),
     };
     loaded.map(|(train, _)| train).map_err(|e| e.to_string())
 }
@@ -362,15 +445,20 @@ fn net_arg(widths: &[usize]) -> String {
 }
 
 /// Runs a training comparison: cavitation first, then the numpy script with the same
-/// network, batch, data, optimiser, warm-up and epoch count.
+/// network, batch, data, optimiser, warm-up, epoch count and steps per timed sample.
 ///
 /// # Errors
 ///
 /// Returns a message if either side fails.
 pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, String> {
     let data = load_training_data(spec.data)?;
-    let (ours, warnings) = train_ours(spec, &data)?;
-    let args: Vec<String> = [
+    let (ours, health) = train_ours(spec, &data)?;
+    let rows = data.len();
+    let epoch_steps = rows.div_ceil(spec.batch);
+    let steps = spec.steps.unwrap_or(epoch_steps);
+    // The numpy child loads its own copy; CIFAR-10's is 614 MB as f32.
+    drop(data);
+    let mut args: Vec<String> = [
         "--mode",
         "train",
         "--net",
@@ -388,17 +476,22 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
     ]
     .map(String::from)
     .to_vec();
+    if let Some(n) = spec.steps {
+        args.extend(["--steps".to_string(), n.to_string()]);
+    }
     let theirs = numpy::run(python, &args)?;
-    let steps = data.len().div_ceil(spec.batch);
     theirs.check("train", steps, spec.epochs)?;
+    let timed = match spec.steps {
+        Some(n) => format!("runs of {n} steps ({epoch_steps} steps per epoch)"),
+        None => format!("epochs of {epoch_steps} steps"),
+    };
     Ok(Comparison {
         name: spec.name.clone(),
         detail: format!(
-            "{} network, batch {}, {} steps per epoch, {}, {} untimed warm-up steps, \
-             {} timed epochs, Health::default() on ({} warnings counted)",
+            "{} network, batch {}, {}, {} untimed warm-up steps, \
+             {} timed {timed}, Health::default() on ({} warnings counted)",
             net_arg(&spec.widths),
             spec.batch,
-            steps,
             if spec.adam {
                 "Adam lr 0.001"
             } else {
@@ -406,7 +499,7 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
             },
             TRAIN_WARMUP,
             spec.epochs,
-            warnings
+            health.total()
         ),
         ours,
         numpy: theirs.samples,
@@ -415,8 +508,13 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
             .to_string(),
         numpy_version: theirs.numpy_version,
         blas_threads: theirs.blas_threads,
-        work: data.len() as f64,
+        work: if spec.unit == Unit::StepsPerSecond {
+            steps as f64
+        } else {
+            rows as f64
+        },
         unit: spec.unit,
+        health: health.summary(),
     })
 }
 
@@ -487,6 +585,7 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
         blas_threads: theirs.blas_threads,
         work: LATENCY_CALLS as f64,
         unit: Unit::MicrosPerCall,
+        health: String::new(),
     })
 }
 
@@ -494,6 +593,40 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Warnings group by kind and place, keeping the first one's epoch, and the summary
+    /// names each group once with its count.
+    #[test]
+    fn health_log_groups_by_kind() {
+        let mut log = HealthLog::default();
+        assert_eq!(log.summary(), "health: no warnings");
+        let dead = |layer| Warning::DeadNeurons {
+            epoch: 1,
+            layer,
+            width: 8,
+            neurons: vec![0],
+        };
+        for layer in [3, 3, 5, 3] {
+            log.record(&dead(layer), 1);
+        }
+        assert_eq!(
+            log.summary(),
+            "health: 4 warnings: DeadNeurons (layer 3, from epoch 1) x3; \
+             DeadNeurons (layer 5, from epoch 1) x1"
+        );
+        let vanishing = Warning::Vanishing {
+            step: 9,
+            layer: "linear_2".to_string(),
+            norm: 1e-9,
+        };
+        log.record(&vanishing, 0);
+        assert_eq!(log.total(), 5);
+        assert_eq!(
+            log.summary(),
+            "health: 5 warnings: DeadNeurons (layer 3, from epoch 1) x3; \
+             DeadNeurons (layer 5, from epoch 1) x1; Vanishing (linear_2, from the warm-up) x1"
+        );
+    }
 
     /// The 1M network's eight products do 4,799,488 FLOPs per sample (6 × weights minus the
     /// first layer's input gradient), and the digits network's 269,824.
@@ -511,4 +644,167 @@ mod tests {
         assert_eq!(work("digits128"), 269_824.0);
         assert!(shapes("cifar").is_err());
     }
+}
+
+/// Elements of the one parameter of the `subnormal` run: 1,068,810, the size of the 1M
+/// network.
+pub const SUBNORMAL_ELEMENTS: usize = 1_068_810;
+
+/// Steps per block of the `subnormal` run's report.
+pub const BLOCK: usize = 100;
+
+/// One optimiser's update times from the `subnormal` run.
+#[derive(Clone, Debug)]
+pub struct SubnormalRun {
+    /// The optimiser's name.
+    pub name: &'static str,
+    /// The median update time, in seconds, of each block of [`BLOCK`] steps.
+    pub blocks: Vec<f64>,
+    /// The median of the blocks from step 901 on over the median of the blocks of steps 1 to
+    /// 700 (`None` when the run is shorter than 1,000 steps).
+    pub ratio: Option<f64>,
+}
+
+/// Times `steps` updates of `opt` on one parameter of [`SUBNORMAL_ELEMENTS`] elements whose
+/// gradient is 1e-3 on the first step and 0 on every later one, so the optimiser's state
+/// decays through the subnormal range. Only the update is timed.
+fn time_decay<O: Optimizer<f32>>(name: &'static str, mut opt: O, steps: usize) -> SubnormalRun {
+    let mut store = ParamStore::new();
+    let p = store.add(Tensor::full(&[SUBNORMAL_ELEMENTS], 1.0f32));
+    let mut times = Vec::with_capacity(steps);
+    for step in 0..steps {
+        store.zero_grad();
+        let g = if step == 0 { 1e-3 } else { 0.0 };
+        store.grads.accumulate(p).0.data_mut().fill(g);
+        let start = Instant::now();
+        opt.step(&mut store);
+        times.push(start.elapsed().as_secs_f64());
+    }
+    let blocks: Vec<f64> = times.chunks(BLOCK).map(median).collect();
+    let ratio = (steps >= 1000).then(|| median(&blocks[9..]) / median(&blocks[..7]));
+    SubnormalRun {
+        name,
+        blocks,
+        ratio,
+    }
+}
+
+/// Runs the `subnormal` benchmark: SGD, SGD with momentum 0.9 and Adam (lr 1e-3) for `steps`
+/// steps each, one after the other.
+pub fn subnormal(steps: usize) -> Vec<SubnormalRun> {
+    vec![
+        time_decay("sgd", Sgd::new(0.01), steps),
+        time_decay("sgd momentum 0.9", Sgd::new(0.01).with_momentum(0.9), steps),
+        time_decay("adam lr 1e-3", Adam::new(1e-3), steps),
+    ]
+}
+
+/// The layer widths of the `small` run's network: 4 to 32 to 32 to 1, tanh between layers,
+/// 1,249 parameters.
+pub const SMALL_NET: [usize; 4] = [4, 32, 32, 1];
+
+/// Rows of the `small` run's training data.
+pub const SMALL_ROWS: usize = 20_000;
+
+/// The batch size of the `small` run.
+pub const SMALL_BATCH: usize = 64;
+
+/// Timed epochs of the `small` run.
+pub const SMALL_EPOCHS: usize = 10;
+
+/// What one `small` training run measured.
+#[derive(Clone, Copy, Debug)]
+pub struct SmallRun {
+    /// Wall-clock seconds of the timed epochs.
+    pub wall: f64,
+    /// CPU seconds (all threads, user plus system) the process used in the timed epochs.
+    pub cpu: f64,
+    /// The bits of the last step's loss, which must be the same for every thread count.
+    pub loss_bits: u32,
+}
+
+/// The `small` run's data: [`SMALL_ROWS`] rows of 4 inputs uniform in `[-1, 1)` from seed
+/// 3, each with the target `sin(π·x₀)·x₁ + x₂·x₃`.
+fn small_data() -> Result<Dataset, String> {
+    let mut rng = Rng::seed(3);
+    let x: Vec<f32> = (0..SMALL_ROWS * SMALL_NET[0])
+        .map(|_| rng.range(-1.0, 1.0) as f32)
+        .collect();
+    let y: Vec<f32> = x
+        .as_chunks::<{ SMALL_NET[0] }>()
+        .0
+        .iter()
+        .map(|&[a, b, c, d]| (std::f32::consts::PI * a).sin() * b + c * d)
+        .collect();
+    Ok(Dataset {
+        x: Tensor::from_vec(x, &[SMALL_ROWS, SMALL_NET[0]]).map_err(|e| e.to_string())?,
+        targets: Targets::Values(Tensor::from_vec(y, &[SMALL_ROWS, 1]).map_err(|e| e.to_string())?),
+    })
+}
+
+/// Trains the `small` network (4 → 32 → tanh → 32 → tanh → 1, Xavier uniform weights from
+/// seed 1, zero biases) with mean squared error and Adam (lr 1e-3) in batches of
+/// [`SMALL_BATCH`], shuffled with seed 7, through the public path with the default health
+/// checks on, at the current thread count: [`TRAIN_WARMUP`] untimed steps, then
+/// [`SMALL_EPOCHS`] timed epochs, whose wall and CPU time it returns.
+///
+/// # Errors
+///
+/// Returns a message if the training stops or the CPU time cannot be read (only Linux
+/// reports it).
+pub fn small_once() -> Result<SmallRun, String> {
+    let data = small_data()?;
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(1);
+    let mut net = Sequential::new();
+    for (i, pair) in SMALL_NET.windows(2).enumerate() {
+        net = net.push(Linear::with_init(
+            &mut params,
+            pair[0],
+            pair[1],
+            Init::XavierUniform,
+            Init::Zeros,
+            &mut rng,
+        ));
+        if i + 2 < SMALL_NET.len() {
+            net = net.push(Tanh);
+        }
+    }
+    let optimizer = OptimizerConfig::Adam {
+        lr: 1e-3,
+        weight_decay: 0.0,
+    };
+    let mut trainer = Trainer::new(&net, optimizer.build(), Loss::Mse, SMALL_BATCH);
+    trainer.set_health(Health {
+        sink: Some(Box::new(|_: &Warning| {})),
+        ..Health::default()
+    });
+    let mut batcher = Batcher::new(data.len(), SMALL_BATCH, Some(7));
+    let mut buffer = Batch::new(&data, SMALL_BATCH);
+    let ranges: Vec<_> = batcher.batches().collect();
+    let mut loss = 0.0f32;
+    for k in 0..TRAIN_WARMUP {
+        let view = batcher.gather(&data, ranges[k % ranges.len()].clone(), &mut buffer);
+        loss = trainer
+            .step(&net, &mut params, view)
+            .map_err(|e| e.to_string())?;
+    }
+    let cpu = || crate::machine::process_cpu_seconds().ok_or("no CPU time on this system");
+    let (cpu0, start) = (cpu()?, Instant::now());
+    for epoch in 1..=SMALL_EPOCHS {
+        batcher.epoch();
+        for range in &ranges {
+            let view = batcher.gather(&data, range.clone(), &mut buffer);
+            loss = trainer
+                .step(&net, &mut params, view)
+                .map_err(|e| e.to_string())?;
+        }
+        trainer.end_epoch(epoch).map_err(|e| e.to_string())?;
+    }
+    let wall = start.elapsed().as_secs_f64();
+    Ok(SmallRun {
+        wall,
+        cpu: cpu()? - cpu0,
+        loss_bits: black_box(loss).to_bits(),
+    })
 }

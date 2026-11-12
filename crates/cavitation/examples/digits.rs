@@ -32,10 +32,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .push(he(128, 10));
 
     // Health checks stay on. A dead-ReLU warning means a ReLU neuron output exactly 0 for
-    // every sample of an epoch: it passed no signal forward and its own weights received no
-    // gradient. It can still come back if the layers before it change what it receives, so
-    // a later epoch may report it alive again. The warnings are collected here, every epoch's, and
-    // summarised at the end; without a sink each layer's first report would be printed.
+    // every sample of an epoch: it received no gradient that epoch; a neuron after the first
+    // hidden layer can come back when the layers before it change, and "dead" is measured on
+    // this data. The warnings are collected here, every epoch's, and summarised at the end;
+    // without a sink only reports that pass a threshold are printed.
     let warnings: Rc<RefCell<Vec<String>>> = Rc::default();
     let sink = Rc::clone(&warnings);
     let health = Health {

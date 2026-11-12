@@ -36,7 +36,7 @@
 
 use std::cell::RefCell;
 
-use super::{Level, MatMut, MatRef, detected_features, pool, reference, supported};
+use super::{Level, MatMut, MatRef, pool, reference, supported};
 
 /// A microkernel and the block sizes the driver uses with it.
 ///
@@ -109,13 +109,23 @@ pub(super) struct Dest {
 
 /// Products of fewer floating-point operations than this (`2 · m · n · k`) run on the
 /// calling thread alone, with the same blocking: about the size below which two thread-pool
-/// round trips per block cost more than splitting the work saves. Timing whole training
-/// steps on an idle 4-core Intel Celeron N5105 with 2¹⁵, 2¹⁹ and 2²⁰ found none faster.
-const SINGLE_THREAD_FLOPS: usize = 1 << 17;
+/// round trips per block, and the workers kept spinning between them, cost more than
+/// splitting the work saves. 2¹⁸ keeps a 64-row product with 32 on the other two sides
+/// (2¹⁷) on one thread; at 2¹⁷ such a network's training used 4 times the CPU on 4 threads
+/// for no gain in wall time. Measured on a 4-core Intel Celeron N5105 with
+/// `cavitation-bench small`, `digits` and `mnist` (batch 128 and 32) at 2¹⁷, 2¹⁸, 2¹⁹ and
+/// 2²⁰: 2¹⁸ left `digits` and `mnist` unchanged, 2¹⁹ and 2²⁰ made `digits` slower.
+const SINGLE_THREAD_FLOPS: usize = 1 << 18;
 
-/// Compute tasks per thread the driver aims for. More tasks balance uneven work better but
-/// pack each row of `A` more often. One was chosen with `cavitation-bench gemm` and
-/// re-checked by timing whole training steps (see the SSE kernel's notes in `x86.rs`).
+/// Compute tasks per thread the driver aims for. Threads take tasks in order as they finish,
+/// so more tasks would let fast cores take over work from slow ones, but each task packs
+/// its rows of `A` again and the products get narrower. One was chosen with
+/// `cavitation-bench gemm` and re-checked by timing whole training steps (see the SSE
+/// kernel's notes in `x86.rs`), then again against 2 and 4 with `cavitation-bench all`
+/// (medians of 3 interleaved runs, measured on an Intel Celeron N5105, 4 cores): 2 and 4
+/// cost MNIST at batch 128 1.8% and 9.1% and digits training 12.1% and 28.5%; on an
+/// Apple M4 at its default 4 threads, 2 gave no gain (0.96 against 0.97 s per MNIST epoch)
+/// and cost digits 16%.
 const TASKS_PER_THREAD: usize = 1;
 
 /// General matrix multiply in f32, `C = alpha · A · B + beta · C`, with the kernel for the
@@ -162,13 +172,16 @@ pub fn gemm_f32(alpha: f32, a: MatRef<f32>, b: MatRef<f32>, beta: f32, c: MatMut
 /// [`gemm_f32`] with the kernel level and the thread count given explicitly, instead of
 /// the process-wide settings.
 ///
-/// [`Level::Sse42`] runs the packed SSE4.2 kernel (6 by 8 tiles), [`Level::Avx2Fma`] the
-/// packed AVX2 kernel (6 by 16 tiles, fused multiply-add) and [`Level::Neon`] the packed
-/// NEON kernel (8 by 12 tiles, fused multiply-add). [`Level::Reference`] runs
-/// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one
-/// thread; [`threads_used`] tells how many a call uses. Each level rounds differently (fused
-/// multiply-add rounds once per step, and each kernel blocks the sum differently), so
-/// results are bit-identical across thread counts within one level, not across levels.
+/// [`Level::Sse42`] runs the packed SSE4.2 kernel (6 by 8 tiles), [`Level::Avx2Fma`] the packed
+/// AVX2 kernel (6 by 16 tiles, fused multiply-add) and [`Level::Neon`] the packed NEON kernel (8 by
+/// 12 tiles, fused multiply-add). [`Level::Accelerate`] (Apple Silicon) calls Accelerate's
+/// `cblas_sgemm` once, on the calling thread, when every view is row-major or column-major with
+/// rows (or columns) that do not overlap, padded or not, and fits in `i32` indices; any other
+/// layout, or `alpha = 0`, runs the NEON kernel instead. [`Level::Reference`] runs
+/// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one thread;
+/// [`threads_used`] tells how many a call uses. Each level rounds differently (fused multiply-add
+/// rounds once per step, and each kernel blocks the sum differently), so results are bit-identical
+/// across thread counts within one level, not across levels.
 ///
 /// # Panics
 ///
@@ -210,8 +223,8 @@ pub fn gemm_f32_with(
     );
     assert!(
         supported(level),
-        "gemm_f32_with: this CPU cannot run kernel level {level} (detected features: {})",
-        detected_features()
+        "gemm_f32_with: {}",
+        super::cannot_run(level)
     );
     reference::check_gemm_shapes(&a, &b, &c);
     let (m, n, k) = (a.rows(), b.cols(), a.cols());
@@ -236,6 +249,17 @@ pub fn gemm_f32_with(
         Level::Neon if supported(Level::Neon) => unsafe {
             dispatch::<super::aarch64::Neon>(threads, alpha, a, b, beta, c)
         },
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        Level::Accelerate if supported(Level::Accelerate) => {
+            // One call into Accelerate on this thread; a layout BLAS cannot express runs the
+            // NEON kernel instead. Which one runs depends only on the layout, never on
+            // `threads`, so the result does not depend on the thread count either way.
+            if let Err(c) = super::accelerate::gemm(alpha, a, b, beta, c) {
+                // SAFETY: this CPU supports NEON: `supported(Level::Accelerate)` (the guard)
+                // checks for it.
+                unsafe { dispatch::<super::aarch64::Neon>(threads, alpha, a, b, beta, c) }
+            }
+        }
         _ => reference::gemm(alpha, a, b, beta, c),
     }
 }
@@ -275,9 +299,11 @@ unsafe fn dispatch<K: Kernel>(
 }
 
 /// The number of threads [`gemm_f32_with`] uses for an `m` by `k` times `k` by `n` product
-/// at `level` when given `threads`: 1 for the reference loops, for empty products and for
-/// products too small to be worth splitting, else the most threads any step of the product
-/// runs on (never more than its number of tasks, nor more than the pool's maximum of 256).
+/// at `level` when given `threads`: 1 for the reference loops, for Accelerate's single call
+/// (a layout it cannot express runs on `threads_used(Level::Neon, ..)` threads instead), for
+/// empty products and for products too small to be worth splitting, else the most threads
+/// any step of the product runs on (never more than its number of tasks, nor more than the
+/// pool's maximum of 256).
 ///
 /// # Examples
 ///
@@ -304,6 +330,8 @@ pub fn threads_used(level: Level, threads: usize, m: usize, n: usize, k: usize) 
         Level::Neon if supported(Level::Neon) => {
             plan_threads::<super::aarch64::Neon>(threads, m, n, k)
         }
+        // The reference loops, and Accelerate's one call (any threads it starts itself are
+        // its own).
         _ => 1,
     }
 }

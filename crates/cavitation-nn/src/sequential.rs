@@ -1,6 +1,8 @@
 //! `Sequential` and `Trace`: layers run one after another, with optional neuron masks on
 //! their outputs, and a record of each layer's input and output.
 
+use std::sync::Arc;
+
 use cavitation_core::{ParamId, Real, Tape, Var};
 
 use crate::activation::last_dim;
@@ -49,8 +51,17 @@ impl Trace {
     }
 
     /// An empty trace with room for `layers` layers, so tracing a network of that many layers
-    /// allocates nothing.
-    pub(crate) fn with_capacity(layers: usize) -> Trace {
+    /// allocates nothing for the trace's layer list. A manual training loop that makes its trace
+    /// this way and passes it to [`Sequential::forward_traced`] each step saves the first
+    /// pass's allocation (a trace made with [`Trace::new`] and reused stops allocating after
+    /// its first pass too).
+    ///
+    /// ```
+    /// use cavitation_nn::Trace;
+    /// let trace = Trace::with_capacity(5);
+    /// assert!(trace.is_empty());
+    /// ```
+    pub fn with_capacity(layers: usize) -> Trace {
         Trace {
             inputs: Vec::with_capacity(layers),
             outputs: Vec::with_capacity(layers),
@@ -145,6 +156,31 @@ impl Trace {
 /// Its parameters are named `"{index}.{local name}"`, so layer 0's weight is `0.weight`, as
 /// in a PyTorch `nn.Sequential`. A `Sequential` is not itself a layer, so they do not nest.
 ///
+/// A `Sequential` is `Clone`. A clone shares its layers with the original, and they never
+/// change after [`push`](Self::push), so a layer that holds its own interior mutability (a
+/// `Mutex` field, say) is shared between the copies. The clone copies the neuron masks:
+/// setting or clearing a mask on one copy leaves the other as it was. A layer keeps only
+/// [`ParamId`]s, so for an independent network clone the
+/// [`ParamStore`](cavitation_core::ParamStore) too: `params.clone()` copies every value, and
+/// training the clone then leaves the original's values untouched.
+///
+/// ```
+/// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
+/// use cavitation_nn::{Linear, Relu, Sequential};
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+///     .push(Relu);
+/// let copy = net.clone();
+/// let copy_params = params.clone();
+/// let mut graph = Graph::new();
+/// let mut tape = graph.tape(&copy_params.values);
+/// let x = tape.input(Tensor::full(&[1, 2], 1.0f32).view());
+/// let y = copy.forward(&mut tape, x);
+/// assert_eq!(copy.len(), net.len());
+/// assert_eq!(tape.shape(y).dims(), &[1, 3]);
+/// ```
+///
 /// Any layer can carry a [`NeuronMask`] ([`set_mask`](Self::set_mask)): the forward pass sets
 /// the off neurons of that layer's output to exactly 0, and they pass no gradient back.
 ///
@@ -163,9 +199,10 @@ impl Trace {
 /// let y = net.forward(&mut tape, x);
 /// assert_eq!(tape.shape(y).dims(), &[5, 2]);
 /// ```
+#[derive(Clone)]
 pub struct Sequential<T: Real = f32> {
-    /// The layers, in order.
-    layers: Vec<Box<dyn Layer<T>>>,
+    /// The layers, in order. Shared between clones; a layer never changes after `push`.
+    layers: Vec<Arc<dyn Layer<T>>>,
     /// The neuron mask on each layer's output, if any; one entry per layer.
     masks: Vec<Option<LayerMask<T>>>,
 }
@@ -211,7 +248,7 @@ impl<T: Real> Sequential<T> {
     /// assert_eq!(net.len(), 2);
     /// ```
     pub fn push(mut self, layer: impl Layer<T> + 'static) -> Sequential<T> {
-        self.layers.push(Box::new(layer));
+        self.layers.push(Arc::new(layer));
         self.masks.push(None);
         self
     }
@@ -463,5 +500,143 @@ impl<T: Real> Sequential<T> {
             }
         }
         names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests that a cloned `Sequential` shares its layers, copies its masks and trains
+    //! independently of the original once the parameter store is cloned too.
+
+    use cavitation_core::{Graph, ParamId, ParamStore, Real, Reduction, Rng, Tape, Tensor, Var};
+
+    use crate::{Init, Layer, Linear, NeuronMask, Optimizer, Relu, Sequential, Sgd};
+
+    /// The digits-shaped network, 64 → 32 → 10, with its parameters in `params`.
+    fn digits_net(params: &mut ParamStore) -> Sequential {
+        let mut rng = Rng::seed(1);
+        Sequential::new()
+            .push(Linear::with_init(
+                params,
+                64,
+                32,
+                Init::HeUniform,
+                Init::Zeros,
+                &mut rng,
+            ))
+            .push(Relu)
+            .push(Linear::with_init(
+                params,
+                32,
+                10,
+                Init::HeUniform,
+                Init::Zeros,
+                &mut rng,
+            ))
+    }
+
+    /// The network's output on `x`, as a vector.
+    fn output(net: &Sequential, params: &ParamStore, x: &Tensor<f32>) -> Vec<f32> {
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let input = tape.input(x.view());
+        let y = net.forward(&mut tape, input);
+        tape.value(y).data().to_vec()
+    }
+
+    /// A cloned network and a cloned store give bit-identical outputs, and ten training steps
+    /// on the clone leave the original store's values unchanged.
+    #[test]
+    fn cloned_network_is_independent() {
+        let mut params = ParamStore::new();
+        let net = digits_net(&mut params);
+        let mut rng = Rng::seed(7);
+        let data: Vec<f32> = (0..8 * 64).map(|_| rng.range(0.0, 1.0) as f32).collect();
+        let x = Tensor::from_vec(data, &[8, 64]).unwrap();
+        let labels: Vec<usize> = (0..8).collect();
+
+        let copy = net.clone();
+        let mut copy_params = params.clone();
+        let before = output(&net, &params, &x);
+        assert_eq!(output(&copy, &copy_params, &x), before);
+
+        let mut optimizer = Sgd::new(0.1);
+        for _ in 0..10 {
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&copy_params.values);
+            let input = tape.input(x.view());
+            let logits = copy.forward(&mut tape, input);
+            let loss = tape.softmax_cross_entropy(logits, &labels, Reduction::Mean);
+            tape.backward(loss, &mut copy_params.grads);
+            drop(tape);
+            optimizer.step(&mut copy_params);
+            copy_params.zero_grad();
+        }
+        assert_eq!(output(&net, &params, &x), before);
+        assert_ne!(output(&copy, &copy_params, &x), before);
+    }
+
+    /// A mask set before cloning is on both networks with the same contents; a mask set on
+    /// either network afterwards is on that network only.
+    #[test]
+    fn clone_keeps_masks() {
+        let mut net = Sequential::new().push(Relu).push(Relu);
+        let mask = NeuronMask::all_on(4);
+        net.set_mask(0, mask.clone());
+        let mut copy = net.clone();
+        assert_eq!(net.mask(0), Some(&mask));
+        assert_eq!(copy.mask(0), Some(&mask));
+        copy.set_mask(1, NeuronMask::all_on(2));
+        assert!(copy.mask(1).is_some());
+        assert!(net.mask(1).is_none());
+        net.set_mask(1, NeuronMask::all_on(3));
+        assert_eq!(copy.mask(1), Some(&NeuronMask::all_on(2)));
+    }
+
+    /// A layer that is not `Clone` works inside a cloned network, and both copies share it.
+    #[test]
+    fn user_layer_clones_without_clone() {
+        /// The `ScaledTanh` layer of the `Layer` docs: `tanh(x)` times a learnable `alpha`.
+        /// It is not `Clone`.
+        struct ScaledTanh {
+            /// The scale.
+            alpha: ParamId,
+        }
+
+        impl<T: Real> Layer<T> for ScaledTanh {
+            /// The layer's name.
+            fn name(&self) -> &str {
+                "scaled_tanh"
+            }
+            /// The output is as wide as the input.
+            fn output_width(&self, input_width: usize) -> usize {
+                input_width
+            }
+            /// `tanh(x)` times `alpha`.
+            fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+                let t = tape.tanh(x);
+                let alpha = tape.param(self.alpha);
+                tape.mul(t, alpha)
+            }
+            /// The one parameter, `alpha`.
+            fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+                vec![("alpha", self.alpha)]
+            }
+        }
+
+        let mut params = ParamStore::new();
+        let alpha = params.add(Tensor::from_vec(vec![1.5f32], &[1]).unwrap());
+        let net = Sequential::new().push(ScaledTanh { alpha });
+        let copy = net.clone();
+        assert_eq!(copy.len(), 1);
+        assert_eq!(copy.layer(0).name(), "scaled_tanh");
+        assert_eq!(
+            output(&copy, &params, &Tensor::full(&[1, 2], 0.5f32)),
+            output(&net, &params, &Tensor::full(&[1, 2], 0.5f32))
+        );
+        assert!(std::ptr::eq(
+            net.layer(0) as *const dyn Layer<f32> as *const u8,
+            copy.layer(0) as *const dyn Layer<f32> as *const u8,
+        ));
     }
 }

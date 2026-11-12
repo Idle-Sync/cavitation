@@ -1,12 +1,12 @@
 //! Health checks during training: non-finite values, exploding and vanishing gradient norms,
-//! clamped binary cross-entropy logarithms and dead ReLU neurons.
+//! clamped binary cross-entropy logarithms, impossible negative losses and dead ReLU neurons.
 
 use std::fmt;
 
-use cavitation_core::{Error, ParamId, Tape};
+use cavitation_core::{Error, ParamId, Tape, TensorView};
 
 use crate::activation::last_dim;
-use crate::{ActivationKind, GradStats, Sequential, Trace};
+use crate::{ActivationKind, GradStats, Loss, Sequential, TargetsView, Trace};
 
 /// What the health checks do when the loss or a gradient is NaN or infinite.
 ///
@@ -21,12 +21,177 @@ pub enum OnNonFinite {
     /// Stop training with [`Error::NonFinite`], naming the step and where the value was,
     /// after sending the matching [`Warning::NonFinite`] to the sink.
     Stop,
-    /// Send a [`Warning::NonFinite`] to the sink and keep training.
+    /// Send a [`Warning::NonFinite`] to the sink and keep training. The update is applied: a
+    /// NaN or infinite gradient is written into its parameter, and from the next step the
+    /// NaN reaches every parameter.
     Warn,
 }
 
+/// The first non-finite value found in a step's batch, named so that a NaN or an infinity
+/// in the loss can be traced to the data. Two bad values are equal when every field is
+/// equal and the values have the same bits. `value` is compared by its bits because NaN is
+/// not equal to itself: with a bit comparison two warnings about the same NaN compare
+/// equal, in tests and in sinks that collect warnings.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_nn::BadInput;
+/// let bad = BadInput { position: 3, row: Some(17), feature: 2, value: f32::NAN, target: false };
+/// assert_eq!(
+///     bad.to_string(),
+///     "the batch's input held NaN at batch position 3, feature 2 (row 17 of the dataset)"
+/// );
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct BadInput {
+    /// The position in the batch, counting from 0.
+    pub position: usize,
+    /// The row of the dataset that sat at that position, when the caller passed the batch's
+    /// rows (a hand-written loop that sets `StepInputs::rows`); `None` when it gave none.
+    /// [`fit`](crate::fit) rejects non-finite data before training, with an error that names
+    /// the row, so it never reaches this check.
+    pub row: Option<usize>,
+    /// The feature (the position within the row) for an input; the output index for a target.
+    pub feature: usize,
+    /// The value: NaN, infinity or negative infinity.
+    pub value: f32,
+    /// Whether the value is in the targets rather than in the inputs.
+    pub target: bool,
+}
+
+impl PartialEq for BadInput {
+    /// Equal when every field is equal, comparing `value` by its bits.
+    ///
+    /// ```
+    /// use cavitation_nn::BadInput;
+    /// let a = BadInput { position: 0, row: None, feature: 1, value: f32::NAN, target: false };
+    /// assert_eq!(a, a);
+    /// ```
+    fn eq(&self, other: &BadInput) -> bool {
+        self.position == other.position
+            && self.row == other.row
+            && self.feature == other.feature
+            && self.value.to_bits() == other.value.to_bits()
+            && self.target == other.target
+    }
+}
+
+impl fmt::Display for BadInput {
+    /// Writes where the bad value sat, for example `the batch's input held NaN at batch
+    /// position 3, feature 2 (row 17 of the dataset)`.
+    ///
+    /// ```
+    /// use cavitation_nn::BadInput;
+    /// let bad = BadInput { position: 0, row: None, feature: 4, value: f32::INFINITY, target: true };
+    /// assert_eq!(bad.to_string(), "the batch's targets held infinity at batch position 0, output 4");
+    /// ```
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let value = if self.value.is_nan() {
+            "NaN"
+        } else if self.value > 0.0 {
+            "infinity"
+        } else {
+            "-infinity"
+        };
+        let (what, part) = if self.target {
+            ("targets", "output")
+        } else {
+            ("input", "feature")
+        };
+        write!(
+            f,
+            "the batch's {what} held {value} at batch position {}, {part} {}",
+            self.position, self.feature
+        )?;
+        match self.row {
+            Some(row) => write!(f, " (row {row} of the dataset)"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// What a step fed the network, borrowed, for [`HealthMonitor::after_backward`] to look
+/// through when the loss turns out not to be finite. Nothing is read unless it does.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::Tensor;
+/// use cavitation_nn::{StepInputs, TargetsView};
+/// let x = Tensor::from_vec(vec![0.5f32, 1.0], &[2, 1]).unwrap();
+/// let inputs = StepInputs { x: x.view(), targets: TargetsView::Classes(&[0, 1]), rows: None };
+/// assert_eq!(inputs.x.shape().dims(), &[2, 1]);
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct StepInputs<'a> {
+    /// The batch's inputs, `[rows, features]`.
+    pub x: TensorView<'a, f32>,
+    /// The batch's targets.
+    pub targets: TargetsView<'a, f32>,
+    /// The dataset row at each batch position (for example a slice of
+    /// [`Batcher::order`](crate::Batcher::order)), or `None` when the batch did not come from
+    /// a dataset.
+    pub rows: Option<&'a [usize]>,
+}
+
+impl StepInputs<'_> {
+    /// The first non-finite value in the inputs, else in the value targets; `None` when
+    /// every value is finite.
+    fn first_non_finite(&self) -> Option<BadInput> {
+        let find = |data: &[f32], per_position: usize, target: bool| {
+            let at = data.iter().position(|v| !v.is_finite())?;
+            let per_position = per_position.max(1);
+            let position = at / per_position;
+            Some(BadInput {
+                position,
+                row: self.rows.and_then(|rows| rows.get(position).copied()),
+                feature: at % per_position,
+                value: data[at],
+                target,
+            })
+        };
+        let per = |view: &TensorView<'_, f32>| {
+            view.data().len() / view.shape().dims().first().copied().unwrap_or(1).max(1)
+        };
+        find(self.x.data(), per(&self.x), false).or_else(|| match &self.targets {
+            TargetsView::Values(v) => find(v.data(), per(v), true),
+            TargetsView::Classes(_) => None,
+        })
+    }
+}
+
+/// The kind of a [`Warning`], without its fields, for counting or filtering warnings.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_nn::{Warning, WarningKind};
+/// let w = Warning::ClampedLogs { step: 4, count: 1 };
+/// assert_eq!(w.kind(), WarningKind::ClampedLogs);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum WarningKind {
+    /// [`Warning::ClampedLogs`].
+    ClampedLogs,
+    /// [`Warning::NonFinite`].
+    NonFinite,
+    /// [`Warning::Exploding`].
+    Exploding,
+    /// [`Warning::Vanishing`].
+    Vanishing,
+    /// [`Warning::DeadNeurons`].
+    DeadNeurons,
+    /// [`Warning::NegativeLoss`].
+    NegativeLoss,
+}
+
 /// Something the health checks noticed. Every warning names the step or epoch it belongs
-/// to; its [`Display`](fmt::Display) form is one plain-English line.
+/// to; its [`Display`](fmt::Display) form is one plain-English line that ends with what to
+/// try. [`kind`](Warning::kind), [`step`](Warning::step), [`epoch`](Warning::epoch),
+/// [`location`](Warning::location) and [`layer`](Warning::layer) read the parts without
+/// matching on the variant.
 ///
 /// # Examples
 ///
@@ -36,6 +201,7 @@ pub enum OnNonFinite {
 /// assert!(w.to_string().starts_with("step 4:"));
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Warning {
     /// Binary cross-entropy met probabilities of exactly 0 or 1 and clamped their
     /// logarithms to -100 (see [`Tape::clamped_logs`]). Sent at most once per epoch.
@@ -53,6 +219,10 @@ pub enum Warning {
         step: u64,
         /// `"loss"`, or the parameter's name, for example `"0.weight"`.
         location: String,
+        /// For a non-finite loss: the first non-finite value in the batch's inputs or
+        /// targets. `None` when every input was finite (the values overflowed inside the
+        /// network) and for a gradient.
+        input: Option<BadInput>,
     },
     /// A parameter's gradient norm was above [`Health::grad_norm_high`]. Sent at most once
     /// per epoch for each parameter.
@@ -75,24 +245,145 @@ pub enum Warning {
         norm: f64,
     },
     /// Neurons of a ReLU or ReLU6 layer that output exactly 0 for every sample of the epoch.
-    /// Neurons turned off by a [`NeuronMask`](crate::NeuronMask) are not counted. Sent to the
-    /// sink every epoch; without a sink, printed only the first time for each layer.
+    /// Neurons turned off by a [`NeuronMask`](crate::NeuronMask), on the activation layer or
+    /// on the layer before it, are not counted. Sent to the sink every epoch; without a sink,
+    /// printed when the layer's share of dead neurons passes 25%, 50% or 90% for the first
+    /// time. "Dead" is measured per epoch and on the data the epoch ran over: a neuron that is
+    /// silent on every training row of one epoch can fire in a later epoch, once the layers
+    /// before it change, or on rows it was not counted on.
     DeadNeurons {
         /// The epoch, as passed to [`HealthMonitor::end_epoch`].
         epoch: usize,
         /// The layer's index in the [`Sequential`].
         layer: usize,
+        /// The layer's output width: how many neurons it has.
+        width: usize,
         /// The dead neurons' positions on the layer's output, in increasing order.
         neurons: Vec<usize>,
     },
+    /// The loss was below 0 although [`Loss::non_negative`] says the trainer's loss cannot
+    /// be negative on valid inputs. Sent at most once per epoch, only by a monitor that
+    /// knows the loss ([`HealthMonitor::with_loss`]).
+    ///
+    /// It is sent at the first step whose loss is below 0, which can be a few steps after
+    /// the mistake starts: with [`Loss::Nll`] on raw scores, for example, the loss is
+    /// negative only once the target class's score is positive.
+    NegativeLoss {
+        /// The step, counting from 1.
+        step: u64,
+        /// The loss.
+        loss: f32,
+    },
 }
 
-impl fmt::Display for Warning {
-    /// Writes the warning as one plain-English line, starting with its step or epoch.
+impl Warning {
+    /// Which kind of warning this is.
+    ///
+    /// ```
+    /// use cavitation_nn::{Warning, WarningKind};
+    /// let w = Warning::Exploding { step: 3, layer: "0.weight".to_string(), norm: 1e4 };
+    /// assert_eq!(w.kind(), WarningKind::Exploding);
+    /// ```
+    pub fn kind(&self) -> WarningKind {
+        match self {
+            Warning::ClampedLogs { .. } => WarningKind::ClampedLogs,
+            Warning::NonFinite { .. } => WarningKind::NonFinite,
+            Warning::Exploding { .. } => WarningKind::Exploding,
+            Warning::Vanishing { .. } => WarningKind::Vanishing,
+            Warning::DeadNeurons { .. } => WarningKind::DeadNeurons,
+            Warning::NegativeLoss { .. } => WarningKind::NegativeLoss,
+        }
+    }
+
+    /// The step the warning belongs to, counting from 1; `None` for
+    /// [`Warning::DeadNeurons`], which belongs to an epoch.
     ///
     /// ```
     /// use cavitation_nn::Warning;
-    /// let w = Warning::NonFinite { step: 1, location: "loss".to_string() };
+    /// let w = Warning::ClampedLogs { step: 4, count: 1 };
+    /// assert_eq!(w.step(), Some(4));
+    /// ```
+    pub fn step(&self) -> Option<u64> {
+        match self {
+            Warning::ClampedLogs { step, .. }
+            | Warning::NonFinite { step, .. }
+            | Warning::Exploding { step, .. }
+            | Warning::Vanishing { step, .. }
+            | Warning::NegativeLoss { step, .. } => Some(*step),
+            Warning::DeadNeurons { .. } => None,
+        }
+    }
+
+    /// The epoch the warning belongs to; `Some` only for [`Warning::DeadNeurons`].
+    ///
+    /// ```
+    /// use cavitation_nn::Warning;
+    /// let w = Warning::DeadNeurons { epoch: 2, layer: 1, width: 8, neurons: vec![0] };
+    /// assert_eq!(w.epoch(), Some(2));
+    /// ```
+    pub fn epoch(&self) -> Option<usize> {
+        match self {
+            Warning::DeadNeurons { epoch, .. } => Some(*epoch),
+            _ => None,
+        }
+    }
+
+    /// Where the warning happened, as a parameter's name (for example `"0.weight"`) or
+    /// `"loss"`; `None` for [`Warning::ClampedLogs`], [`Warning::DeadNeurons`] and
+    /// [`Warning::NegativeLoss`].
+    ///
+    /// ```
+    /// use cavitation_nn::Warning;
+    /// let w = Warning::NonFinite { step: 1, location: "loss".to_string(), input: None };
+    /// assert_eq!(w.location(), Some("loss"));
+    /// ```
+    pub fn location(&self) -> Option<&str> {
+        match self {
+            Warning::NonFinite { location, .. } => Some(location),
+            Warning::Exploding { layer, .. } | Warning::Vanishing { layer, .. } => Some(layer),
+            Warning::ClampedLogs { .. }
+            | Warning::DeadNeurons { .. }
+            | Warning::NegativeLoss { .. } => None,
+        }
+    }
+
+    /// The layer's index in the [`Sequential`]; `Some` only for [`Warning::DeadNeurons`].
+    ///
+    /// ```
+    /// use cavitation_nn::Warning;
+    /// let w = Warning::DeadNeurons { epoch: 2, layer: 1, width: 8, neurons: vec![0] };
+    /// assert_eq!(w.layer(), Some(1));
+    /// ```
+    pub fn layer(&self) -> Option<usize> {
+        match self {
+            Warning::DeadNeurons { layer, .. } => Some(*layer),
+            _ => None,
+        }
+    }
+}
+
+/// The share of dead neurons that a printed report must reach to count as worse, as
+/// percentages of the layer.
+const DEAD_THRESHOLDS: [usize; 3] = [25, 50, 90];
+
+/// How many of [`DEAD_THRESHOLDS`] `dead` neurons of `width` have reached.
+fn dead_level(dead: usize, width: usize) -> usize {
+    DEAD_THRESHOLDS
+        .iter()
+        .filter(|&&percent| dead * 100 >= width * percent)
+        .count()
+}
+
+/// How many neuron indices a dead-neuron line lists before its ellipsis.
+const LISTED_NEURONS: usize = 10;
+
+impl fmt::Display for Warning {
+    /// Writes the warning as one plain-English line, starting with its step or epoch and
+    /// ending with what to try.
+    ///
+    /// ```
+    /// use cavitation_nn::Warning;
+    /// let w = Warning::NonFinite { step: 1, location: "loss".to_string(), input: None };
     /// assert_eq!(w.to_string(), "step 1: a NaN or infinite value in loss");
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -100,31 +391,81 @@ impl fmt::Display for Warning {
             Warning::ClampedLogs { step, count } => write!(
                 f,
                 "step {step}: binary cross-entropy met {count} probabilities of exactly 0 or 1 \
-                 and clamped their logarithms to -100"
+                 and clamped their logarithms to -100; the clamped rows pass no gradient, so use \
+                 Loss::BinaryCrossEntropyWithLogits on raw scores instead"
             ),
-            Warning::NonFinite { step, location } => {
-                write!(f, "step {step}: a NaN or infinite value in {location}")
+            Warning::NonFinite {
+                step,
+                location,
+                input,
+            } => {
+                write!(f, "step {step}: a NaN or infinite value in {location}")?;
+                match input {
+                    Some(bad) => write!(f, "; {bad}"),
+                    None => Ok(()),
+                }
             }
+            Warning::NegativeLoss { step, loss } => write!(
+                f,
+                "step {step}: the loss is {loss:.4e}, below 0, but this loss cannot be negative on \
+                 valid inputs; the usual causes are Loss::Nll on scores that are not \
+                 log-probabilities (end the model with LogSoftmax, or use Loss::CrossEntropy) and \
+                 binary cross-entropy targets outside [0, 1]"
+            ),
             Warning::Exploding { step, layer, norm } => write!(
                 f,
-                "step {step}: the gradient norm of {layer} is {norm:.3e}, above the exploding limit"
+                "step {step}: the gradient norm of {layer} is {norm:.3e}, above the exploding limit \
+                 (Health::grad_norm_high, 1e3 by default); lower the learning rate, or raise the \
+                 limit if this size is normal for the model"
             ),
-            Warning::Vanishing { step, layer, norm } => write!(
-                f,
-                "step {step}: the gradient norm of {layer} is {norm:.3e}, below the vanishing limit \
-                 (a gradient this small with a loss that has not fallen 10,000-fold is a vanishing \
-                 gradient)"
-            ),
+            Warning::Vanishing { step, layer, norm } => {
+                write!(
+                    f,
+                    "step {step}: the gradient norm of {layer} is {norm:.3e}, below the vanishing \
+                     limit (Health::grad_norm_low, 1e-7 by default; a gradient this small with a \
+                     loss that has not fallen 10,000-fold is a vanishing gradient); "
+                )?;
+                if *norm == 0.0 {
+                    write!(
+                        f,
+                        "a norm of exactly 0 means no gradient reached it, which points at dead \
+                         ReLUs or a saturated output"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "a small norm that is not 0 points at a deep network or saturating \
+                         activations such as sigmoid and tanh"
+                    )
+                }
+            }
             Warning::DeadNeurons {
                 epoch,
                 layer,
+                width,
                 neurons,
-            } => write!(
-                f,
-                "epoch {epoch}: {} neurons of layer {layer} output 0 for every sample (dead ReLU): \
-                 {neurons:?}",
-                neurons.len()
-            ),
+            } => {
+                let dead = neurons.len();
+                let percent = (dead * 200 + width) / (2 * (*width).max(1));
+                write!(
+                    f,
+                    "epoch {epoch}: {dead} of {width} ({percent}%) neurons of layer {layer} output 0 \
+                     for every sample (dead ReLU): ["
+                )?;
+                for (i, n) in neurons.iter().take(LISTED_NEURONS).enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{n}")?;
+                }
+                if dead > LISTED_NEURONS {
+                    f.write_str(", …")?;
+                }
+                f.write_str(
+                    "]; try a lower learning rate, a positive bias initialisation or a leaky \
+                     activation such as LeakyRelu",
+                )
+            }
         }
     }
 }
@@ -133,9 +474,20 @@ impl fmt::Display for Warning {
 ///
 /// The default stops on a non-finite loss or gradient, warns about gradient norms above
 /// 1e3 or below 1e-7, reports dead ReLU neurons, and prints the warnings to standard error
-/// as `cavitation: warning: <the warning>`. Printed, a layer's dead-neuron report appears
-/// only the first time, so a network with a dead layer does not print a line every epoch;
-/// a [`sink`](Health::sink) receives every epoch's report.
+/// as `cavitation: warning: <the warning>`. Printing is bounded so a long bad run stays
+/// readable and a healthy run prints nothing:
+///
+/// - a layer's dead-neuron report is printed at the end of an epoch in which its share of
+///   dead neurons passes 25%, 50% or 90% for the first time (one line, however many it
+///   passes), so a layer at 3% prints nothing;
+/// - an exploding or vanishing gradient, or a non-finite value under [`OnNonFinite::Warn`],
+///   is printed once for each parameter, and each later epoch adds one line per kind
+///   naming the parameters that repeated.
+/// - a negative loss that cannot be negative on valid inputs ([`Warning::NegativeLoss`]) is
+///   printed in full once, and each later epoch in which it happens again adds one line.
+///
+/// A [`sink`](Health::sink) receives every warning of every epoch, and [`Health::quiet`]
+/// drops them all.
 ///
 /// # Examples
 ///
@@ -162,11 +514,30 @@ pub struct Health {
     /// Whether to look for dead ReLU and ReLU6 neurons (one pass over those layers' outputs
     /// each step).
     pub dead_relu: bool,
-    /// Receives every warning; `None` prints them to standard error, prefixed
-    /// `cavitation: warning:`, each layer's [`Warning::DeadNeurons`] only the first time.
+    /// Receives every warning of every epoch; `None` prints them to standard error, prefixed
+    /// `cavitation: warning:`, with the bounded printing described on [`Health`].
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
     pub sink: Option<Box<dyn FnMut(&Warning)>>,
+}
+
+impl Health {
+    /// Every check on and `Stop` on non-finite values, but no output: the warnings go to a
+    /// sink that drops them. A step that meets a NaN or infinity still returns
+    /// [`Error::NonFinite`].
+    ///
+    /// ```
+    /// use cavitation_nn::{Health, OnNonFinite};
+    /// let health = Health::quiet();
+    /// assert_eq!(health.on_non_finite, OnNonFinite::Stop);
+    /// assert!(health.dead_relu && health.sink.is_some());
+    /// ```
+    pub fn quiet() -> Health {
+        Health {
+            sink: Some(Box::new(|_: &Warning| {})),
+            ..Health::default()
+        }
+    }
 }
 
 impl Default for Health {
@@ -202,6 +573,10 @@ const WARNED_NON_FINITE: u8 = 1;
 const WARNED_EXPLODING: u8 = 2;
 /// Bit in a parameter's warned flags: [`Warning::Vanishing`] was sent this epoch.
 const WARNED_VANISHING: u8 = 4;
+
+/// The error detail for a non-finite loss whose inputs and targets were all finite.
+const OVERFLOW_DETAIL: &str = "the inputs were finite, so the values overflowed inside the \
+     network; try a lower learning rate or smaller inputs";
 
 /// A run whose latest loss is at most this fraction of its first loss has converged, so a
 /// small gradient is not a vanishing one.
@@ -243,7 +618,9 @@ struct ReluLayer {
 ///
 /// ```
 /// use cavitation_core::{Error, Graph, ParamStore, Reduction, Rng, Tensor};
-/// use cavitation_nn::{Health, HealthMonitor, Linear, Optimizer, Sequential, Sgd, Trace};
+/// use cavitation_nn::{
+///     Health, HealthMonitor, Linear, Optimizer, Sequential, Sgd, StepInputs, TargetsView, Trace,
+/// };
 /// let x = Tensor::from_vec(vec![0.0f32, 1.0, f32::NAN, 3.0], &[4, 1]).unwrap();
 /// let y = Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap();
 /// let mut params = ParamStore::new();
@@ -260,16 +637,25 @@ struct ReluLayer {
 ///         let loss = tape.mse(out, target, Reduction::Mean);
 ///         let value = tape.value(loss).data()[0];
 ///         tape.backward(loss, &mut params.grads);
-///         monitor.after_backward(step, value, &tape, &trace, &net)?;
+///         let inputs = StepInputs { x: x.view(), targets: TargetsView::Values(y.view()), rows: None };
+///         let checked = monitor.after_backward(step, value, &tape, &trace, &net, inputs);
 ///         drop(tape);
-///         optimizer.step(&mut params);
-///         monitor.after_update(step, optimizer.last_stats(), &names)?;
+///         // Update only if the loss was finite, and clear the gradients before returning
+///         // the error, so a stopped step leaves nothing behind for the next one to add to.
+///         if checked.is_ok() {
+///             optimizer.step(&mut params);
+///         }
+///         let checked = checked.and_then(|()| monitor.after_update(step, optimizer.last_stats(), &names));
 ///         params.zero_grad();
+///         checked?;
 ///     }
 ///     monitor.end_epoch(1)
 /// };
 /// let err = train().unwrap_err();
-/// assert_eq!(err.to_string(), "non-finite value at step 1 in loss");
+/// assert_eq!(
+///     err.to_string(),
+///     "non-finite value at step 1 in loss: the batch's input held NaN at batch position 2, feature 0"
+/// );
 /// ```
 pub struct HealthMonitor {
     /// The checks and the sink.
@@ -278,6 +664,10 @@ pub struct HealthMonitor {
     loss_warned: bool,
     /// Whether the clamped-logarithm warning was sent this epoch.
     clamped_warned: bool,
+    /// Whether the loss cannot be negative on valid inputs, so a negative one is reported.
+    non_negative: bool,
+    /// Whether the negative-loss warning was sent this epoch.
+    negative_warned: bool,
     /// For each parameter, in the order of the names passed to `after_update`, which
     /// warnings were sent this epoch (the `WARNED_*` bits).
     warned: Vec<u8>,
@@ -288,8 +678,15 @@ pub struct HealthMonitor {
     alive: Vec<bool>,
     /// Whether `alive` holds at least one step of this epoch.
     tracked: bool,
-    /// The layers whose dead-neuron report was printed to standard error (with no sink).
-    dead_printed: Vec<usize>,
+    /// For each layer whose dead-neuron report was printed to standard error (with no
+    /// sink), how many of [`DEAD_THRESHOLDS`] the printed share had reached.
+    dead_printed: Vec<(usize, usize)>,
+    /// The kind and parameter of each norm or non-finite warning printed to standard error
+    /// (with no sink), so a later one is summarised instead.
+    printed: Vec<(WarningKind, String)>,
+    /// This epoch's norm and non-finite warnings that were already printed once: the kind,
+    /// the parameter and its norm. Summarised and cleared by `end_epoch`.
+    repeats: Vec<(WarningKind, String, f64)>,
     /// The first finite loss seen by `after_backward`, kept for the monitor's whole life.
     first_loss: Option<f64>,
     /// The latest finite loss seen by `after_backward`.
@@ -309,14 +706,33 @@ impl HealthMonitor {
             health,
             loss_warned: false,
             clamped_warned: false,
+            non_negative: false,
+            negative_warned: false,
             warned: Vec::new(),
             relu_layers: Vec::new(),
             alive: Vec::new(),
             tracked: false,
             dead_printed: Vec::new(),
+            printed: Vec::new(),
+            repeats: Vec::new(),
             first_loss: None,
             latest_loss: None,
         }
+    }
+
+    /// Makes the monitor report a loss below 0 with [`Warning::NegativeLoss`] (at most once
+    /// per epoch) when `loss` cannot be negative on valid inputs ([`Loss::non_negative`]).
+    /// [`Trainer`](crate::Trainer) does this for its own loss; a hand-written loop opts in
+    /// here.
+    ///
+    /// ```
+    /// use cavitation_nn::{Health, HealthMonitor, Loss};
+    /// let mut monitor = HealthMonitor::new(Health::default()).with_loss(Loss::Nll);
+    /// assert!(monitor.end_epoch(1).is_ok());
+    /// ```
+    pub fn with_loss(mut self, loss: Loss) -> HealthMonitor {
+        self.non_negative = loss.non_negative();
+        self
     }
 
     /// Whether the loss has fallen to at most [`CONVERGED_LOSS_RATIO`] of its first value.
@@ -330,33 +746,122 @@ impl HealthMonitor {
         }
     }
 
-    /// Sends `warning` to the sink, or prints it to standard error when there is none: each
-    /// layer's dead-neuron report only the first time, saying that later epochs are not
-    /// printed.
+    /// Sends `warning` to the sink, or, with none, prints it to standard error by the rules
+    /// on [`Health`]: a dead-neuron report when its share passes a threshold not passed
+    /// before; the first norm or non-finite warning of each parameter, with later ones kept
+    /// for the summary of `end_epoch`; anything else always.
     fn emit(&mut self, warning: Warning) {
-        match (self.health.sink.as_mut(), &warning) {
-            (Some(sink), _) => sink(&warning),
-            (None, Warning::DeadNeurons { layer, .. }) => {
-                if !self.dead_printed.contains(layer) {
-                    self.dead_printed.push(*layer);
-                    eprintln!(
-                        "cavitation: warning: {warning}; later epochs' reports for layer {layer} \
-                         are not printed (a Health::sink receives every one)"
-                    );
+        if let Some(sink) = self.health.sink.as_mut() {
+            sink(&warning);
+            return;
+        }
+        match warning {
+            Warning::DeadNeurons {
+                layer,
+                width,
+                ref neurons,
+                ..
+            } => {
+                let level = dead_level(neurons.len(), width);
+                let at = match self.dead_printed.iter().position(|(l, _)| *l == layer) {
+                    Some(at) => at,
+                    None => {
+                        self.dead_printed.push((layer, 0));
+                        self.dead_printed.len() - 1
+                    }
+                };
+                if level > self.dead_printed[at].1 {
+                    self.dead_printed[at].1 = level;
+                    eprintln!("cavitation: warning: {warning}");
                 }
             }
-            (None, _) => eprintln!("cavitation: warning: {warning}"),
+            Warning::NonFinite { .. }
+            | Warning::Exploding { .. }
+            | Warning::Vanishing { .. }
+            | Warning::NegativeLoss { .. } => {
+                let kind = warning.kind();
+                let name = warning.location().unwrap_or_default();
+                let norm = match warning {
+                    Warning::Exploding { norm, .. } | Warning::Vanishing { norm, .. } => norm,
+                    Warning::NegativeLoss { loss, .. } => f64::from(loss),
+                    _ => 0.0,
+                };
+                if self.printed.iter().any(|(k, n)| *k == kind && n == name) {
+                    self.repeats.push((kind, name.to_string(), norm));
+                } else {
+                    eprintln!("cavitation: warning: {warning}");
+                    self.printed.push((kind, name.to_string()));
+                }
+            }
+            Warning::ClampedLogs { .. } => {
+                eprintln!("cavitation: warning: {warning}")
+            }
         }
     }
 
+    /// Prints one line per kind for the parameters whose norm or non-finite warning repeated
+    /// in epoch `epoch` after being printed once, and one line if the negative loss repeated,
+    /// then forgets them.
+    fn print_repeats(&mut self, epoch: usize) {
+        let kinds = [
+            (WarningKind::NonFinite, "locations", "non-finite"),
+            (WarningKind::Exploding, "parameters", "exploding"),
+            (WarningKind::Vanishing, "parameters", "vanishing"),
+        ];
+        for (kind, noun, what) in kinds {
+            let of_kind = || self.repeats.iter().filter(|(k, _, _)| *k == kind);
+            let count = of_kind().count();
+            if count == 0 {
+                continue;
+            }
+            let mut line =
+                format!("cavitation: warning: epoch {epoch}: {count} {noun} {what} again: ");
+            for (i, (_, name, norm)) in of_kind().take(LISTED_NEURONS).enumerate() {
+                if i > 0 {
+                    line.push_str(", ");
+                }
+                line.push_str(name);
+                if kind != WarningKind::NonFinite {
+                    line.push_str(&format!(" {norm:.3e}"));
+                }
+            }
+            if count > LISTED_NEURONS {
+                line.push_str(", …");
+            }
+            eprintln!("{line}");
+        }
+        if let Some((_, _, first)) = self
+            .repeats
+            .iter()
+            .find(|(k, _, _)| *k == WarningKind::NegativeLoss)
+        {
+            eprintln!(
+                "cavitation: warning: epoch {epoch}: the loss was negative again \
+                 (first negative loss this epoch: {first:.3e})"
+            );
+        }
+        self.repeats.clear();
+    }
+
     /// Sends [`Warning::NonFinite`] for `location` at `step` to the sink and returns the
-    /// matching [`Error::NonFinite`], for [`OnNonFinite::Stop`].
-    fn stop(&mut self, step: u64, location: String) -> Error {
+    /// matching [`Error::NonFinite`] with `detail`, for [`OnNonFinite::Stop`].
+    fn stop(
+        &mut self,
+        step: u64,
+        location: String,
+        input: Option<BadInput>,
+        detail: Option<String>,
+    ) -> Error {
         self.emit(Warning::NonFinite {
             step,
             location: location.clone(),
+            input,
         });
-        Error::NonFinite { step, location }
+        Error::NonFinite {
+            step,
+            location,
+            detail,
+        }
     }
 
     /// The checks that need the tape, run after the backward pass of step `step` (counting
@@ -364,14 +869,21 @@ impl HealthMonitor {
     /// clamps send [`Warning::ClampedLogs`] (at most once per epoch), and, with
     /// [`Health::dead_relu`], each ReLU and ReLU6 layer's output in `trace` is checked for
     /// neurons that are not 0. `trace` must come from this step's
-    /// [`Sequential::forward_traced`] of `model` on `tape`.
+    /// [`Sequential::forward_traced`] of `model` on `tape`. A monitor made with
+    /// [`with_loss`](HealthMonitor::with_loss) for a loss that cannot be negative sends
+    /// [`Warning::NegativeLoss`] (at most once per epoch) when `loss` is below 0.
+    ///
+    /// `inputs` is what the step fed the network. It is read only when `loss` is NaN or
+    /// infinite, to name the first non-finite input or target value (or to say that the
+    /// inputs were finite, so the values overflowed inside the network); a healthy step
+    /// reads and allocates nothing for it.
     ///
     /// # Errors
     ///
     /// With [`OnNonFinite::Stop`], returns [`Error::NonFinite`] with location `"loss"` if
-    /// `loss` is NaN or infinite, after sending [`Warning::NonFinite`] to the sink. With
-    /// [`OnNonFinite::Warn`] it only sends the warning (at most once per epoch) and returns
-    /// `Ok`.
+    /// `loss` is NaN or infinite, after sending [`Warning::NonFinite`] to the sink; the error's
+    /// detail names the input or says the inputs were finite. With [`OnNonFinite::Warn`] it
+    /// only sends the warning (at most once per epoch) and returns `Ok`.
     ///
     /// # Panics
     ///
@@ -379,18 +891,23 @@ impl HealthMonitor {
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
-    /// use cavitation_nn::{Health, HealthMonitor, Relu, Sequential, Trace};
+    /// use cavitation_nn::{
+    ///     Health, HealthMonitor, Relu, Sequential, StepInputs, TargetsView, Trace,
+    /// };
     /// let params = ParamStore::new();
     /// let net = Sequential::new().push(Relu);
     /// let mut graph = Graph::new();
     /// let mut tape = graph.tape(&params.values);
-    /// let x = tape.input(Tensor::full(&[2, 2], 1.0f32).view());
+    /// let data = Tensor::full(&[2, 2], 1.0f32);
+    /// let x = tape.input(data.view());
     /// let mut trace = Trace::new();
     /// net.forward_traced(&mut tape, x, &mut trace);
+    /// let inputs = StepInputs { x: data.view(), targets: TargetsView::Classes(&[0, 1]), rows: None };
     /// let mut monitor = HealthMonitor::new(Health::default());
-    /// assert!(monitor.after_backward(1, 4.0, &tape, &trace, &net).is_ok());
-    /// let err = monitor.after_backward(2, f32::NAN, &tape, &trace, &net).unwrap_err();
-    /// assert_eq!(err.to_string(), "non-finite value at step 2 in loss");
+    /// assert!(monitor.after_backward(1, 4.0, &tape, &trace, &net, inputs).is_ok());
+    /// let err = monitor.after_backward(2, f32::NAN, &tape, &trace, &net, inputs).unwrap_err();
+    /// // Every input was finite, so the detail says the values overflowed.
+    /// assert!(err.to_string().starts_with("non-finite value at step 2 in loss: the inputs were finite"));
     /// ```
     pub fn after_backward(
         &mut self,
@@ -399,6 +916,7 @@ impl HealthMonitor {
         tape: &Tape<'_, f32>,
         trace: &Trace,
         model: &Sequential,
+        inputs: StepInputs<'_>,
     ) -> Result<(), Error> {
         let clamped = tape.clamped_logs();
         if clamped > 0 && !self.clamped_warned {
@@ -412,16 +930,30 @@ impl HealthMonitor {
             let loss = f64::from(loss);
             self.first_loss.get_or_insert(loss);
             self.latest_loss = Some(loss);
+            if self.non_negative && loss < 0.0 && !self.negative_warned {
+                self.negative_warned = true;
+                self.emit(Warning::NegativeLoss {
+                    step,
+                    loss: loss as f32,
+                });
+            }
         } else {
             match self.health.on_non_finite {
                 OnNonFinite::Stop => {
-                    return Err(self.stop(step, "loss".to_string()));
+                    let input = inputs.first_non_finite();
+                    let detail = match input {
+                        Some(bad) => bad.to_string(),
+                        None => OVERFLOW_DETAIL.to_string(),
+                    };
+                    return Err(self.stop(step, "loss".to_string(), input, Some(detail)));
                 }
                 OnNonFinite::Warn if !self.loss_warned => {
                     self.loss_warned = true;
+                    let input = inputs.first_non_finite();
                     self.emit(Warning::NonFinite {
                         step,
                         location: "loss".to_string(),
+                        input,
                     });
                 }
                 OnNonFinite::Warn => {}
@@ -469,9 +1001,14 @@ impl HealthMonitor {
                     }
                 }
             }
-            if let Some(mask) = model.mask(i) {
-                for (j, a) in alive.iter_mut().enumerate() {
-                    *a |= !mask.is_on(j);
+            // A neuron masked on the layer's own output, or on the layer before it (the
+            // `Linear` that feeds the ReLU), is off on purpose, not dead.
+            let before = i.checked_sub(1).and_then(|p| model.mask(p));
+            for mask in [model.mask(i), before].into_iter().flatten() {
+                if mask.width() == width {
+                    for (j, a) in alive.iter_mut().enumerate() {
+                        *a |= !mask.is_on(j);
+                    }
                 }
             }
             k += 1;
@@ -544,7 +1081,7 @@ impl HealthMonitor {
                 Some((name, _)) => name.clone(),
                 None => format!("{id:?}"),
             };
-            return Err(self.stop(step, location));
+            return Err(self.stop(step, location, None, None));
         }
         self.warned.resize(names.len(), 0);
         let (high, low) = (self.health.grad_norm_high, self.health.grad_norm_low);
@@ -574,6 +1111,7 @@ impl HealthMonitor {
                 WARNED_NON_FINITE => Warning::NonFinite {
                     step,
                     location: name,
+                    input: None,
                 },
                 WARNED_EXPLODING => Warning::Exploding {
                     step,
@@ -593,8 +1131,9 @@ impl HealthMonitor {
 
     /// Ends epoch `epoch`: with [`Health::dead_relu`], sends [`Warning::DeadNeurons`] for
     /// each ReLU or ReLU6 layer with neurons that output exactly 0 for every sample since the
-    /// last `end_epoch` (masked-off neurons excepted), then starts a new epoch, so each
-    /// once-per-epoch warning can be sent again.
+    /// last `end_epoch` (masked-off neurons excepted), prints the summary lines of repeated
+    /// norm warnings when there is no sink, then starts a new epoch, so each once-per-epoch
+    /// warning can be sent again.
     ///
     /// # Errors
     ///
@@ -623,14 +1162,17 @@ impl HealthMonitor {
                 self.emit(Warning::DeadNeurons {
                     epoch,
                     layer,
+                    width,
                     neurons,
                 });
             }
         }
+        self.print_repeats(epoch);
         self.alive.fill(false);
         self.tracked = false;
         self.loss_warned = false;
         self.clamped_warned = false;
+        self.negative_warned = false;
         self.warned.fill(0);
         Ok(())
     }
@@ -664,6 +1206,27 @@ mod tests {
             seen,
             Box::new(move |w: &Warning| sink.borrow_mut().push(w.clone())),
         )
+    }
+
+    /// The bad value of `nan_dataset` as `Trainer::step` reports it: the first feature of the
+    /// first row, with no dataset row given.
+    fn nan_at_origin() -> BadInput {
+        BadInput {
+            position: 0,
+            row: None,
+            feature: 0,
+            value: f32::NAN,
+            target: false,
+        }
+    }
+
+    /// Inputs for a step whose data the test does not care about: `x` and no targets.
+    fn no_labels(x: &Tensor<f32>) -> StepInputs<'_> {
+        StepInputs {
+            x: x.view(),
+            targets: TargetsView::Classes(&[]),
+            rows: None,
+        }
     }
 
     /// The default checks with `on_non_finite` and the given sink.
@@ -713,65 +1276,89 @@ mod tests {
 
     /// Whether `err` is `Error::NonFinite` at `step` in `location`.
     fn is_non_finite(err: &Error, step: u64, location: &str) -> bool {
-        matches!(err, Error::NonFinite { step: s, location: l } if *s == step && l == location)
+        matches!(err, Error::NonFinite { step: s, location: l, .. } if *s == step && l == location)
     }
 
-    /// A NaN in the first input row stops `fit` at step 1 with the loss named as the
-    /// location, before the optimiser applies anything.
+    /// `fit` rejects a NaN input before training, so nothing is trained or changed.
+    #[test]
+    fn fit_rejects_nan_input() {
+        let data = nan_dataset();
+        let mut params = ParamStore::new();
+        let net = classifier(&mut params);
+        let before = parameter_bits(&net, &params);
+        let err = fit(&net, &mut params, &data, FitConfig::default()).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(_)), "{err:?}");
+        assert!(err.to_string().contains("row 0, column 0"), "{err}");
+        assert_eq!(parameter_bits(&net, &params), before);
+    }
+
+    /// A NaN in the first input row (fed through `Trainer::step`, which does not check the
+    /// data) stops training at step 1 with the loss named as the location, before the
+    /// optimiser applies anything.
     #[test]
     fn nan_in_input_stops_training() {
         let data = nan_dataset();
         let mut params = ParamStore::new();
         let net = classifier(&mut params);
         let before = parameter_bits(&net, &params);
-        let config = FitConfig {
-            epochs: 2,
-            batch: 32,
-            shuffle_seed: None,
-            ..FitConfig::default()
-        };
-        let err = fit(&net, &mut params, &data, config).unwrap_err();
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 32);
+        let batcher = Batcher::new(64, 32, None);
+        let mut batch = Batch::new(&data, 32);
+        let err = trainer
+            .step(&net, &mut params, batcher.gather(&data, 0..32, &mut batch))
+            .unwrap_err();
         assert!(is_non_finite(&err, 1, "loss"), "{err:?}");
-        assert_eq!(err.to_string(), "non-finite value at step 1 in loss");
+        assert_eq!(
+            err.to_string(),
+            "non-finite value at step 1 in loss: the batch's input held NaN at batch position 0, \
+             feature 0"
+        );
         assert_eq!(parameter_bits(&net, &params), before);
     }
 
     /// With `OnNonFinite::Warn` the sink receives the non-finite loss (once per epoch) and
-    /// the non-finite gradients, and training runs every epoch.
+    /// the non-finite gradients, and a manual loop of steps runs every epoch (`Trainer::step`
+    /// does not check the data, as `fit` does).
     #[test]
     fn warn_mode_continues() {
         let data = nan_dataset();
         let mut params = ParamStore::new();
         let net = classifier(&mut params);
         let (seen, sink) = collecting_sink();
-        let config = FitConfig {
-            epochs: 2,
-            batch: 32,
-            shuffle_seed: None,
-            health: health(OnNonFinite::Warn, sink),
-            ..FitConfig::default()
-        };
-        let history = fit(&net, &mut params, &data, config).unwrap();
-        assert_eq!(history.epochs.len(), 2);
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 32);
+        trainer.set_health(health(OnNonFinite::Warn, sink));
+        let batcher = Batcher::new(64, 32, None);
+        let mut batch = Batch::new(&data, 32);
+        for epoch in 1..=2 {
+            for range in [0..32, 32..64] {
+                trainer
+                    .step(&net, &mut params, batcher.gather(&data, range, &mut batch))
+                    .unwrap();
+            }
+            trainer.end_epoch(epoch).unwrap();
+        }
+        assert_eq!(trainer.steps(), 4);
         let seen = seen.borrow();
         assert_eq!(
             seen[0],
             Warning::NonFinite {
                 step: 1,
-                location: "loss".to_string()
+                location: "loss".to_string(),
+                input: Some(nan_at_origin())
             }
         );
         let loss_steps: Vec<u64> = seen
             .iter()
             .filter_map(|w| match w {
-                Warning::NonFinite { step, location } if location == "loss" => Some(*step),
+                Warning::NonFinite { step, location, .. } if location == "loss" => Some(*step),
                 _ => None,
             })
             .collect();
         assert_eq!(loss_steps, [1, 3]);
         assert!(seen.contains(&Warning::NonFinite {
             step: 1,
-            location: "0.weight".to_string()
+            location: "0.weight".to_string(),
+            input: None
         }));
     }
 
@@ -830,8 +1417,13 @@ mod tests {
     }
 
     /// A 2 → 4 → ReLU → 1 network whose first bias is −100 (so the ReLU outputs 0 for every
-    /// sample), with `masked` neurons of the ReLU layer turned off, and 8 rows to train on.
-    fn dead_network(params: &mut ParamStore, masked: &[usize]) -> (Sequential, Dataset) {
+    /// sample), with `masked` neurons of layer `mask_layer` (0, the `Linear`, or 1, the ReLU)
+    /// turned off, and 8 rows to train on.
+    fn dead_network(
+        params: &mut ParamStore,
+        masked: &[usize],
+        mask_layer: usize,
+    ) -> (Sequential, Dataset) {
         let mut rng = Rng::seed(3);
         let first = Linear::new(params, 2, 4, &mut rng);
         params.value_mut(first.bias()).data_mut().fill(-100.0);
@@ -844,7 +1436,7 @@ mod tests {
             for &n in masked {
                 mask.set(n, false);
             }
-            net.set_mask(1, mask);
+            net.set_mask(mask_layer, mask);
         }
         let x: Vec<f32> = (0..16).map(|_| rng.range(-1.0, 1.0) as f32).collect();
         let data = Dataset {
@@ -869,7 +1461,7 @@ mod tests {
     fn dead_relu_reported() {
         for (masked, dead) in [(vec![], vec![0, 1, 2, 3]), (vec![2], vec![0, 1, 3])] {
             let mut params = ParamStore::new();
-            let (net, data) = dead_network(&mut params, &masked);
+            let (net, data) = dead_network(&mut params, &masked, 1);
             let (seen, sink) = collecting_sink();
             let config = FitConfig {
                 epochs: 1,
@@ -889,6 +1481,7 @@ mod tests {
                 [Warning::DeadNeurons {
                     epoch: 1,
                     layer: 1,
+                    width: 4,
                     neurons: dead
                 }],
                 "masked {masked:?}"
@@ -896,13 +1489,13 @@ mod tests {
         }
     }
 
-    /// Three epochs of `fit` on [`dead_network`] with `health`, using SGD and mean squared
+    /// `epochs` epochs of `fit` on [`dead_network`] with `health`, using SGD and mean squared
     /// error; the network stays dead every epoch.
-    fn fit_dead_network(health: Health) {
+    fn fit_dead_network(health: Health, epochs: usize) {
         let mut params = ParamStore::new();
-        let (net, data) = dead_network(&mut params, &[]);
+        let (net, data) = dead_network(&mut params, &[], 1);
         let config = FitConfig {
-            epochs: 3,
+            epochs,
             batch: 4,
             optimizer: OptimizerConfig::Sgd {
                 lr: 0.1,
@@ -920,7 +1513,7 @@ mod tests {
     #[test]
     fn dead_relu_sink_receives_every_epoch() {
         let (seen, sink) = collecting_sink();
-        fit_dead_network(health(OnNonFinite::Stop, sink));
+        fit_dead_network(health(OnNonFinite::Stop, sink), 3);
         let epochs: Vec<usize> = dead_reports(&seen)
             .iter()
             .map(|w| match w {
@@ -931,49 +1524,404 @@ mod tests {
         assert_eq!(epochs, [1, 2, 3]);
     }
 
-    /// Without a sink, a layer's dead neurons are printed to standard error once per run, with
-    /// their count, and not again every epoch: the test binary re-runs itself as a child that
-    /// trains the dead network for three epochs, and its standard error has one such line.
+    /// Without a sink, a layer that is dead from the first epoch on is printed once, with its
+    /// count and share, not again every epoch: the test binary re-runs itself as a child that
+    /// trains the dead network for 50 epochs, and its standard error has one such line.
     #[test]
-    fn dead_relu_prints_once_per_layer_without_a_sink() {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let out = std::process::Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                "health::tests::dead_relu_printing_child",
-            ])
-            .output()
-            .expect("the test binary runs");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+    fn fully_dead_layer_prints_once() {
+        let out = crate::test_child::run_alone("health::tests::fully_dead_printing_child", &[]);
+        crate::test_child::assert_passed(&out);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "the child should run the helper and pass; stdout:\n{stdout}\nstderr:\n{stderr}"
-        );
         let dead: Vec<&str> = stderr
             .lines()
-            .filter(|l| l.starts_with("cavitation: warning:") && l.contains("dead ReLU"))
+            .filter(|l| l.contains("(dead ReLU)"))
             .collect();
         assert_eq!(dead.len(), 1, "stderr:\n{stderr}");
         assert!(
-            dead[0].starts_with(
-                "cavitation: warning: epoch 1: 4 neurons of layer 1 output 0 for every sample"
-            ) && dead[0].contains("later epochs"),
+            dead[0].starts_with("cavitation: warning: epoch 1: 4 of 4 (100%) neurons of layer 1"),
             "{}",
             dead[0]
         );
     }
 
-    /// Helper for `dead_relu_prints_once_per_layer_without_a_sink`: trains the dead network
-    /// with the default checks, which print to standard error. Ignored by default; it is run
-    /// in a child process.
+    /// Helper for `fully_dead_layer_prints_once`: trains the dead network for 50 epochs with
+    /// the default checks, which print to standard error. Ignored by default; it is run in a
+    /// child process.
     #[test]
-    #[ignore = "run in a child process by dead_relu_prints_once_per_layer_without_a_sink"]
-    fn dead_relu_printing_child() {
-        fit_dead_network(Health::default());
+    #[ignore = "run in a child process by fully_dead_layer_prints_once"]
+    fn fully_dead_printing_child() {
+        fit_dead_network(Health::default(), 50);
+    }
+
+    /// A one-layer ReLU network of 20 neurons, trained by a manual loop of one step per epoch
+    /// with the default checks, whose biases are lowered between epochs so that 1, 3, 6, 6 and
+    /// 19 neurons (5%, 15%, 30%, 30%, 95%) are dead in epochs 1 to 5.
+    fn thresholds_loop() {
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 2, 20, &mut Rng::seed(0));
+        let (w, b) = (layer.weight(), layer.bias());
+        params.value_mut(w).data_mut().fill(1.0);
+        let net = Sequential::new().push(layer).push(Relu);
+        let mut monitor = HealthMonitor::new(Health::default());
+        let (mut graph, mut trace) = (Graph::new(), crate::Trace::new());
+        let x = Tensor::full(&[4, 2], 1.0f32);
+        for (epoch, dead) in [1usize, 3, 6, 6, 19].into_iter().enumerate() {
+            let bias = params.value_mut(b).data_mut();
+            bias.fill(0.0);
+            bias[..dead].fill(-100.0);
+            let mut tape = graph.tape(&params.values);
+            let input = tape.input(x.view());
+            net.forward_traced(&mut tape, input, &mut trace);
+            monitor
+                .after_backward(epoch as u64 + 1, 1.0, &tape, &trace, &net, no_labels(&x))
+                .unwrap();
+            drop(tape);
+            monitor.end_epoch(epoch + 1).unwrap();
+        }
+    }
+
+    /// Without a sink, a layer's dead report is printed in the epoch its share passes a
+    /// threshold (25%, 50%, 90%) it had not passed: with 5%, 15%, 30%, 30% and 95% dead in
+    /// epochs 1 to 5, standard error has two dead lines, for epochs 3 and 5.
+    #[test]
+    fn dead_report_printed_at_thresholds() {
+        let out = crate::test_child::run_alone("health::tests::thresholds_child", &[]);
+        crate::test_child::assert_passed(&out);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let dead: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("(dead ReLU)"))
+            .collect();
+        assert_eq!(dead.len(), 2, "stderr:\n{stderr}");
+        assert!(dead[0].contains("epoch 3: 6 of 20 (30%)"), "{}", dead[0]);
+        assert!(dead[1].contains("epoch 5: 19 of 20 (95%)"), "{}", dead[1]);
+    }
+
+    /// Helper for `dead_report_printed_at_thresholds`. Ignored by default; it is run in a
+    /// child process.
+    #[test]
+    #[ignore = "run in a child process by dead_report_printed_at_thresholds"]
+    fn thresholds_child() {
+        thresholds_loop();
+    }
+
+    /// `epochs` epochs of `fit` on one `Linear` 2 → 1 fitting a target of 1e4 with a learning
+    /// rate of 1e-12, so nothing moves and both parameters' gradient norms (about 2.8e4 and
+    /// 2e4) are above the exploding limit at every step.
+    fn fit_exploding(health: Health, epochs: usize) {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+        let data = Dataset {
+            x: Tensor::full(&[4, 2], 1.0f32),
+            targets: Targets::Values(Tensor::full(&[4, 1], 1e4f32)),
+        };
+        let config = FitConfig {
+            epochs,
+            batch: 2,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 1e-12,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            shuffle_seed: None,
+            health,
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+    }
+
+    /// Without a sink, an exploding parameter is printed once for the run, then each later
+    /// epoch adds one summary line for the kind: three epochs give two per-parameter lines
+    /// (`0.weight` and `0.bias`), then one summary line each for epochs 2 and 3.
+    #[test]
+    fn norm_warnings_print_once_then_summarise() {
+        let out = crate::test_child::run_alone("health::tests::norm_printing_child", &[]);
+        crate::test_child::assert_passed(&out);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("cavitation: warning:"))
+            .collect();
+        assert_eq!(lines.len(), 4, "stderr:\n{stderr}");
+        assert!(lines[0].contains("step 1:") && lines[0].contains("0.weight"));
+        assert!(lines[1].contains("step 1:") && lines[1].contains("0.bias"));
+        for (line, epoch) in lines[2..].iter().zip([2, 3]) {
+            assert!(
+                line.starts_with(&format!(
+                    "cavitation: warning: epoch {epoch}: 2 parameters exploding again: 0.weight "
+                )) && line.contains(", 0.bias "),
+                "{line}"
+            );
+        }
+    }
+
+    /// Helper for `norm_warnings_print_once_then_summarise`. Ignored by default; it is run in
+    /// a child process.
+    #[test]
+    #[ignore = "run in a child process by norm_warnings_print_once_then_summarise"]
+    fn norm_printing_child() {
+        fit_exploding(Health::default(), 3);
+    }
+
+    /// A sink still receives every warning of every epoch: three epochs of the exploding run
+    /// give one `Exploding` for `0.weight` in each, at steps 1, 3 and 5.
+    #[test]
+    fn sink_receives_every_warning() {
+        let (seen, sink) = collecting_sink();
+        fit_exploding(health(OnNonFinite::Stop, sink), 3);
+        let steps: Vec<u64> = seen
+            .borrow()
+            .iter()
+            .filter_map(|w| match w {
+                Warning::Exploding { step, layer, .. } if layer == "0.weight" => Some(*step),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steps, [1, 3, 5]);
+    }
+
+    /// Two parameters above the limit send two warnings, one for each, in the same epoch.
+    #[test]
+    fn exploding_limit_is_per_parameter() {
+        let (seen, sink) = collecting_sink();
+        fit_exploding(health(OnNonFinite::Stop, sink), 1);
+        let names: Vec<String> = seen
+            .borrow()
+            .iter()
+            .filter_map(|w| match w {
+                Warning::Exploding { layer, .. } => Some(layer.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["0.weight", "0.bias"]);
+    }
+
+    /// `Health::quiet` keeps every check and `Stop`: a NaN loss still returns the error. It
+    /// drops the warnings: a child that trains the dead network with it prints nothing.
+    #[test]
+    fn quiet_drops_warnings_but_stops() {
+        let health = Health::quiet();
+        assert_eq!(health.on_non_finite, OnNonFinite::Stop);
+        assert!(health.dead_relu && health.sink.is_some());
+        let data = nan_dataset();
+        let mut params = ParamStore::new();
+        let net = classifier(&mut params);
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 32);
+        trainer.set_health(Health::quiet());
+        let batcher = Batcher::new(64, 32, None);
+        let mut batch = Batch::new(&data, 32);
+        let err = trainer
+            .step(&net, &mut params, batcher.gather(&data, 0..32, &mut batch))
+            .unwrap_err();
+        assert!(is_non_finite(&err, 1, "loss"), "{err:?}");
+
+        let out = crate::test_child::run_alone("health::tests::quiet_printing_child", &[]);
+        crate::test_child::assert_passed(&out);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("cavitation: warning"), "{stderr}");
+    }
+
+    /// Helper for `quiet_drops_warnings_but_stops`: trains the dead network with
+    /// `Health::quiet()`. Ignored by default; it is run in a child process.
+    #[test]
+    #[ignore = "run in a child process by quiet_drops_warnings_but_stops"]
+    fn quiet_printing_child() {
+        fit_dead_network(Health::quiet(), 3);
+    }
+
+    /// A neuron masked on the `Linear` before a ReLU layer is not reported dead, as one masked
+    /// on the ReLU layer itself is not.
+    #[test]
+    fn mask_on_linear_not_reported_dead() {
+        let mut params = ParamStore::new();
+        let (net, data) = dead_network(&mut params, &[2], 0);
+        let (seen, sink) = collecting_sink();
+        let config = FitConfig {
+            epochs: 1,
+            batch: 4,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.1,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            health: health(OnNonFinite::Stop, sink),
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(
+            dead_reports(&seen),
+            [Warning::DeadNeurons {
+                epoch: 1,
+                layer: 1,
+                width: 4,
+                neurons: vec![0, 1, 3]
+            }]
+        );
+    }
+
+    /// An activation `f(x) = x` whose derivative is NaN above 0.
+    struct NanGrad;
+
+    impl crate::Activation<f32> for NanGrad {
+        /// Returns `"nan_grad"`.
+        fn name(&self) -> &str {
+            "nan_grad"
+        }
+        /// `x`.
+        fn f(&self, x: f32) -> f32 {
+            x
+        }
+        /// NaN above 0, else 1.
+        fn df(&self, x: f32, _y: f32) -> f32 {
+            if x > 0.0 { f32::NAN } else { 1.0 }
+        }
+    }
+
+    /// A finite loss with a NaN gradient reaching the first layer: `fit` stops with
+    /// `Error::NonFinite` naming `0.weight`.
+    #[test]
+    fn fit_stops_on_non_finite_gradient() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(2);
+        let first = Linear::new(&mut params, 2, 3, &mut rng);
+        params.value_mut(first.weight()).data_mut().fill(1.0);
+        let net = Sequential::new()
+            .push(first)
+            .push(crate::ActivationLayer::new(NanGrad))
+            .push(Linear::new(&mut params, 3, 1, &mut rng));
+        let data = Dataset {
+            x: Tensor::full(&[8, 2], 1.0f32),
+            targets: Targets::Values(Tensor::full(&[8, 1], 0.5f32)),
+        };
+        let config = FitConfig {
+            epochs: 1,
+            batch: 4,
+            loss: Loss::Mse,
+            ..FitConfig::default()
+        };
+        let err = fit(&net, &mut params, &data, config).unwrap_err();
+        assert!(is_non_finite(&err, 1, "0.weight"), "{err:?}");
+    }
+
+    /// Every variant's accessors: `kind`, `step`, `epoch`, `location` and `layer`.
+    #[test]
+    fn warning_accessors() {
+        let exploding = Warning::Exploding {
+            step: 3,
+            layer: "0.weight".to_string(),
+            norm: 1e4,
+        };
+        assert_eq!(exploding.kind(), WarningKind::Exploding);
+        assert_eq!(exploding.step(), Some(3));
+        assert_eq!(exploding.epoch(), None);
+        assert_eq!(exploding.location(), Some("0.weight"));
+        assert_eq!(exploding.layer(), None);
+        let dead = Warning::DeadNeurons {
+            epoch: 2,
+            layer: 1,
+            width: 8,
+            neurons: vec![0],
+        };
+        assert_eq!(dead.kind(), WarningKind::DeadNeurons);
+        assert_eq!(dead.step(), None);
+        assert_eq!(dead.epoch(), Some(2));
+        assert_eq!(dead.location(), None);
+        assert_eq!(dead.layer(), Some(1));
+        let clamped = Warning::ClampedLogs { step: 4, count: 1 };
+        assert_eq!(clamped.kind(), WarningKind::ClampedLogs);
+        assert_eq!(
+            (
+                clamped.step(),
+                clamped.epoch(),
+                clamped.location(),
+                clamped.layer()
+            ),
+            (Some(4), None, None, None)
+        );
+        let non_finite = Warning::NonFinite {
+            step: 1,
+            location: "loss".to_string(),
+            input: None,
+        };
+        assert_eq!(non_finite.kind(), WarningKind::NonFinite);
+        assert_eq!(
+            (
+                non_finite.step(),
+                non_finite.epoch(),
+                non_finite.location(),
+                non_finite.layer()
+            ),
+            (Some(1), None, Some("loss"), None)
+        );
+        let vanishing = Warning::Vanishing {
+            step: 9,
+            layer: "1.bias".to_string(),
+            norm: 0.0,
+        };
+        assert_eq!(vanishing.kind(), WarningKind::Vanishing);
+        assert_eq!(
+            (
+                vanishing.step(),
+                vanishing.epoch(),
+                vanishing.location(),
+                vanishing.layer()
+            ),
+            (Some(9), None, Some("1.bias"), None)
+        );
+    }
+
+    /// A dead report of 247 of 256 neurons shows the count and share, the first ten indices
+    /// and an ellipsis, and the remedies.
+    #[test]
+    fn dead_line_shows_share_and_ten_indices() {
+        let line = Warning::DeadNeurons {
+            epoch: 2,
+            layer: 1,
+            width: 256,
+            neurons: (0..247).collect(),
+        }
+        .to_string();
+        assert!(line.contains("247 of 256 (96%)"), "{line}");
+        assert!(line.contains("[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, …]"), "{line}");
+        assert!(!line.contains("10,"), "{line}");
+        for phrase in ["learning rate", "bias", "leaky"] {
+            assert!(line.contains(phrase), "{phrase}: {line}");
+        }
+    }
+
+    /// Every warning's text carries its hint; a norm of exactly 0 gets its own explanation.
+    #[test]
+    fn hints_in_messages() {
+        let exploding = Warning::Exploding {
+            step: 2,
+            layer: "0.weight".to_string(),
+            norm: 2.5e4,
+        }
+        .to_string();
+        assert!(exploding.contains("Health::grad_norm_high"), "{exploding}");
+        assert!(exploding.contains("lower the learning rate"), "{exploding}");
+        let vanishing = |norm| {
+            Warning::Vanishing {
+                step: 2,
+                layer: "2.bias".to_string(),
+                norm,
+            }
+            .to_string()
+        };
+        let zero = vanishing(0.0);
+        assert!(zero.contains("Health::grad_norm_low"), "{zero}");
+        assert!(zero.contains("no gradient reached"), "{zero}");
+        let small = vanishing(1e-9);
+        assert!(small.contains("Health::grad_norm_low"), "{small}");
+        assert!(!small.contains("no gradient reached"), "{small}");
+        let clamped = Warning::ClampedLogs { step: 3, count: 2 }.to_string();
+        assert!(clamped.contains("pass no gradient"), "{clamped}");
+        assert!(
+            clamped.contains("BinaryCrossEntropyWithLogits"),
+            "{clamped}"
+        );
     }
 
     /// Runs the manual loop over the first `steps` batches of 32 rows of `data` with a
@@ -1003,10 +1951,15 @@ mod tests {
             let mut tape = graph.tape(&params.values);
             let xi = tape.input(x);
             let out = net.forward_traced(&mut tape, xi, &mut trace);
-            let loss = tape.softmax_cross_entropy(out, &labels[rows], Reduction::Mean);
+            let loss = tape.softmax_cross_entropy(out, &labels[rows.clone()], Reduction::Mean);
             let value = tape.value(loss).data()[0];
             tape.backward(loss, &mut params.grads);
-            monitor.after_backward(step, value, &tape, &trace, net)?;
+            let inputs = StepInputs {
+                x,
+                targets: TargetsView::Classes(&labels[rows]),
+                rows: None,
+            };
+            monitor.after_backward(step, value, &tape, &trace, net, inputs)?;
             drop(tape);
             optimizer.step(params);
             monitor.after_update(step, optimizer.last_stats(), &names)?;
@@ -1062,7 +2015,8 @@ mod tests {
             *seen.borrow(),
             [Warning::NonFinite {
                 step: 5,
-                location: "0.bias".to_string()
+                location: "0.bias".to_string(),
+                input: None
             }]
         );
     }
@@ -1138,7 +2092,8 @@ mod tests {
             *seen.borrow(),
             [Warning::NonFinite {
                 step: 1,
-                location: "loss".to_string()
+                location: "loss".to_string(),
+                input: Some(nan_at_origin())
             }]
         );
         assert!(trainer.end_epoch(1).is_ok());
@@ -1211,9 +2166,10 @@ mod tests {
         let (seen, sink) = collecting_sink();
         let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
         let tape = graph.tape(&params.values);
+        let x = Tensor::full(&[1, 1], 0.0f32);
         for (step, loss) in [(1, 1.0), (2, 0.9)] {
             monitor
-                .after_backward(step, loss, &tape, &trace, &net)
+                .after_backward(step, loss, &tape, &trace, &net, no_labels(&x))
                 .unwrap();
         }
         monitor
@@ -1241,9 +2197,10 @@ mod tests {
         let (seen, sink) = collecting_sink();
         let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
         let tape = graph.tape(&params.values);
+        let x = Tensor::full(&[1, 1], 0.0f32);
         for (step, loss) in [(1, 1.0), (2, 0.0)] {
             monitor
-                .after_backward(step, loss, &tape, &trace, &net)
+                .after_backward(step, loss, &tape, &trace, &net, no_labels(&x))
                 .unwrap();
         }
         monitor
@@ -1266,9 +2223,10 @@ mod tests {
         let (seen, sink) = collecting_sink();
         let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
         let tape = graph.tape(&params.values);
+        let x = Tensor::full(&[1, 1], 0.0f32);
         for (step, loss) in [(1, -1.0), (2, -1.0)] {
             monitor
-                .after_backward(step, loss, &tape, &trace, &net)
+                .after_backward(step, loss, &tape, &trace, &net, no_labels(&x))
                 .unwrap();
         }
         monitor
@@ -1291,6 +2249,7 @@ mod tests {
             Warning::NonFinite {
                 step: 1,
                 location: "loss".to_string(),
+                input: None,
             }
             .to_string(),
             Warning::Exploding {
@@ -1308,6 +2267,7 @@ mod tests {
             Warning::DeadNeurons {
                 epoch: 1,
                 layer: 1,
+                width: 4,
                 neurons: vec![0, 3],
             }
             .to_string(),
@@ -1315,13 +2275,300 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "step 3: binary cross-entropy met 2 probabilities of exactly 0 or 1 and clamped their logarithms to -100",
+                "step 3: binary cross-entropy met 2 probabilities of exactly 0 or 1 and clamped their \
+                 logarithms to -100; the clamped rows pass no gradient, so use \
+                 Loss::BinaryCrossEntropyWithLogits on raw scores instead",
                 "step 1: a NaN or infinite value in loss",
-                "step 2: the gradient norm of 0.weight is 2.500e4, above the exploding limit",
-                "step 2: the gradient norm of 2.bias is 0.000e0, below the vanishing limit (a gradient \
-                 this small with a loss that has not fallen 10,000-fold is a vanishing gradient)",
-                "epoch 1: 2 neurons of layer 1 output 0 for every sample (dead ReLU): [0, 3]",
+                "step 2: the gradient norm of 0.weight is 2.500e4, above the exploding limit \
+                 (Health::grad_norm_high, 1e3 by default); lower the learning rate, or raise the \
+                 limit if this size is normal for the model",
+                "step 2: the gradient norm of 2.bias is 0.000e0, below the vanishing limit \
+                 (Health::grad_norm_low, 1e-7 by default; a gradient this small with a loss that \
+                 has not fallen 10,000-fold is a vanishing gradient); a norm of exactly 0 means no \
+                 gradient reached it, which points at dead ReLUs or a saturated output",
+                "epoch 1: 2 of 4 (50%) neurons of layer 1 output 0 for every sample (dead ReLU): \
+                 [0, 3]; try a lower learning rate, a positive bias initialisation or a leaky \
+                 activation such as LeakyRelu",
             ]
+        );
+    }
+
+    /// `Trainer::step` on 8 rows with a NaN at batch position 3, feature 2 stops with an error
+    /// whose detail names the position and the feature, and the sink gets the same bad value.
+    #[test]
+    fn non_finite_loss_names_the_input() {
+        let mut rng = Rng::seed(4);
+        let mut x: Vec<f32> = (0..8 * 4).map(|_| rng.range(-1.0, 1.0) as f32).collect();
+        x[3 * 4 + 2] = f32::NAN;
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[8, 4]).unwrap(),
+            targets: Targets::Classes((0..8).map(|i| i % 3).collect()),
+        };
+        let mut params = ParamStore::new();
+        let net = classifier(&mut params);
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 8);
+        let (seen, sink) = collecting_sink();
+        trainer.set_health(health(OnNonFinite::Stop, sink));
+        let mut batch = Batch::new(&data, 8);
+        let view = Batcher::new(8, 8, None).gather(&data, 0..8, &mut batch);
+        let err = trainer.step(&net, &mut params, view).unwrap_err();
+        let Error::NonFinite {
+            step,
+            location,
+            detail: Some(detail),
+        } = &err
+        else {
+            panic!("expected a non-finite error with a detail, got {err:?}");
+        };
+        assert_eq!((*step, location.as_str()), (1, "loss"));
+        assert!(detail.contains("position 3"), "{detail}");
+        assert!(detail.contains("feature 2"), "{detail}");
+        let bad = BadInput {
+            position: 3,
+            row: None,
+            feature: 2,
+            value: f32::NAN,
+            target: false,
+        };
+        assert_eq!(
+            *seen.borrow(),
+            [Warning::NonFinite {
+                step: 1,
+                location: "loss".to_string(),
+                input: Some(bad)
+            }]
+        );
+    }
+
+    /// An infinite value target is named as a target, after the inputs (all finite) are
+    /// checked; the scan reads only a non-finite loss's batch.
+    #[test]
+    fn non_finite_target_is_named_as_a_target() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+        let mut targets = vec![0.5f32; 4];
+        targets[1] = f32::INFINITY;
+        let data = Dataset {
+            x: Tensor::full(&[4, 2], 1.0f32),
+            targets: Targets::Values(Tensor::from_vec(targets, &[4, 1]).unwrap()),
+        };
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
+        trainer.set_health(Health::quiet());
+        let mut batch = Batch::new(&data, 4);
+        let view = Batcher::new(4, 4, None).gather(&data, 0..4, &mut batch);
+        let err = trainer.step(&net, &mut params, view).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.ends_with("the batch's targets held infinity at batch position 1, output 0"),
+            "{text}"
+        );
+    }
+
+    /// The 64 → 256 → 128 → 10 ReLU network on finite synthetic data (values up to 1000) with
+    /// SGD at a learning rate of 10 blows up; the error says the inputs were finite and
+    /// suggests a lower learning rate rather than naming an input.
+    #[test]
+    fn overflow_says_inputs_finite() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(1);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 64, 256, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 256, 128, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 128, 10, &mut rng));
+        let x: Vec<f32> = (0..128 * 64)
+            .map(|_| rng.range(0.0, 1000.0) as f32)
+            .collect();
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[128, 64]).unwrap(),
+            targets: Targets::Classes((0..128).map(|i| i % 10).collect()),
+        };
+        let config = FitConfig {
+            epochs: 30,
+            batch: 32,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 10.0,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::CrossEntropy,
+            health: Health::quiet(),
+            ..FitConfig::default()
+        };
+        let err = fit(&net, &mut params, &data, config).unwrap_err();
+        let Error::NonFinite {
+            location,
+            detail: Some(detail),
+            ..
+        } = &err
+        else {
+            panic!("expected a non-finite error with a detail, got {err:?}");
+        };
+        assert_eq!(location, "loss", "{err}");
+        assert!(detail.contains("inputs were finite"), "{detail}");
+        assert!(detail.contains("learning rate"), "{detail}");
+    }
+
+    /// A `Linear` 2 → 2 with zero parameters under `Loss::Nll` (raw scores, not
+    /// log-probabilities): the loss is 0 at step 1 and falls below 0 from step 2, so the sink
+    /// receives `NegativeLoss` at step 2 and, after `end_epoch`, at the first step of the next
+    /// epoch, and no other step sends one.
+    #[test]
+    fn negative_loss_warns() {
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
+        for id in [layer.weight(), layer.bias()] {
+            params.value_mut(id).data_mut().fill(0.0);
+        }
+        let net = Sequential::new().push(layer);
+        let data = Dataset {
+            x: Tensor::full(&[4, 2], 1.0f32),
+            targets: Targets::Classes(vec![0; 4]),
+        };
+        let mut trainer = Trainer::new(&net, Sgd::new(0.5), Loss::Nll, 4);
+        let (seen, sink) = collecting_sink();
+        trainer.set_health(health(OnNonFinite::Stop, sink));
+        let batcher = Batcher::new(4, 4, None);
+        let mut batch = Batch::new(&data, 4);
+        let mut losses = Vec::new();
+        for epoch in 1..=2 {
+            for _ in 0..3 {
+                let view = batcher.gather(&data, 0..4, &mut batch);
+                losses.push(trainer.step(&net, &mut params, view).unwrap());
+            }
+            trainer.end_epoch(epoch).unwrap();
+        }
+        assert_eq!(losses[0], 0.0);
+        assert!(losses[1..].iter().all(|&l| l < 0.0), "{losses:?}");
+        let warnings = seen.borrow();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            matches!(warnings[0], Warning::NegativeLoss { step: 2, loss } if loss == losses[1])
+        );
+        assert!(
+            matches!(warnings[1], Warning::NegativeLoss { step: 4, loss } if loss == losses[3])
+        );
+        assert_eq!(warnings[0].kind(), WarningKind::NegativeLoss);
+        assert_eq!(warnings[0].step(), Some(2));
+    }
+
+    /// `Loss::KlDiv` can be negative on valid use of the library's own conventions, and a
+    /// monitor built without a loss does not know the loss: neither sends `NegativeLoss`.
+    #[test]
+    fn negative_loss_is_silent_when_not_impossible() {
+        let params = ParamStore::new();
+        let net = Sequential::new();
+        let mut graph = Graph::new();
+        let tape = graph.tape(&params.values);
+        let trace = crate::Trace::new();
+        let x = Tensor::full(&[1, 1], 0.0f32);
+        for monitor in [
+            HealthMonitor::new(Health::quiet()).with_loss(Loss::KlDiv),
+            HealthMonitor::new(Health::quiet()),
+        ] {
+            let mut monitor = monitor;
+            let (seen, sink) = collecting_sink();
+            monitor.health.sink = Some(sink);
+            monitor
+                .after_backward(1, -1.0, &tape, &trace, &net, no_labels(&x))
+                .unwrap();
+            assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
+        }
+    }
+
+    /// Without a sink, a negative loss prints its full line once for the run, then one summary
+    /// line in each later epoch where it happens again: three epochs of three steps give one
+    /// full line (step 2) and summaries for epochs 2 and 3.
+    #[test]
+    fn negative_loss_prints_once_then_summarises() {
+        let out = crate::test_child::run_alone("health::tests::negative_loss_printing_child", &[]);
+        crate::test_child::assert_passed(&out);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.starts_with("cavitation: warning:"))
+            .collect();
+        assert_eq!(lines.len(), 3, "stderr:\n{stderr}");
+        assert!(lines[0].contains("step 2:") && lines[0].contains("LogSoftmax"));
+        for (line, epoch) in lines[1..].iter().zip([2, 3]) {
+            assert!(
+                line.starts_with(&format!(
+                    "cavitation: warning: epoch {epoch}: the loss was negative again"
+                )),
+                "{line}"
+            );
+        }
+    }
+
+    /// Helper for `negative_loss_prints_once_then_summarises`: trains the zero-parameter `Nll`
+    /// model for three epochs of three steps with the default checks, which print to standard
+    /// error. Ignored by default; it is run in a child process.
+    #[test]
+    #[ignore = "run in a child process by negative_loss_prints_once_then_summarises"]
+    fn negative_loss_printing_child() {
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
+        for id in [layer.weight(), layer.bias()] {
+            params.value_mut(id).data_mut().fill(0.0);
+        }
+        let net = Sequential::new().push(layer);
+        let data = Dataset {
+            x: Tensor::full(&[4, 2], 1.0f32),
+            targets: Targets::Classes(vec![0; 4]),
+        };
+        let mut trainer = Trainer::new(&net, Sgd::new(0.5), Loss::Nll, 4);
+        let batcher = Batcher::new(4, 4, None);
+        let mut batch = Batch::new(&data, 4);
+        for epoch in 1..=3 {
+            for _ in 0..3 {
+                let view = batcher.gather(&data, 0..4, &mut batch);
+                trainer.step(&net, &mut params, view).unwrap();
+            }
+            trainer.end_epoch(epoch).unwrap();
+        }
+    }
+
+    /// The accessors and the text of `NegativeLoss`, and of a non-finite loss that names its
+    /// input.
+    #[test]
+    fn negative_loss_and_input_text() {
+        let w = Warning::NegativeLoss {
+            step: 7,
+            loss: -0.5,
+        };
+        assert_eq!(
+            (w.kind(), w.step(), w.epoch(), w.location(), w.layer()),
+            (WarningKind::NegativeLoss, Some(7), None, None, None)
+        );
+        let text = w.to_string();
+        assert!(
+            text.starts_with("step 7: the loss is -5.0000e-1, below 0"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Loss::Nll") && text.contains("LogSoftmax"),
+            "{text}"
+        );
+        assert!(
+            text.contains("binary cross-entropy targets outside [0, 1]"),
+            "{text}"
+        );
+        let named = Warning::NonFinite {
+            step: 1,
+            location: "loss".to_string(),
+            input: Some(BadInput {
+                position: 3,
+                row: Some(17),
+                feature: 2,
+                value: f32::NEG_INFINITY,
+                target: false,
+            }),
+        };
+        assert_eq!(
+            named.to_string(),
+            "step 1: a NaN or infinite value in loss; the batch's input held -infinity at batch \
+             position 3, feature 2 (row 17 of the dataset)"
         );
     }
 }

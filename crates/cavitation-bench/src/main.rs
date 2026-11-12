@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|digits|latency|gemm|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -8,11 +8,30 @@
 //!   through the 50k network. Each also runs `scripts/bench/numpy_mlp.py` with the same
 //!   network, batch, data and step counts, and prints cavitation against numpy with the
 //!   ratio. The results are also written to `target/bench/results.json`.
-//! - `all` runs `info`, `mnist` at batch 128 and 32, `digits` and `latency`.
+//! - `cifar [--batch 32|128] [--steps N]` times 3 epochs of the 3072 → 1024 → 512 → 10
+//!   network (ReLU, cross-entropy, Adam lr 1e-3) on CIFAR-10's 50,000 training images, at
+//!   batch 128 and then 32 (or only the batch given), against the same numpy baseline. With
+//!   `--steps N` each timed sample is N steps instead of an epoch and the result is steps
+//!   per second, for machines on which an epoch takes minutes.
+//! - `all` runs `info`, `mnist` at batch 128 and 32, `digits` and `latency`; not `cifar`,
+//!   whose epochs take minutes on a small machine.
 //! - `gemm --shapes mnist128|digits128` times the eight matrix products of one batch-128
 //!   training step of the named network at the current kernel level and thread count
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
 //!   GFLOPS (`2·m·n·k` / time) and threads used, then the rate over all eight.
+//! - `subnormal [--steps N]` (default 2,000) times the optimiser update of one parameter of
+//!   1,068,810 elements whose gradient is 1e-3 on the first step and 0 after, for SGD,
+//!   SGD with momentum 0.9 and Adam (lr 1e-3), so their state decays through the subnormal
+//!   range. It prints the median update time of each block of 100 steps, and the ratio of
+//!   the blocks from step 901 on to the blocks of steps 1 to 700.
+//! - `small [--rounds N]` (default 3) trains a small network (4 → 32 → tanh → 32 → tanh →
+//!   1, mean squared error, Adam lr 1e-3, batch 64, 20,000 seeded rows, 10 timed epochs) at
+//!   1 and at 4 threads, in interleaved rounds, each run in a child process with
+//!   `CAVITATION_THREADS` set. It prints each run's wall-clock and CPU seconds, then the
+//!   medians and the 4-thread figures over the 1-thread ones, and checks that every run
+//!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
+//!   only; its ticks are taken as 1/100 s (`USER_HZ` = 100, as on x86 and Arm Linux).
+//!   `small --child` is the child's side: one run at the current thread count.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
@@ -29,12 +48,15 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|digits|latency|gemm|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH]\n\
+    \x20 cifar   [--batch 32|128] [--steps N] [--python PATH]\n\
     \x20 digits  [--python PATH]\n\
     \x20 latency [--python PATH]\n\
     \x20 all     [--python PATH]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
+    \x20 subnormal [--steps N]\n\
+    \x20 small   [--rounds N]\n\
     \x20 info";
 
 /// Entry point of the benchmark runner.
@@ -51,7 +73,9 @@ fn main() -> ExitCode {
             .then(info)
             .ok_or_else(|| "info takes no arguments".to_string()),
         "gemm" => gemm(rest),
-        "mnist" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
+        "subnormal" => subnormal(rest),
+        "small" => small(rest),
+        "mnist" | "cifar" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
             let mut rows = Vec::new();
             if command == "all" {
                 info();
@@ -85,10 +109,12 @@ fn info() {
 
 /// The options of the training and latency commands.
 struct Options {
-    /// `--batch`: 32 or 128 (`mnist` only).
-    batch: usize,
+    /// `--batch`: 32 or 128 (`mnist` and `cifar` only).
+    batch: Option<usize>,
     /// `--adam`: time Adam instead of plain SGD (`mnist` only).
     adam: bool,
+    /// `--steps`: steps per timed sample instead of whole epochs (`cifar` only).
+    steps: Option<usize>,
     /// The Python interpreter that runs the baseline.
     python: String,
 }
@@ -98,12 +124,13 @@ impl Options {
     ///
     /// # Errors
     ///
-    /// Returns a message for an unknown option, a missing value or a batch other than 32
-    /// or 128.
+    /// Returns a message for an unknown option, a missing value, a batch other than 32
+    /// or 128, or a `--steps` that is not a positive number.
     fn parse(args: &[String]) -> Result<Options, String> {
         let mut o = Options {
-            batch: 128,
+            batch: None,
             adam: false,
+            steps: None,
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
         };
         let mut rest = args.iter();
@@ -112,10 +139,17 @@ impl Options {
                 "--batch" => {
                     let v = rest.next().ok_or("--batch needs a value")?;
                     o.batch = match v.as_str() {
-                        "32" => 32,
-                        "128" => 128,
+                        "32" => Some(32),
+                        "128" => Some(128),
                         _ => return Err(format!("--batch must be 32 or 128, got `{v}`")),
                     };
+                }
+                "--steps" => {
+                    let v = rest.next().ok_or("--steps needs a value")?;
+                    o.steps =
+                        Some(v.parse().ok().filter(|&n| n > 0).ok_or_else(|| {
+                            format!("--steps must be a positive number, got `{v}`")
+                        })?);
                 }
                 "--adam" => o.adam = true,
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
@@ -148,7 +182,21 @@ fn plan(command: &str, o: &Options) -> Result<Vec<Run>, String> {
             batch,
             adam,
             epochs: 3,
+            steps: None,
             unit: Unit::EpochSeconds,
+        })
+    };
+    let cifar = |batch: usize| {
+        let steps = o.steps.map_or(String::new(), |n| format!(", {n} steps"));
+        Run::Train(TrainSpec {
+            name: format!("cifar batch {batch}{steps}"),
+            data: "cifar",
+            widths: runs::CIFAR_NET,
+            batch,
+            adam: true,
+            epochs: 3,
+            steps: o.steps,
+            unit: o.steps.map_or(Unit::EpochSeconds, |_| Unit::StepsPerSecond),
         })
     };
     let digits = Run::Train(TrainSpec {
@@ -158,15 +206,26 @@ fn plan(command: &str, o: &Options) -> Result<Vec<Run>, String> {
         batch: 128,
         adam: false,
         epochs: 100,
+        steps: None,
         unit: Unit::SamplesPerSecond,
     });
-    if command != "mnist" && (o.adam || o.batch != 128) {
+    if command != "mnist" && o.adam {
+        return Err(format!("--adam applies to mnist only, not {command}"));
+    }
+    if command != "mnist" && command != "cifar" && o.batch.is_some() {
         return Err(format!(
-            "--batch and --adam apply to mnist only, not {command}"
+            "--batch applies to mnist and cifar only, not {command}"
         ));
     }
+    if command != "cifar" && o.steps.is_some() {
+        return Err(format!("--steps applies to cifar only, not {command}"));
+    }
     Ok(match command {
-        "mnist" => vec![mnist(o.batch, o.adam)],
+        "mnist" => vec![mnist(o.batch.unwrap_or(128), o.adam)],
+        "cifar" => match o.batch {
+            Some(batch) => vec![cifar(batch)],
+            None => vec![cifar(128), cifar(32)],
+        },
         "digits" => vec![digits],
         "latency" => vec![Run::Latency],
         _ => vec![mnist(128, false), mnist(32, false), digits, Run::Latency],
@@ -193,9 +252,7 @@ fn execute(run: Run, python: &str) -> Result<Comparison, String> {
 ///
 /// Returns a message if the results file cannot be written.
 fn report(rows: &[Comparison]) -> Result<(), String> {
-    let load = std::fs::read_to_string("/proc/loadavg")
-        .map(|l| l.split_whitespace().take(3).collect::<Vec<_>>().join(" "))
-        .unwrap_or_else(|_| "unknown".to_string());
+    let load = machine::load_average();
     println!(
         "kernel {}, {} threads, load average at the end {load}",
         level(),
@@ -208,12 +265,12 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
         );
     }
     println!(
-        "{:<24} {:>12} {:>12} {:>10}  unit",
+        "{:<28} {:>12} {:>12} {:>10}  unit",
         "run", "cavitation", "numpy", "ratio"
     );
     for row in rows {
         println!(
-            "{:<24} {:>12.2} {:>12.2} {:>9.2}x  {}",
+            "{:<28} {:>12.2} {:>12.2} {:>9.2}x  {}",
             row.name,
             row.value(runs::median(&row.ours)),
             row.value(runs::median(&row.numpy)),
@@ -224,6 +281,9 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
     println!("ratio = numpy time over cavitation time; medians of the timed epochs or rounds.");
     for row in rows {
         println!("{}: {}; {}", row.name, row.detail, row.timing_note);
+    }
+    for row in rows.iter().filter(|r| !r.health.is_empty()) {
+        println!("{}: {}", row.name, row.health);
     }
     write_results(rows, &load)
 }
@@ -246,11 +306,12 @@ fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
         .iter()
         .map(|r| {
             format!(
-                "    {{\"name\": \"{}\", \"detail\": \"{}\", \"timing\": \"{}\", \"unit\": \"{}\", \
+                "    {{\"name\": \"{}\", \"detail\": \"{}\", \"health\": \"{}\", \"timing\": \"{}\", \"unit\": \"{}\", \
                  \"cavitation\": {:e}, \"numpy\": {:e}, \"ratio\": {:e},\n     \
                  \"cavitation_seconds\": {}, \"numpy_seconds\": {}}}",
                 escape(&r.name),
                 escape(&r.detail),
+                escape(&r.health),
                 escape(&r.timing_note),
                 r.unit_label(),
                 r.value(runs::median(&r.ours)),
@@ -325,4 +386,243 @@ fn gemm(args: &[String]) -> Result<(), String> {
         flops / seconds / 1e9
     );
     Ok(())
+}
+
+/// Runs the `subnormal` subcommand with its arguments (after `subnormal`).
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument or a `--steps` that is not a positive number.
+fn subnormal(args: &[String]) -> Result<(), String> {
+    let mut steps = 2000usize;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--steps" => {
+                let v = rest.next().ok_or("--steps needs a value")?;
+                steps = v
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("--steps must be a positive number, got `{v}`"))?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    println!(
+        "subnormal: one parameter of {} elements, gradient 1e-3 on step 1 and 0 after, \
+         kernel {}, {} threads",
+        runs::SUBNORMAL_ELEMENTS,
+        level(),
+        threads()
+    );
+    println!(
+        "median update time in ms per block of {} steps",
+        runs::BLOCK
+    );
+    for run in runs::subnormal(steps) {
+        println!("{}", run.name);
+        for (b, t) in run.blocks.iter().enumerate() {
+            let (first, last) = (b * runs::BLOCK + 1, (b + 1) * runs::BLOCK);
+            println!("  steps {first:>5}-{last:<5} {:>8.3}", t * 1e3);
+        }
+        match run.ratio {
+            Some(r) => println!("  steps 901+ over steps 1-700: {r:.2}x"),
+            None => println!("  steps 901+ over steps 1-700: needs at least 1,000 steps"),
+        }
+    }
+    Ok(())
+}
+
+/// The thread counts the `small` run compares; the first is the baseline.
+const SMALL_THREADS: [usize; 2] = [1, 4];
+
+/// Runs the `small` subcommand with its arguments (after `small`).
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument, a `--rounds` that is not a positive number,
+/// a child run that fails, or runs that ended on different losses.
+fn small(args: &[String]) -> Result<(), String> {
+    let mut rounds = 3usize;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--child" => {
+                let run = runs::small_once()?;
+                println!(
+                    "wall {:e} cpu {:e} loss {:08x}",
+                    run.wall, run.cpu, run.loss_bits
+                );
+                return Ok(());
+            }
+            "--rounds" => {
+                let v = rest.next().ok_or("--rounds needs a value")?;
+                rounds = v
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("--rounds must be a positive number, got `{v}`"))?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    let net = runs::SMALL_NET.map(|w| w.to_string()).join(" → ");
+    println!(
+        "small: {net} with tanh, MSE, Adam lr 1e-3, batch {}, {} rows, {} timed epochs, \
+         kernel {}, {rounds} interleaved rounds",
+        runs::SMALL_BATCH,
+        runs::SMALL_ROWS,
+        runs::SMALL_EPOCHS,
+        level()
+    );
+    let mut results: Vec<Vec<runs::SmallRun>> = vec![Vec::new(); SMALL_THREADS.len()];
+    for round in 1..=rounds {
+        for (i, &threads) in SMALL_THREADS.iter().enumerate() {
+            let run = small_child(threads)?;
+            println!(
+                "round {round}, {threads} thread{}: wall {:.3} s, cpu {:.2} s, loss bits {:08x}",
+                if threads == 1 { "" } else { "s" },
+                run.wall,
+                run.cpu,
+                run.loss_bits
+            );
+            results[i].push(run);
+        }
+    }
+    let medians: Vec<(f64, f64)> = results
+        .iter()
+        .map(|r| {
+            let wall: Vec<f64> = r.iter().map(|x| x.wall).collect();
+            let cpu: Vec<f64> = r.iter().map(|x| x.cpu).collect();
+            (runs::median(&wall), runs::median(&cpu))
+        })
+        .collect();
+    for (&threads, &(wall, cpu)) in SMALL_THREADS.iter().zip(&medians) {
+        let s = if threads == 1 { "" } else { "s" };
+        println!("median, {threads} thread{s}: wall {wall:.3} s, cpu {cpu:.2} s");
+    }
+    let (base_wall, base_cpu) = medians[0];
+    for (&threads, &(wall, cpu)) in SMALL_THREADS.iter().zip(&medians).skip(1) {
+        println!(
+            "{threads} threads over 1: wall {:.3}x, cpu {:.3}x",
+            wall / base_wall,
+            cpu / base_cpu
+        );
+    }
+    let first = results[0][0].loss_bits;
+    if results.iter().flatten().any(|r| r.loss_bits != first) {
+        return Err("the runs ended on different losses".to_string());
+    }
+    println!("every run ended on the same loss");
+    Ok(())
+}
+
+/// Runs `small --child` in a new process of this program with `CAVITATION_THREADS` set to
+/// `threads`, and reads back its result line.
+///
+/// # Errors
+///
+/// Returns a message if the child cannot start, fails, or prints something unexpected.
+fn small_child(threads: usize) -> Result<runs::SmallRun, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
+    let out = std::process::Command::new(exe)
+        .args(["small", "--child"])
+        .env("CAVITATION_THREADS", threads.to_string())
+        .output()
+        .map_err(|e| format!("starting the {threads}-thread run: {e}"))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        return Err(format!(
+            "the {threads}-thread run failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    parse_small_line(text.trim())
+        .ok_or_else(|| format!("the {threads}-thread run printed `{}`", text.trim()))
+}
+
+/// Reads the line `small --child` prints: `wall <seconds> cpu <seconds> loss <hex bits>`.
+fn parse_small_line(line: &str) -> Option<runs::SmallRun> {
+    match line.split_whitespace().collect::<Vec<_>>()[..] {
+        ["wall", wall, "cpu", cpu, "loss", loss] => Some(runs::SmallRun {
+            wall: wall.parse().ok()?,
+            cpu: cpu.parse().ok()?,
+            loss_bits: u32::from_str_radix(loss, 16).ok()?,
+        }),
+        _ => None,
+    }
+}
+
+/// Tests for the command-line side of the runner.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The child's result line reads back into the numbers it was printed from.
+    #[test]
+    fn small_child_line_round_trips() {
+        let run = parse_small_line("wall 1.25e0 cpu 4.5e0 loss 3f800000").unwrap();
+        assert_eq!((run.wall, run.cpu, run.loss_bits), (1.25, 4.5, 0x3f80_0000));
+        assert!(parse_small_line("wall 1 cpu 2").is_none());
+        assert!(parse_small_line("wall x cpu 2 loss 0").is_none());
+    }
+
+    /// The training specs of a command line, or its error message.
+    fn specs(command: &str, args: &[&str]) -> Result<Vec<TrainSpec>, String> {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        let o = Options::parse(&args)?;
+        Ok(plan(command, &o)?
+            .into_iter()
+            .filter_map(|run| match run {
+                Run::Train(spec) => Some(spec),
+                Run::Latency => None,
+            })
+            .collect())
+    }
+
+    /// `cifar` runs Adam on the CIFAR-10 network at batch 128 then 32 in seconds per epoch,
+    /// or only the batch given, and in steps per second with `--steps`.
+    #[test]
+    fn cifar_plan_runs_both_batches_or_steps() {
+        let both = specs("cifar", &[]).unwrap();
+        let batches: Vec<usize> = both.iter().map(|s| s.batch).collect();
+        assert_eq!(batches, [128, 32]);
+        assert!(both.iter().all(|s| s.adam
+            && s.data == "cifar"
+            && s.widths == runs::CIFAR_NET
+            && s.steps.is_none()
+            && s.unit == Unit::EpochSeconds));
+
+        let one = specs("cifar", &["--batch", "32", "--steps", "50"]).unwrap();
+        assert_eq!(one.len(), 1);
+        assert_eq!((one[0].batch, one[0].steps), (32, Some(50)));
+        assert_eq!(one[0].unit, Unit::StepsPerSecond);
+        assert_eq!(one[0].name, "cifar batch 32, 50 steps");
+    }
+
+    /// `--steps` belongs to `cifar`, `--adam` to `mnist`, `--batch` to both; `all` leaves
+    /// `cifar` out.
+    #[test]
+    fn options_apply_only_where_they_mean_something() {
+        assert!(
+            specs("mnist", &["--steps", "10"])
+                .unwrap_err()
+                .contains("cifar only")
+        );
+        assert!(
+            specs("cifar", &["--adam"])
+                .unwrap_err()
+                .contains("mnist only")
+        );
+        assert!(specs("digits", &["--batch", "32"]).is_err());
+        assert!(
+            specs("cifar", &["--steps", "0"])
+                .unwrap_err()
+                .contains("positive")
+        );
+        assert_eq!(specs("mnist", &["--batch", "32"]).unwrap()[0].batch, 32);
+        assert!(specs("all", &[]).unwrap().iter().all(|s| s.data != "cifar"));
+    }
 }

@@ -2,7 +2,9 @@
 //! statistics they collect while they update.
 //!
 //! All arithmetic is done per element in `f64` and stored back as `T`, so an `f32` run
-//! rounds once per stored value. Momentum and Adam's moment estimates are stored as `T`.
+//! rounds once per stored value. Momentum and Adam's moment estimates are stored as `T`, with
+//! any value smaller than the type's smallest normal number stored as 0: left to decay, they
+//! would pass through the subnormal range, where each update runs many times slower.
 //!
 //! Each parameter is updated in chunks of [`CHUNK`] elements, split over the kernel thread
 //! pool ([`threads`]), with the gradient's sum of squares kept in [`LANES`] partial sums per
@@ -23,6 +25,20 @@ const CHUNK: usize = 1 << 14;
 /// Partial sums of the gradient's squares per chunk: independent sums the compiler can keep
 /// in vector registers, instead of one chain of dependent adds.
 const LANES: usize = 8;
+
+/// `x` stored as a `T` for optimiser state, with any value below the type's smallest normal
+/// number ([`Real::MIN_POSITIVE`]) stored as 0. Momentum and Adam's moments decay towards
+/// zero, through the subnormal range, where reading and writing a value takes many times
+/// longer; flushing it keeps every update at full speed. The test is on the `f64` value, a
+/// compare and a select, so the result does not depend on the thread count.
+#[inline(always)]
+fn store_state<T: Real>(x: f64) -> T {
+    if x.abs() < T::MIN_POSITIVE.to_f64() {
+        T::ZERO
+    } else {
+        T::from_f64(x)
+    }
+}
 
 /// Which loops an update runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -159,10 +175,10 @@ fn chunked<T: Real, const M: usize>(
 /// What the optimiser saw in the gradients during a step: for every parameter the sum of the
 /// squares of its gradient (in `f64`) and whether every value was finite.
 ///
-/// The optimiser fills it in the same pass that updates the parameters, so reading the
-/// gradients costs no extra pass. A parameter whose gradient is stale (nothing contributed to
-/// it since [`ParamStore::zero_grad`]) is not updated and counts as zeros here. A `GradStats` can be reused from step to step;
-/// after the first step it allocates nothing.
+/// The optimiser fills it in the same pass that updates the parameters, so reading the gradients
+/// costs no extra pass. A parameter whose gradient is stale (nothing contributed to it since
+/// [`ParamStore::zero_grad`]) is not updated and counts as zeros here. A `GradStats` can be reused
+/// from step to step; after the first step it allocates nothing.
 ///
 /// # Examples
 ///
@@ -277,12 +293,12 @@ impl GradStats {
 
 /// Changes parameters from their gradients.
 ///
-/// An optimiser keeps its state (momentum, moment estimates) in buffers it allocates on the
-/// first step and reuses afterwards. A parameter whose gradient is stale (nothing has
-/// contributed to it since [`ParamStore::zero_grad`]) is skipped, as PyTorch skips a
-/// parameter whose `grad` is `None`: its value and its state stay as they are, and Adam's
-/// bias correction counts only the steps that updated it. The parameter store must not change its number or the
-/// sizes of its parameters after that: a later step panics if it does.
+/// An optimiser keeps its state (momentum, moment estimates) in buffers it allocates on the first
+/// step and reuses afterwards. A parameter whose gradient is stale (nothing has contributed to it
+/// since [`ParamStore::zero_grad`]) is skipped, as PyTorch skips a parameter whose `grad` is
+/// `None`: its value and its state stay as they are, and Adam's bias correction counts only the
+/// steps that updated it. The parameter store must not change its number or the sizes of its
+/// parameters after that: a later step panics if it does.
 ///
 /// # Examples
 ///
@@ -320,8 +336,8 @@ pub trait Optimizer<T: Real>: Send {
     fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats);
 
     /// Updates every parameter that has a gradient, as
-    /// [`step_with_stats`](Optimizer::step_with_stats) does. The statistics go into a [`GradStats`] the
-    /// optimiser owns, allocated on the first step and reused, so after the first step this
+    /// [`step_with_stats`](Optimizer::step_with_stats) does. The statistics go into a [`GradStats`]
+    /// the optimiser owns, allocated on the first step and reused, so after the first step this
     /// allocates nothing; read them with [`last_stats`](Optimizer::last_stats).
     ///
     /// # Panics
@@ -526,6 +542,26 @@ impl<T: Real> Sgd<T> {
 }
 
 impl<T: Real> Sgd<T> {
+    /// The momentum buffer of parameter `id`, or `None` while there is none: the optimiser
+    /// has no momentum, has not stepped yet, or has not updated this parameter yet. The ids
+    /// are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Optimizer, Sgd};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = Sgd::new(0.1).with_momentum(0.9);
+    /// assert!(opt.momentum(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// assert_eq!(opt.momentum(p), Some(&[2.0f32][..]));
+    /// ```
+    pub fn momentum(&self, id: ParamId) -> Option<&[T]> {
+        let k = id.position();
+        (*self.started.get(k)?).then(|| &self.buffers[k][..])
+    }
+
     /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
     fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
         if self.sizes.prepare("Sgd", params) && self.momentum != 0.0 {
@@ -617,7 +653,7 @@ fn sgd_reference<T: Real>(
             } else {
                 mu * buf.to_f64() + step
             };
-            *buf = T::from_f64(step);
+            *buf = store_state(step);
         }
         values[i] = T::from_f64(p - lr * step);
     }
@@ -663,7 +699,7 @@ fn sgd_momentum_chunk<T: Real, const WD: bool, const FIRST: bool>(
         } else {
             mu * buf.to_f64() + step
         };
-        *buf = T::from_f64(step);
+        *buf = store_state(step);
         *value = T::from_f64(p - lr * step);
     })
 }
@@ -737,6 +773,12 @@ impl<T: Real> AdamCore<T> {
             stats: GradStats::new(),
             partials: Vec::new(),
         }
+    }
+
+    /// The two moments of parameter `id`, or `None` until it has been updated once.
+    fn moments(&self, id: ParamId) -> Option<(&[T], &[T])> {
+        let k = id.position();
+        (*self.steps.get(k)? > 0).then(|| (&self.m[k][..], &self.v[k][..]))
     }
 
     /// Checks the decay rates.
@@ -859,8 +901,8 @@ fn adam_reference<T: Real>(
         }
         let mi = c.b1 * m[i].to_f64() + (1.0 - c.b1) * g;
         let vi = c.b2 * v[i].to_f64() + (1.0 - c.b2) * g * g;
-        m[i] = T::from_f64(mi);
-        v[i] = T::from_f64(vi);
+        m[i] = store_state(mi);
+        v[i] = store_state(vi);
         let m_hat = mi / c.correction1;
         let v_hat = vi / c.correction2;
         values[i] = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
@@ -887,8 +929,8 @@ fn adam_chunk<T: Real, const DECOUPLED: bool, const WD: bool>(
         }
         let mi = c.b1 * m.to_f64() + (1.0 - c.b1) * g;
         let vi = c.b2 * v.to_f64() + (1.0 - c.b2) * g * g;
-        *m = T::from_f64(mi);
-        *v = T::from_f64(vi);
+        *m = store_state(mi);
+        *v = store_state(vi);
         let m_hat = mi / c.correction1;
         let v_hat = vi / c.correction2;
         *value = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
@@ -968,6 +1010,28 @@ impl<T: Real> Adam<T> {
     }
 }
 
+impl<T: Real> Adam<T> {
+    /// The first and second moment estimates of parameter `id`, or `None` until it has been
+    /// updated once. The ids are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Adam, Optimizer};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = Adam::new(0.01);
+    /// assert!(opt.moments(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// let (m, v) = opt.moments(p).unwrap();
+    /// // m = (1 - 0.9)·2 and v = (1 - 0.999)·2².
+    /// assert!((m[0] - 0.2).abs() < 1e-7 && (v[0] - 0.004).abs() < 1e-7);
+    /// ```
+    pub fn moments(&self, id: ParamId) -> Option<(&[T], &[T])> {
+        self.core.moments(id)
+    }
+}
+
 impl<T: Real> Optimizer<T> for Adam<T> {
     fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats) {
         self.core
@@ -996,6 +1060,10 @@ impl<T: Real> Optimizer<T> for Adam<T> {
 /// AdamW (Loshchilov and Hutter, 2019) with PyTorch's `torch.optim.AdamW` semantics: the
 /// weight decay is decoupled, `p ← p·(1 − lr·wd)` before the Adam update, and the default
 /// weight decay is 0.01.
+///
+/// The default decay pulls every parameter towards 0 on every step, so with a constant rate it
+/// can keep a run from settling on a minimum away from 0; set `with_weight_decay(0.0)` when
+/// the minimum is not near 0.
 ///
 /// # Examples
 ///
@@ -1063,6 +1131,28 @@ impl<T: Real> AdamW<T> {
     pub fn with_weight_decay(mut self, weight_decay: f64) -> AdamW<T> {
         self.core.weight_decay = weight_decay;
         self
+    }
+}
+
+impl<T: Real> AdamW<T> {
+    /// The first and second moment estimates of parameter `id`, or `None` until it has been
+    /// updated once. The ids are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{AdamW, Optimizer};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = AdamW::new(0.01);
+    /// assert!(opt.moments(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// let (m, v) = opt.moments(p).unwrap();
+    /// // m = (1 - 0.9)·2 and v = (1 - 0.999)·2².
+    /// assert!((m[0] - 0.2).abs() < 1e-7 && (v[0] - 0.004).abs() < 1e-7);
+    /// ```
+    pub fn moments(&self, id: ParamId) -> Option<(&[T], &[T])> {
+        self.core.moments(id)
     }
 }
 
@@ -1346,55 +1436,6 @@ mod tests {
             .collect()
     }
 
-    /// Runs the ignored test `name` of this test binary in a child process, alone, and fails
-    /// unless it ran and passed. Alone in its process, nothing else holds the thread pool, so
-    /// a call on several threads is never sent to the inline path because another test's call
-    /// is using the pool.
-    fn run_alone(name: &str) {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let out = std::process::Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                name,
-            ])
-            .output()
-            .expect("the test binary runs");
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        // A filter that matches nothing also exits 0; "1 passed" shows the test ran.
-        assert!(
-            out.status.success() && stdout.contains("1 passed"),
-            "{name} failed or did not run; stdout:\n{stdout}\nstderr:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Fails unless the thread pool runs tasks on its workers, not only on the caller: runs
-    /// 64 short tasks on 4 threads, again for up to 10 seconds, until one runs on a worker
-    /// other than 0.
-    fn assert_pool_runs_on_workers() {
-        use cavitation_core::kernels::pool::{Task, run};
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let start = std::time::Instant::now();
-        loop {
-            let highest = AtomicUsize::new(0);
-            run(4, 64, &|t: Task| {
-                let spin = std::time::Instant::now();
-                while spin.elapsed() < std::time::Duration::from_micros(20) {}
-                highest.fetch_max(t.worker, Ordering::Relaxed);
-            });
-            if highest.into_inner() > 0 {
-                return;
-            }
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(10),
-                "the pool ran every task on the caller for 10 s"
-            );
-        }
-    }
-
     /// The chunked update gives the same parameters and the same optimiser state, bit for
     /// bit, as the reference loop, for every setting, over 3 steps (the last with a NaN and
     /// an infinity in one gradient) and on 1, 2 and 4 threads. Its statistics differ from
@@ -1402,7 +1443,11 @@ mod tests {
     /// child process, so the 2- and 4-thread runs really use the pool's workers.
     #[test]
     fn chunked_update_matches_the_reference_bit_for_bit() {
-        run_alone("optim::tests::chunked_update_matches_the_reference_child");
+        let out = crate::test_child::run_alone(
+            "optim::tests::chunked_update_matches_the_reference_child",
+            &[],
+        );
+        crate::test_child::assert_passed(&out);
     }
 
     /// The body of `chunked_update_matches_the_reference_bit_for_bit`, run in a child
@@ -1410,7 +1455,7 @@ mod tests {
     #[test]
     #[ignore = "run in a child process by chunked_update_matches_the_reference_bit_for_bit"]
     fn chunked_update_matches_the_reference_child() {
-        assert_pool_runs_on_workers();
+        crate::test_child::assert_pool_runs_on_workers();
         for (name, make) in chunk_configs() {
             let (mut reference, ids) = chunk_store();
             let mut ref_opt = make();
@@ -1459,7 +1504,8 @@ mod tests {
     /// the 2- and 4-thread runs really use the pool's workers.
     #[test]
     fn chunked_statistics_do_not_depend_on_the_thread_count() {
-        run_alone("optim::tests::chunked_statistics_child");
+        let out = crate::test_child::run_alone("optim::tests::chunked_statistics_child", &[]);
+        crate::test_child::assert_passed(&out);
     }
 
     /// The body of `chunked_statistics_do_not_depend_on_the_thread_count`, run in a child
@@ -1467,7 +1513,7 @@ mod tests {
     #[test]
     #[ignore = "run in a child process by chunked_statistics_do_not_depend_on_the_thread_count"]
     fn chunked_statistics_child() {
-        assert_pool_runs_on_workers();
+        crate::test_child::assert_pool_runs_on_workers();
         for (name, make) in chunk_configs() {
             let norms: Vec<Vec<u64>> = [1, 2, 4]
                 .into_iter()
@@ -1543,6 +1589,85 @@ mod tests {
         }
     }
 
+    /// A parameter that already has momentum or Adam moments keeps them, and its value, while
+    /// it has no gradient. For SGD with momentum 0.9, Adam and AdamW on both paths: both
+    /// parameters get a gradient on step 1; only `a` gets one on steps 2 and 3, and after each
+    /// of those `b`'s value bits and state bits equal what step 1 left. On step 4, when `b`
+    /// has a gradient again, it moves exactly as the second update of an optimiser that only
+    /// ever saw `b` (its own step count is 2, its state carried over from step 1).
+    #[test]
+    fn skipped_parameter_keeps_its_state() {
+        for (name, make) in chunk_configs() {
+            if !["sgd momentum", "adam", "adamw"].contains(&name) {
+                continue;
+            }
+            for path in [Path::Reference, Path::Chunked(2)] {
+                let at = format!("{name}, {path:?}");
+                let (n_a, n_b) = (40, 30);
+                let start_b = sequence(n_b, 2, &[]);
+                let mut store = ParamStore::new();
+                let a = store.add(Tensor::from_vec(sequence(n_a, 1, &[]), &[n_a]).unwrap());
+                let b = store.add(Tensor::from_vec(start_b.clone(), &[n_b]).unwrap());
+                let mut opt = make();
+                let mut stats = GradStats::new();
+                let (g1, g4) = (sequence(n_b, 20, &[]), sequence(n_b, 21, &[]));
+
+                store.zero_grad();
+                set_grad(&mut store, a, &sequence(n_a, 10, &[]));
+                set_grad(&mut store, b, &g1);
+                opt.step(&mut store, &mut stats, path);
+                let value_after_1 = value_bits(&store, &[b]);
+                let state_after_1 = opt.state_of(1);
+                assert!(
+                    state_after_1.iter().flatten().any(|&x| x != 0),
+                    "{at}: step 1 left b's state at zero"
+                );
+                assert_ne!(
+                    value_after_1,
+                    vec![start_b.iter().map(|x| x.to_bits()).collect::<Vec<u32>>()],
+                    "{at}: step 1 did not move b"
+                );
+
+                for step in 2..=3 {
+                    store.zero_grad();
+                    set_grad(&mut store, a, &sequence(n_a, 10 + step, &[]));
+                    opt.step(&mut store, &mut stats, path);
+                    assert_eq!(
+                        value_bits(&store, &[b]),
+                        value_after_1,
+                        "{at}, step {step}: value"
+                    );
+                    assert_eq!(opt.state_of(1), state_after_1, "{at}, step {step}: state");
+                }
+
+                store.zero_grad();
+                set_grad(&mut store, a, &sequence(n_a, 14, &[]));
+                set_grad(&mut store, b, &g4);
+                opt.step(&mut store, &mut stats, path);
+
+                let mut twin = ParamStore::new();
+                let only_b = twin.add(Tensor::from_vec(start_b, &[n_b]).unwrap());
+                let mut twin_opt = make();
+                let mut twin_stats = GradStats::new();
+                for g in [&g1, &g4] {
+                    twin.zero_grad();
+                    set_grad(&mut twin, only_b, g);
+                    twin_opt.step(&mut twin, &mut twin_stats, path);
+                }
+                assert_eq!(
+                    value_bits(&store, &[b]),
+                    value_bits(&twin, &[only_b]),
+                    "{at}: b's update on step 4"
+                );
+                assert_eq!(
+                    opt.state_of(1),
+                    twin_opt.state_of(0),
+                    "{at}: b's state on step 4"
+                );
+            }
+        }
+    }
+
     /// A `Box<dyn Optimizer>` is an optimiser.
     #[test]
     fn boxed_optimizer_steps() {
@@ -1554,5 +1679,112 @@ mod tests {
         opt.step(&mut store);
         assert_eq!(opt.learning_rate(), 0.25);
         assert_eq!(store.value(p).data(), &[0.75]);
+    }
+
+    /// Whether every value is 0 or at least `f32::MIN_POSITIVE` in magnitude (NaN passes).
+    fn none_subnormal(values: &[f32]) -> bool {
+        values
+            .iter()
+            .all(|x| *x == 0.0 || x.abs() >= f32::MIN_POSITIVE || x.is_nan())
+    }
+
+    /// A parameter of 1,000 elements that gets gradient 1e-3 on the first step and 0 on all
+    /// later ones, so the optimiser's state decays through the subnormal range.
+    fn decaying_store() -> (ParamStore, ParamId) {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[1000], 1.0f32));
+        (store, p)
+    }
+
+    /// Momentum's buffer never holds a subnormal value over 2,000 steps (it decays from 1e-3
+    /// by a factor 0.9 a step, so it crosses `f32::MIN_POSITIVE` near step 800), on the
+    /// chunked loops and on the reference loop, and ends at exactly 0.
+    #[test]
+    fn momentum_state_never_subnormal() {
+        for path in [Path::Reference, Path::Chunked(1)] {
+            let (mut store, p) = decaying_store();
+            let mut opt = Sgd::new(0.01).with_momentum(0.9);
+            let mut stats = GradStats::new();
+            for step in 0..2000 {
+                set_grad(
+                    &mut store,
+                    p,
+                    &vec![if step == 0 { 1e-3 } else { 0.0 }; 1000],
+                );
+                opt.update(&mut store, &mut stats, path);
+                let buf = opt.momentum(p).unwrap();
+                assert!(none_subnormal(buf), "{path:?}: step {step}: {:e}", buf[0]);
+            }
+            assert!(
+                opt.momentum(p).unwrap().iter().all(|&x| x == 0.0),
+                "{path:?}"
+            );
+        }
+    }
+
+    /// Adam's moments never hold a subnormal value over 2,000 steps, on both paths: with
+    /// the default betas the first moment crosses the bound near step 800, and with
+    /// both betas 0.9 the second moment crosses it near step 400 too.
+    #[test]
+    fn adam_state_never_subnormal() {
+        for path in [Path::Reference, Path::Chunked(1)] {
+            for betas in [(0.9, 0.999), (0.9, 0.9)] {
+                let (mut store, p) = decaying_store();
+                let mut core = AdamCore::<f32>::new(1e-3, 0.0);
+                core.set_betas(betas.0, betas.1);
+                let mut stats = GradStats::new();
+                for step in 0..2000 {
+                    set_grad(
+                        &mut store,
+                        p,
+                        &vec![if step == 0 { 1e-3 } else { 0.0 }; 1000],
+                    );
+                    core.step("Adam", false, &mut store, &mut stats, path);
+                    let (m, v) = core.moments(p).unwrap();
+                    assert!(
+                        none_subnormal(m),
+                        "{path:?} {betas:?}: step {step}: m {:e}",
+                        m[0]
+                    );
+                    assert!(
+                        none_subnormal(v),
+                        "{path:?} {betas:?}: step {step}: v {:e}",
+                        v[0]
+                    );
+                }
+                let (m, _) = core.moments(p).unwrap();
+                assert!(m.iter().all(|&x| x == 0.0), "{path:?} {betas:?}");
+            }
+        }
+    }
+
+    /// The accessors return `None` before a parameter's first update and the state after
+    /// it: after two steps with gradient g, momentum 0.9 holds 1.9·g, and Adam and AdamW
+    /// hold m = 0.19·g and v = 0.001999·g².
+    #[test]
+    fn state_accessors() {
+        let g = 0.5f32;
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[3], 1.0f32));
+        let mut sgd = Sgd::new(0.1).with_momentum(0.9);
+        let mut plain = Sgd::<f32>::new(0.1);
+        let mut adam = Adam::new(0.01);
+        let mut adamw = AdamW::new(0.01);
+        assert!(sgd.momentum(p).is_none() && adam.moments(p).is_none());
+        assert!(adamw.moments(p).is_none());
+        for _ in 0..2 {
+            set_grad(&mut store, p, &[g; 3]);
+            sgd.step(&mut store);
+            plain.step(&mut store);
+            adam.step(&mut store);
+            adamw.step(&mut store);
+        }
+        assert!(plain.momentum(p).is_none());
+        let close = |got: &[f32], want: f32| got.iter().all(|x| (x - want).abs() <= 1e-6 * want);
+        assert!(close(sgd.momentum(p).unwrap(), 1.9 * g));
+        for (m, v) in [adam.moments(p).unwrap(), adamw.moments(p).unwrap()] {
+            assert!(close(m, 0.19 * g), "{m:?}");
+            assert!(close(v, 0.001999 * g * g), "{v:?}");
+        }
     }
 }

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
-use cavitation_core::{Error, ParamId, ParamStore};
+use cavitation_core::{Error, KeyErrors, ParamId, ParamStore};
 use safetensors::tensor::{Dtype, SafeTensorError, SafeTensors, TensorView, serialize_to_file};
 
 use crate::Sequential;
@@ -109,9 +109,10 @@ pub fn save(
 ///
 /// Returns [`Error::Io`] if the file cannot be read, [`Error::Format`] if it is not a valid
 /// safetensors file (for example truncated, or a `torch.save` file, which the message says),
-/// [`Error::MissingKey`] for an absent key,
-/// [`Error::WrongShape`] or [`Error::Dtype`] (both name the key and what was expected) for a
-/// tensor that does not fit, and [`Error::UnexpectedKey`] for a key the model does not have.
+/// [`Error::Keys`] for keys that do not fit: the missing, the unexpected, the wrong-shape and
+/// the wrong-type keys are all found in one pass and listed in one error (see
+/// [`KeyErrors`]), with the file's own first keys when none of the model's keys is there
+/// and a hint when a weight looks transposed.
 ///
 /// # Panics
 ///
@@ -119,47 +120,93 @@ pub fn save(
 ///
 /// ```
 /// use cavitation_core::{Error, ParamStore, Rng};
-/// use cavitation_nn::{Linear, Sequential, load};
+/// use cavitation_nn::{Linear, Relu, Sequential, load, save};
 /// let mut params = ParamStore::new();
 /// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
 /// assert!(matches!(
 ///     load("cavitation-doc-no-such-file.safetensors", &net, &mut params),
 ///     Err(Error::Io { .. })
 /// ));
+///
+/// // Save a model, load the file into a fresh model with other weights, compare.
+/// let path = std::env::temp_dir().join(format!("cavitation-doc-load-{}.safetensors", std::process::id()));
+/// save(&path, &net, &params)?;
+/// let mut fresh_params = ParamStore::new();
+/// let fresh = Sequential::new().push(Linear::new(&mut fresh_params, 2, 3, &mut Rng::seed(9)));
+/// assert_ne!(params.value(net.parameter_names()[0].1).data(), fresh_params.value(fresh.parameter_names()[0].1).data());
+/// load(&path, &fresh, &mut fresh_params)?;
+/// for ((_, a), (_, b)) in net.parameter_names().into_iter().zip(fresh.parameter_names()) {
+///     assert_eq!(params.value(a).data(), fresh_params.value(b).data());
+/// }
+///
+/// // A model whose Linear layer sits at index 1 does not match this file's keys `0.*`:
+/// // one error lists every key that is missing and every key that is unexpected.
+/// let mut other = ParamStore::new();
+/// let other_net = Sequential::new().push(Relu).push(Linear::new(&mut other, 2, 3, &mut Rng::seed(0)));
+/// let err = load(&path, &other_net, &mut other).unwrap_err();
+/// assert!(err.to_string().contains("missing keys (2): 1.weight, 1.bias"));
+/// assert!(err.to_string().contains("unexpected keys (2): 0.bias, 0.weight"));
+/// std::fs::remove_file(&path).ok();
+/// # Ok::<(), Error>(())
 /// ```
 pub fn load(
     path: impl AsRef<Path>,
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
 ) -> Result<(), Error> {
-    load_with(path, model, params, LoadOptions::default())
+    load_with(path, model, params, LoadOptions::default()).map(|_| ())
 }
 
-/// Like [`load`], but keys in the file that the model does not have are ignored. Every key
-/// the model needs must still be present with its exact shape and the `F32` type, and
-/// nothing is written unless all of them check out.
+/// Like [`load`], but keys in the file that the model does not have are ignored, and
+/// returned: the result is those keys, sorted, so the caller can print or check what was
+/// dropped (for example the slopes of a `Prelu` loaded into a network that uses `Relu`).
+/// Every key the model needs must still be present with its exact shape and the `F32` type,
+/// and nothing is written unless all of them check out.
 ///
 /// # Errors
 ///
-/// The errors of [`load`] except [`Error::UnexpectedKey`].
+/// The errors of [`load`], except that unexpected keys are not an error.
 ///
 /// # Panics
 ///
 /// Panics if `model` was built from a different [`ParamStore`] than `params`.
 ///
 /// ```
-/// use cavitation_core::{Error, ParamStore, Rng};
-/// use cavitation_nn::{Linear, Sequential, load_lenient};
+/// use cavitation_core::{ParamStore, Rng};
+/// use cavitation_nn::{Linear, Prelu, Relu, Sequential, load_lenient, save};
+///
+/// // A file from a network with PReLU slopes at index 1.
+/// let mut file_params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let with_prelu = Sequential::new()
+///     .push(Linear::new(&mut file_params, 2, 3, &mut rng))
+///     .push(Prelu::new(&mut file_params, 1))
+///     .push(Linear::new(&mut file_params, 3, 1, &mut rng));
+/// let path = std::env::temp_dir().join(format!("cavitation-doc-lenient-{}.safetensors", std::process::id()));
+/// save(&path, &with_prelu, &file_params)?;
+///
+/// // The same network with ReLU: it has no slopes, so the file's `1.weight` is ignored.
 /// let mut params = ParamStore::new();
-/// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
-/// let missing = std::env::temp_dir().join("cavitation-doc-no-such-file.safetensors");
-/// assert!(matches!(load_lenient(missing, &net, &mut params), Err(Error::Io { .. })));
+/// let mut rng = Rng::seed(5);
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 3, 1, &mut rng));
+/// let ignored = load_lenient(&path, &net, &mut params)?;
+/// assert_eq!(ignored, ["1.weight"]);
+///
+/// // The Linear layers hold the file's values.
+/// let loaded = params.value(net.parameter_names()[0].1).data().to_vec();
+/// let saved = file_params.value(with_prelu.parameter_names()[0].1).data().to_vec();
+/// assert_eq!(loaded, saved);
+/// std::fs::remove_file(&path).ok();
+/// # Ok::<(), cavitation_core::Error>(())
 /// ```
 pub fn load_lenient(
     path: impl AsRef<Path>,
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     let options = LoadOptions {
         strict: false,
         ..LoadOptions::default()
@@ -193,8 +240,8 @@ pub struct LoadOptions<'a> {
     /// Maps each key in the file to the key the model uses; `None` keeps the keys as they are.
     #[allow(clippy::type_complexity)]
     pub rename: Option<Box<dyn Fn(&str) -> String + 'a>>,
-    /// Whether a key that the model lacks (after renaming) is an [`Error::UnexpectedKey`]
-    /// (`true`) or ignored (`false`).
+    /// Whether a key that the model lacks (after renaming) is an error, listed in
+    /// [`KeyErrors::unexpected`] (`true`), or ignored (`false`).
     pub strict: bool,
 }
 
@@ -245,12 +292,15 @@ impl<'a> LoadOptions<'a> {
 /// and with `options.strict` a renamed key the model lacks is an error. Nothing is written
 /// into `params` unless every check passes, a collision between renamed keys included.
 ///
+/// Returns the keys of the file that the model does not have, renamed and sorted, when
+/// `options.strict` is `false`; it is empty when `strict` is `true`, since such a key is an
+/// error then.
+///
 /// # Errors
 ///
-/// The errors of [`load`] (the keys in [`Error::MissingKey`] and [`Error::UnexpectedKey`] are
-/// the renamed ones), and [`Error::Format`] when two keys of the file rename to the same key;
-/// the message names both. For two keys that collide, the first in alphabetical order is
-/// named first.
+/// The errors of [`load`] (the keys in [`Error::Keys`] are the renamed ones), and [`Error::Format`]
+/// when two keys of the file rename to the same key; the message names both. For two keys that
+/// collide, the first in alphabetical order is named first.
 ///
 /// # Panics
 ///
@@ -312,7 +362,7 @@ pub fn load_with(
     model: &Sequential<f32>,
     params: &mut ParamStore<f32>,
     options: LoadOptions<'_>,
-) -> Result<(), Error> {
+) -> Result<Vec<String>, Error> {
     let path = path.as_ref();
     let bytes = std::fs::read(path).map_err(|source| Error::Io {
         path: path.to_path_buf(),
@@ -341,25 +391,26 @@ pub fn load_with(
         by_name.insert(renamed, key);
     }
 
+    // Every key is checked and every problem collected, so one error shows all of them.
+    let mut problems = KeyErrors::default();
     let mut staged: Vec<(ParamId, Vec<f32>)> = Vec::with_capacity(names.len());
     for (name, id) in &names {
-        let tensor = by_name
-            .get(name)
-            .and_then(|key| file.tensor(key).ok())
-            .ok_or_else(|| Error::MissingKey(name.clone()))?;
+        let Some(tensor) = by_name.get(name).and_then(|key| file.tensor(key).ok()) else {
+            problems.missing.push(name.clone());
+            continue;
+        };
         if tensor.dtype() != Dtype::F32 {
-            return Err(Error::Dtype {
-                key: name.clone(),
-                found: format!("{:?}", tensor.dtype()),
-            });
+            problems
+                .wrong_dtype
+                .push((name.clone(), format!("{:?}", tensor.dtype())));
+            continue;
         }
         let expected = params.value(*id).shape().dims();
         if tensor.shape() != expected {
-            return Err(Error::WrongShape {
-                key: name.clone(),
-                expected: expected.to_vec(),
-                found: tensor.shape().to_vec(),
-            });
+            problems
+                .wrong_shape
+                .push((name.clone(), expected.to_vec(), tensor.shape().to_vec()));
+            continue;
         }
         let values = tensor
             .data()
@@ -370,35 +421,47 @@ pub fn load_with(
             .collect();
         staged.push((*id, values));
     }
+    let mut extra: Vec<String> = by_name
+        .keys()
+        .filter(|renamed| !names.iter().any(|(name, _)| name == *renamed))
+        .cloned()
+        .collect();
+    extra.sort_unstable();
     if options.strict {
-        let mut extra: Vec<&String> = by_name
-            .keys()
-            .filter(|renamed| !names.iter().any(|(name, _)| name == *renamed))
-            .collect();
-        extra.sort_unstable();
-        if let Some(key) = extra.first() {
-            return Err(Error::UnexpectedKey((*key).clone()));
+        problems.unexpected = extra.clone();
+    }
+    if !(problems.missing.is_empty()
+        && problems.unexpected.is_empty()
+        && problems.wrong_shape.is_empty()
+        && problems.wrong_dtype.is_empty())
+    {
+        // When no key of the model was found at all, show what the file holds instead.
+        if problems.missing.len() == names.len() {
+            let mut held: Vec<&String> = by_name.keys().collect();
+            held.sort_unstable();
+            problems.file_keys = held.into_iter().take(5).cloned().collect();
         }
+        return Err(Error::Keys(Box::new(problems)));
     }
 
     for (id, values) in staged {
         params.value_mut(id).data_mut().copy_from_slice(&values);
     }
-    Ok(())
+    Ok(if options.strict { Vec::new() } else { extra })
 }
 
 #[cfg(test)]
 mod tests {
-    //! Tests of `save`, `load` and `load_lenient`.
+    //! Tests of `save`, `load`, `load_lenient` and `load_with`.
 
     use std::path::{Path, PathBuf};
 
-    use cavitation_core::{Error, Graph, ParamStore, Rng, Tensor};
+    use cavitation_core::{Error, Graph, KeyErrors, ParamStore, Rng, Tensor};
     use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     use serde_json::Value;
 
     use super::{LoadOptions, load, load_lenient, load_with, save};
-    use crate::{Linear, Relu, Sequential};
+    use crate::{Linear, Prelu, Relu, Sequential};
 
     /// A path in the temporary folder that no other test or process uses.
     fn temp_path(name: &str) -> PathBuf {
@@ -570,7 +633,15 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// A file without `2.bias` is `MissingKey("2.bias")`.
+    /// The key problems of a load error, failing the test for any other error.
+    fn keys_of(err: &Error) -> &KeyErrors {
+        match err {
+            Error::Keys(keys) => keys,
+            other => panic!("expected Error::Keys, got {other:?}"),
+        }
+    }
+
+    /// A file without `2.bias` lists exactly that key as missing.
     #[test]
     fn missing_key_error() {
         let path = temp_path("missing");
@@ -579,10 +650,10 @@ mod tests {
         write_entries(&path, &entries);
         let (net, mut params) = mlp(1);
         let err = load(&path, &net, &mut params).unwrap_err();
-        assert!(
-            matches!(&err, Error::MissingKey(k) if k == "2.bias"),
-            "{err:?}"
-        );
+        let keys = keys_of(&err);
+        assert_eq!(keys.missing, ["2.bias"]);
+        assert!(keys.unexpected.is_empty() && keys.wrong_shape.is_empty());
+        assert!(err.to_string().contains("2.bias"), "{err}");
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -595,11 +666,9 @@ mod tests {
         write_entries(&path, &entries);
         let (net, mut params) = mlp(1);
         let err = load(&path, &net, &mut params).unwrap_err();
-        assert!(
-            matches!(&err, Error::UnexpectedKey(k) if k == "3.weight"),
-            "{err:?}"
-        );
-        load_lenient(&path, &net, &mut params).unwrap();
+        assert_eq!(keys_of(&err).unexpected, ["3.weight"]);
+        let ignored = load_lenient(&path, &net, &mut params).unwrap();
+        assert_eq!(ignored, ["3.weight"]);
         assert!(
             params
                 .value(net.parameter_names()[0].1)
@@ -639,9 +708,9 @@ mod tests {
         write_entries(&path, &entries);
         let (net, mut params) = mlp(1);
         let err = load(&path, &net, &mut params).unwrap_err();
-        assert!(
-            matches!(&err, Error::Dtype { key, .. } if key == "0.bias"),
-            "{err:?}"
+        assert_eq!(
+            keys_of(&err).wrong_dtype,
+            [("0.bias".to_string(), "F16".to_string())]
         );
         assert!(err.to_string().contains("F32"), "{err}");
         std::fs::remove_file(&path).unwrap();
@@ -675,6 +744,166 @@ mod tests {
         let before = bits(&net, &params);
         assert!(load(&path, &net, &mut params).is_err());
         assert_eq!(bits(&net, &params), before);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The 64 -> 256 -> ReLU -> 128 -> ReLU -> 10 network of the known-result test.
+    fn digits_net() -> (Sequential<f32>, ParamStore<f32>) {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(1);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 64, 256, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 256, 128, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 128, 10, &mut rng));
+        (net, params)
+    }
+
+    /// A file named for PyTorch modules `fc1`, `fc2`, `fc3` gives one error that lists every
+    /// missing and unexpected key and the file's own first keys.
+    #[test]
+    fn every_problem_listed() {
+        let path = temp_path("fc-names");
+        write_entries(
+            &path,
+            &[
+                zeros("fc1.weight", &[256, 64]),
+                zeros("fc1.bias", &[256]),
+                zeros("fc2.weight", &[128, 256]),
+                zeros("fc2.bias", &[128]),
+                zeros("fc3.weight", &[10, 128]),
+                zeros("fc3.bias", &[10]),
+            ],
+        );
+        let (net, mut params) = digits_net();
+        let err = load(&path, &net, &mut params).unwrap_err();
+        let keys = keys_of(&err);
+        assert_eq!(
+            keys.missing,
+            [
+                "0.weight", "0.bias", "2.weight", "2.bias", "4.weight", "4.bias"
+            ]
+        );
+        let mut fc: Vec<String> = ["1", "2", "3"]
+            .iter()
+            .flat_map(|n| [format!("fc{n}.bias"), format!("fc{n}.weight")])
+            .collect();
+        fc.sort();
+        assert_eq!(keys.unexpected, fc);
+        assert_eq!(keys.file_keys[0], "fc1.bias");
+        assert_eq!(keys.file_keys.len(), 5);
+        let text = err.to_string();
+        for key in keys.missing.iter().chain(&keys.unexpected) {
+            assert!(text.contains(key.as_str()), "{key} not in {text}");
+        }
+        assert!(text.contains("fc1.bias"), "{text}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A wrong dtype on one key and a wrong shape on another are both in one error.
+    #[test]
+    fn wrong_shape_and_dtype_together() {
+        let path = temp_path("shape-and-dtype");
+        let mut entries = good_entries();
+        entries[1] = Entry {
+            name: "0.bias",
+            dtype: Dtype::F16,
+            shape: vec![8],
+            bytes: vec![0; 16],
+        };
+        entries[2] = zeros("2.weight", &[3, 7]);
+        write_entries(&path, &entries);
+        let (net, mut params) = mlp(1);
+        let err = load(&path, &net, &mut params).unwrap_err();
+        let keys = keys_of(&err);
+        assert_eq!(
+            keys.wrong_shape,
+            [("2.weight".to_string(), vec![3, 8], vec![3, 7])]
+        );
+        assert_eq!(
+            keys.wrong_dtype,
+            [("0.bias".to_string(), "F16".to_string())]
+        );
+        assert!(keys.missing.is_empty() && keys.unexpected.is_empty());
+        let text = err.to_string();
+        assert!(
+            text.contains("2.weight") && text.contains("[3, 7]"),
+            "{text}"
+        );
+        assert!(text.contains("0.bias") && text.contains("F16"), "{text}");
+        assert!(!text.contains("transposed"), "{text}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A weight stored as `[inputs, outputs]` gets the transposed hint.
+    #[test]
+    fn transposed_weight_hint() {
+        let path = temp_path("transposed");
+        write_entries(
+            &path,
+            &[
+                zeros("0.weight", &[64, 256]),
+                zeros("0.bias", &[256]),
+                zeros("2.weight", &[128, 256]),
+                zeros("2.bias", &[128]),
+                zeros("4.weight", &[10, 128]),
+                zeros("4.bias", &[10]),
+            ],
+        );
+        let (net, mut params) = digits_net();
+        let err = load(&path, &net, &mut params).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains(
+                "this looks transposed: PyTorch and Cavitation store Linear weights as [outputs, inputs]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("[64, 256]") && text.contains("[256, 64]"),
+            "{text}"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// With eleven missing keys, ten are listed and the message ends with "and 1 more".
+    #[test]
+    fn eleven_missing_keys_capped_at_ten() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(1);
+        let mut net = Sequential::new();
+        for _ in 0..5 {
+            net = net.push(Linear::new(&mut params, 2, 2, &mut rng));
+        }
+        net = net.push(Prelu::new(&mut params, 1));
+        let path = temp_path("eleven");
+        write_entries(&path, &[zeros("other", &[1])]);
+        let err = load(&path, &net, &mut params).unwrap_err();
+        let keys = keys_of(&err);
+        assert_eq!(keys.missing.len(), 11);
+        let text = err.to_string();
+        assert!(text.contains("and 1 more"), "{text}");
+        assert!(text.contains(keys.missing[9].as_str()), "{text}");
+        assert!(!text.contains(keys.missing[10].as_str()), "{text}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A PReLU network's file loaded into the ReLU network reports the slope key it dropped.
+    #[test]
+    fn lenient_returns_ignored_keys() {
+        let mut file_params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let with_prelu = Sequential::new()
+            .push(Linear::new(&mut file_params, 4, 8, &mut rng))
+            .push(Prelu::new(&mut file_params, 1))
+            .push(Linear::new(&mut file_params, 8, 3, &mut rng));
+        let path = temp_path("prelu");
+        save(&path, &with_prelu, &file_params).unwrap();
+        let (net, mut params) = mlp(1);
+        assert!(load(&path, &net, &mut params).is_err());
+        let ignored = load_lenient(&path, &net, &mut params).unwrap();
+        assert_eq!(ignored, ["1.weight"]);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -966,7 +1195,8 @@ mod tests {
     }
 
     /// With a rename, `strict` checks the renamed keys: a key mapped to a name the model
-    /// lacks is `UnexpectedKey` with the renamed key, and ignored when not strict.
+    /// lacks is listed in `KeyErrors::unexpected` under the renamed key, and ignored (and
+    /// returned) when not strict.
     #[test]
     fn strict_checks_renamed_keys() {
         let path = temp_path("renamed-extra");
@@ -980,15 +1210,13 @@ mod tests {
             ..LoadOptions::default()
         };
         let err = load_with(&path, &net, &mut params, strict).unwrap_err();
-        assert!(
-            matches!(&err, Error::UnexpectedKey(k) if k == "9.weight"),
-            "{err:?}"
-        );
+        assert_eq!(keys_of(&err).unexpected, ["9.weight"]);
         let lenient = LoadOptions {
             rename: Some(Box::new(rename)),
             strict: false,
         };
-        load_with(&path, &net, &mut params, lenient).unwrap();
+        let ignored = load_with(&path, &net, &mut params, lenient).unwrap();
+        assert_eq!(ignored, ["9.weight"]);
         std::fs::remove_file(&path).unwrap();
     }
 

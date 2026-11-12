@@ -453,3 +453,50 @@ fn empty_sequential_is_identity() {
 fn layer_out_of_range_panics() {
     Sequential::new().push(Relu).layer(2);
 }
+
+/// Every parameterised activation's `Default` holds PyTorch's default setting: `nn.LeakyReLU()`
+/// slope 0.01, `nn.ELU()` and `nn.CELU()` alpha 1.0, `nn.Softplus()` beta 1 and threshold 20,
+/// `nn.Hardtanh()` range -1 to 1.
+#[test]
+fn activation_defaults_match_pytorch() {
+    assert_eq!(LeakyRelu::default(), LeakyRelu { slope: 0.01 });
+    assert_eq!(Elu::default(), Elu { alpha: 1.0 });
+    assert_eq!(Celu::default(), Celu { alpha: 1.0 });
+    assert_eq!(
+        Softplus::default(),
+        Softplus {
+            beta: 1.0,
+            threshold: 20.0
+        }
+    );
+    assert_eq!(
+        Hardtanh::default(),
+        Hardtanh {
+            min: -1.0,
+            max: 1.0
+        }
+    );
+    assert_eq!(
+        Gelu::default(),
+        Gelu {
+            approx: GeluApprox::Exact
+        }
+    );
+}
+
+/// `Gelu::default()` is the exact (erf) form, `nn.GELU()`'s `approximate='none'`: its kind and
+/// its value at 1 (`0.5 · (1 + erf(1/√2))`, 0.8413447) say so, and differ from the tanh form.
+#[test]
+fn gelu_default_is_exact() {
+    let kind = Activation::<f64>::builtin(&Gelu::default());
+    assert_eq!(kind, Some(ActivationKind::Gelu(GeluApprox::Exact)));
+    let exact = Activation::<f64>::f(&Gelu::default(), 1.0);
+    assert!((exact - 0.841_344_746_068_542_9).abs() < 1e-12);
+    let tanh = Activation::<f64>::f(
+        &Gelu {
+            approx: GeluApprox::Tanh,
+        },
+        1.0,
+    );
+    assert!((exact - tanh).abs() > 1e-6);
+}

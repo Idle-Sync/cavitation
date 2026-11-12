@@ -1,5 +1,5 @@
 //! CPU kernels: strided matrix views, the plain reference implementations, the kernel level
-//! (which instruction set the fast kernels use) and the thread count.
+//! (which instruction set, or which vendor library, the fast kernels use) and the thread count.
 //!
 //! The tape's matrix products and the optimisers run on these kernels; most programs never
 //! call them directly. [`MatRef`] and [`MatMut`] describe a matrix inside a slice by its
@@ -24,6 +24,8 @@
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(any(test, all(target_vendor = "apple", target_arch = "aarch64")))]
+mod accelerate;
 pub mod gemm;
 pub mod matvec;
 pub mod pool;
@@ -40,11 +42,13 @@ use crate::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-/// The instruction set the fast kernels use.
+/// The instruction set, or the vendor library, the fast kernels use.
 ///
 /// The level starts as [`detected`] (or as `CAVITATION_KERNEL`, if set) and can be changed
 /// with [`set_level`]. Every level gives results within the documented tolerance of the
-/// reference kernels; the same level and inputs give bit-identical results.
+/// reference kernels; the same level and inputs give bit-identical results, except at
+/// [`Level::Accelerate`], where that holds on one machine and one macOS version (Apple does
+/// not promise its rounding across chips or releases).
 ///
 /// # Examples
 ///
@@ -53,6 +57,7 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 /// assert_eq!(Level::Avx2Fma.to_string(), "avx2");
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Level {
     /// The plain reference loops, on every CPU.
     Reference = 0,
@@ -62,11 +67,23 @@ pub enum Level {
     Avx2Fma = 2,
     /// aarch64 with NEON: 4-wide f32 vectors with fused multiply-add.
     Neon = 3,
+    /// Apple Silicon: matrix products through Apple's Accelerate framework (`cblas_sgemm`),
+    /// everything else through the NEON kernels. Products whose layout BLAS cannot express
+    /// (neither stride 1, overlapping or broadcast rows, sizes beyond `i32`) and products
+    /// with `alpha = 0` run the NEON GEMM. Results match the reference within the GEMM
+    /// tolerance, as every level does, and differ from NEON's in the last bits.
+    Accelerate = 4,
 }
 
 impl Level {
     /// Every level, in the order of their numbers.
-    const ALL: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
+    const ALL: [Level; 5] = [
+        Level::Reference,
+        Level::Sse42,
+        Level::Avx2Fma,
+        Level::Neon,
+        Level::Accelerate,
+    ];
 
     /// The level stored as `n` in [`LEVEL`], if `n` is one.
     fn from_u8(n: u8) -> Option<Level> {
@@ -75,11 +92,13 @@ impl Level {
 }
 
 impl fmt::Display for Level {
-    /// Writes the name `CAVITATION_KERNEL` accepts: `reference`, `sse4.2`, `avx2` or `neon`.
+    /// Writes the name `CAVITATION_KERNEL` accepts: `reference`, `sse4.2`, `avx2`, `neon` or
+    /// `accelerate`.
     ///
     /// ```
     /// use cavitation_core::kernels::Level;
     /// assert_eq!(Level::Sse42.to_string(), "sse4.2");
+    /// assert_eq!(Level::Accelerate.to_string(), "accelerate");
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -87,12 +106,13 @@ impl fmt::Display for Level {
             Level::Sse42 => "sse4.2",
             Level::Avx2Fma => "avx2",
             Level::Neon => "neon",
+            Level::Accelerate => "accelerate",
         })
     }
 }
 
-/// Parses a level name as `CAVITATION_KERNEL` takes it: `reference`, `sse4.2`, `avx2` or
-/// `neon`. Whether this CPU can run the level is not checked; see [`supported`].
+/// Parses a level name as `CAVITATION_KERNEL` takes it: `reference`, `sse4.2`, `avx2`, `neon`
+/// or `accelerate`. Whether this CPU can run the level is not checked; see [`supported`].
 ///
 /// # Errors
 ///
@@ -103,6 +123,7 @@ impl fmt::Display for Level {
 /// ```
 /// use cavitation_core::kernels::{parse_level, Level};
 /// assert_eq!(parse_level("avx2"), Ok(Level::Avx2Fma));
+/// assert_eq!(parse_level("accelerate"), Ok(Level::Accelerate));
 /// assert!(parse_level("avx512").is_err());
 /// ```
 pub fn parse_level(s: &str) -> Result<Level, String> {
@@ -110,7 +131,9 @@ pub fn parse_level(s: &str) -> Result<Level, String> {
         .into_iter()
         .find(|l| l.to_string() == s)
         .ok_or_else(|| {
-            format!("unknown kernel level `{s}`; expected reference, sse4.2, avx2 or neon")
+            format!(
+                "unknown kernel level `{s}`; expected reference, sse4.2, avx2, neon or accelerate"
+            )
         })
 }
 
@@ -137,7 +160,9 @@ pub fn parse_threads(s: &str) -> Result<usize, String> {
     }
 }
 
-/// Whether this CPU can run `level`. [`Level::Reference`] always can.
+/// Whether this CPU can run `level`. [`Level::Reference`] always can;
+/// [`Level::Accelerate`] runs on Apple Silicon only (an Apple aarch64 target, where the
+/// Accelerate framework is part of the system).
 ///
 /// # Examples
 ///
@@ -157,13 +182,16 @@ pub fn supported(level: Level) -> bool {
         }
         #[cfg(target_arch = "aarch64")]
         Level::Neon => std::arch::is_aarch64_feature_detected!("neon"),
+        // The level runs the NEON kernels for everything but the matrix products.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        Level::Accelerate => std::arch::is_aarch64_feature_detected!("neon"),
         #[allow(unreachable_patterns)]
         _ => false,
     }
 }
 
-/// The best level this CPU supports: AVX2 with FMA, then SSE4.2, on x86_64; NEON on
-/// aarch64; the reference kernels anywhere else.
+/// The best level this CPU supports: AVX2 with FMA, then SSE4.2, on x86_64; Accelerate on
+/// Apple Silicon; NEON on other aarch64 systems; the reference kernels anywhere else.
 ///
 /// # Examples
 ///
@@ -172,7 +200,7 @@ pub fn supported(level: Level) -> bool {
 /// assert!(supported(detected()));
 /// ```
 pub fn detected() -> Level {
-    [Level::Avx2Fma, Level::Neon, Level::Sse42]
+    [Level::Accelerate, Level::Avx2Fma, Level::Neon, Level::Sse42]
         .into_iter()
         .find(|&l| supported(l))
         .unwrap_or(Level::Reference)
@@ -199,6 +227,8 @@ fn detected_features() -> String {
             found.push("neon");
         }
     }
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    found.push("accelerate");
     if found.is_empty() {
         "none".to_string()
     } else {
@@ -211,6 +241,23 @@ static LEVEL: AtomicU8 = AtomicU8::new(UNSET);
 
 /// The value of [`LEVEL`] before the level is first read or set.
 const UNSET: u8 = u8::MAX;
+
+/// Why this machine cannot run `level`, for the error and panic messages: the platform for a
+/// level that exists only on one (Accelerate), the CPU for the instruction-set levels. Names
+/// the detected features either way.
+pub(crate) fn cannot_run(level: Level) -> String {
+    if level == Level::Accelerate {
+        format!(
+            "accelerate runs on Apple Silicon only (detected features: {})",
+            detected_features()
+        )
+    } else {
+        format!(
+            "this CPU cannot run kernel level {level} (detected features: {})",
+            detected_features()
+        )
+    }
+}
 
 /// The level `CAVITATION_KERNEL` names, or [`detected`] if it is not set.
 ///
@@ -225,9 +272,8 @@ fn level_from_env() -> Level {
     let level = parse_level(&value).unwrap_or_else(|e| panic!("CAVITATION_KERNEL: {e}"));
     assert!(
         supported(level),
-        "CAVITATION_KERNEL=`{level}`: this CPU cannot run kernel level {level} \
-         (detected features: {})",
-        detected_features()
+        "CAVITATION_KERNEL=`{level}`: {}",
+        cannot_run(level)
     );
     level
 }
@@ -274,10 +320,7 @@ pub fn level() -> Level {
 /// ```
 pub fn set_level(level: Level) -> Result<(), Error> {
     if !supported(level) {
-        return Err(Error::Unsupported(format!(
-            "kernel level {level} on this CPU (detected features: {})",
-            detected_features()
-        )));
+        return Err(Error::Unsupported(cannot_run(level)));
     }
     LEVEL.store(level as u8, Ordering::Relaxed);
     Ok(())
@@ -286,8 +329,7 @@ pub fn set_level(level: Level) -> Result<(), Error> {
 /// The current thread count, or 0 before the first use.
 static THREADS: AtomicUsize = AtomicUsize::new(0);
 
-/// The thread count `CAVITATION_THREADS` gives, or the available parallelism (1 if unknown)
-/// if it is not set.
+/// The thread count `CAVITATION_THREADS` gives, or [`default_threads`] if it is not set.
 ///
 /// # Panics
 ///
@@ -296,13 +338,125 @@ fn threads_from_env() -> usize {
     match std::env::var_os("CAVITATION_THREADS") {
         Some(value) => parse_threads(&value.to_string_lossy())
             .unwrap_or_else(|e| panic!("CAVITATION_THREADS: {e}")),
-        None => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        None => default_threads(),
     }
 }
 
+/// [`std::thread::available_parallelism`], or 1 if it is unknown.
+fn available_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+/// The thread count used when neither [`set_threads`] nor `CAVITATION_THREADS` gives one:
+/// the number of performance cores where the system reports it (Apple Silicon), else
+/// [`std::thread::available_parallelism`] (1 if that is unknown). [`threads`] calls it once,
+/// on first use, and keeps the answer.
+///
+/// On an Apple M4 (4 performance and 6 efficiency cores) training at 10 threads was slower
+/// than at 4: 1.14 against 0.97 s per MNIST epoch at batch 128, and 392k against 677k digits
+/// samples per second (measured with `cavitation-bench all`, NEON kernels, medians of 3 runs).
+///
+/// # Examples
+///
+/// The function is private; its answer is what [`threads`] returns when nothing overrides it:
+///
+/// ```
+/// let n = cavitation_core::kernels::threads();
+/// assert!(n >= 1);
+/// if std::env::var_os("CAVITATION_THREADS").is_none() {
+///     let available = std::thread::available_parallelism().map_or(1, |n| n.get());
+///     // On Apple systems the performance-core count, when the sysctl reports one.
+///     let performance_cores = std::process::Command::new("sysctl")
+///         .args(["-n", "hw.perflevel0.physicalcpu"])
+///         .output()
+///         .ok()
+///         .filter(|out| out.status.success())
+///         .and_then(|out| String::from_utf8(out.stdout).ok()?.trim().parse::<usize>().ok())
+///         .filter(|&cores| cores > 0);
+///     let expected = match performance_cores {
+///         Some(cores) if cfg!(target_vendor = "apple") => cores.min(available),
+///         _ => available,
+///     };
+///     assert_eq!(n, expected);
+/// }
+/// ```
+fn default_threads() -> usize {
+    default_threads_from(performance_cores)
+}
+
+/// [`default_threads`] with the performance-core count read by `read`, so tests can stand in
+/// for the system: `read`'s count if it gives a positive one (at most the available
+/// parallelism), else the available parallelism (1 if that is unknown).
+fn default_threads_from(read: impl FnOnce() -> std::io::Result<usize>) -> usize {
+    let available = available_threads();
+    match read() {
+        Ok(n) if n > 0 => n.min(available),
+        _ => available,
+    }
+}
+
+/// The number of performance cores, from `sysctl hw.perflevel0.physicalcpu`. Fails on a Mac
+/// without performance levels (Intel), and the error says why.
+#[cfg(target_vendor = "apple")]
+fn performance_cores() -> std::io::Result<usize> {
+    use std::ffi::{c_char, c_int, c_void};
+    // SAFETY: the declaration matches `sysctlbyname` in the system's `<sys/sysctl.h>`
+    // (`size_t` is `usize` on every Apple target), and the C library exports it.
+    unsafe extern "C" {
+        /// Reads (or, with `newp` non-null, writes) the system value named `name` into the
+        /// `*oldlenp` bytes at `oldp`, storing the length written in `*oldlenp`. Returns 0
+        /// on success, or -1 with `errno` set.
+        fn sysctlbyname(
+            name: *const c_char,
+            oldp: *mut c_void,
+            oldlenp: *mut usize,
+            newp: *mut c_void,
+            newlen: usize,
+        ) -> c_int;
+    }
+    let mut value: i32 = 0;
+    let mut len = size_of::<i32>();
+    // SAFETY: the name is a NUL-terminated C string; `oldp` points at `len` writable bytes
+    // (an `i32` this function owns), and `oldlenp` at `len`; nothing is written (`newp` null,
+    // `newlen` 0). All three pointers outlive the call.
+    let status = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut value).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if status != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if len != size_of::<i32>() {
+        return Err(std::io::Error::other(format!(
+            "hw.perflevel0.physicalcpu: expected 4 bytes, got {len}"
+        )));
+    }
+    usize::try_from(value).map_err(|_| {
+        std::io::Error::other(format!("hw.perflevel0.physicalcpu: negative count {value}"))
+    })
+}
+
+/// The number of performance cores: unknown on systems other than Apple's, so the default
+/// thread count falls back to the available parallelism.
+#[cfg(not(target_vendor = "apple"))]
+fn performance_cores() -> std::io::Result<usize> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// The number of threads the threaded kernels use: the last value passed to
-/// [`set_threads`], else `CAVITATION_THREADS` if it is set, else
-/// [`std::thread::available_parallelism`] (1 if that is unknown). Always at least 1.
+/// [`set_threads`], else `CAVITATION_THREADS` if it is set, else the number of performance
+/// cores on Apple Silicon (where the efficiency cores slow training down) and
+/// [`std::thread::available_parallelism`] elsewhere (1 if that is unknown). Always at
+/// least 1.
+///
+/// At [`Level::Accelerate`] each matrix product is one Accelerate call, so this count does not
+/// limit the threads Accelerate starts itself (Apple's `VECLIB_MAXIMUM_THREADS` does); it
+/// still governs the optimiser update and every product at the other levels.
 ///
 /// # Panics
 ///
@@ -366,9 +520,10 @@ fn required_len(rows: usize, cols: usize, row_stride: usize, col_stride: usize) 
 
 /// Whether no two distinct elements of a `rows` by `cols` view can share an offset.
 ///
-/// An empty view (no rows or no columns) always passes. Otherwise only dimensions with
-/// extent above 1 count. A single such dimension needs a stride of at least 1. Two need, with the smaller stride `s` and its extent `e`, `s >= 1` and
-/// `e * s <= ` the larger stride. This is sufficient, not necessary.
+/// An empty view (no rows or no columns) always passes. Otherwise only dimensions with extent above
+/// 1 count. A single such dimension needs a stride of at least 1. Two need, with the smaller stride
+/// `s` and its extent `e`, `s >= 1` and `e * s <= ` the larger stride. This is sufficient, not
+/// necessary.
 fn is_non_aliasing(rows: usize, cols: usize, row_stride: usize, col_stride: usize) -> bool {
     if rows == 0 || cols == 0 {
         // No elements, so none can share an offset.
@@ -708,7 +863,6 @@ impl<'a, T: Real> MatMut<'a, T> {
 mod tests {
     use super::*;
     use crate::Error;
-    use std::process::Command;
 
     /// Every level name parses to its level and prints back the same; unknown names are
     /// rejected with an error naming them.
@@ -719,6 +873,7 @@ mod tests {
             ("sse4.2", Level::Sse42),
             ("avx2", Level::Avx2Fma),
             ("neon", Level::Neon),
+            ("accelerate", Level::Accelerate),
         ];
         for (name, level) in names {
             assert_eq!(parse_level(name), Ok(level));
@@ -744,6 +899,23 @@ mod tests {
         assert!(supported(detected()));
     }
 
+    /// Accelerate is supported, and is the detected level, exactly on Apple Silicon; anywhere
+    /// else forcing it is an `Unsupported` error naming it, like any level the CPU cannot run.
+    #[test]
+    fn accelerate_only_on_apple_silicon() {
+        let apple_silicon = cfg!(all(target_vendor = "apple", target_arch = "aarch64"));
+        assert_eq!(supported(Level::Accelerate), apple_silicon);
+        assert_eq!(detected() == Level::Accelerate, apple_silicon);
+        if !apple_silicon {
+            let before = level();
+            match set_level(Level::Accelerate) {
+                Err(Error::Unsupported(msg)) => assert!(msg.contains("accelerate"), "{msg}"),
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+            assert_eq!(level(), before);
+        }
+    }
+
     /// Zero, negative numbers and words are not thread counts; the error names the value.
     #[test]
     fn parse_threads_rejects() {
@@ -755,6 +927,38 @@ mod tests {
         assert_eq!(parse_threads("16"), Ok(16));
     }
 
+    /// The default thread count takes a positive performance-core count (capped at the
+    /// available parallelism) and falls back to the available parallelism when the read
+    /// fails or reports 0.
+    #[test]
+    fn default_threads_falls_back() {
+        let available = available_threads();
+        let missing = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(default_threads_from(missing), available);
+        assert_eq!(default_threads_from(|| Ok(0)), available);
+        assert_eq!(default_threads_from(|| Ok(1)), 1);
+        assert_eq!(default_threads_from(|| Ok(available + 1)), available);
+        #[cfg(not(target_vendor = "apple"))]
+        assert_eq!(default_threads(), available);
+    }
+
+    /// On Apple Silicon the sysctl reports at least one performance core, no more than the
+    /// logical cores, and that count is the default.
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    #[test]
+    fn performance_cores_read_on_apple_silicon() {
+        let Ok(n) = performance_cores() else {
+            // A virtual machine's guest can lack the sysctl; the default then falls back to
+            // the available parallelism, which `default_threads_falls_back` covers.
+            println!(
+                "performance_cores_read_on_apple_silicon: skipped, hw.perflevel0.physicalcpu is not available"
+            );
+            return;
+        };
+        assert!(n >= 1 && n <= available_threads(), "{n} performance cores");
+        assert_eq!(default_threads(), n);
+    }
+
     /// Re-runs this test binary with `name` (an ignored helper test) and one environment
     /// variable set, and returns whether it succeeded and what it wrote to stderr.
     ///
@@ -763,20 +967,11 @@ mod tests {
     /// Panics if the child did not run the helper: a filter that matches no test also exits
     /// successfully, so the child's summary must report the one test passed or failed.
     fn run_child(name: &str, var: &str, value: &str) -> (bool, String) {
-        let exe = std::env::current_exe().expect("the test binary's path");
-        let out = Command::new(exe)
-            .args([
-                "--ignored",
-                "--exact",
-                "--nocapture",
-                "--test-threads=1",
-                name,
-            ])
-            .env_remove("CAVITATION_THREADS")
-            .env_remove("CAVITATION_KERNEL")
-            .env(var, value)
-            .output()
-            .expect("the test binary runs");
+        let out = crate::test_child::run_alone_without(
+            name,
+            &[(var, value)],
+            &["CAVITATION_THREADS", "CAVITATION_KERNEL"],
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let ok = out.status.success();
         let summary = if ok { "1 passed" } else { "1 failed" };
@@ -843,6 +1038,22 @@ mod tests {
             "reference",
         );
         assert!(ok, "stderr:\n{stderr}");
+        // `accelerate` runs on Apple Silicon and is refused, the same way, everywhere else.
+        let (ok, stderr) = run_child(
+            "kernels::tests::level_from_env",
+            "CAVITATION_KERNEL",
+            "accelerate",
+        );
+        if supported(Level::Accelerate) {
+            assert!(ok, "stderr:\n{stderr}");
+        } else {
+            assert!(!ok, "stderr:\n{stderr}");
+            assert!(
+                stderr.contains("accelerate runs on Apple Silicon only")
+                    && stderr.contains("detected features"),
+                "stderr:\n{stderr}"
+            );
+        }
     }
 
     /// Helper for `env_invalid_panics_in_child`: reads the thread count from the

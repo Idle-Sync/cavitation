@@ -1,10 +1,13 @@
-# PyTorch CPU build and its dependencies, pinned to the versions the fixtures were written with.
+# PyTorch and its dependencies, pinned to the versions the fixtures were written with. On Linux
+# torch is the CPU build from the PyTorch CPU index (which has no macOS wheels); on macOS it is
+# the same version from PyPI. The index flags below do the rest.
 # Install with:
 #   uv venv scripts/fixtures/.venv --python 3.14
 #   uv pip install --python scripts/fixtures/.venv/bin/python --index-strategy unsafe-best-match -r scripts/fixtures/requirements.txt
 --index-url https://download.pytorch.org/whl/cpu
 --extra-index-url https://pypi.org/simple
-torch==2.15.0+cpu
+torch==2.15.0+cpu; sys_platform != "darwin"
+torch==2.15.0; sys_platform == "darwin"
 numpy==2.5.4
 safetensors==0.8.0
 filelock==4.2.10

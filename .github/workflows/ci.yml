@@ -45,7 +45,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [reference, neon]
+        kernel: [reference, neon, accelerate]
     env:
       CAVITATION_KERNEL: ${{ matrix.kernel }}
     steps:

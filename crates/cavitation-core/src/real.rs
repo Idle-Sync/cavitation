@@ -64,6 +64,15 @@ pub trait Real:
     /// assert!(<f64 as Real>::EPSILON < <f32 as Real>::EPSILON.to_f64());
     /// ```
     const EPSILON: Self;
+    /// The smallest positive normal value of the type: below it, values are subnormal and
+    /// arithmetic on them can be many times slower.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// assert_eq!(<f32 as Real>::MIN_POSITIVE, f32::MIN_POSITIVE);
+    /// assert_eq!(<f64 as Real>::MIN_POSITIVE, f64::MIN_POSITIVE);
+    /// ```
+    const MIN_POSITIVE: Self;
 
     /// Converts from `f64`, rounding to the nearest value of this type.
     ///
@@ -209,6 +218,7 @@ macro_rules! impl_real {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
             const EPSILON: Self = $t::EPSILON;
+            const MIN_POSITIVE: Self = $t::MIN_POSITIVE;
             fn from_f64(x: f64) -> Self {
                 x as $t
             }

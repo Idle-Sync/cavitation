@@ -29,6 +29,23 @@ pub struct ParamId {
     store: u32,
 }
 
+impl ParamId {
+    /// The parameter's place in its store: 0 for the first one added, 1 for the next, and
+    /// so on. Code that keeps one entry per parameter, such as an optimiser's state, indexes
+    /// by it.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// let mut store = ParamStore::new();
+    /// let a = store.add(Tensor::zeros(&[2]));
+    /// let b = store.add(Tensor::zeros(&[3]));
+    /// assert_eq!((a.position(), b.position()), (0, 1));
+    /// ```
+    pub fn position(&self) -> usize {
+        self.index
+    }
+}
+
 /// The position of `id` in the store with id `store`.
 ///
 /// # Panics

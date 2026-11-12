@@ -27,7 +27,7 @@
 //! assert_eq!(fast, [-1.875, 4.5]);
 //! ```
 
-use super::{Level, MatRef, detected_features, reference, supported};
+use super::{Level, MatRef, reference, supported};
 
 /// One input times a weight matrix stored transposed, with the kernel for the current
 /// [`level`](super::level): `out[j] = bias[j] + Σᵢ x[i] · w_t[i][j]`, then
@@ -64,10 +64,10 @@ pub fn matvec_f32(w_t: MatRef<f32>, x: &[f32], bias: Option<&[f32]>, relu: bool,
 /// setting.
 ///
 /// [`Level::Sse42`] runs 4-wide vectors with a separate multiply and add, [`Level::Avx2Fma`]
-/// 8-wide vectors with fused multiply-add and [`Level::Neon`] 4-wide vectors with fused
-/// multiply-add; [`Level::Reference`] runs [`reference::matvec`]. A weight matrix whose
-/// columns are not contiguous (`col_stride` other than 1) runs the reference loop at every
-/// level.
+/// 8-wide vectors with fused multiply-add, and [`Level::Neon`] and [`Level::Accelerate`]
+/// (whose matvec is NEON's) 4-wide vectors with fused multiply-add; [`Level::Reference`]
+/// runs [`reference::matvec`]. A weight matrix whose columns are not contiguous
+/// (`col_stride` other than 1) runs the reference loop at every level.
 ///
 /// # Panics
 ///
@@ -96,8 +96,8 @@ pub fn matvec_f32_with(
 ) {
     assert!(
         supported(level),
-        "matvec_f32_with: this CPU cannot run kernel level {level} (detected features: {})",
-        detected_features()
+        "matvec_f32_with: {}",
+        super::cannot_run(level)
     );
     reference::check_matvec_shapes(&w_t, x, bias, out);
     let contiguous = w_t.col_stride() == 1 || w_t.cols() <= 1;
@@ -123,8 +123,9 @@ pub fn matvec_f32_with(
             super::x86::matvec_sse(&job, out)
         },
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: this CPU supports NEON (the guard); `job` as for AVX2 above.
-        Level::Neon if contiguous && supported(Level::Neon) => unsafe {
+        // SAFETY: this CPU supports NEON (the guard; Accelerate's support check includes
+        // NEON); `job` as for AVX2 above.
+        Level::Neon | Level::Accelerate if contiguous && supported(level) => unsafe {
             super::aarch64::matvec_neon(&job, out)
         },
         _ => {

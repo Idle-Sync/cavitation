@@ -70,7 +70,12 @@ fn main() -> Result<(), Error> {
         let loss = tape.mse(out, target, Reduction::Mean);
         let value = tape.value(loss).data()[0];
         tape.backward(loss, &mut params.grads);
-        monitor.after_backward(step, value, &tape, &trace, &net)?;
+        let inputs = StepInputs {
+            x: x.view(),
+            targets: TargetsView::Values(y.view()),
+            rows: None,
+        };
+        monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
         drop(tape);
         optimizer.step(&mut params);
         monitor.after_update(step, optimizer.last_stats(), &names)?;

@@ -108,7 +108,7 @@ impl NeuronMask {
 /// A mask stored on a layer of a [`Sequential`](crate::Sequential): the mask, and the same as
 /// a `[width]` tensor of 1 (on) and 0 (off) that the forward pass records as the condition of
 /// [`Tape::keep_where`](cavitation_core::Tape::keep_where).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct LayerMask<T: Real> {
     /// The mask as set.
     pub(crate) mask: NeuronMask,
