@@ -1,5 +1,5 @@
 //! CPU kernels: strided matrix views, the plain reference implementations, the kernel level
-//! (which instruction set the fast kernels use) and the thread count.
+//! (which instruction set, or which vendor library, the fast kernels use) and the thread count.
 //!
 //! The tape's matrix products and the optimisers run on these kernels; most programs never
 //! call them directly. [`MatRef`] and [`MatMut`] describe a matrix inside a slice by its
@@ -24,6 +24,8 @@
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;
+#[cfg(any(test, all(target_vendor = "apple", target_arch = "aarch64")))]
+mod accelerate;
 pub mod gemm;
 pub mod matvec;
 pub mod pool;
@@ -40,7 +42,7 @@ use crate::error::Error;
 use std::fmt;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-/// The instruction set the fast kernels use.
+/// The instruction set, or the vendor library, the fast kernels use.
 ///
 /// The level starts as [`detected`] (or as `CAVITATION_KERNEL`, if set) and can be changed
 /// with [`set_level`]. Every level gives results within the documented tolerance of the
@@ -62,11 +64,22 @@ pub enum Level {
     Avx2Fma = 2,
     /// aarch64 with NEON: 4-wide f32 vectors with fused multiply-add.
     Neon = 3,
+    /// Apple Silicon: matrix products through Apple's Accelerate framework (`cblas_sgemm`),
+    /// everything else through the NEON kernels. Products whose layout BLAS cannot express
+    /// (neither stride 1) run the NEON GEMM. Results match the reference within the GEMM
+    /// tolerance, as every level does, and differ from NEON's in the last bits.
+    Accelerate = 4,
 }
 
 impl Level {
     /// Every level, in the order of their numbers.
-    const ALL: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
+    const ALL: [Level; 5] = [
+        Level::Reference,
+        Level::Sse42,
+        Level::Avx2Fma,
+        Level::Neon,
+        Level::Accelerate,
+    ];
 
     /// The level stored as `n` in [`LEVEL`], if `n` is one.
     fn from_u8(n: u8) -> Option<Level> {
@@ -75,11 +88,13 @@ impl Level {
 }
 
 impl fmt::Display for Level {
-    /// Writes the name `CAVITATION_KERNEL` accepts: `reference`, `sse4.2`, `avx2` or `neon`.
+    /// Writes the name `CAVITATION_KERNEL` accepts: `reference`, `sse4.2`, `avx2`, `neon` or
+    /// `accelerate`.
     ///
     /// ```
     /// use cavitation_core::kernels::Level;
     /// assert_eq!(Level::Sse42.to_string(), "sse4.2");
+    /// assert_eq!(Level::Accelerate.to_string(), "accelerate");
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -87,12 +102,13 @@ impl fmt::Display for Level {
             Level::Sse42 => "sse4.2",
             Level::Avx2Fma => "avx2",
             Level::Neon => "neon",
+            Level::Accelerate => "accelerate",
         })
     }
 }
 
-/// Parses a level name as `CAVITATION_KERNEL` takes it: `reference`, `sse4.2`, `avx2` or
-/// `neon`. Whether this CPU can run the level is not checked; see [`supported`].
+/// Parses a level name as `CAVITATION_KERNEL` takes it: `reference`, `sse4.2`, `avx2`, `neon`
+/// or `accelerate`. Whether this CPU can run the level is not checked; see [`supported`].
 ///
 /// # Errors
 ///
@@ -103,6 +119,7 @@ impl fmt::Display for Level {
 /// ```
 /// use cavitation_core::kernels::{parse_level, Level};
 /// assert_eq!(parse_level("avx2"), Ok(Level::Avx2Fma));
+/// assert_eq!(parse_level("accelerate"), Ok(Level::Accelerate));
 /// assert!(parse_level("avx512").is_err());
 /// ```
 pub fn parse_level(s: &str) -> Result<Level, String> {
@@ -110,7 +127,9 @@ pub fn parse_level(s: &str) -> Result<Level, String> {
         .into_iter()
         .find(|l| l.to_string() == s)
         .ok_or_else(|| {
-            format!("unknown kernel level `{s}`; expected reference, sse4.2, avx2 or neon")
+            format!(
+                "unknown kernel level `{s}`; expected reference, sse4.2, avx2, neon or accelerate"
+            )
         })
 }
 
@@ -137,7 +156,9 @@ pub fn parse_threads(s: &str) -> Result<usize, String> {
     }
 }
 
-/// Whether this CPU can run `level`. [`Level::Reference`] always can.
+/// Whether this CPU can run `level`. [`Level::Reference`] always can;
+/// [`Level::Accelerate`] runs on Apple Silicon only (an Apple aarch64 target, where the
+/// Accelerate framework is part of the system).
 ///
 /// # Examples
 ///
@@ -157,13 +178,16 @@ pub fn supported(level: Level) -> bool {
         }
         #[cfg(target_arch = "aarch64")]
         Level::Neon => std::arch::is_aarch64_feature_detected!("neon"),
+        // The level runs the NEON kernels for everything but the matrix products.
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        Level::Accelerate => std::arch::is_aarch64_feature_detected!("neon"),
         #[allow(unreachable_patterns)]
         _ => false,
     }
 }
 
-/// The best level this CPU supports: AVX2 with FMA, then SSE4.2, on x86_64; NEON on
-/// aarch64; the reference kernels anywhere else.
+/// The best level this CPU supports: AVX2 with FMA, then SSE4.2, on x86_64; Accelerate on
+/// Apple Silicon; NEON on other aarch64 systems; the reference kernels anywhere else.
 ///
 /// # Examples
 ///
@@ -172,7 +196,7 @@ pub fn supported(level: Level) -> bool {
 /// assert!(supported(detected()));
 /// ```
 pub fn detected() -> Level {
-    [Level::Avx2Fma, Level::Neon, Level::Sse42]
+    [Level::Accelerate, Level::Avx2Fma, Level::Neon, Level::Sse42]
         .into_iter()
         .find(|&l| supported(l))
         .unwrap_or(Level::Reference)
@@ -199,6 +223,8 @@ fn detected_features() -> String {
             found.push("neon");
         }
     }
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+    found.push("accelerate");
     if found.is_empty() {
         "none".to_string()
     } else {
@@ -816,6 +842,7 @@ mod tests {
             ("sse4.2", Level::Sse42),
             ("avx2", Level::Avx2Fma),
             ("neon", Level::Neon),
+            ("accelerate", Level::Accelerate),
         ];
         for (name, level) in names {
             assert_eq!(parse_level(name), Ok(level));
@@ -839,6 +866,23 @@ mod tests {
         assert_eq!(level(), before);
         assert!(supported(Level::Reference));
         assert!(supported(detected()));
+    }
+
+    /// Accelerate is supported, and is the detected level, exactly on Apple Silicon; anywhere
+    /// else forcing it is an `Unsupported` error naming it, like any level the CPU cannot run.
+    #[test]
+    fn accelerate_only_on_apple_silicon() {
+        let apple_silicon = cfg!(all(target_vendor = "apple", target_arch = "aarch64"));
+        assert_eq!(supported(Level::Accelerate), apple_silicon);
+        assert_eq!(detected() == Level::Accelerate, apple_silicon);
+        if !apple_silicon {
+            let before = level();
+            match set_level(Level::Accelerate) {
+                Err(Error::Unsupported(msg)) => assert!(msg.contains("accelerate"), "{msg}"),
+                other => panic!("expected Unsupported, got {other:?}"),
+            }
+            assert_eq!(level(), before);
+        }
     }
 
     /// Zero, negative numbers and words are not thread counts; the error names the value.
@@ -956,6 +1000,22 @@ mod tests {
             "reference",
         );
         assert!(ok, "stderr:\n{stderr}");
+        // `accelerate` runs on Apple Silicon and is refused, the same way, everywhere else.
+        let (ok, stderr) = run_child(
+            "kernels::tests::level_from_env",
+            "CAVITATION_KERNEL",
+            "accelerate",
+        );
+        if supported(Level::Accelerate) {
+            assert!(ok, "stderr:\n{stderr}");
+        } else {
+            assert!(!ok, "stderr:\n{stderr}");
+            assert!(
+                stderr.contains("cannot run kernel level accelerate")
+                    && stderr.contains("detected features"),
+                "stderr:\n{stderr}"
+            );
+        }
     }
 
     /// Helper for `env_invalid_panics_in_child`: reads the thread count from the

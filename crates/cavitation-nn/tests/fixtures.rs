@@ -155,7 +155,13 @@ fn check_at_current_level() {
 }
 
 /// Every kernel level, in the order of their numbers.
-const ALL_LEVELS: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
+const ALL_LEVELS: [Level; 5] = [
+    Level::Reference,
+    Level::Sse42,
+    Level::Avx2Fma,
+    Level::Neon,
+    Level::Accelerate,
+];
 
 /// Serialises the tests that change the process-wide kernel level, so each one knows which
 /// level, and so which path, the code it compares with PyTorch runs on.

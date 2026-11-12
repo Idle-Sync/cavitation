@@ -64,10 +64,10 @@ pub fn matvec_f32(w_t: MatRef<f32>, x: &[f32], bias: Option<&[f32]>, relu: bool,
 /// setting.
 ///
 /// [`Level::Sse42`] runs 4-wide vectors with a separate multiply and add, [`Level::Avx2Fma`]
-/// 8-wide vectors with fused multiply-add and [`Level::Neon`] 4-wide vectors with fused
-/// multiply-add; [`Level::Reference`] runs [`reference::matvec`]. A weight matrix whose
-/// columns are not contiguous (`col_stride` other than 1) runs the reference loop at every
-/// level.
+/// 8-wide vectors with fused multiply-add, and [`Level::Neon`] and [`Level::Accelerate`]
+/// (whose matvec is NEON's) 4-wide vectors with fused multiply-add; [`Level::Reference`]
+/// runs [`reference::matvec`]. A weight matrix whose columns are not contiguous
+/// (`col_stride` other than 1) runs the reference loop at every level.
 ///
 /// # Panics
 ///
@@ -123,8 +123,9 @@ pub fn matvec_f32_with(
             super::x86::matvec_sse(&job, out)
         },
         #[cfg(target_arch = "aarch64")]
-        // SAFETY: this CPU supports NEON (the guard); `job` as for AVX2 above.
-        Level::Neon if contiguous && supported(Level::Neon) => unsafe {
+        // SAFETY: this CPU supports NEON (the guard; Accelerate's support check includes
+        // NEON); `job` as for AVX2 above.
+        Level::Neon | Level::Accelerate if contiguous && supported(level) => unsafe {
             super::aarch64::matvec_neon(&job, out)
         },
         _ => {

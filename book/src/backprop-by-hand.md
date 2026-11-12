@@ -174,7 +174,7 @@ Predictions (targets 0, 1, 1, 0):
 health: no warnings
 ```
 
-The seeds are fixed, so the program prints these numbers every time. On a CPU that runs a different kernel level (AVX2 or NEON) the last digits can differ, because those kernels round and add the products of a matrix multiplication in a different order.
+The seeds are fixed, so the program prints these numbers every time. On a CPU that runs a different kernel level (AVX2, NEON or Accelerate) the last digits can differ, because those kernels round and add the products of a matrix multiplication in a different order.
 
 ## Checking the numbers by hand
 

@@ -80,7 +80,8 @@ fn train() -> Vec<u32> {
 
 /// The same run with `set_threads(1)` and with `set_threads(4)` gives bit-identical
 /// parameters. On a CPU with a packed GEMM kernel, every matrix product of a full batch
-/// (forward, input gradient and weight gradient of each layer) runs on 4 threads at 4.
+/// (forward, input gradient and weight gradient of each layer) runs on 4 threads at 4; at
+/// the reference and Accelerate levels each product is one call on one thread.
 #[test]
 fn threads_1_and_4_identical() {
     // (m, n, k) of each product in one step: layer outputs, input gradients, weight gradients.
@@ -95,8 +96,8 @@ fn threads_1_and_4_identical() {
         (10, 128, BATCH),
     ];
     let level = level();
-    if level == Level::Reference {
-        println!("kernel level is reference: the products run on one thread at any count");
+    if matches!(level, Level::Reference | Level::Accelerate) {
+        println!("kernel level is {level}: each product is one call on one thread at any count");
     } else {
         for (m, n, k) in products {
             assert_eq!(

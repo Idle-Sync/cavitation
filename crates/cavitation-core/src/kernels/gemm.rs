@@ -174,7 +174,10 @@ pub fn gemm_f32(alpha: f32, a: MatRef<f32>, b: MatRef<f32>, beta: f32, c: MatMut
 ///
 /// [`Level::Sse42`] runs the packed SSE4.2 kernel (6 by 8 tiles), [`Level::Avx2Fma`] the
 /// packed AVX2 kernel (6 by 16 tiles, fused multiply-add) and [`Level::Neon`] the packed
-/// NEON kernel (8 by 12 tiles, fused multiply-add). [`Level::Reference`] runs
+/// NEON kernel (8 by 12 tiles, fused multiply-add). [`Level::Accelerate`] (Apple Silicon)
+/// calls Accelerate's `cblas_sgemm` once, on the calling thread, for any `A`, `B` and `C` with
+/// a stride of 1 (row-major, column-major or transposed, rows padded or not); a view with
+/// neither stride 1, or `alpha = 0`, runs the NEON kernel instead. [`Level::Reference`] runs
 /// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one
 /// thread; [`threads_used`] tells how many a call uses. Each level rounds differently (fused
 /// multiply-add rounds once per step, and each kernel blocks the sum differently), so
@@ -246,6 +249,17 @@ pub fn gemm_f32_with(
         Level::Neon if supported(Level::Neon) => unsafe {
             dispatch::<super::aarch64::Neon>(threads, alpha, a, b, beta, c)
         },
+        #[cfg(all(target_vendor = "apple", target_arch = "aarch64"))]
+        Level::Accelerate if supported(Level::Accelerate) => {
+            // One call into Accelerate on this thread; a layout BLAS cannot express runs the
+            // NEON kernel instead. Which one runs depends only on the layout, never on
+            // `threads`, so the result does not depend on the thread count either way.
+            if let Err(c) = super::accelerate::gemm(alpha, a, b, beta, c) {
+                // SAFETY: this CPU supports NEON: `supported(Level::Accelerate)` (the guard)
+                // checks for it.
+                unsafe { dispatch::<super::aarch64::Neon>(threads, alpha, a, b, beta, c) }
+            }
+        }
         _ => reference::gemm(alpha, a, b, beta, c),
     }
 }
@@ -285,9 +299,11 @@ unsafe fn dispatch<K: Kernel>(
 }
 
 /// The number of threads [`gemm_f32_with`] uses for an `m` by `k` times `k` by `n` product
-/// at `level` when given `threads`: 1 for the reference loops, for empty products and for
-/// products too small to be worth splitting, else the most threads any step of the product
-/// runs on (never more than its number of tasks, nor more than the pool's maximum of 256).
+/// at `level` when given `threads`: 1 for the reference loops, for Accelerate's single call
+/// (a layout it cannot express runs on `threads_used(Level::Neon, ..)` threads instead), for
+/// empty products and for products too small to be worth splitting, else the most threads
+/// any step of the product runs on (never more than its number of tasks, nor more than the
+/// pool's maximum of 256).
 ///
 /// # Examples
 ///
@@ -314,6 +330,8 @@ pub fn threads_used(level: Level, threads: usize, m: usize, n: usize, k: usize) 
         Level::Neon if supported(Level::Neon) => {
             plan_threads::<super::aarch64::Neon>(threads, m, n, k)
         }
+        // The reference loops, and Accelerate's one call (any threads it starts itself are
+        // its own).
         _ => 1,
     }
 }

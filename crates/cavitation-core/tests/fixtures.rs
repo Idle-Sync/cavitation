@@ -808,7 +808,13 @@ const OP_GROUPS: &[&[&str]] = &[
 ];
 
 /// Every level, in the order of their numbers.
-const ALL_LEVELS: [Level; 4] = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon];
+const ALL_LEVELS: [Level; 5] = [
+    Level::Reference,
+    Level::Sse42,
+    Level::Avx2Fma,
+    Level::Neon,
+    Level::Accelerate,
+];
 
 /// Serialises the tests that change the process-wide kernel level.
 static LEVEL_LOCK: Mutex<()> = Mutex::new(());

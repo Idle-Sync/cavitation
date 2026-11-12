@@ -8,7 +8,7 @@ Cavitation trains and runs small and medium neural networks on the CPU, inside a
 
 - **Glass box.** A training step is a tape of recorded operations you can read. Hooks on any layer show its input z, its output a, the local derivative f′(z), and the gradients ∂L/∂a and ∂L/∂z. Neuron masks turn single neurons off in both the forward and the backward pass.
 - **Checked.** Every operation passes a numerical gradient check (central differences in `f64`) and a comparison with PyTorch on stored fixtures. Every fast kernel has a plain reference version, and tests check that the two agree. Known-result tests train real networks with fixed seeds and check the accuracy.
-- **Fast on ordinary CPUs.** The kernel level (SSE4.2, AVX2 with FMA, or NEON) is chosen at run time, matrix products are split across threads, and a training step allocates nothing after a warm-up epoch.
+- **Fast on ordinary CPUs.** The kernel level (SSE4.2, AVX2 with FMA, NEON, or Apple's Accelerate framework for matrix products on Apple Silicon) is chosen at run time, matrix products are split across threads, and a training step allocates nothing after a warm-up epoch.
 - **Compatible with PyTorch.** Operations follow PyTorch's definitions. `Linear` stores its weight as `[outputs, inputs]`, and weights save and load as safetensors named like a PyTorch `state_dict` (`0.weight`, `2.bias`).
 
 What v0.1 contains:
@@ -166,7 +166,7 @@ The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH
 
 Two environment variables change how the library runs, for the benchmark and for your own programs:
 
-- `CAVITATION_KERNEL` forces a kernel level: `reference`, `sse4.2`, `avx2` or `neon`. The default is the best level the CPU supports.
+- `CAVITATION_KERNEL` forces a kernel level: `reference`, `sse4.2`, `avx2`, `neon` or `accelerate`. The default is the best level the CPU supports: `accelerate` on Apple Silicon, which runs matrix products through Apple's Accelerate framework (part of macOS, so nothing to install) and everything else through the NEON kernels. Its results match NEON's within the matrix-product tolerance, not bit for bit; `neon` runs the NEON matrix product instead.
 - `CAVITATION_THREADS` sets the number of threads the threaded kernels use: the matrix products (in training and in `infer_batch`) and the optimiser update. The default is the number of performance cores on Apple Silicon (the efficiency cores slow training down) and the number of logical cores elsewhere; `infer` always runs on the calling thread.
 
 ## Tests
