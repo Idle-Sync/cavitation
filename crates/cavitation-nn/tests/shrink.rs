@@ -1,4 +1,4 @@
-//! Tests of `shrink::compact`: a masked network rebuilt without its off neurons gives the
+//! Tests of `shrink::ablate` (the ablation sweep, at the end) and of `shrink::compact`: a masked network rebuilt without its off neurons gives the
 //! masked network's outputs (bit for bit on the kernel levels whose sums do not depend on an
 //! output's position, within the documented rounding bound on the others), and the masks
 //! and layers it cannot compact are refused with a message that says what to do. The kernel
@@ -8,10 +8,10 @@
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{Level, MatRef, supported};
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
-use cavitation_nn::shrink::compact;
+use cavitation_nn::shrink::{Ablation, ablate, ablate_with, compact};
 use cavitation_nn::{
-    InferenceModel, Layer, Linear, NeuronMask, Prelu, Relu, Sequential, Sigmoid, Softmax, Tanh,
-    Trace, load, save,
+    Activation, ActivationLayer, Dataset, Evaluator, InferenceModel, Layer, Linear, Loss,
+    NeuronMask, Prelu, Relu, Sequential, Sigmoid, Softmax, Tanh, Targets, Trace, load, save,
 };
 
 /// The number of seeded inputs each comparison runs.
@@ -930,4 +930,248 @@ fn downcasts_work_on_every_trait_object_form() {
             "{what}"
         );
     }
+}
+
+/// The 6 → 10 → ReLU → 8 → ReLU → 3 network, seeded, with a spread of weights.
+fn small_network(params: &mut ParamStore) -> Sequential {
+    let mut rng = Rng::seed(5);
+    Sequential::new()
+        .push(linear(params, 6, 10, &mut rng))
+        .push(Relu)
+        .push(linear(params, 10, 8, &mut rng))
+        .push(Relu)
+        .push(linear(params, 8, 3, &mut rng))
+}
+
+/// 90 seeded rows of 6 inputs with class labels from the sign pattern of the first two.
+fn class_data() -> Dataset {
+    let x = inputs(90, 6, 21);
+    let labels = x
+        .chunks(6)
+        .map(|r| usize::from(r[0] > 0.0) + usize::from(r[1] > 0.0))
+        .collect();
+    Dataset {
+        x: Tensor::from_vec(x, &[90, 6]).unwrap(),
+        targets: Targets::Classes(labels),
+    }
+}
+
+/// 90 seeded rows of 6 inputs with 3 value targets that follow the inputs.
+fn value_data() -> Dataset {
+    let x = inputs(90, 6, 22);
+    let y: Vec<f32> = x
+        .chunks(6)
+        .flat_map(|r| [r[0] + r[1], r[2] - r[3], r[4] * 0.5])
+        .collect();
+    Dataset {
+        x: Tensor::from_vec(x, &[90, 6]).unwrap(),
+        targets: Targets::Values(Tensor::from_vec(y, &[90, 3]).unwrap()),
+    }
+}
+
+/// The evaluation of `net` with the neuron `neuron` of `Linear` `linear` switched off on
+/// top of the masks it has, through a plain `Evaluator`.
+fn masked_evaluation(
+    net: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    loss: Loss,
+    linear: usize,
+    neuron: usize,
+) -> cavitation_nn::Evaluation {
+    let mut masked = net.clone();
+    let mut mask = net
+        .neuron_mask(linear)
+        .cloned()
+        .unwrap_or_else(|| NeuronMask::all_on(net.linear(linear).unwrap().outputs()));
+    mask.set(neuron, false);
+    masked.set_neuron_mask(linear, mask);
+    Evaluator::new(&masked, params, loss, 32)
+        .unwrap()
+        .evaluate(data)
+        .unwrap()
+}
+
+/// A neuron that never fires costs nothing: its ablation drops exactly 0.
+#[test]
+fn dead_neuron_ablation_drops_nothing() {
+    let mut params = ParamStore::new();
+    let net = small_network(&mut params);
+    let first = net.linear(0).unwrap();
+    params.value_mut(first.bias()).data_mut()[3] = -1000.0;
+    for w in &mut params.value_mut(first.weight()).data_mut()[3 * 6..4 * 6] {
+        *w = 0.0;
+    }
+    for (data, loss) in [
+        (class_data(), Loss::CrossEntropy),
+        (value_data(), Loss::Mse),
+    ] {
+        let all = ablate(&net, &params, &data, &[0, 2], loss, 32).unwrap();
+        let dead = all.iter().find(|a| (a.linear, a.neuron) == (0, 3)).unwrap();
+        assert_eq!(dead.drop, 0.0);
+        assert!(dead.drop.is_sign_positive());
+        assert!(all.iter().any(|a| a.drop != 0.0));
+    }
+}
+
+/// Each entry equals `evaluate` on the model with that one neuron masked, on class and on
+/// value targets, with the model compiled and on the tape.
+#[test]
+fn ablation_matches_masked_evaluate() {
+    let mut params = ParamStore::new();
+    let net = small_network(&mut params);
+    let mut own = Sequential::new();
+    for i in 0..net.len() {
+        own = match net.linear(i) {
+            Some(l) => own.push(l.clone()),
+            None => own.push(ActivationLayer::new(MyRelu)),
+        };
+    }
+    for model in [&net, &own] {
+        for (data, loss) in [
+            (class_data(), Loss::CrossEntropy),
+            (value_data(), Loss::Mse),
+        ] {
+            let all = ablate(model, &params, &data, &[0, 2], loss, 32).unwrap();
+            assert_eq!(all.len(), 10 + 8);
+            let base = Evaluator::new(model, &params, loss, 32)
+                .unwrap()
+                .evaluate(&data)
+                .unwrap();
+            for a in &all {
+                let want = masked_evaluation(model, &params, &data, loss, a.linear, a.neuron);
+                assert_eq!(
+                    a.evaluation, want,
+                    "linear {} neuron {}",
+                    a.linear, a.neuron
+                );
+                let drop = match (&data.targets, base.accuracy, a.evaluation.accuracy) {
+                    (Targets::Classes(_), Some(b), Some(m)) => (b - m) * 100.0,
+                    _ => (a.evaluation.loss - base.loss) / base.loss,
+                };
+                assert_eq!(a.drop, drop);
+            }
+        }
+    }
+}
+
+/// ReLU written as an activation of your own, so the model has no inference form.
+struct MyRelu;
+
+impl Activation<f32> for MyRelu {
+    /// Returns `"my_relu"`.
+    fn name(&self) -> &str {
+        "my_relu"
+    }
+    /// `max(x, 0)`.
+    fn f(&self, x: f32) -> f32 {
+        x.max(0.0)
+    }
+    /// 1 above 0, else 0.
+    fn df(&self, x: f32, _y: f32) -> f32 {
+        if x > 0.0 { 1.0 } else { 0.0 }
+    }
+}
+
+/// Neurons already off are skipped and stay off, in the model and in the other neurons'
+/// measurements; the caller's model and masks are not changed.
+#[test]
+fn existing_masks_kept() {
+    let mut params = ParamStore::new();
+    let mut net = small_network(&mut params);
+    net.set_neuron_mask(0, NeuronMask::from_off(10, &[2, 5]));
+    let data = class_data();
+    let all = ablate(&net, &params, &data, &[0, 2], Loss::CrossEntropy, 32).unwrap();
+    assert_eq!(all.len(), 8 + 8);
+    assert!(
+        all.iter()
+            .all(|a| a.linear != 0 || (a.neuron != 2 && a.neuron != 5))
+    );
+    let off: Vec<usize> = net.neuron_mask(0).unwrap().off().collect();
+    assert_eq!(off, [2, 5]);
+    assert!(net.neuron_mask(2).is_none());
+    // Each entry is measured with 2 and 5 still off.
+    for a in &all {
+        let want = masked_evaluation(&net, &params, &data, Loss::CrossEntropy, a.linear, a.neuron);
+        assert_eq!(a.evaluation, want);
+    }
+}
+
+/// The list is sorted by drop, largest first, ties by (linear, neuron); class drops are in
+/// accuracy points.
+#[test]
+fn sorted_by_drop() {
+    let mut params = ParamStore::new();
+    let net = small_network(&mut params);
+    let data = class_data();
+    let all = ablate(&net, &params, &data, &[2, 0], Loss::CrossEntropy, 32).unwrap();
+    for pair in all.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        assert!(
+            a.drop > b.drop || (a.drop == b.drop && (a.linear, a.neuron) < (b.linear, b.neuron))
+        );
+    }
+    let base = Evaluator::new(&net, &params, Loss::CrossEntropy, 32)
+        .unwrap()
+        .evaluate(&data)
+        .unwrap()
+        .accuracy
+        .unwrap();
+    let top = &all[0];
+    assert!((top.drop - (base - top.evaluation.accuracy.unwrap()) * 100.0).abs() < 1e-9);
+    // Row counts make the drops multiples of 100/90 points.
+    assert!(all.iter().any(|a| a.drop != 0.0));
+}
+
+/// The output `Linear`, a layer that is not a `Linear` and an index past the end are
+/// `InvalidData`, each naming the layer.
+#[test]
+fn output_linear_refused() {
+    let mut params = ParamStore::new();
+    let net = small_network(&mut params);
+    let data = class_data();
+    for (bad, words) in [(4, "layer 4"), (1, "layer 1"), (9, "layer 9")] {
+        let err = ablate(&net, &params, &data, &[0, bad], Loss::CrossEntropy, 32).unwrap_err();
+        let Error::InvalidData(msg) = err else {
+            panic!("expected InvalidData");
+        };
+        assert!(msg.contains(words), "{msg}");
+    }
+    let err = ablate(&net, &params, &data, &[4], Loss::CrossEntropy, 32).unwrap_err();
+    assert!(err.to_string().contains("output"), "{err}");
+}
+
+/// `ablate_with` calls the closure once per neuron as it finishes, in sweep order, with the
+/// entries `ablate_with` returns (unsorted order is the sweep order).
+#[test]
+fn ablate_with_reports_each_neuron() {
+    let mut params = ParamStore::new();
+    let net = small_network(&mut params);
+    let data = value_data();
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    let mut copies: Vec<Ablation> = Vec::new();
+    let all = ablate_with(&net, &params, &data, &[0, 2], Loss::Mse, 32, &mut |a| {
+        seen.push((a.linear, a.neuron));
+        copies.push(*a);
+    })
+    .unwrap();
+    let sweep: Vec<(usize, usize)> = (0..10)
+        .map(|n| (0, n))
+        .chain((0..8).map(|n| (2, n)))
+        .collect();
+    assert_eq!(seen, sweep);
+    let mut sorted = copies;
+    sorted.sort_by(|a, b| b.drop.total_cmp(&a.drop));
+    let drops: Vec<f64> = all.iter().map(|a| a.drop).collect();
+    let want: Vec<f64> = sorted.iter().map(|a| a.drop).collect();
+    assert_eq!(drops, want);
+    // A repeated Linear in the list is swept once; no Linear gives an empty result.
+    let twice = ablate(&net, &params, &data, &[0, 0], Loss::Mse, 32).unwrap();
+    assert_eq!(twice.len(), 10);
+    assert!(
+        ablate(&net, &params, &data, &[], Loss::Mse, 32)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(ablate(&net, &params, &data, &[0], Loss::Mse, 0).is_err());
 }
