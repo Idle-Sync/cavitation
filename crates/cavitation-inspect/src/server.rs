@@ -4,7 +4,9 @@
 //! One accept thread takes connections. Each connection gets a short-lived thread that
 //! reads its request head (within the read timeout), checks it, answers it and closes it;
 //! an `/events` connection's thread stays on as that client's writer. At most
-//! [`MAX_PENDING`] connections may be reading their heads at once; more are closed at once.
+//! [`MAX_PENDING`] connections may be reading their heads at once, and [`MAX_ANSWERING`] may be
+//! sending an answer or waiting for the client to close; beyond either, new connections are
+//! closed at once.
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
@@ -23,6 +25,12 @@ use crate::token::new_token;
 
 /// The most connections reading their request heads at once.
 pub(crate) const MAX_PENDING: usize = 32;
+
+/// At most this many answered connections may still be sending their answer or waiting
+/// for the client to close; more new connections are closed at once until some finish.
+/// Each such connection ends within the write timeout plus a short linger, so this bounds
+/// the server's threads without letting answered connections block new requests.
+pub(crate) const MAX_ANSWERING: usize = 128;
 
 /// How long `Drop` waits for its wake-up connection to the accept thread.
 const WAKE_TIMEOUT: Duration = Duration::from_millis(500);
@@ -130,6 +138,8 @@ struct Shared {
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// Connections still reading their request heads.
     pending: AtomicUsize,
+    /// Connections answered and still sending or lingering; see [`MAX_ANSWERING`].
+    answering: AtomicUsize,
 }
 
 /// A live view of a training run in the browser: an HTTP and Server-Sent Events server on
@@ -262,6 +272,7 @@ impl Inspector {
             title: config.title.clone(),
             threads: Mutex::new(Vec::new()),
             pending: AtomicUsize::new(0),
+            answering: AtomicUsize::new(0),
         });
         let accept = {
             let shared = Arc::clone(&shared);
@@ -409,7 +420,9 @@ fn accept_loop(listener: &TcpListener, shared: &Arc<Shared>) {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         threads.retain(|t| !t.is_finished());
-        if shared.pending.load(Ordering::Acquire) >= MAX_PENDING {
+        if shared.pending.load(Ordering::Acquire) >= MAX_PENDING
+            || shared.answering.load(Ordering::Acquire) >= MAX_ANSWERING
+        {
             continue;
         }
         shared.pending.fetch_add(1, Ordering::AcqRel);
@@ -501,6 +514,8 @@ fn connection(mut stream: TcpStream, shared: &Shared) {
     drop(pending);
     match outcome {
         Outcome::Reply(reply) => {
+            shared.answering.fetch_add(1, Ordering::AcqRel);
+            let _answering = Pending(&shared.answering);
             let sent = http::respond(
                 &mut stream,
                 reply.status,
