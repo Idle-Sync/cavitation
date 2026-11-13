@@ -92,7 +92,7 @@ pub use mask::NeuronMask;
 pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
-    Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, History,
-    Loss, LrSchedule, OptimizerConfig, Targets, TargetsView, Trainer, accuracy, evaluate, fit,
-    fit_with_hooks,
+    Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,
+    History, Loss, LrSchedule, OptimizerConfig, Targets, TargetsView, Trainer, accuracy, evaluate,
+    fit, fit_with_hooks,
 };

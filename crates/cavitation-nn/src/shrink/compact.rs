@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 
 use cavitation_core::{Error, Graph, ParamStore, Real, Tensor};
 
+use super::neurons_on;
 use crate::{Layer, Linear, Prelu, Sequential};
 
 /// Rebuilds `model` with every switched-off hidden neuron removed: a smaller dense network
@@ -299,18 +300,25 @@ fn kept_neurons<T: Real>(
     for (&linear, masked) in masks {
         let (width, end) = (linear_width(model, linear), model.neuron_layer(linear));
         let mut zeros: Vec<Option<Vec<T>>> = vec![None; end + 1];
+        let on = neurons_on(model, linear);
         let mut kept = Vec::with_capacity(width);
         for j in 0..width {
-            let last = masked.iter().rev().find(|&&m| {
-                !model
-                    .mask(m)
-                    .expect("placed_masks lists masked layers")
-                    .is_on(j)
-            });
-            let Some(&last) = last else {
+            if on[j] {
                 kept.push(j);
                 continue;
-            };
+            }
+            // The last mask of the run that switches the neuron off: the layers after it
+            // must carry its 0 to the next Linear.
+            let &last = masked
+                .iter()
+                .rev()
+                .find(|&&m| {
+                    !model
+                        .mask(m)
+                        .expect("placed_masks lists masked layers")
+                        .is_on(j)
+                })
+                .expect("an off neuron is off in one of the run's masks");
             for (l, cached) in zeros.iter_mut().enumerate().skip(last + 1) {
                 let out =
                     cached.get_or_insert_with(|| zeros_through(model.layer(l), params, width));

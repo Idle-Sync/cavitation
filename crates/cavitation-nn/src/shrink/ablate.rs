@@ -4,6 +4,7 @@
 
 use cavitation_core::{Error, ParamStore};
 
+use super::neurons_on;
 use crate::{Dataset, Evaluation, Evaluator, Loss, NeuronMask, Sequential, Targets};
 
 /// What switching one neuron off costs, from [`ablate`]: the neuron, the network's
@@ -143,7 +144,7 @@ pub fn ablate_with(
 ) -> Result<Vec<Ablation>, Error> {
     let mut chosen: Vec<usize> = Vec::with_capacity(linears.len());
     for &linear in linears {
-        check_hidden(model, linear)?;
+        check_hidden(model, linear, "ablate")?;
         if !chosen.contains(&linear) {
             chosen.push(linear);
         }
@@ -157,20 +158,13 @@ pub fn ablate_with(
         // The neurons that are off in any mask of the `Linear`'s run (the `Linear` and the
         // element-wise layers up to `neuron_layer`) are off already: no entry, and they
         // stay off, since the evaluator keeps every mask of the model in place.
-        let mut already_off = vec![false; width];
-        for layer in linear..=model.neuron_layer(linear) {
-            if let Some(mask) = model.mask(layer) {
-                for neuron in mask.off().filter(|&n| n < width) {
-                    already_off[neuron] = true;
-                }
-            }
-        }
+        let on = neurons_on(model, linear);
         let start = model
             .neuron_mask(linear)
             .cloned()
             .unwrap_or_else(|| NeuronMask::all_on(width));
         let mut work = start.clone();
-        for neuron in (0..width).filter(|&n| !already_off[n]) {
+        for neuron in (0..width).filter(|&n| on[n]) {
             work.set(neuron, false);
             evaluator.set_neuron_mask(linear, &work)?;
             let evaluation = evaluator.evaluate(data)?;
@@ -194,17 +188,17 @@ pub fn ablate_with(
     Ok(all)
 }
 
-/// Returns [`Error::InvalidData`] naming `linear` unless it is a `Linear` layer of `model`
-/// with another `Linear` after it.
-fn check_hidden(model: &Sequential, linear: usize) -> Result<(), Error> {
+/// Returns [`Error::InvalidData`] naming `linear`, with the message prefixed `"{op}: "`,
+/// unless it is a `Linear` layer of `model` with another `Linear` after it.
+pub(super) fn check_hidden(model: &Sequential, linear: usize, op: &str) -> Result<(), Error> {
     if model.linear(linear).is_none() {
         return Err(Error::InvalidData(format!(
-            "ablate: layer {linear} is not a Linear layer"
+            "{op}: layer {linear} is not a Linear layer"
         )));
     }
     if (linear + 1..model.len()).all(|l| model.linear(l).is_none()) {
         return Err(Error::InvalidData(format!(
-            "ablate: layer {linear} is the last Linear layer, so its neurons are the model's \
+            "{op}: layer {linear} is the last Linear layer, so its neurons are the model's \
              output and not a hidden layer's; list the hidden Linear layers"
         )));
     }
@@ -212,18 +206,33 @@ fn check_hidden(model: &Sequential, linear: usize) -> Result<(), Error> {
 }
 
 /// The cost of `ablated` against `base` over `rows` rows, as [`Ablation::drop`] defines it.
-/// A class drop is whole rows lost times 100 over `rows`, so it is rounded once.
 fn drop_of(base: &Evaluation, ablated: &Evaluation, targets: &Targets, rows: usize) -> f64 {
     match (targets, base.accuracy, ablated.accuracy) {
-        (Targets::Classes(_), Some(before), Some(after)) => {
-            let n = rows as f64;
-            let lost = ((before - after) * n).round();
-            lost * 100.0 / n
-        }
-        _ if ablated.loss.is_nan() => f64::INFINITY,
-        _ if base.loss != 0.0 => (ablated.loss - base.loss) / base.loss.abs(),
-        _ if ablated.loss == base.loss => 0.0,
-        _ => f64::INFINITY,
+        (Targets::Classes(_), Some(before), Some(after)) => points_lost(before, after, rows),
+        _ => relative_increase(base.loss, ablated.loss),
+    }
+}
+
+/// The accuracy points lost going from the share `before` to the share `after` of `rows`
+/// rows: whole rows lost times 100 over `rows`, so it is rounded once, and one row in 100
+/// is exactly 1.0. Negative when `after` is the better.
+pub(super) fn points_lost(before: f64, after: f64, rows: usize) -> f64 {
+    let n = rows as f64;
+    let lost = ((before - after) * n).round();
+    lost * 100.0 / n
+}
+
+/// The relative increase from the loss `base` to `loss`, `(loss - base) / |base|`: 0 if
+/// both are 0, infinity for a rise from 0 or a NaN `loss`.
+pub(super) fn relative_increase(base: f64, loss: f64) -> f64 {
+    if loss.is_nan() {
+        f64::INFINITY
+    } else if base != 0.0 {
+        (loss - base) / base.abs()
+    } else if loss == base {
+        0.0
+    } else {
+        f64::INFINITY
     }
 }
 

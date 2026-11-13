@@ -1,6 +1,6 @@
-//! Tests of `shrink::ablate` (the ablation sweep, at the end) and of `shrink::compact`: a
-//! masked network rebuilt without its off neurons gives the
-//! masked network's outputs (bit for bit on the kernel levels whose sums do not depend on an
+//! Tests of `shrink::shrink` (the shrink tool, at the end), `shrink::ablate` (the ablation
+//! sweep, before it) and `shrink::compact`: a masked network rebuilt without its off
+//! neurons gives the masked network's outputs (bit for bit on the kernel levels whose sums do not depend on an
 //! output's position, within the documented rounding bound on the others), and the masks
 //! and layers it cannot compact are refused with a message that says what to do. The kernel
 //! level is the one `CAVITATION_KERNEL` sets for the test process, except in
@@ -9,9 +9,12 @@
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{Level, MatRef, supported};
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
-use cavitation_nn::shrink::{Ablation, ablate, ablate_with, compact};
+use cavitation_nn::shrink::{
+    Ablation, Criterion, Ranking, RetrainConfig, ShrinkConfig, ShrinkStep, ShrinkWarning,
+    Validation, ablate, ablate_with, compact, shrink,
+};
 use cavitation_nn::{
-    Activation, ActivationLayer, Dataset, Evaluator, InferenceModel, Layer, Linear, Loss,
+    Activation, ActivationLayer, Dataset, Evaluator, Flow, InferenceModel, Layer, Linear, Loss,
     NeuronMask, Prelu, Relu, Sequential, Sigmoid, Softmax, Tanh, Targets, Trace, load, save,
 };
 
@@ -1232,4 +1235,571 @@ fn negative_baseline_loss_gives_finite_drops() {
         assert_eq!(a.drop > 0.0, a.evaluation.loss > base.loss);
     }
     assert!(all.iter().any(|a| a.drop < 0.0) && all.iter().any(|a| a.drop > 0.0));
+}
+
+// The shrink tool.
+
+/// `rows` seeded rows of `features` inputs in three classes: row `r` is in class `r % 3`
+/// and lies around that class's centre (the same three centres for every seed), with
+/// normal noise of standard deviation 0.8 on each input.
+fn clusters(rows: usize, features: usize, seed: u64) -> Dataset {
+    let mut at = Rng::seed(1000 + features as u64);
+    let centres: Vec<f64> = (0..3 * features).map(|_| at.range(-2.0, 2.0)).collect();
+    let mut rng = Rng::seed(seed);
+    let mut x = Vec::with_capacity(rows * features);
+    for r in 0..rows {
+        let class = r % 3;
+        for f in 0..features {
+            x.push((centres[class * features + f] + 0.8 * rng.normal()) as f32);
+        }
+    }
+    Dataset {
+        x: Tensor::from_vec(x, &[rows, features]).unwrap(),
+        targets: Targets::Classes((0..rows).map(|r| r % 3).collect()),
+    }
+}
+
+/// A `features → width → ReLU → 3` network with seeded weights.
+fn hidden_network(params: &mut ParamStore, features: usize, width: usize) -> Sequential {
+    let mut rng = Rng::seed(3);
+    Sequential::new()
+        .push(linear(params, features, width, &mut rng))
+        .push(Relu)
+        .push(linear(params, width, 3, &mut rng))
+}
+
+/// The 8 → 32 → ReLU → 3 network trained for 20 epochs on 600 rows of `clusters`, with
+/// those rows.
+fn trained(params: &mut ParamStore) -> (Sequential, Dataset) {
+    let net = hidden_network(params, 8, 32);
+    let train = clusters(600, 8, 1);
+    let config = cavitation_nn::FitConfig {
+        epochs: 20,
+        health: cavitation_nn::Health::quiet(),
+        ..cavitation_nn::FitConfig::default()
+    };
+    cavitation_nn::fit(&net, params, &train, config).unwrap();
+    (net, train)
+}
+
+/// A config that validates on `validation`, retrains one epoch per step and keeps every
+/// checkpoint; the rest as the defaults.
+fn quick(validation: Dataset) -> ShrinkConfig {
+    ShrinkConfig {
+        validation: Some(Validation::Given(validation)),
+        retrain: RetrainConfig {
+            epochs: 1,
+            ..RetrainConfig::default()
+        },
+        keep_checkpoints: true,
+        ..ShrinkConfig::default()
+    }
+}
+
+/// A criterion every step meets: no accuracy drop exceeds 100 points.
+const ALWAYS: Criterion = Criterion::AccuracyDrop { points: 100.0 };
+/// A criterion no step meets: the accuracy would have to rise by more than 100 points.
+const NEVER: Criterion = Criterion::AccuracyDrop { points: -101.0 };
+
+/// The neurons a checkpoint's mask switches off on `Linear` `linear`.
+fn off_in(step: &ShrinkStep, linear: usize) -> Vec<usize> {
+    let (masks, _) = step.checkpoint.as_ref().expect("keep_checkpoints is on");
+    let (_, mask) = masks.iter().find(|(l, _)| *l == linear).unwrap();
+    mask.off().collect()
+}
+
+/// The default levels on a width of 256 keep 231, 205, 180, 154, 128, 103, 77, 64, 52, 39,
+/// 26 and 13 neurons: twelve levels, 1,000 to 7,000 basis points by 1,000 then to 9,500 by
+/// 500, and none lost to rounding.
+#[test]
+fn levels_follow_the_schedule() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 256);
+    let train = clusters(64, 4, 2);
+    let config = ShrinkConfig {
+        criterion: Some(ALWAYS),
+        patience: None,
+        keep_checkpoints: false,
+        ..quick(clusters(30, 4, 3))
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    let kept: Vec<usize> = report.steps.iter().map(|s| s.kept[0]).collect();
+    assert_eq!(kept, [231, 205, 180, 154, 128, 103, 77, 64, 52, 39, 26, 13]);
+    let levels: Vec<u32> = report.steps.iter().map(|s| s.removed_bp).collect();
+    assert_eq!(
+        levels,
+        [
+            1000, 2000, 3000, 4000, 5000, 6000, 7000, 7500, 8000, 8500, 9000, 9500
+        ]
+    );
+    assert!(report.steps.iter().all(|s| s.checkpoint.is_none()));
+    assert_eq!(report.chosen, Some(11));
+    assert_eq!(net.neuron_mask(0).unwrap().count_on(), 13);
+}
+
+/// A 4 → 10 → ReLU → 3 network whose neurons 2 and 7 never fire (bias −1000, no incoming
+/// weight) but have the largest outgoing weights, so the out-norm ranking alone would keep
+/// them; with 32 rows of `clusters`.
+fn dead_pair(params: &mut ParamStore) -> (Sequential, Dataset) {
+    let net = hidden_network(params, 4, 10);
+    let first = net.linear(0).unwrap();
+    for dead in [2, 7] {
+        params.value_mut(first.bias()).data_mut()[dead] = -1000.0;
+        for w in &mut params.value_mut(first.weight()).data_mut()[dead * 4..dead * 4 + 4] {
+            *w = 0.0;
+        }
+    }
+    let last = net.linear(2).unwrap().weight();
+    for row in params.value_mut(last).data_mut().chunks_mut(10) {
+        row[2] = 10.0;
+        row[7] = -10.0;
+    }
+    (net, clusters(32, 4, 4))
+}
+
+/// One level of 2,000 basis points on the dead pair's network.
+fn one_level(validation: Dataset, dead_first: bool) -> ShrinkConfig {
+    ShrinkConfig {
+        step_bp: 2000,
+        max_removed_bp: 2000,
+        dead_first,
+        criterion: Some(ALWAYS),
+        ..quick(validation)
+    }
+}
+
+/// With `dead_first`, the two neurons that never fire are the two removed at 20%, though
+/// their outgoing weights are the largest.
+#[test]
+fn dead_neurons_go_first() {
+    let mut params = ParamStore::new();
+    let (mut net, train) = dead_pair(&mut params);
+    let config = one_level(clusters(30, 4, 5), true);
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert_eq!(report.steps.len(), 1);
+    assert_eq!(report.steps[0].kept, [8]);
+    assert_eq!(off_in(&report.steps[0], 0), [2, 7]);
+}
+
+/// With `dead_first` off, the dead neurons are ranked by out-norm like the rest: the two
+/// live neurons with the smallest outgoing norms go, and the dead pair stays.
+#[test]
+fn dead_first_off_ranks_dead_by_norm() {
+    let mut params = ParamStore::new();
+    let (mut net, train) = dead_pair(&mut params);
+    let w = params
+        .value(net.linear(2).unwrap().weight())
+        .data()
+        .to_vec();
+    let norm = |j: usize| {
+        (0..3)
+            .map(|r| f64::from(w[r * 10 + j]).powi(2))
+            .sum::<f64>()
+    };
+    let mut live: Vec<usize> = (0..10).filter(|&j| j != 2 && j != 7).collect();
+    live.sort_by(|&a, &b| norm(a).total_cmp(&norm(b)));
+    let mut want = live[..2].to_vec();
+    want.sort_unstable();
+    let config = one_level(clusters(30, 4, 5), false);
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert_eq!(off_in(&report.steps[0], 0), want);
+}
+
+/// With no patience, a run whose steps all miss goes through every level, chooses none,
+/// and leaves the model unpruned: no mask, and the parameters as they were, bit for bit.
+#[test]
+fn patience_none_runs_every_level() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 16);
+    let before = params.clone();
+    let config = ShrinkConfig {
+        criterion: Some(NEVER),
+        patience: None,
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    assert_eq!(report.steps.len(), 12);
+    assert!(report.steps.iter().all(|s| !s.met));
+    assert_eq!(report.chosen, None);
+    assert!(net.neuron_mask(0).is_none());
+    assert_same_store(&net, &params, &before);
+}
+
+/// Asserts that every parameter of `net` holds the same bits in `got` and `want`.
+fn assert_same_store(net: &Sequential, got: &ParamStore, want: &ParamStore) {
+    for (name, id) in net.parameter_names() {
+        assert_bits(got.value(id).data(), want.value(id).data(), &name);
+    }
+}
+
+/// With the default patience of 2, two misses in a row end the run.
+#[test]
+fn patience_two_ends_after_two_misses() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 16);
+    let config = ShrinkConfig {
+        criterion: Some(NEVER),
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    assert_eq!(report.steps.len(), 2);
+}
+
+/// `Flow::Stop` from `on_step` after the third step ends the run there, keeping the best
+/// step so far, and the callback sees each step as it is recorded.
+#[test]
+fn on_step_stop_keeps_best() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 16);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = seen.clone();
+    let config = ShrinkConfig {
+        criterion: Some(ALWAYS),
+        on_step: Some(Box::new(move |step: &ShrinkStep| {
+            log.borrow_mut().push(step.removed_bp);
+            if step.removed_bp == 3000 {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            }
+        })),
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    assert_eq!(*seen.borrow(), [1000, 2000, 3000]);
+    assert_eq!(report.steps.len(), 3);
+    assert_eq!(report.chosen, Some(2));
+    assert_eq!(net.neuron_mask(0).unwrap().count_on(), 12);
+}
+
+/// The default config has no validation set: `InvalidData` naming `validation`, and the
+/// model is not changed.
+#[test]
+fn missing_validation_is_invalid_data() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 16);
+    let err = shrink(
+        &mut net,
+        &mut params,
+        &clusters(48, 4, 7),
+        ShrinkConfig::default(),
+    )
+    .unwrap_err();
+    let Error::InvalidData(msg) = err else {
+        panic!("expected InvalidData, got {err:?}");
+    };
+    assert!(msg.contains("validation"), "{msg}");
+    assert!(msg.contains("must not have seen"), "{msg}");
+    assert!(net.neuron_mask(0).is_none());
+}
+
+/// Value targets have no default criterion: `InvalidData` naming `criterion`; with
+/// `LossIncrease` they shrink.
+#[test]
+fn value_targets_need_a_criterion() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 6, 12);
+    let data = value_data();
+    let (train, validation) = data.split_at(60);
+    let retrain = RetrainConfig {
+        epochs: 1,
+        loss: Loss::Mse,
+        ..RetrainConfig::default()
+    };
+    let config = ShrinkConfig {
+        retrain,
+        ..quick(validation.clone())
+    };
+    let err = shrink(&mut net, &mut params, &train, config).unwrap_err();
+    let Error::InvalidData(msg) = err else {
+        panic!("expected InvalidData, got {err:?}");
+    };
+    assert!(msg.contains("criterion"), "{msg}");
+    let config = ShrinkConfig {
+        retrain,
+        criterion: Some(Criterion::LossIncrease { relative: 1e9 }),
+        max_removed_bp: 3000,
+        ..quick(validation.clone())
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert_eq!(report.steps.len(), 3);
+    assert!(report.steps.iter().all(|s| s.met));
+    // An accuracy criterion on value targets is refused too.
+    let config = ShrinkConfig {
+        retrain,
+        criterion: Some(Criterion::AccuracyDrop { points: 1.0 }),
+        ..quick(validation)
+    };
+    let err = shrink(&mut net, &mut params, &train, config).unwrap_err();
+    assert!(err.to_string().contains("AccuracyDrop"), "{err}");
+}
+
+/// A validation set where one row is more than half the allowed drop warns: 150 rows give
+/// 0.667 points a row against 1 point; 288 rows (0.347 points a row) do not.
+#[test]
+fn small_validation_warns() {
+    let mut params = ParamStore::new();
+    let net = hidden_network(&mut params, 4, 8);
+    let run = |rows: usize| {
+        let (mut net, mut params) = (net.clone(), params.clone());
+        let config = ShrinkConfig {
+            max_removed_bp: 1000,
+            ..quick(clusters(rows, 4, 8))
+        };
+        shrink(&mut net, &mut params, &clusters(48, 4, 7), config)
+            .unwrap()
+            .warnings
+    };
+    let warnings = run(150);
+    assert_eq!(warnings.len(), 1);
+    let ShrinkWarning::SmallValidation {
+        rows,
+        row_points,
+        threshold,
+    } = warnings[0]
+    else {
+        panic!("expected SmallValidation, got {:?}", warnings[0]);
+    };
+    assert_eq!((rows, threshold), (150, 1.0));
+    assert!((row_points - 100.0 / 150.0).abs() < 1e-12);
+    assert!(warnings[0].to_string().contains("150"), "{}", warnings[0]);
+    assert!(run(288).is_empty());
+}
+
+/// On return the model's masks are the chosen step's checkpoint masks and the parameters
+/// its store, bit for bit.
+#[test]
+fn model_left_at_chosen_step() {
+    let mut params = ParamStore::new();
+    let (mut net, train) = trained(&mut params);
+    let config = ShrinkConfig {
+        max_removed_bp: 5000,
+        ..quick(clusters(200, 8, 9))
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    let chosen = report.chosen.expect("a step meets the criterion");
+    let (masks, store) = report.steps[chosen].checkpoint.as_ref().unwrap();
+    assert_eq!(masks.len(), 1);
+    for (linear, mask) in masks {
+        assert_eq!(net.neuron_mask(*linear), Some(mask));
+    }
+    assert_same_store(&net, &params, store);
+    // A later step's store differs, so the comparison above is not empty.
+    if let Some(later) = report.steps.get(chosen + 1) {
+        let (_, other) = later.checkpoint.as_ref().unwrap();
+        let w = net.linear(0).unwrap().weight();
+        assert_ne!(other.value(w).data(), params.value(w).data());
+    }
+}
+
+/// Removing 99.9% of 8 neurons keeps one: no level leaves a layer empty.
+#[test]
+fn at_least_one_neuron_kept() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 8);
+    let config = ShrinkConfig {
+        max_removed_bp: 9990,
+        criterion: Some(ALWAYS),
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    let last = report.steps.last().unwrap();
+    assert_eq!((last.removed_bp, last.kept[0]), (9990, 1));
+    assert!(report.steps.iter().all(|s| s.kept[0] >= 1));
+    assert_eq!(net.neuron_mask(0).unwrap().count_on(), 1);
+}
+
+/// `Ranking::Random` with one seed removes the same neurons on every run, and another seed
+/// removes others.
+#[test]
+fn random_ranking_is_deterministic() {
+    let mut params = ParamStore::new();
+    let net = hidden_network(&mut params, 4, 32);
+    let run = |seed: u64| {
+        let (mut net, mut params) = (net.clone(), params.clone());
+        let config = ShrinkConfig {
+            ranking: Ranking::Random(seed),
+            max_removed_bp: 5000,
+            criterion: Some(ALWAYS),
+            ..quick(clusters(30, 4, 6))
+        };
+        let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+        let offs: Vec<Vec<usize>> = report.steps.iter().map(|s| off_in(s, 0)).collect();
+        let evaluations: Vec<_> = report.steps.iter().map(|s| s.validation).collect();
+        (offs, evaluations)
+    };
+    let first = run(11);
+    assert_eq!(first.0.len(), 5);
+    assert_eq!(run(11), first);
+    assert_ne!(run(12).0, first.0);
+}
+
+/// A model with no hidden `Linear` is refused, saying there is no hidden layer to shrink;
+/// so is a listed layer that is not a hidden `Linear`.
+#[test]
+fn model_without_hidden_linear_refused() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(1);
+    let lone = Sequential::new().push(linear(&mut params, 4, 3, &mut rng));
+    let capped = lone.clone().push(Relu);
+    for mut net in [lone, capped] {
+        let err = shrink(
+            &mut net,
+            &mut params,
+            &clusters(48, 4, 7),
+            quick(clusters(30, 4, 6)),
+        )
+        .unwrap_err();
+        let Error::InvalidData(msg) = err else {
+            panic!("expected InvalidData, got {err:?}");
+        };
+        assert!(msg.contains("no hidden layer to shrink"), "{msg}");
+    }
+    let mut net = hidden_network(&mut params, 4, 8);
+    for (bad, words) in [(1, "layer 1 is not a Linear"), (2, "last Linear")] {
+        let config = ShrinkConfig {
+            linears: vec![0, bad],
+            ..quick(clusters(30, 4, 6))
+        };
+        let err = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap_err();
+        assert!(err.to_string().contains(words), "{err}");
+    }
+}
+
+/// A mask set with `set_mask` on the `Linear` itself (its neurons are read at the ReLU) is
+/// refused: the tool masks neurons by `Linear`, at the ReLU.
+#[test]
+fn mask_inside_the_run_refused() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 8);
+    net.set_mask(0, NeuronMask::from_off(8, &[1]));
+    let err = shrink(
+        &mut net,
+        &mut params,
+        &clusters(48, 4, 7),
+        quick(clusters(30, 4, 6)),
+    )
+    .unwrap_err();
+    let Error::Unsupported(msg) = err else {
+        panic!("expected Unsupported, got {err:?}");
+    };
+    assert!(msg.contains("clear_mask(0)"), "{msg}");
+}
+
+/// Neurons the model already has off stay off and count as removed.
+#[test]
+fn existing_neuron_mask_counts_as_removed() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 10);
+    net.set_neuron_mask(0, NeuronMask::from_off(10, &[0, 1, 2]));
+    let config = ShrinkConfig {
+        criterion: Some(ALWAYS),
+        max_removed_bp: 5000,
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    let kept: Vec<usize> = report.steps.iter().map(|s| s.kept[0]).collect();
+    // 9, 8 and 7 would be kept at 1,000 to 3,000; 7 are on already.
+    assert_eq!(kept, [7, 7, 7, 6, 5]);
+    for step in &report.steps {
+        let off = off_in(step, 0);
+        assert!(off.starts_with(&[0, 1, 2]), "{off:?}");
+    }
+}
+
+/// `Validation::Carve` holds out the last `ceil(share · rows)` rows: the baseline is the
+/// model measured on them, and shares that leave no row on either side are refused.
+#[test]
+fn carve_holds_out_the_last_rows() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 8);
+    let train = clusters(100, 4, 7);
+    let config = ShrinkConfig {
+        validation: Some(Validation::Carve { share: 0.255 }),
+        max_removed_bp: 1000,
+        ..quick(clusters(1, 4, 1))
+    };
+    let held = train.subset(74..100);
+    let want = cavitation_nn::evaluate(&net, &params, &held, Loss::CrossEntropy, 256).unwrap();
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert_eq!(report.baseline, want);
+    for share in [0.0, 1.0, -0.5, f64::NAN] {
+        let config = ShrinkConfig {
+            validation: Some(Validation::Carve { share }),
+            ..ShrinkConfig::default()
+        };
+        let err = shrink(&mut net, &mut params, &train, config).unwrap_err();
+        assert!(
+            err.to_string().contains("must not have seen"),
+            "{share}: {err}"
+        );
+    }
+}
+
+/// The 8 → 32 → ReLU → 3 network trained on 600 rows shrinks, with the defaults and a
+/// given validation set of 200 rows, to a chosen step within 1 point of the baseline with
+/// fewer than 32 neurons, whose parameter count is the compacted network's.
+#[test]
+fn shrink_end_to_end_small() {
+    let mut params = ParamStore::new();
+    let (mut net, train) = trained(&mut params);
+    let config = ShrinkConfig {
+        validation: Some(Validation::Given(clusters(200, 8, 9))),
+        ..ShrinkConfig::default()
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert!(report.warnings.is_empty());
+    let chosen = report.chosen.expect("a step meets the criterion");
+    let step = &report.steps[chosen];
+    let (base, got) = (
+        report.baseline.accuracy.unwrap(),
+        step.validation.accuracy.unwrap(),
+    );
+    assert!(base - got <= 0.01 + 1e-12, "{base} → {got}");
+    assert!(step.kept[0] < 32, "kept {}", step.kept[0]);
+    assert!(step.checkpoint.is_none());
+    let (small, small_params) = compact(&net, &params).unwrap();
+    assert_eq!(small.linear(0).unwrap().outputs(), step.kept[0]);
+    let count: usize = small
+        .parameter_names()
+        .iter()
+        .map(|(_, id)| small_params.value(*id).data().len())
+        .sum();
+    assert_eq!(step.parameters, count);
+}
+
+/// Data that does not hold one target per row is `InvalidData` naming which set, not a
+/// panic, for the training data (also when a validation set is carved from it) and for a
+/// given validation set.
+#[test]
+fn bad_data_is_invalid_data() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 8);
+    let mut short = clusters(30, 4, 6);
+    short.targets = Targets::Classes(vec![0; 29]);
+    let good = clusters(48, 4, 7);
+    let cases = [
+        (
+            good.clone(),
+            Validation::Given(short.clone()),
+            "the validation set",
+        ),
+        (
+            short.clone(),
+            Validation::Given(good.clone()),
+            "the training data",
+        ),
+        (short, Validation::Carve { share: 0.2 }, "the training data"),
+    ];
+    for (train, validation, words) in cases {
+        let config = ShrinkConfig {
+            validation: Some(validation),
+            ..ShrinkConfig::default()
+        };
+        let err = shrink(&mut net, &mut params, &train, config).unwrap_err();
+        let Error::InvalidData(msg) = err else {
+            panic!("expected InvalidData, got {err:?}");
+        };
+        assert!(msg.contains(words) && msg.contains("29 labels"), "{msg}");
+    }
 }
