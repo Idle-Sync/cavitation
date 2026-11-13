@@ -20,7 +20,8 @@
 //!   files named like a PyTorch `state_dict`.
 //! - [`shrink`]: shrinking a trained network, with [`shrink::activity`], each neuron's mean,
 //!   mean absolute value, firing share and maximum over a data set, and [`shrink::compact`],
-//!   which removes switched-off neurons into smaller dense layers.
+//!   which removes switched-off neurons into smaller dense layers, and [`shrink::ablate`],
+//!   which ranks neurons by what switching each one off costs.
 //!
 //! # Examples
 //!

@@ -38,10 +38,12 @@ pub struct Ablation {
     pub evaluation: Evaluation,
     /// The cost of switching the neuron off. For class targets, the accuracy points lost:
     /// the accuracy without any neuron switched off minus the accuracy with this one off,
-    /// times 100 (negative if the network does better without it). For value targets, the
-    /// relative increase of the loss, `(loss_off - loss) / loss`; when the loss is 0 it is 0
-    /// if the loss stays 0 and infinity otherwise. A loss that is NaN without the neuron
-    /// counts as an infinite drop.
+    /// times 100, worked out from whole rows (negative if the network does better without
+    /// it; one row in 100 is exactly 1.0). For value targets, the relative increase of the
+    /// loss, `(loss_off - loss) / |loss|`: dividing by the magnitude keeps a higher loss a
+    /// positive drop when the loss is negative (as a KL divergence can be). When the loss is
+    /// 0 the drop is 0 if the loss stays 0 and infinity otherwise. A NaN loss with the
+    /// neuron off counts as an infinite drop.
     pub drop: f64,
 }
 
@@ -93,9 +95,10 @@ pub fn ablate(
 /// [`Evaluator::set_neuron_mask`], measured and switched back on, so nothing is compiled
 /// or allocated per neuron. A model with a layer that has no inference form (an activation
 /// of your own, say) is swept on the tape, as an [`Evaluator`] runs it. `model` is not
-/// changed. Neurons that `model` already has switched off are skipped (they have no entry)
-/// and stay off in every measurement, so each entry is the model's own masked network minus
-/// one more neuron. A `Linear` listed twice is swept once.
+/// changed. A neuron that is off in any mask of its `Linear`'s run (the `Linear` itself and
+/// the element-wise layers after it, up to [`Sequential::neuron_layer`]) is already off: it
+/// has no entry and stays off in every measurement, so each entry is the model's own masked
+/// network minus one more neuron. A `Linear` listed twice is swept once.
 ///
 /// The sort is by [`Ablation::drop`], largest first, ties by `(linear, neuron)` ascending,
 /// so the order is the same on every run. The measurements are deterministic, so a neuron
@@ -147,15 +150,27 @@ pub fn ablate_with(
     }
     let mut evaluator = Evaluator::with_neuron_masks(model, params, loss, batch, &chosen)?;
     let base = evaluator.evaluate(data)?;
+    let rows = data.len();
     let mut all = Vec::new();
     for &linear in &chosen {
         let width = model.linear(linear).expect("checked above").outputs();
+        // The neurons that are off in any mask of the `Linear`'s run (the `Linear` and the
+        // element-wise layers up to `neuron_layer`) are off already: no entry, and they
+        // stay off, since the evaluator keeps every mask of the model in place.
+        let mut already_off = vec![false; width];
+        for layer in linear..=model.neuron_layer(linear) {
+            if let Some(mask) = model.mask(layer) {
+                for neuron in mask.off().filter(|&n| n < width) {
+                    already_off[neuron] = true;
+                }
+            }
+        }
         let start = model
             .neuron_mask(linear)
             .cloned()
             .unwrap_or_else(|| NeuronMask::all_on(width));
         let mut work = start.clone();
-        for neuron in start.on() {
+        for neuron in (0..width).filter(|&n| !already_off[n]) {
             work.set(neuron, false);
             evaluator.set_neuron_mask(linear, &work)?;
             let evaluation = evaluator.evaluate(data)?;
@@ -164,7 +179,7 @@ pub fn ablate_with(
                 linear,
                 neuron,
                 evaluation,
-                drop: drop_of(&base, &evaluation, &data.targets),
+                drop: drop_of(&base, &evaluation, &data.targets, rows),
             };
             on_neuron(&ablation);
             all.push(ablation);
@@ -196,16 +211,69 @@ fn check_hidden(model: &Sequential, linear: usize) -> Result<(), Error> {
     Ok(())
 }
 
-/// The cost of `ablated` against `base`, as [`Ablation::drop`] defines it, never `-0.0`
-/// and never NaN, so that the sort is total and keeps equal drops together.
-fn drop_of(base: &Evaluation, ablated: &Evaluation, targets: &Targets) -> f64 {
-    let drop = match (targets, base.accuracy, ablated.accuracy) {
-        (Targets::Classes(_), Some(before), Some(after)) => (before - after) * 100.0,
+/// The cost of `ablated` against `base` over `rows` rows, as [`Ablation::drop`] defines it.
+/// A class drop is whole rows lost times 100 over `rows`, so it is rounded once.
+fn drop_of(base: &Evaluation, ablated: &Evaluation, targets: &Targets, rows: usize) -> f64 {
+    match (targets, base.accuracy, ablated.accuracy) {
+        (Targets::Classes(_), Some(before), Some(after)) => {
+            let n = rows as f64;
+            let lost = ((before - after) * n).round();
+            lost * 100.0 / n
+        }
         _ if ablated.loss.is_nan() => f64::INFINITY,
-        _ if base.loss > 0.0 => (ablated.loss - base.loss) / base.loss,
+        _ if base.loss != 0.0 => (ablated.loss - base.loss) / base.loss.abs(),
         _ if ablated.loss == base.loss => 0.0,
         _ => f64::INFINITY,
-    };
-    // `-0.0 + 0.0` is `+0.0`.
-    drop + 0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests of the arms of `drop_of`.
+
+    use super::*;
+
+    /// An evaluation with `loss` and `accuracy` (R² unused).
+    fn eval(loss: f64, accuracy: Option<f64>) -> Evaluation {
+        Evaluation {
+            loss,
+            accuracy,
+            r2: None,
+        }
+    }
+
+    /// Value targets: a zero baseline gives 0 for an equal loss and infinity otherwise, NaN
+    /// gives infinity, and a negative baseline is divided by its magnitude.
+    #[test]
+    fn value_drop_arms() {
+        let values = Targets::Values(cavitation_core::Tensor::zeros(&[1, 1]));
+        let drop =
+            |base: f64, after: f64| drop_of(&eval(base, None), &eval(after, None), &values, 1);
+        assert_eq!(drop(0.0, 0.0), 0.0);
+        assert_eq!(drop(0.0, 0.5), f64::INFINITY);
+        assert_eq!(drop(2.0, f64::NAN), f64::INFINITY);
+        assert_eq!(drop(2.0, 3.0), 0.5);
+        assert_eq!(drop(2.0, 1.0), -0.5);
+        // A higher loss is a positive drop whatever the baseline's sign.
+        assert_eq!(drop(-2.0, -1.0), 0.5);
+        assert_eq!(drop(-2.0, -3.0), -0.5);
+    }
+
+    /// Class targets: equal accuracies drop 0, and whole rows give exact point counts.
+    #[test]
+    fn class_drop_is_exact() {
+        let classes = Targets::Classes(vec![0; 100]);
+        let drop = |before: f64, after: f64, rows: usize| {
+            drop_of(
+                &eval(1.0, Some(before)),
+                &eval(1.0, Some(after)),
+                &classes,
+                rows,
+            )
+        };
+        assert_eq!(drop(0.5, 0.5, 100), 0.0);
+        assert_eq!(drop(0.97, 0.96, 100), 1.0);
+        assert_eq!(drop(0.96, 0.97, 100), -1.0);
+        assert_eq!(drop(1.0, 0.0, 100), 100.0);
+    }
 }

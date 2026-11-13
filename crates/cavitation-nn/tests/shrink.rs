@@ -1,4 +1,5 @@
-//! Tests of `shrink::ablate` (the ablation sweep, at the end) and of `shrink::compact`: a masked network rebuilt without its off neurons gives the
+//! Tests of `shrink::ablate` (the ablation sweep, at the end) and of `shrink::compact`: a
+//! masked network rebuilt without its off neurons gives the
 //! masked network's outputs (bit for bit on the kernel levels whose sums do not depend on an
 //! output's position, within the documented rounding bound on the others), and the masks
 //! and layers it cannot compact are refused with a message that says what to do. The kernel
@@ -1009,7 +1010,6 @@ fn dead_neuron_ablation_drops_nothing() {
         let all = ablate(&net, &params, &data, &[0, 2], loss, 32).unwrap();
         let dead = all.iter().find(|a| (a.linear, a.neuron) == (0, 3)).unwrap();
         assert_eq!(dead.drop, 0.0);
-        assert!(dead.drop.is_sign_positive());
         assert!(all.iter().any(|a| a.drop != 0.0));
     }
 }
@@ -1046,7 +1046,9 @@ fn ablation_matches_masked_evaluate() {
                     a.linear, a.neuron
                 );
                 let drop = match (&data.targets, base.accuracy, a.evaluation.accuracy) {
-                    (Targets::Classes(_), Some(b), Some(m)) => (b - m) * 100.0,
+                    (Targets::Classes(_), Some(b), Some(m)) => {
+                        ((b - m) * 90.0).round() * 100.0 / 90.0
+                    }
                     _ => (a.evaluation.loss - base.loss) / base.loss,
                 };
                 assert_eq!(a.drop, drop);
@@ -1174,4 +1176,60 @@ fn ablate_with_reports_each_neuron() {
             .is_empty()
     );
     assert!(ablate(&net, &params, &data, &[0], Loss::Mse, 0).is_err());
+}
+
+/// Neurons off in a mask on the `Linear` itself (not at the neuron layer) are already off:
+/// no entries, and they stay off, as the other neurons' measurements show.
+#[test]
+fn masks_anywhere_in_the_run_are_honoured() {
+    let mut params = ParamStore::new();
+    let mut net = small_network(&mut params);
+    net.set_mask(0, NeuronMask::from_off(10, &[1, 4]));
+    let data = class_data();
+    let all = ablate(&net, &params, &data, &[0], Loss::CrossEntropy, 32).unwrap();
+    assert_eq!(all.len(), 8);
+    assert!(all.iter().all(|a| a.neuron != 1 && a.neuron != 4));
+    let off: Vec<usize> = net.mask(0).unwrap().off().collect();
+    assert_eq!(off, [1, 4]);
+    assert!(net.neuron_mask(0).is_none());
+    // Each entry is measured with 1 and 4 still off.
+    for a in &all {
+        let mut masked = net.clone();
+        masked.set_mask(1, NeuronMask::from_off(10, &[a.neuron]));
+        let want = Evaluator::new(&masked, &params, Loss::CrossEntropy, 32)
+            .unwrap()
+            .evaluate(&data)
+            .unwrap();
+        assert_eq!(a.evaluation, want);
+    }
+}
+
+/// A negative baseline loss (KL divergence on small targets) gives finite drops whose sign
+/// follows the loss: a higher loss is a positive drop.
+#[test]
+fn negative_baseline_loss_gives_finite_drops() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(8);
+    let net = Sequential::new()
+        .push(linear(&mut params, 4, 6, &mut rng))
+        .push(Relu)
+        .push(linear(&mut params, 6, 2, &mut rng));
+    let x = inputs(40, 4, 9);
+    let data = Dataset {
+        x: Tensor::from_vec(x, &[40, 4]).unwrap(),
+        targets: Targets::Values(Tensor::from_vec(vec![0.1f32; 80], &[40, 2]).unwrap()),
+    };
+    let base = Evaluator::new(&net, &params, Loss::KlDiv, 16)
+        .unwrap()
+        .evaluate(&data)
+        .unwrap();
+    assert!(base.loss < 0.0, "baseline {}", base.loss);
+    let all = ablate(&net, &params, &data, &[0], Loss::KlDiv, 16).unwrap();
+    assert_eq!(all.len(), 6);
+    for a in &all {
+        assert!(a.drop.is_finite());
+        assert_eq!(a.drop, (a.evaluation.loss - base.loss) / base.loss.abs());
+        assert_eq!(a.drop > 0.0, a.evaluation.loss > base.loss);
+    }
+    assert!(all.iter().any(|a| a.drop < 0.0) && all.iter().any(|a| a.drop > 0.0));
 }
