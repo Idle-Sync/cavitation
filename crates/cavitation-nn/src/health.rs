@@ -83,8 +83,17 @@ impl fmt::Display for BadInput {
     ///
     /// ```
     /// use cavitation_nn::BadInput;
-    /// let bad = BadInput { position: 0, row: None, feature: 4, value: f32::INFINITY, target: true };
-    /// assert_eq!(bad.to_string(), "the batch's targets held infinity at batch position 0, output 4");
+    /// let bad = BadInput {
+    ///     position: 0,
+    ///     row: None,
+    ///     feature: 4,
+    ///     value: f32::INFINITY,
+    ///     target: true,
+    /// };
+    /// assert_eq!(
+    ///     bad.to_string(),
+    ///     "the batch's targets held infinity at batch position 0, output 4"
+    /// );
     /// ```
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let value = if self.value.is_nan() {
@@ -637,7 +646,11 @@ struct ReluLayer {
 ///         let loss = tape.mse(out, target, Reduction::Mean);
 ///         let value = tape.value(loss).data()[0];
 ///         tape.backward(loss, &mut params.grads);
-///         let inputs = StepInputs { x: x.view(), targets: TargetsView::Values(y.view()), rows: None };
+///         let inputs = StepInputs {
+///             x: x.view(),
+///             targets: TargetsView::Values(y.view()),
+///             rows: None,
+///         };
 ///         let checked = monitor.after_backward(step, value, &tape, &trace, &net, inputs);
 ///         drop(tape);
 ///         // Update only if the loss was finite, and clear the gradients before returning
@@ -645,7 +658,8 @@ struct ReluLayer {
 ///         if checked.is_ok() {
 ///             optimizer.step(&mut params);
 ///         }
-///         let checked = checked.and_then(|()| monitor.after_update(step, optimizer.last_stats(), &names));
+///         let checked =
+///             checked.and_then(|()| monitor.after_update(step, optimizer.last_stats(), &names));
 ///         params.zero_grad();
 ///         checked?;
 ///     }
@@ -654,7 +668,8 @@ struct ReluLayer {
 /// let err = train().unwrap_err();
 /// assert_eq!(
 ///     err.to_string(),
-///     "non-finite value at step 1 in loss: the batch's input held NaN at batch position 2, feature 0"
+///     "non-finite value at step 1 in loss: the batch's input held NaN at batch position 2, \
+///      feature 0"
 /// );
 /// ```
 pub struct HealthMonitor {
@@ -902,12 +917,19 @@ impl HealthMonitor {
     /// let x = tape.input(data.view());
     /// let mut trace = Trace::new();
     /// net.forward_traced(&mut tape, x, &mut trace);
-    /// let inputs = StepInputs { x: data.view(), targets: TargetsView::Classes(&[0, 1]), rows: None };
+    /// let inputs = StepInputs {
+    ///     x: data.view(),
+    ///     targets: TargetsView::Classes(&[0, 1]),
+    ///     rows: None,
+    /// };
     /// let mut monitor = HealthMonitor::new(Health::default());
     /// assert!(monitor.after_backward(1, 4.0, &tape, &trace, &net, inputs).is_ok());
     /// let err = monitor.after_backward(2, f32::NAN, &tape, &trace, &net, inputs).unwrap_err();
     /// // Every input was finite, so the detail says the values overflowed.
-    /// assert!(err.to_string().starts_with("non-finite value at step 2 in loss: the inputs were finite"));
+    /// assert!(
+    ///     err.to_string()
+    ///         .starts_with("non-finite value at step 2 in loss: the inputs were finite")
+    /// );
     /// ```
     pub fn after_backward(
         &mut self,

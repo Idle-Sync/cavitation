@@ -117,7 +117,9 @@ impl<T: Real> Tape<'_, T> {
     ///
     /// ```
     /// use std::sync::Arc;
-    /// use cavitation_core::{CustomOp, Graph, ParamStore, Real, Shape, Tensor, TensorView, TensorViewMut};
+    /// use cavitation_core::{
+    ///     CustomOp, Graph, ParamStore, Real, Shape, Tensor, TensorView, TensorViewMut,
+    /// };
     ///
     /// /// `x + 1`.
     /// struct AddOne;

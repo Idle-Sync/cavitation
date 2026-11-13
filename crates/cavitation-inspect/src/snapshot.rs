@@ -702,7 +702,10 @@ impl StepControl for Inspector {
     ///     Flow, Linear, Loss, ModelHandle, Sequential, Sgd, StepControl, StepInfo, Trainer,
     ///     TrainerHandle,
     /// };
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let mut inspector = Inspector::start(config)?;
     /// let mut params = ParamStore::new();
     /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
@@ -780,7 +783,10 @@ impl StepControl for Inspector {
     ///     EpochReport, Flow, Linear, Loss, ModelHandle, Sequential, Sgd, StepControl, Trainer,
     ///     TrainerHandle,
     /// };
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let mut inspector = Inspector::start(config)?;
     /// let mut params = ParamStore::new();
     /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
@@ -851,7 +857,10 @@ impl StepControl for Inspector {
 /// use cavitation_core::{ParamStore, Rng, Tensor};
 /// use cavitation_inspect::{Inspector, InspectorConfig};
 /// use cavitation_nn::{Dataset, FitConfig, Linear, Loss, Relu, Sequential, Targets};
-/// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+/// let config = InspectorConfig {
+///     address: "127.0.0.1:0".parse().unwrap(),
+///     ..Default::default()
+/// };
 /// let mut inspector = Inspector::start(config)?;
 /// println!("open {}", inspector.url());
 /// let mut params = ParamStore::new();
@@ -864,7 +873,12 @@ impl StepControl for Inspector {
 ///     x: Tensor::from_vec(vec![0.0f32, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0], &[4, 2]).unwrap(),
 ///     targets: Targets::Classes(vec![0, 1, 1, 0]),
 /// };
-/// let config = FitConfig { epochs: 5, batch: 4, loss: Loss::CrossEntropy, ..FitConfig::default() };
+/// let config = FitConfig {
+///     epochs: 5,
+///     batch: 4,
+///     loss: Loss::CrossEntropy,
+///     ..FitConfig::default()
+/// };
 /// let history = cavitation_inspect::fit(&mut net, &mut params, &data, config, &mut inspector)?;
 /// assert_eq!(history.epochs.len(), 5);
 /// # Ok::<(), cavitation_core::Error>(())

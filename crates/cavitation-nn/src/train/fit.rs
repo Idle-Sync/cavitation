@@ -165,7 +165,9 @@ impl Loss {
 ///
 /// ```
 /// use cavitation_core::{Error, ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
+/// use cavitation_nn::{
+///     Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer,
+/// };
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
 ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
@@ -221,7 +223,11 @@ impl Loss {
 ///         let loss = tape.l1(out, target, Reduction::Sum);
 ///         let value = tape.value(loss).data()[0];
 ///         tape.backward(loss, &mut params.grads);
-///         let inputs = StepInputs { x: x.view(), targets: TargetsView::Values(y.view()), rows: None };
+///         let inputs = StepInputs {
+///             x: x.view(),
+///             targets: TargetsView::Values(y.view()),
+///             rows: None,
+///         };
 ///         monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
 ///         drop(tape);
 ///         optimizer.step(&mut params);
@@ -376,7 +382,9 @@ impl Trainer {
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng, Tensor};
-    /// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
+    /// use cavitation_nn::{
+    ///     Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer,
+    /// };
     /// let data = Dataset { x: Tensor::zeros(&[3, 2]), targets: Targets::Classes(vec![0, 1, 1]) };
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
@@ -416,7 +424,10 @@ impl Trainer {
     /// use cavitation_nn::{
     ///     Batch, Batcher, Dataset, Hooks, Linear, Loss, Sequential, Sgd, Targets, Tanh, Trainer,
     /// };
-    /// let data = Dataset { x: Tensor::full(&[2, 2], 0.5f32), targets: Targets::Classes(vec![0, 1]) };
+    /// let data = Dataset {
+    ///     x: Tensor::full(&[2, 2], 0.5f32),
+    ///     targets: Targets::Classes(vec![0, 1]),
+    /// };
     /// let mut params = ParamStore::new();
     /// let mut rng = Rng::seed(0);
     /// let net = Sequential::new()
@@ -1608,7 +1619,9 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Dataset, FitConfig, Linear, Loss, OptimizerConfig, Sequential, Targets, fit};
+/// use cavitation_nn::{
+///     Dataset, FitConfig, Linear, Loss, OptimizerConfig, Sequential, Targets, fit,
+/// };
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
 ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
@@ -1648,7 +1661,9 @@ pub fn fit(
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Dataset, FitConfig, Hooks, Linear, Loss, Sequential, Targets, fit_with_hooks};
+/// use cavitation_nn::{
+///     Dataset, FitConfig, Hooks, Linear, Loss, Sequential, Targets, fit_with_hooks,
+/// };
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
 ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
