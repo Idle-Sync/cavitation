@@ -1075,10 +1075,15 @@ fn check_layout(model: &Sequential, linears: &[usize]) -> Result<Vec<ShrinkWarni
         }
     }
     if let Some(layer) = foreign_parameters(model) {
+        // One warning per layer: a layer of your own can be both element-wise and have
+        // parameters, and its parameters are the reason that decides.
+        warnings.retain(|warning| {
+            !matches!(warning, ShrinkWarning::NotCompactable { layer: l, .. } if *l == layer)
+        });
         warnings.push(ShrinkWarning::NotCompactable {
             layer,
             reason: format!(
-                "the layer {} has parameters and is neither a Linear nor a Prelu, so compact \
+                "the layer {} has parameters and is neither a Linear nor a Prelu, and compact \
                  cannot move them to a new store",
                 model.layer(layer).name()
             ),

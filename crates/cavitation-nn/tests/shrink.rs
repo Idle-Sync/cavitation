@@ -2044,7 +2044,8 @@ fn softmax_and_glu_refused_before_training() {
 /// Where masking removes neurons but `compact` cannot rebuild the result, `shrink` runs,
 /// warns at the start with `NotCompactable` naming the layer, and `compact` then refuses
 /// the chosen network: a layer of your own with parameters (after the output layer), and
-/// an element-wise layer of your own without parameters in a shrunk run.
+/// an element-wise layer of your own without parameters in a shrunk run, and one that is
+/// both (warned once).
 #[test]
 fn not_compactable_runs_and_warns() {
     let mut params = ParamStore::new();
@@ -2060,9 +2061,16 @@ fn not_compactable_runs_and_warns() {
         .push(Relu)
         .push(PositionScale)
         .push(linear(&mut params, 8, 3, &mut rng));
+    let inner = Prelu::new(&mut params, 8);
+    let both = Sequential::new()
+        .push(linear(&mut params, 4, 8, &mut rng))
+        .push(PreluTimesTwo { inner })
+        .push(linear(&mut params, 8, 3, &mut rng));
     for (mut net, layer, words) in [
         (with_parameters, 3, "scaled_tanh has parameters"),
         (own_elementwise, 2, "position_scale"),
+        // Element-wise and with parameters: one warning, for the parameters.
+        (both, 1, "prelu_times_two has parameters"),
     ] {
         let (result, steps) = counted_shrink(&mut net, &mut params.clone(), Ranking::OutNorm);
         let report = result.unwrap();
