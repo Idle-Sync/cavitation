@@ -6,6 +6,7 @@ mod pool;
 pub use params::{ParamGrads, ParamId, ParamStore, ParamValues};
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use crate::ops::Op;
 use crate::{Real, Shape, TensorView};
@@ -596,6 +597,95 @@ impl<T: Real> Tape<'_, T> {
         self.backward_seeded(loss, &[T::ONE], grads);
     }
 
+    /// The same pass as [`backward`](Tape::backward), with the time it spends split at
+    /// `marks`. The time spent on the nodes recorded after `marks[j - 1]` and up to and
+    /// including `marks[j]` is added to `times[j]` (for `j = 0`, every node up to `marks[0]`),
+    /// and the time spent on the nodes after the last mark to `times[marks.len()]`. With each
+    /// layer's output as a mark, `times[j]` is layer `j`'s backward time and the last entry
+    /// is the loss's.
+    ///
+    /// The gradients are bit for bit those `backward` gives: both run one node loop. The
+    /// clock is read once before the walk and once at each mark boundary the walk crosses,
+    /// never per node. Times are added, not written, so a caller can sum them over steps;
+    /// set `times` to zero to start afresh. Nothing is allocated beyond what `backward`
+    /// allocates.
+    ///
+    /// Marks must be in the order they were recorded; two equal marks are allowed and give
+    /// an empty segment. A segment with no node at or before the loss (a mark recorded after
+    /// the loss, say) adds nothing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `times.len()` is not `marks.len() + 1`, if a mark comes before the one
+    /// ahead of it, if a mark or `loss` was not recorded on this tape, and under the same
+    /// conditions as [`backward`](Tape::backward).
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let mut store = ParamStore::new();
+    /// let a = store.add(Tensor::full(&[1], 2.0f32));
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let va = tape.param(a);
+    /// let h = tape.mul(va, va); // segment 0: everything up to `h`
+    /// let loss = tape.add(h, h); // segment 1: after `h`
+    /// let mut times = [Duration::ZERO; 2];
+    /// tape.backward_timed(loss, &mut store.grads, &[h], &mut times);
+    /// drop(tape);
+    /// assert_eq!(store.grad(a).data(), &[8.0]);
+    /// ```
+    pub fn backward_timed(
+        &mut self,
+        loss: Var,
+        grads: &mut ParamGrads<T>,
+        marks: &[Var],
+        times: &mut [Duration],
+    ) {
+        self.backward_timed_with(loss, grads, marks, times, Instant::now);
+    }
+
+    /// [`backward_timed`](Tape::backward_timed) reading the clock through `now`, so a test
+    /// can count the reads; `backward_timed` passes `Instant::now`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions `backward_timed` lists.
+    fn backward_timed_with(
+        &mut self,
+        loss: Var,
+        grads: &mut ParamGrads<T>,
+        marks: &[Var],
+        times: &mut [Duration],
+        now: impl FnMut() -> Instant,
+    ) {
+        let shape = self.shape(loss);
+        assert!(
+            shape.len() == 1,
+            "backward_timed: the loss must have one element, but its shape is {:?}",
+            shape.dims()
+        );
+        assert!(
+            times.len() == marks.len() + 1,
+            "backward_timed: {} marks need {} times, but times has {}",
+            marks.len(),
+            marks.len() + 1,
+            times.len()
+        );
+        let mut previous = 0;
+        for (j, mark) in marks.iter().enumerate() {
+            let index = mark.index_on(self.id);
+            assert!(
+                j == 0 || index >= previous,
+                "backward_timed: mark {j} (node {index}) was recorded before mark {} (node \
+                 {previous}); marks go in the order they were recorded",
+                j - 1
+            );
+            previous = index;
+        }
+        self.backward_pass(loss, &[T::ONE], grads, Some((marks, times, now)));
+    }
+
     /// Like [`backward`](Tape::backward) for an output of any size: seeds the gradient of
     /// `out` with `seed` (the gradient of the loss with respect to each element of `out`)
     /// and runs the same reverse pass.
@@ -606,6 +696,26 @@ impl<T: Real> Tape<'_, T> {
     /// on this tape, or if `grads` belongs to another [`ParamStore`] than the values this
     /// tape reads.
     pub(crate) fn backward_seeded(&mut self, out: Var, seed: &[T], grads: &mut ParamGrads<T>) {
+        self.backward_pass(out, seed, grads, None::<(_, _, fn() -> Instant)>);
+    }
+
+    /// The reverse pass behind [`backward`](Tape::backward), `backward_seeded` and
+    /// [`backward_timed`](Tape::backward_timed): seeds `out`'s gradient with `seed` and
+    /// walks the nodes from `out` down to the first. With `timing`, the walk is split at the
+    /// marks (already checked to be in recording order) as [`segments`] gives them, and
+    /// each segment's time is added to its entry; the node loop is the same either way. The
+    /// clock, `now`, is read once before the walk and once after each segment.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions [`backward_seeded`](Tape::backward_seeded) lists.
+    fn backward_pass(
+        &mut self,
+        out: Var,
+        seed: &[T],
+        grads: &mut ParamGrads<T>,
+        timing: Option<(&[Var], &mut [Duration], impl FnMut() -> Instant)>,
+    ) {
         assert!(
             grads.store_id() == self.params.store_id(),
             "backward: the grads belong to another ParamStore than the values this tape reads \
@@ -645,23 +755,38 @@ impl<T: Real> Tape<'_, T> {
         if let Some(slot) = seed_ctx.slot(out) {
             slot.add_from(seed);
         }
-        for i in (0..=loss_index).rev() {
-            let (before, rest) = node_grads.split_at_mut(i);
-            let Some(out_grad) = rest[0].as_deref() else {
-                continue;
-            };
-            let mut ctx = BackwardCtx {
-                values,
-                grads: before,
-                labels,
-                pool,
-                params: grads,
-            };
-            let this = Var {
-                index: i as u32,
-                tape: self.id,
-            };
-            nodes[i].op.backward(this, out_grad, &mut ctx);
+        let tape = self.id;
+        // Differentiates the nodes `range`, last first.
+        let mut walk = |range: std::ops::Range<usize>| {
+            for i in range.rev() {
+                let (before, rest) = node_grads.split_at_mut(i);
+                let Some(out_grad) = rest[0].as_deref() else {
+                    continue;
+                };
+                let mut ctx = BackwardCtx {
+                    values,
+                    grads: before,
+                    labels,
+                    pool,
+                    params: grads,
+                };
+                let this = Var {
+                    index: i as u32,
+                    tape,
+                };
+                nodes[i].op.backward(this, out_grad, &mut ctx);
+            }
+        };
+        let Some((marks, times, mut now)) = timing else {
+            walk(0..loss_index + 1);
+            return;
+        };
+        let mut clock = now();
+        for (j, range) in segments(marks, tape, loss_index) {
+            walk(range);
+            let t = now();
+            times[j] += t - clock;
+            clock = t;
         }
     }
 
@@ -730,6 +855,34 @@ impl<T: Real> Tape<'_, T> {
     }
 }
 
+/// The non-empty segments of a timed backward pass over a tape whose loss is node
+/// `loss_index`, in the order the pass walks them (last first): each segment's entry in
+/// `times` and its node range. Segment `j` is the nodes after `marks[j - 1]` up to and
+/// including `marks[j]` (from node 0 for `j = 0`); segment `marks.len()` is the nodes after
+/// the last mark up to the loss. Nodes after the loss belong to no segment, so a segment
+/// that would hold only such nodes, or none (between equal marks), is left out. `marks`
+/// must be in recording order, on the tape with id `tape`.
+fn segments(
+    marks: &[Var],
+    tape: u32,
+    loss_index: usize,
+) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_ {
+    // Each segment ends where the one above it began.
+    let mut end = loss_index + 1;
+    (0..=marks.len()).rev().filter_map(move |j| {
+        let start = match j {
+            0 => 0,
+            _ => marks[j - 1].index_on(tape) + 1,
+        };
+        if start >= end {
+            return None;
+        }
+        let range = start..end;
+        end = start;
+        Some((j, range))
+    })
+}
+
 impl<T: Real> Drop for Tape<'_, T> {
     /// Returns every buffer the tape used to the graph's pool.
     fn drop(&mut self) {
@@ -740,6 +893,8 @@ impl<T: Real> Drop for Tape<'_, T> {
 /// Tests for the tape.
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use crate::{Graph, ParamStore, Tensor};
 
     /// Gradients add up over backward calls until `zero_grad`, which reads as zeros.
@@ -844,6 +999,149 @@ mod tests {
         let v = tape.param(p);
         let loss = tape.add(v, v);
         tape.backward(loss, &mut s2.grads);
+    }
+
+    /// A store with one parameter of value 3, its id and a graph, for the timed-pass tests.
+    fn square_store() -> (ParamStore, crate::ParamId, Graph) {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[1], 3.0f32));
+        (store, p, Graph::new())
+    }
+
+    /// `times` must have one entry more than `marks`.
+    #[test]
+    #[should_panic(expected = "backward_timed: 1 marks need 2 times, but times has 1")]
+    fn backward_timed_checks_times_length() {
+        let (mut store, p, mut graph) = square_store();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let h = tape.mul(v, v);
+        let loss = tape.add(h, h);
+        tape.backward_timed(loss, &mut store.grads, &[h], &mut [Duration::ZERO]);
+    }
+
+    /// Marks out of recording order are refused, naming both.
+    #[test]
+    #[should_panic(expected = "mark 1 (node 1) was recorded before mark 0 (node 2)")]
+    fn backward_timed_checks_mark_order() {
+        let (mut store, p, mut graph) = square_store();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let h = tape.mul(v, v);
+        let g = tape.add(h, h);
+        let loss = tape.add(g, g);
+        tape.backward_timed(loss, &mut store.grads, &[g, h], &mut [Duration::ZERO; 3]);
+    }
+
+    /// A mark from another tape panics like any foreign `Var`.
+    #[test]
+    #[should_panic(expected = "Var belongs to another tape")]
+    fn backward_timed_checks_mark_tape() {
+        let (mut store, p, mut graph) = square_store();
+        let mut other = Graph::new();
+        let foreign = other.tape(&store.values).param(p);
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let loss = tape.mul(v, v);
+        tape.backward_timed(loss, &mut store.grads, &[foreign], &mut [Duration::ZERO; 2]);
+    }
+
+    /// Equal marks give an empty segment and a mark after the loss gives nothing to its
+    /// segments; neither changes the gradients, and nothing is timed for a segment with no
+    /// node.
+    #[test]
+    fn backward_timed_allows_equal_marks_and_marks_after_the_loss() {
+        let (mut store, p, mut graph) = square_store();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        let h = tape.mul(v, v);
+        let loss = tape.add(h, h);
+        let after = tape.add(loss, loss);
+        let mut times = [Duration::ZERO; 4];
+        tape.backward_timed(loss, &mut store.grads, &[h, h, after], &mut times);
+        assert_eq!(tape.grad(h).unwrap().data(), &[2.0]);
+        drop(tape);
+        assert_eq!(store.grad(p).data(), &[12.0]);
+        assert_eq!(
+            times[1],
+            Duration::ZERO,
+            "the empty segment between equal marks"
+        );
+        assert_eq!(
+            times[3],
+            Duration::ZERO,
+            "the segment after a mark past the loss"
+        );
+    }
+
+    /// `Var`s at the given node positions of tape 0, as marks for [`super::segments`].
+    fn at(indices: &[u32]) -> Vec<super::Var> {
+        indices
+            .iter()
+            .map(|&index| super::Var { index, tape: 0 })
+            .collect()
+    }
+
+    /// The segments of a timed pass, case by case: each mark's own node is in its segment,
+    /// equal marks and marks at or past the loss leave segments out, and no marks give one
+    /// segment of every node up to the loss.
+    #[test]
+    fn segments_cover_each_node_once() {
+        let seg = |marks: &[u32], loss| super::segments(&at(marks), 0, loss).collect::<Vec<_>>();
+        // Layers end at nodes 2, 5 and 7; the loss is node 9.
+        assert_eq!(
+            seg(&[2, 5, 7], 9),
+            [(3, 8..10), (2, 6..8), (1, 3..6), (0, 0..3)]
+        );
+        // Equal marks: segment 1 holds nothing.
+        assert_eq!(seg(&[2, 2, 7], 9), [(3, 8..10), (2, 3..8), (0, 0..3)]);
+        // A mark at the loss: nothing after it.
+        assert_eq!(seg(&[2, 9], 9), [(1, 3..10), (0, 0..3)]);
+        // A mark after the loss: its segment is cut at the loss, the one after is empty.
+        assert_eq!(seg(&[2, 12], 9), [(1, 3..10), (0, 0..3)]);
+        // A first mark at node 0.
+        assert_eq!(seg(&[0, 4], 6), [(2, 5..7), (1, 1..5), (0, 0..1)]);
+        // No marks.
+        assert_eq!(seg(&[], 4), [(0, 0..5)]);
+    }
+
+    /// The timed pass reads the clock once before the walk and once after each non-empty
+    /// segment, never per node, and each segment gets the time between its two reads.
+    #[test]
+    fn backward_timed_reads_the_clock_at_boundaries_only() {
+        let (mut store, p, mut graph) = square_store();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p); // node 0
+        let a = tape.mul(v, v); // 1
+        let b = tape.add(a, a); // 2
+        let c = tape.mul(b, b); // 3
+        let d = tape.add(c, c); // 4
+        let loss = tape.sum(d); // 5
+        let base = std::time::Instant::now();
+        let mut reads = 0u32;
+        // Each read is one millisecond after the last.
+        let clock = || {
+            reads += 1;
+            base + Duration::from_millis(u64::from(reads))
+        };
+        let mut times = [Duration::ZERO; 5];
+        // Segments: 4 = 5..6, 3 = 3..5, 2 = empty (equal marks), 1 = 2..3, 0 = 0..2.
+        tape.backward_timed_with(loss, &mut store.grads, &[a, b, b, d], &mut times, clock);
+        let ms = Duration::from_millis(1);
+        assert_eq!(times, [ms, ms, Duration::ZERO, ms, ms]);
+        assert_eq!(reads, 4 + 1);
+    }
+
+    /// The timed pass checks the loss's size as `backward` does.
+    #[test]
+    #[should_panic(expected = "backward_timed: the loss must have one element")]
+    fn backward_timed_on_non_scalar_panics() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::zeros(&[2]));
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p);
+        tape.backward_timed(v, &mut store.grads, &[], &mut [Duration::ZERO]);
     }
 
     /// A gradient write that panics on a shape mismatch leaves the parameter stale.

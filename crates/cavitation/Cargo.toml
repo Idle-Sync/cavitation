@@ -26,3 +26,12 @@ ml = ["dep:cavitation-ml"]
 [dev-dependencies]
 # Real datasets for the examples and known-result tests.
 cavitation-datasets = { path = "../cavitation-datasets" }
+
+# The regression examples use the classic models, which the `ml` feature provides.
+[[example]]
+name = "linear_regression"
+required-features = ["ml"]
+
+[[example]]
+name = "logistic_regression"
+required-features = ["ml"]
