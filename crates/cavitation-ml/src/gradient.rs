@@ -312,6 +312,7 @@ impl LinearRegression {
             history.epochs.push(EpochReport {
                 epoch,
                 mean_loss: total / rows as f64,
+                rows,
                 seconds: start.elapsed().as_secs_f64(),
             });
         }

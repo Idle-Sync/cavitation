@@ -165,13 +165,14 @@ pub mod prelude {
     };
     pub use cavitation_nn::{
         Activation, ActivationLayer, Adam, AdamW, BadInput, Batch, BatchView, Batcher, Celu,
-        Dataset, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Gelu, Glu, GradStats,
+        Dataset, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Flow, Gelu, Glu, GradStats,
         Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks, InferenceModel,
         Init, Layer, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss,
-        LrSchedule, Mish, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu, Relu6,
-        Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, Standardizer,
-        StepInputs, Tanh, Targets, TargetsView, Trace, Trainer, Warning, WarningKind, accuracy,
-        evaluate, fit, fit_with_hooks, load, load_lenient, load_with, save,
+        LrSchedule, Mish, ModelHandle, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu,
+        Relu, Relu6, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign,
+        Standardizer, StepControl, StepInfo, StepInputs, StepProfile, Tanh, Targets, TargetsView,
+        Trace, Trainer, TrainerHandle, Warning, WarningKind, accuracy, evaluate, fit,
+        fit_controlled, fit_with_hooks, load, load_lenient, load_with, save,
     };
 }
 

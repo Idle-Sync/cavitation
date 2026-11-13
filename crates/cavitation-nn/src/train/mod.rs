@@ -14,7 +14,7 @@ pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
 pub use evaluate::{Evaluation, Evaluator, evaluate};
 pub use fit::{
     EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig, StepControl,
-    StepInfo, StepProfile, Trainer, accuracy, fit, fit_controlled, fit_with_hooks,
+    StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled, fit_with_hooks,
 };
 pub(crate) use fit::{check_dataset, check_widths};
 pub use standardize::Standardizer;
