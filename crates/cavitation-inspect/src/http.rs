@@ -58,7 +58,8 @@ pub enum Method {
 ///
 /// ```
 /// use cavitation_inspect::http::parse_request;
-/// let r = parse_request(b"GET /events?token=ab HTTP/1.1\r\nHost: 127.0.0.1:7878\r\n\r\n").unwrap();
+/// let r =
+///     parse_request(b"GET /events?token=ab HTTP/1.1\r\nHost: 127.0.0.1:7878\r\n\r\n").unwrap();
 /// assert_eq!(r.path, "/events");
 /// assert_eq!(r.param("token"), Some("ab"));
 /// assert_eq!(r.host.as_deref(), Some("127.0.0.1:7878"));
@@ -171,7 +172,8 @@ impl std::error::Error for HttpError {}
 ///
 /// ```
 /// use cavitation_inspect::http::{HttpError, parse_request};
-/// let r = parse_request(b"GET /?token=1 HTTP/1.1\r\nOrigin: http://localhost:7878\r\n\r\n").unwrap();
+/// let r =
+///     parse_request(b"GET /?token=1 HTTP/1.1\r\nOrigin: http://localhost:7878\r\n\r\n").unwrap();
 /// assert_eq!(r.origin.as_deref(), Some("http://localhost:7878"));
 /// assert_eq!(parse_request(b"GET /?a=%41 HTTP/1.1\r\n\r\n"), Err(HttpError::Query));
 /// ```

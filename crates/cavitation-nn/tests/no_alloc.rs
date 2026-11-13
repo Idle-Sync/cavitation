@@ -792,7 +792,8 @@ fn forward_timing_off_allocates_nothing() -> usize {
 /// The manual training loop with Adam, timed: forward timing on, each layer's output kept
 /// as a mark in a reused list, and `backward_timed` into the caller's `times`. Also runs a
 /// second backward pass each step into a `ParamGrads::like` set, cleared with its own
-/// `zero_grad`, on a graph of its own, as an inspector's probe does. One warm-up epoch, then counts the allocations of a second.
+/// `zero_grad`, on a graph of its own, as an inspector's probe does. One warm-up epoch, then counts
+/// the allocations of a second.
 fn timed_step_allocates_nothing() -> usize {
     let data = synthetic_1437();
     let mut params = ParamStore::new();
