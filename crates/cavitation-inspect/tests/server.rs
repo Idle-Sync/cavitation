@@ -794,7 +794,7 @@ fn stalled_client_is_dropped() {
     assert!(wait_until(Duration::from_secs(5), || inspector.clients() == 1));
     let big = "x".repeat(1 << 20);
     let start = Instant::now();
-    // The brief's bound is 2 s; 5 s here allows for a loaded machine.
+    // It is usually gone within 2 s; 5 s here allows for a loaded machine.
     while inspector.clients() > 0 && start.elapsed() < Duration::from_secs(5) {
         inspector.hub().publish_snapshot(Snapshot::Stats, |w| {
             w.string(&big);
