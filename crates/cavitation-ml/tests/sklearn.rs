@@ -332,3 +332,27 @@ fn dataset_reference_reproduces_the_fit() {
         );
     }
 }
+
+/// `Standardizer::fit` on the Concrete training rows gives scikit-learn's `StandardScaler`
+/// mean and scale within 1e-12 relative. The loader's rows are `f32` and scikit-learn
+/// fitted the same values widened to `f64`, as `fixture` does.
+#[test]
+fn standard_scaler_matches() {
+    use cavitation_core::Tensor;
+    use cavitation_nn::Standardizer;
+    let f = fixture("standard-scaler-concrete");
+    let x = f.x.as_ref().unwrap();
+    let rows: Vec<f32> = x.data.iter().map(|&v| v as f32).collect();
+    let rows = Tensor::from_vec(rows, &x.shape).unwrap();
+    let s = Standardizer::fit(rows.view());
+    for (key, ours) in [("mean", s.mean()), ("scale", s.scale())] {
+        let theirs = numbers(&f.json[key], "standard-scaler-concrete");
+        assert_eq!(ours.len(), theirs.len(), "{key}");
+        for (j, (&a, &b)) in ours.iter().zip(&theirs).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-12 * b.abs(),
+                "{key}[{j}]: {a} against scikit-learn's {b}"
+            );
+        }
+    }
+}
