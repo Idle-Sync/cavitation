@@ -1,0 +1,16 @@
+# Package manifest for cavitation-ml: classic machine learning (least squares, regression) in f64.
+
+[package]
+name = "cavitation-ml"
+description = "Classic machine learning for the cavitation library: least squares and regression in f64."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
