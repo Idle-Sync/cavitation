@@ -50,6 +50,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
 .badge{font-family:var(--f-mono);font-size:.72rem;border:1px solid var(--line);border-radius:999px;padding:2px 9px;color:var(--muted)}
 .badge.live{color:var(--pos);border-color:var(--pos)}
 .badge.bad{color:var(--neg);border-color:var(--neg)}
+.notice{font-family:var(--f-mono);font-size:.78rem;color:var(--neg);overflow-wrap:anywhere}
 .statusline{font-family:var(--f-mono);font-size:.78rem;color:var(--muted);border-top:1px dashed var(--line);padding-top:10px;overflow-wrap:anywhere}
 .layers{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start}
 .layer{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1 1 120px}
@@ -114,6 +115,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       <label class="ctl"><span class="k">Learning rate</span><input type="number" id="lr" step="any" min="0" max="10"></label>
       <button id="lrSet" type="button">Set rate</button>
     </div>
+    <p class="notice" id="notice" role="status" hidden></p>
     <p class="statusline" id="statusLine" aria-live="polite">–</p>
   </section>
 
@@ -196,6 +198,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     model: null, stats: null, probe: null, neuron: null, profile: null, status: null,
     epochs: [], ablations: new Map(), shrinks: new Map(),
     mode: 'a', views: [], live: false, exported: false, connected: false,
+    pending: null, modelSeen: false,
   };
   const token = new URLSearchParams(location.search).get('token') || '';
 
@@ -220,6 +223,16 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
   }
   function setText(id, text) { $(id).textContent = String(text); }
   function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  // A message of the page's own (a refused command, a value it will not send) in its own
+  // area for a few seconds, so the run's status line does not overwrite it.
+  let noticeTimer = 0;
+  function notice(text) {
+    const n = $('notice');
+    n.textContent = String(text);
+    n.hidden = false;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { n.hidden = true; n.textContent = ''; }, 6000);
+  }
 
   // ---- Colours ----------------------------------------------------------------------
   let PAL = null;
@@ -331,6 +344,21 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       box.appendChild(v.label);
       if (last && layer.width <= 32) {
         v.outs = el('div', 'outs');
+        v.rows = [];
+        for (let j = 0; j < layer.width; j++) {
+          const row = el('button', 'out');
+          row.type = 'button';
+          row.appendChild(el('b', null, className(j)));
+          const tr = el('span', 'tr');
+          const fi = el('span', 'fi');
+          tr.appendChild(fi);
+          row.appendChild(tr);
+          const val = el('span', 'v', '–');
+          row.appendChild(val);
+          row.addEventListener('click', () => send('neuron', 'layer=' + neuronLayer(v) + '&neuron=' + j));
+          v.outs.appendChild(row);
+          v.rows.push({ row: row, fi: fi, val: val });
+        }
         box.appendChild(v.outs);
       } else {
         v.canvas = el('canvas');
@@ -374,8 +402,10 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     if (!N) return null;
     return N.layer === v.i || (v.from !== null && N.layer === v.from) ? N.neuron : null;
   }
+  // Whether the run can take a neuron selection or a switch: connected and not finished.
+  function canAsk() { return S.live && state() !== 'finished'; }
   function pickCell(v, e) {
-    if (!S.live || !v.grid) return;
+    if (!canAsk() || !v.grid) return;
     const r = v.canvas.getBoundingClientRect();
     const cx = Math.floor((e.clientX - r.left) / r.width * v.grid.cols);
     const cy = Math.floor((e.clientY - r.top) / r.height * v.grid.rows);
@@ -421,35 +451,28 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       }
     });
   }
+  // Updates the output rows in place, so a press or keyboard focus survives a render.
   function renderOutputs(v, vals) {
-    clear(v.outs);
-    const n = S.model.layers[v.i].width;
     const sel = selectedIn(v);
     const soft = S.model.layers[v.i].kind === 'softmax' && S.mode === 'a';
     let m = 1e-12, signed = false;
     if (vals) for (const x of vals) if (ok(x)) { m = Math.max(m, Math.abs(x)); if (x < 0) signed = true; }
-    for (let j = 0; j < n; j++) {
+    v.rows.forEach((r, j) => {
       const x = vals ? vals[j] : null;
-      const row = el('button', 'out');
-      row.type = 'button';
-      if (j === sel) row.classList.add('sel');
-      if (S.probe.label === j) row.classList.add('truth');
-      row.appendChild(el('b', null, className(j)));
-      const tr = el('span', 'tr');
-      const fi = el('span', 'fi');
+      r.row.classList.toggle('sel', j === sel);
+      r.row.classList.toggle('truth', S.probe.label === j);
+      r.row.disabled = !canAsk();
+      let w = 0, left = 0;
       if (ok(x)) {
-        const w = soft ? Math.min(1, Math.max(0, x)) * 100 : Math.abs(x) / m * (signed ? 50 : 100);
-        fi.style.left = (signed ? (x >= 0 ? 50 : 50 - w) : 0) + '%';
-        fi.style.width = w + '%';
-        fi.style.background = x >= 0 ? 'var(--pos)' : 'var(--neg)';
+        w = soft ? Math.min(1, Math.max(0, x)) * 100 : Math.abs(x) / m * (signed ? 50 : 100);
+        left = signed ? (x >= 0 ? 50 : 50 - w) : 0;
       }
-      tr.appendChild(fi);
-      row.appendChild(tr);
-      row.appendChild(el('span', 'v', soft ? pct(x) : fmt(x, 2)));
-      row.disabled = !S.live;
-      row.addEventListener('click', () => send('neuron', 'layer=' + neuronLayer(v) + '&neuron=' + j));
-      v.outs.appendChild(row);
-    }
+      r.fi.style.left = left + '%';
+      r.fi.style.width = w + '%';
+      r.fi.style.background = ok(x) && x < 0 ? 'var(--neg)' : 'var(--pos)';
+      const text = soft ? pct(x) : fmt(x, 2);
+      if (r.val.textContent !== text) r.val.textContent = text;
+    });
   }
   function renderProbeLabel() {
     const P = S.probe;
@@ -513,8 +536,16 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     setText('nTitle', isOutput ? 'Output ' + className(N.neuron) : 'Neuron ' + N.neuron);
     const info = linearInfo(N);
     const box = $('onoff');
-    box.checked = !!N.on;
-    box.disabled = !S.live || !info || info.output;
+    // A switch the page asked for shows as asked until the neuron snapshot agrees, the
+    // command is refused (a failed request or a status message), or 5 s pass.
+    let on = !!N.on;
+    const P = S.pending;
+    if (P && P.layer === N.layer && P.neuron === N.neuron) {
+      if (on === P.on || Date.now() - P.at > 5000) S.pending = null;
+      else on = P.on;
+    }
+    box.checked = on;
+    box.disabled = !canAsk() || !info || info.output;
     const vals = $('vals');
     clear(vals);
     vals.appendChild(valueBox('z · before activation', fmt(N.z)));
@@ -853,29 +884,48 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
   // ---- Data in ----------------------------------------------------------------------
   function keyOf(a) { return a.linear + ':' + a.neuron; }
   const HANDLERS = {
-    model: (d) => { S.model = d; buildViews(); renderLinearChoice(); },
+    model: (d) => {
+      // A second model on one connection, or a different one after a reconnect, is a new
+      // run: what the last run left is cleared. The same model replayed on reconnect keeps it.
+      const same = S.model !== null && JSON.stringify(S.model) === JSON.stringify(d);
+      if (S.modelSeen || !same) {
+        S.epochs = []; S.ablations.clear(); S.shrinks.clear();
+        S.stats = null; S.probe = null; S.neuron = null; S.profile = null; S.pending = null;
+      }
+      S.modelSeen = true;
+      S.model = d;
+      buildViews();
+      renderLinearChoice();
+    },
     stats: (d) => { S.stats = d; },
     probe: (d) => { S.probe = d; },
     neuron: (d) => { S.neuron = d; },
     profile: (d) => { S.profile = d; },
-    status: (d) => { S.status = d; },
-    epoch: (d) => { S.epochs.push(d); if (S.epochs.length > 1000) S.epochs.shift(); },
+    status: (d) => { S.status = d; S.pending = null; },
+    epoch: (d) => {
+      const last = S.epochs[S.epochs.length - 1];
+      if (last && last.epoch === d.epoch && last.mean_loss === d.mean_loss) return;
+      S.epochs.push(d);
+      if (S.epochs.length > 1000) S.epochs.shift();
+    },
     ablation: (d) => { S.ablations.set(keyOf(d), d); },
     shrink: (d) => { S.shrinks.set(d.removed_bp, d); },
   };
   function take(name, d) {
     if (!d || typeof d !== 'object') return;
-    try { HANDLERS[name](d); } catch (e) { setText('statusLine', 'Could not show a ' + name + ' event: ' + e.message); }
+    try { HANDLERS[name](d); } catch (e) { notice('Could not show a ' + name + ' event: ' + e.message); }
     later();
   }
 
   // ---- Commands out -----------------------------------------------------------------
-  function send(name, query) {
+  // Posts a command; `failed` runs when the server refuses it or cannot be reached.
+  function send(name, query, failed) {
     if (!S.live) return;
     const url = '/api/' + name + '?token=' + encodeURIComponent(token) + (query ? '&' + query : '');
+    const fail = (text) => { notice(text); if (failed) failed(); later(); };
     fetch(url, { method: 'POST', cache: 'no-store', credentials: 'same-origin' })
-      .then((r) => (r.ok ? null : r.text().then((t) => setText('statusLine', 'Refused (' + r.status + '): ' + t))))
-      .catch(() => setText('statusLine', 'The command did not reach the server.'));
+      .then((r) => (r.ok ? null : r.text().then((t) => fail('Refused (' + r.status + '): ' + t))))
+      .catch(() => fail('The command did not reach the server.'));
   }
   function wire() {
     $('run').addEventListener('click', () => {
@@ -887,7 +937,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     const setRate = () => {
       const v = Number(lr.value);
       delete lr.dataset.edited;
-      if (!(isFinite(v) && v > 0 && v <= 10)) { setText('statusLine', 'The learning rate must be above 0 and at most 10.'); return; }
+      if (!(isFinite(v) && v > 0 && v <= 10)) { notice('The learning rate must be above 0 and at most 10.'); return; }
       send('lr', 'value=' + encodeURIComponent(String(v)));
     };
     $('lrSet').addEventListener('click', setRate);
@@ -909,7 +959,10 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     $('onoff').addEventListener('change', (e) => {
       const N = S.neuron, info = N && linearInfo(N);
       if (!info || info.output) return;
-      send('mask', 'linear=' + info.index + '&neuron=' + N.neuron + '&on=' + (e.target.checked ? 1 : 0));
+      const on = e.target.checked;
+      S.pending = { layer: N.layer, neuron: N.neuron, on: on, at: Date.now() };
+      setTimeout(later, 5100);
+      send('mask', 'linear=' + info.index + '&neuron=' + N.neuron + '&on=' + (on ? 1 : 0), () => { S.pending = null; });
     });
     document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => { S.mode = b.dataset.mode; later(); }));
     $('ablate').addEventListener('click', () => { const v = $('abLinear').value; if (v !== '') send('ablate', 'linear=' + encodeURIComponent(v)); });
@@ -946,7 +999,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       return;
     }
     const source = new EventSource('/events?token=' + encodeURIComponent(token));
-    source.addEventListener('open', () => { S.live = true; setConn('live', 'live'); later(); });
+    source.addEventListener('open', () => { S.live = true; S.modelSeen = false; setConn('live', 'live'); later(); });
     source.addEventListener('error', () => {
       S.live = false;
       if (source.readyState === EventSource.CLOSED) setConn('disconnected', 'bad');

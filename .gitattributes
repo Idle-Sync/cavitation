@@ -2,3 +2,6 @@
 # rewrite their line endings on checkout, on any platform.
 data/** -text
 crates/*/tests/fixtures/** -text
+# The inspector page is built into the crate byte for byte and must be the same file on
+# every platform.
+crates/cavitation-inspect/assets/** -text

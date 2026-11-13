@@ -1,9 +1,10 @@
 //! Tests of the inspector page and its self-contained HTML export: the page served at `/`
 //! with its Content Security Policy, no external request anywhere in it, and the export's
 //! embedded snapshot, which must parse and must stay inside its `<script>` element whatever
-//! the title holds.
+//! the title, class names or messages hold; and the run's state replayed to a page opened
+//! late.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -26,10 +27,14 @@ const PAGE: &str = include_str!("../assets/inspector.html");
 
 /// The policy the page is served with (before `frame-ancestors`, which only a header can
 /// carry).
-const PAGE_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'";
+const PAGE_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; base-uri 'none'; form-action 'none'";
 
 /// The policy of an exported document: the page's, with no connections at all.
-const EXPORT_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'";
+const EXPORT_POLICY: &str = "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'none'; base-uri 'none'; form-action 'none'";
+
+/// Text that tries to end the snapshot's element, open an HTML comment (which would change
+/// how the browser reads the rest of the script element), and break a line in JavaScript.
+const HOSTILE: &str = "</script><!--<script>\u{2028}\u{2029}<b>";
 
 /// The opening tag of the embedded snapshot.
 const SNAPSHOT_OPEN: &str = r#"<script id="snapshot" type="application/json">"#;
@@ -45,6 +50,74 @@ fn start(title: &str) -> Inspector {
         ..InspectorConfig::default()
     })
     .expect("the server starts")
+}
+
+/// Opens the event stream and returns a reader positioned after the response head.
+fn open_events(inspector: &Inspector) -> BufReader<TcpStream> {
+    let (addr, token) = endpoint(inspector);
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream
+        .write_all(format!("GET /events?token={token} HTTP/1.1\r\nHost: {addr}\r\n\r\n").as_bytes())
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).expect("the response head");
+        if line == "\r\n" {
+            return reader;
+        }
+        assert!(!line.is_empty(), "the stream closed before its head ended");
+    }
+}
+
+/// The next event on the stream, skipping keep-alive comments: its name and its data,
+/// parsed.
+fn next_event(reader: &mut BufReader<TcpStream>) -> (String, Json) {
+    let mut name = String::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        reader.read_line(&mut line).expect("an event line");
+        assert!(!line.is_empty(), "the stream closed");
+        let line = line.trim_end_matches('\n');
+        if let Some(n) = line.strip_prefix("event: ") {
+            name = n.to_string();
+        } else if let Some(data) = line.strip_prefix("data: ") {
+            return (name, Json::parse(data).expect("the event parses"));
+        }
+    }
+}
+
+/// 64 rows of 4 features with two classes.
+fn small_data() -> Dataset {
+    let mut rng = Rng::seed(5);
+    let x: Vec<f32> = (0..64 * 4).map(|_| rng.uniform_f32()).collect();
+    let labels = x.chunks(4).map(|r| usize::from(r[0] > r[1])).collect();
+    Dataset {
+        x: Tensor::from_vec(x, &[64, 4]).unwrap(),
+        targets: Targets::Classes(labels),
+    }
+}
+
+/// Three epochs of Adam at 1e-2, batch 16, quiet health checks.
+fn fit_config() -> FitConfig {
+    FitConfig {
+        epochs: 3,
+        batch: 16,
+        optimizer: OptimizerConfig::Adam {
+            lr: 1e-2,
+            weight_decay: 0.0,
+        },
+        loss: Loss::CrossEntropy,
+        shuffle_seed: Some(1),
+        schedule: LrSchedule::Constant,
+        health: Health::quiet(),
+        on_epoch: None,
+    }
 }
 
 /// The address and token of a running inspector, read from its URL.
@@ -117,12 +190,13 @@ fn network(params: &mut ParamStore) -> Sequential {
         .push(Linear::new(params, 3, 2, &mut rng))
 }
 
-/// Publishes a `model` event titled `title`, a `stats` snapshot at step 42, an `epoch`
-/// event and a `status` event, as a run would.
+/// Publishes a `model` event titled `title` whose first class is also named `title`, a
+/// `stats` snapshot at step 42, an `epoch` event and a `status` event whose message is
+/// `title`, as a run would.
 fn publish_run(inspector: &Inspector, title: &str) {
     let mut params = ParamStore::new();
     let net = network(&mut params);
-    let names = vec!["no".to_string(), "yes".to_string()];
+    let names = vec![title.to_string(), "yes".to_string()];
     let info = ModelInfo {
         title,
         input_width: 4,
@@ -156,7 +230,7 @@ fn publish_run(inspector: &Inspector, title: &str) {
     assert!(hub.publish_event(Event::Epoch, |w| wire::epoch(w, &report, 3, None), true));
     assert!(hub.publish_event(
         Event::Status,
-        |w| wire::status(w, RunState::Training, "training"),
+        |w| wire::status(w, RunState::Training, title),
         true
     ));
 }
@@ -189,9 +263,10 @@ fn page_makes_no_external_requests() {
     // The page reads its token from its own address and talks only to its own server.
     assert!(PAGE.contains("location"));
     assert!(PAGE.contains("new EventSource('/events?token="));
-    // One script, on lines of its own, so it can be checked on its own.
-    assert_eq!(PAGE.matches("\n<script>\n").count(), 1);
-    assert_eq!(PAGE.matches("\n</script>\n").count(), 1);
+    // One script, on lines of its own (whatever the line endings), so it can be checked on
+    // its own.
+    assert_eq!(PAGE.lines().filter(|l| *l == "<script>").count(), 1);
+    assert_eq!(PAGE.lines().filter(|l| *l == "</script>").count(), 1);
     // An HTML comment on the first line says what the file is.
     let first = PAGE.lines().next().unwrap();
     assert!(first.starts_with("<!doctype html><!--"), "{first}");
@@ -270,23 +345,32 @@ fn export_is_valid_html_shape() {
     Json::parse(snapshot_text(&html)).expect("the snapshot parses");
 }
 
-/// A title that tries to close the snapshot's element stays inside it: the file holds it
-/// escaped (checked on disk), the snapshot still parses back to the same title, and the
+/// Text that tries to close the snapshot's element, open a comment or break a script line
+/// stays inside it, in the title, a class name and a status message alike: the file holds
+/// it escaped (checked on disk), the snapshot still parses back to the same text, and the
 /// file has exactly one `</script>` for the snapshot.
 #[test]
 fn title_with_script_tag_stays_inside() {
-    let title = "</script><b>";
-    let inspector = start(title);
-    publish_run(&inspector, title);
+    let inspector = start(HOSTILE);
+    publish_run(&inspector, HOSTILE);
     let html = export_to_disk(&inspector, "title");
-    assert!(html.contains(r"\u003c/script\u003e\u003cb\u003e"));
+    assert!(
+        html.contains(r"\u003c/script\u003e\u003c!--\u003cscript\u003e\u2028\u2029\u003cb\u003e")
+    );
     assert!(!html.contains("<b>"));
+    assert!(!html.contains('\u{2028}') && !html.contains('\u{2029}'));
     assert_eq!(html.matches("</script>").count(), 2);
+    let after = html.find(SNAPSHOT_OPEN).unwrap() + SNAPSHOT_OPEN.len();
+    assert!(!html[after..].contains("<!--"));
     let snapshot = Json::parse(snapshot_text(&html)).expect("the snapshot parses");
-    assert_eq!(snapshot.get("model").get("title").str(), title);
+    assert_eq!(snapshot.get("model").get("title").str(), HOSTILE);
+    assert_eq!(
+        snapshot.get("model").get("class_names").at(0).str(),
+        HOSTILE
+    );
+    assert_eq!(snapshot.get("status").get("message").str(), HOSTILE);
     // The snapshot's closing tag is the first `</script>` after it, and the page's script
     // follows.
-    let after = html.find(SNAPSHOT_OPEN).unwrap() + SNAPSHOT_OPEN.len();
     let close = after + html[after..].find("</script>").unwrap();
     assert!(html[close..].contains("<script>"));
 }
@@ -295,30 +379,11 @@ fn title_with_script_tag_stays_inside() {
 /// its final status.
 #[test]
 fn export_after_training() {
-    let mut rng = Rng::seed(5);
-    let x: Vec<f32> = (0..64 * 4).map(|_| rng.uniform_f32()).collect();
-    let labels = x.chunks(4).map(|r| usize::from(r[0] > r[1])).collect();
-    let data = Dataset {
-        x: Tensor::from_vec(x, &[64, 4]).unwrap(),
-        targets: Targets::Classes(labels),
-    };
+    let data = small_data();
     let mut params = ParamStore::new();
     let mut model = network(&mut params);
     let mut inspector = start("after training");
-    let config = FitConfig {
-        epochs: 3,
-        batch: 16,
-        optimizer: OptimizerConfig::Adam {
-            lr: 1e-2,
-            weight_decay: 0.0,
-        },
-        loss: Loss::CrossEntropy,
-        shuffle_seed: Some(1),
-        schedule: LrSchedule::Constant,
-        health: Health::quiet(),
-        on_epoch: None,
-    };
-    cavitation_inspect::fit(&mut model, &mut params, &data, config, &mut inspector).unwrap();
+    cavitation_inspect::fit(&mut model, &mut params, &data, fit_config(), &mut inspector).unwrap();
     let html = export_to_disk(&inspector, "trained");
     let snapshot = Json::parse(snapshot_text(&html)).expect("the snapshot parses");
     assert_eq!(snapshot.get("model").get("title").str(), "after training");
@@ -327,6 +392,72 @@ fn export_after_training() {
     assert_eq!(snapshot.get("status").get("state").str(), "finished");
     // No client was connected, so nothing was captured.
     assert!(snapshot.get("stats").is_null());
+}
+
+/// An export of a run a client watched holds every snapshot (statistics, probe row,
+/// neuron, profile), escaped like the rest: the largest payloads, and they name no URL.
+#[test]
+fn export_of_a_watched_run_has_every_snapshot() {
+    let data = small_data();
+    let mut params = ParamStore::new();
+    let mut model = network(&mut params);
+    let mut inspector = Inspector::start(InspectorConfig {
+        address: "127.0.0.1:0".parse().unwrap(),
+        // A capture at every step: the 12 steps give each snapshot many chances, so one
+        // publish refused by a busy lock cannot leave it empty.
+        snapshot_hz: 1e6,
+        title: HOSTILE.to_string(),
+        class_names: Some(vec![HOSTILE.to_string(), "yes".to_string()]),
+        ..InspectorConfig::default()
+    })
+    .unwrap();
+    let _stream = open_events(&inspector);
+    let start = std::time::Instant::now();
+    while inspector.clients() == 0 {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the client registers"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cavitation_inspect::fit(&mut model, &mut params, &data, fit_config(), &mut inspector).unwrap();
+    let html = export_to_disk(&inspector, "watched");
+    let snapshot = Json::parse(snapshot_text(&html)).expect("the snapshot parses");
+    for name in ["stats", "probe", "neuron", "profile"] {
+        assert!(!snapshot.get(name).is_null(), "{name} is null");
+    }
+    assert_eq!(snapshot.get("probe").get("layers").arr().len(), 3);
+    assert_eq!(
+        snapshot.get("model").get("class_names").at(0).str(),
+        HOSTILE
+    );
+    let text = snapshot_text(&html);
+    assert!(!text.contains('<'), "a raw < in the snapshot");
+    let lower = html.to_ascii_lowercase();
+    for pattern in EXTERNAL {
+        assert!(!lower.contains(pattern), "the export contains {pattern}");
+    }
+}
+
+/// A page that connects after the run has finished is told so at once: the stream starts
+/// with the model, the last epoch and the `finished` status.
+#[test]
+fn status_replayed_to_late_client() {
+    let data = small_data();
+    let mut params = ParamStore::new();
+    let mut model = network(&mut params);
+    let mut inspector = start("late");
+    cavitation_inspect::fit(&mut model, &mut params, &data, fit_config(), &mut inspector).unwrap();
+    let mut stream = open_events(&inspector);
+    let (name, model_event) = next_event(&mut stream);
+    assert_eq!(name, "model");
+    assert_eq!(model_event.get("title").str(), "late");
+    let (name, epoch) = next_event(&mut stream);
+    assert_eq!(name, "epoch");
+    assert_eq!(epoch.get("epoch").num(), 3.0);
+    let (name, status) = next_event(&mut stream);
+    assert_eq!(name, "status");
+    assert_eq!(status.get("state").str(), "finished");
 }
 
 /// A path the export cannot be written to is `Error::Io` naming it.

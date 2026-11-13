@@ -10,11 +10,11 @@
 //! |---|---|---|
 //! | `model` | event | once per connection: the network's description |
 //! | `stats` | snapshot | on each sampled step, and when the run pauses |
-//! | `epoch` | event | at the end of each epoch |
+//! | `epoch` | event | at the end of each epoch; the latest also when a client connects |
 //! | `probe` | snapshot | on each sampled step: the probed row through every layer |
 //! | `neuron` | snapshot | with each `probe`: the chosen neuron |
 //! | `profile` | snapshot | on the step after each sampled step: where its time went |
-//! | `status` | event | when the run's state changes, or a command cannot be carried out |
+//! | `status` | event | when the run's state changes, or a command cannot be carried out; the latest also when a client connects |
 //! | `ablation` | event | in explore mode, one per neuron switched off |
 //! | `shrink` | event | in explore mode, one per level of the shrink tool |
 //!

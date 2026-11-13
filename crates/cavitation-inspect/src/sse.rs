@@ -117,9 +117,10 @@ impl Snapshot {
 pub enum Event {
     /// The network's description; the latest one is also sent first to each new client.
     Model,
-    /// An epoch ended.
+    /// An epoch ended; the latest one is also sent to each new client, after `model`.
     Epoch,
-    /// The run's state changed (training, paused, explore, finished), with a message.
+    /// The run's state changed (training, paused, explore, finished), with a message; the
+    /// latest one is also sent to each new client, after `model` and `epoch`.
     Status,
     /// One neuron's ablation result.
     Ablation,
@@ -484,8 +485,10 @@ impl Hub {
     }
 
     /// Adds a client; `None` when `max_clients` are already connected or the hub is
-    /// closed. The new client's queue starts with the latest `model` event, if any, and it
-    /// will be sent every snapshot published so far.
+    /// closed. The new client's queue starts with the latest `model`, `epoch` and `status`
+    /// events, in that order, those that were published, so a page opened late or reloaded
+    /// knows the run's state and its last evaluation; it will be sent every snapshot
+    /// published so far.
     pub(crate) fn register(&self) -> Option<u64> {
         let mut state = self.lock();
         if state.closed || state.clients.len() >= state.max_clients {
@@ -496,6 +499,12 @@ impl Hub {
         let mut queue = VecDeque::new();
         if let Some(model) = &state.model {
             queue.push_back((Event::Model, model.clone()));
+        }
+        if let Some(epoch) = state.history[0].back() {
+            queue.push_back((Event::Epoch, epoch.clone()));
+        }
+        if let Some(status) = &state.status {
+            queue.push_back((Event::Status, status.clone()));
         }
         state.clients.push(Client { id, queue });
         self.connected.store(state.clients.len(), Ordering::Release);
