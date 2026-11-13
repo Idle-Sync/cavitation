@@ -36,9 +36,16 @@ use crate::{Layer, Linear, Prelu, Sequential};
 /// (`avx2`, `neon`, `accelerate`) an output's rounding depends on its position (the vector
 /// part of the matvec fuses the multiply and add, its last few columns do not, and
 /// Accelerate's GEMM keeps its own order), and removing neurons moves outputs between those
-/// parts. There each network is within the documented matvec and GEMM tolerance of the
-/// exact in-order result for the masked network's summed lengths, so the two differ by at
-/// most the sum of their tolerances.
+/// parts. There each `Linear` of each network is within the rounding bound every fast
+/// kernel keeps against the reference kernels: for an output `j` of a sum of length `k` with
+/// inputs `h`, weights `w` and bias `b`,
+/// `2·(k + 2)·1.19e-7·(Σᵢ |hᵢ|·|wᵢⱼ| + |bⱼ|)`, the bound
+/// [`matvec_f32`](cavitation_core::kernels::matvec::matvec_f32) states for the matvec and
+/// that the GEMM keeps too. The bound of each layer is carried through the layers after it
+/// (`Σᵢ boundᵢ·|wᵢⱼ|` into the next `Linear`, unchanged through an activation whose slope
+/// is at most 1). The reference results of the two networks are identical, so their outputs
+/// differ by at most twice the masked network's carried bound, with `k` its own summed
+/// lengths.
 ///
 /// All of this holds for finite weights: a masked neuron whose outgoing weight is infinite
 /// or NaN gives `0 · ∞ = NaN` in the masked network, while the compacted network drops that

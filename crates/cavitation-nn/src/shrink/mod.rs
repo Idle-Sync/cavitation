@@ -8,7 +8,8 @@
 //! removes the off neurons for good: it rebuilds the network as a smaller dense one that
 //! gives the masked network's outputs through
 //! [`InferenceModel::infer`](crate::InferenceModel::infer), bit for bit on the `reference`
-//! and `sse4.2` kernel levels and within the documented rounding bound on the others.
+//! and `sse4.2` kernel levels and within the rounding bound [`compact()`] states on the
+//! others.
 //!
 //! The items here are reached through this module, `cavitation_nn::shrink`, and are not in
 //! the crate root or the `cavitation` prelude.

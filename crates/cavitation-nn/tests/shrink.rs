@@ -723,9 +723,8 @@ fn matvec_drops_zero_terms_at_every_level() {
     }
 }
 
-/// A layer of your own that wraps a `Prelu` and doubles its output. It cannot claim to be
-/// a `Prelu` (only the crate's own `Prelu` answers `as_prelu`), so `compact` refuses it as a
-/// layer with parameters instead of putting a bare `Prelu` in its place.
+/// A layer of your own that wraps a `Prelu` and doubles its output, and so has the
+/// `Prelu`'s slopes as its parameters.
 struct PreluTimesTwo {
     /// The wrapped `Prelu`.
     inner: Prelu,
@@ -755,9 +754,12 @@ impl<T: Real> Layer<T> for PreluTimesTwo {
     }
 }
 
-/// A wrapper around a `Prelu` is not taken for one: it is refused, naming it.
+/// A wrapper around a `Prelu` answers `as_prelu` with `None` and is refused as a layer with
+/// parameters, naming it. That a layer of your own cannot answer `as_prelu` at all is
+/// checked at compile time, by the `compile_fail` example on `as_prelu`: a test that runs
+/// cannot hold such a layer.
 #[test]
-fn prelu_wrapper_is_not_taken_for_a_prelu() {
+fn prelu_wrapper_is_refused_as_a_layer_with_parameters() {
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(9);
     let first = linear(&mut params, 3, 4, &mut rng);
@@ -877,4 +879,55 @@ fn misfitting_masks_and_values_are_invalid_data() {
     net.set_neuron_mask(0, NeuronMask::from_off(4, &[0]));
     let msg = invalid(&net, &params);
     assert!(msg.contains("linear layer 2 takes 5 inputs"), "{msg}");
+}
+
+/// `as_linear` and `as_prelu` answer on `dyn Layer` with and without `Send`, `Sync` or both
+/// spelled out.
+#[test]
+fn downcasts_work_on_every_trait_object_form() {
+    let mut params = ParamStore::new();
+    let linear = Linear::new(&mut params, 2, 3, &mut Rng::seed(0));
+    let prelu = Prelu::new(&mut params, 3);
+    let plain: [Box<dyn Layer<f32>>; 2] = [Box::new(linear.clone()), Box::new(prelu)];
+    let send: [Box<dyn Layer<f32> + Send>; 2] = [Box::new(linear.clone()), Box::new(prelu)];
+    let sync: [Box<dyn Layer<f32> + Sync>; 2] = [Box::new(linear.clone()), Box::new(prelu)];
+    let both: [std::sync::Arc<dyn Layer<f32> + Send + Sync>; 2] = [
+        std::sync::Arc::new(linear.clone()),
+        std::sync::Arc::new(prelu),
+    ];
+    assert_eq!(plain[0].as_linear().unwrap().outputs(), 3);
+    assert_eq!(send[0].as_linear().unwrap().outputs(), 3);
+    assert_eq!(sync[0].as_linear().unwrap().outputs(), 3);
+    assert_eq!(both[0].as_linear().unwrap().outputs(), 3);
+    for (what, linear_is_prelu, prelu_is_prelu, prelu_is_linear) in [
+        (
+            "plain",
+            plain[0].as_prelu().is_some(),
+            plain[1].as_prelu().is_some(),
+            plain[1].as_linear().is_some(),
+        ),
+        (
+            "send",
+            send[0].as_prelu().is_some(),
+            send[1].as_prelu().is_some(),
+            send[1].as_linear().is_some(),
+        ),
+        (
+            "sync",
+            sync[0].as_prelu().is_some(),
+            sync[1].as_prelu().is_some(),
+            sync[1].as_linear().is_some(),
+        ),
+        (
+            "both",
+            both[0].as_prelu().is_some(),
+            both[1].as_prelu().is_some(),
+            both[1].as_linear().is_some(),
+        ),
+    ] {
+        assert!(
+            !linear_is_prelu && prelu_is_prelu && !prelu_is_linear,
+            "{what}"
+        );
+    }
 }

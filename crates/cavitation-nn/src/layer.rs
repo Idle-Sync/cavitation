@@ -268,49 +268,65 @@ pub trait Layer<T: Real>: Send + Sync {
     }
 }
 
-impl<'a, T: Real> dyn Layer<T> + 'a {
-    /// This layer as a [`Linear`], if it is one. Only the crate's own `Linear` answers
-    /// `Some`: a layer of your own cannot claim to be one.
-    ///
-    /// ```
-    /// use cavitation_core::{ParamStore, Rng};
-    /// use cavitation_nn::{Layer, Linear, Relu};
-    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
-    /// let layers: [&dyn Layer<f32>; 2] = [&layer, &Relu];
-    /// assert_eq!(layers[0].as_linear().unwrap().outputs(), 3);
-    /// assert!(layers[1].as_linear().is_none());
-    /// ```
-    pub fn as_linear(&self) -> Option<&Linear> {
-        self.linear_form(private::Token(()))
-    }
+/// Adds `as_linear` and `as_prelu` to one form of `dyn Layer` (the bare trait object and
+/// the ones with `Send`, `Sync` or both spelled out), each calling the sealed hooks.
+macro_rules! downcasts {
+    ($($bounds:tt)*) => {
+        impl<'a, T: Real> dyn Layer<T> $($bounds)* + 'a {
+            /// This layer as a [`Linear`], if it is one. Only the crate's own `Linear`
+            /// answers `Some`: a layer of your own cannot claim to be one. It works on
+            /// `dyn Layer<T>` and on the same object with `+ Send`, `+ Sync` or both.
+            ///
+            /// ```
+            /// use cavitation_core::{ParamStore, Rng};
+            /// use cavitation_nn::{Layer, Linear, Relu};
+            /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
+            /// let layers: [&dyn Layer<f32>; 2] = [&layer, &Relu];
+            /// assert_eq!(layers[0].as_linear().unwrap().outputs(), 3);
+            /// assert!(layers[1].as_linear().is_none());
+            /// let boxed: Box<dyn Layer<f32> + Send> = Box::new(Relu);
+            /// assert!(boxed.as_linear().is_none());
+            /// ```
+            pub fn as_linear(&self) -> Option<&Linear> {
+                self.linear_form(private::Token(()))
+            }
 
-    /// This layer as a [`Prelu`], if it is one. Only the crate's own `Prelu` answers `Some`;
-    /// [`shrink::compact`](crate::shrink::compact) uses it to find the slopes it rebuilds.
-    ///
-    /// ```
-    /// use cavitation_core::ParamStore;
-    /// use cavitation_nn::{Layer, Prelu, Relu};
-    /// let layer = Prelu::new(&mut ParamStore::new(), 3);
-    /// let layers: [&dyn Layer<f32>; 2] = [&layer, &Relu];
-    /// assert!(layers[0].as_prelu().is_some());
-    /// assert!(layers[1].as_prelu().is_none());
-    /// ```
-    ///
-    /// A layer of your own cannot answer it, so it cannot pass for a `Prelu`:
-    ///
-    /// ```compile_fail,E0407
-    /// use cavitation_core::{ParamId, Real, Tape, Var};
-    /// use cavitation_nn::{Layer, Prelu};
-    /// struct Fake(Prelu);
-    /// impl<T: Real> Layer<T> for Fake {
-    ///     fn name(&self) -> &str { "fake" }
-    ///     fn output_width(&self, width: usize) -> usize { width }
-    ///     fn forward(&self, _tape: &mut Tape<'_, T>, x: Var) -> Var { x }
-    ///     fn parameters(&self) -> Vec<(&'static str, ParamId)> { Vec::new() }
-    ///     fn as_prelu(&self) -> Option<&Prelu> { Some(&self.0) }
-    /// }
-    /// ```
-    pub fn as_prelu(&self) -> Option<&Prelu> {
-        self.prelu_form(private::Token(()))
-    }
+            /// This layer as a [`Prelu`], if it is one. Only the crate's own `Prelu`
+            /// answers `Some`; [`shrink::compact`](crate::shrink::compact) uses it to find
+            /// the slopes it rebuilds. It works on `dyn Layer<T>` and on the same object
+            /// with `+ Send`, `+ Sync` or both.
+            ///
+            /// ```
+            /// use cavitation_core::ParamStore;
+            /// use cavitation_nn::{Layer, Prelu, Relu};
+            /// let layer = Prelu::new(&mut ParamStore::new(), 3);
+            /// let layers: [&dyn Layer<f32>; 2] = [&layer, &Relu];
+            /// assert!(layers[0].as_prelu().is_some());
+            /// assert!(layers[1].as_prelu().is_none());
+            /// ```
+            ///
+            /// A layer of your own cannot answer it, so it cannot pass for a `Prelu`:
+            ///
+            /// ```compile_fail,E0407
+            /// use cavitation_core::{ParamId, Real, Tape, Var};
+            /// use cavitation_nn::{Layer, Prelu};
+            /// struct Fake(Prelu);
+            /// impl<T: Real> Layer<T> for Fake {
+            ///     fn name(&self) -> &str { "fake" }
+            ///     fn output_width(&self, width: usize) -> usize { width }
+            ///     fn forward(&self, _tape: &mut Tape<'_, T>, x: Var) -> Var { x }
+            ///     fn parameters(&self) -> Vec<(&'static str, ParamId)> { Vec::new() }
+            ///     fn as_prelu(&self) -> Option<&Prelu> { Some(&self.0) }
+            /// }
+            /// ```
+            pub fn as_prelu(&self) -> Option<&Prelu> {
+                self.prelu_form(private::Token(()))
+            }
+        }
+    };
 }
+
+downcasts!();
+downcasts!(+ Send);
+downcasts!(+ Sync);
+downcasts!(+ Send + Sync);
