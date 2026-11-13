@@ -8,7 +8,7 @@ The first release: a CPU neural network library for multilayer perceptrons whose
 
 ### Workspace
 
-- Five crates: `cavitation` (the one to depend on: re-exports the core and nn crates and gathers the everyday names in `cavitation::prelude`), `cavitation-core`, `cavitation-nn`, `cavitation-datasets` and `cavitation-bench`. Every crate is licensed `MIT OR Apache-2.0`.
+- Six crates: `cavitation` (the one to depend on: re-exports the core and nn crates, and `cavitation-ml` under its default `ml` feature, and gathers the everyday names in `cavitation::prelude`), `cavitation-core`, `cavitation-nn`, `cavitation-ml` (classic models in `f64`), `cavitation-datasets` and `cavitation-bench`. Every crate is licensed `MIT OR Apache-2.0`.
 - The PyTorch fixture script's checks now fail under `python -O` too, `--check-rust-save` accepts the path of the file to check and runs without `--out` (which now defaults to `crates`), and `scripts/fixtures/requirements.txt` installs on macOS (PyPI's `torch==2.15.0`) as well as Linux (the CPU build).
 
 ### Tensors and autograd (`cavitation-core`)
@@ -53,7 +53,7 @@ The first release: a CPU neural network library for multilayer perceptrons whose
 
 ### Classic machine learning (`cavitation-ml`)
 
-- A new crate, `cavitation-ml` (re-exported as `cavitation::cavitation_ml` by the `cavitation` crate's `ml` feature, on by default), for classic models in `f64`. It starts with least squares: `linalg::lstsq` and `linalg::Qr` (Householder QR, with `solve`, `r_diagonal`, `column_norms` and `dependent_column`, which finds the first column with `|R_jj| ≤ rows · ε · ‖a_j‖`, so the test does not depend on the columns' scale) return `Error::InvalidData` for a matrix with more columns than rows, non-finite values, or a column that is a linear combination of the columns before it, naming the column; `linalg::qr_reference` is the plain twin the shipped solver is tested against.
+- A new crate, `cavitation-ml` (re-exported as `cavitation::cavitation_ml` by the `cavitation` crate's `ml` feature, on by default), for classic models in `f64`. It starts with least squares: `linalg::lstsq` and `linalg::Qr` (Householder QR from a row-major tensor or, with `Qr::from_columns`, a column-major buffer; with `solve`, `r_diagonal`, `column_norms` and `dependent_column`, which finds the first column with `|R_jj| ≤ rows · ε · ‖a_j‖`, so the test does not depend on the columns' scale; norms and reflectors are scaled by exact powers of two, so columns from about 1e-300 to 1e300 factor correctly) return `Error::InvalidData` for a matrix with more columns than rows, non-finite values, or a column that is a linear combination of the columns before it, naming the column, and `Qr::solve` refuses such a matrix too; `linalg::qr_reference` is the plain twin the shipped solver is tested against.
 
 ### Data, examples, guide and benchmark
 

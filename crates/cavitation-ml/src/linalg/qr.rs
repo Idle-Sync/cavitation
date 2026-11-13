@@ -1,9 +1,12 @@
-//! The shipped Householder QR: column-major storage and dot products in 4 partial sums, so
-//! the compiler vectorises the inner loops. Tested against [`super::qr_reference`].
+//! The shipped Householder QR: column-major storage and sums in 4 partial sums, so the
+//! compiler vectorises the inner loops. Tested against [`super::qr_reference`].
 
 use cavitation_core::{Error, Tensor, TensorView};
 
-use super::{check_norms, dependent_error, first_dependent, matrix_dims, rhs_columns};
+use super::{
+    check_columns, dependent_error, first_dependent, matrix_dims, power_of_two_below, rhs_columns,
+    too_large_error,
+};
 
 /// The Householder QR factorisation of a tall `f64` matrix, `a = Q·R`, for solving least
 /// squares.
@@ -11,6 +14,10 @@ use super::{check_norms, dependent_error, first_dependent, matrix_dims, rhs_colu
 /// Reflection `j` maps column `j`, from row `j` down, onto `R_jj·e_j`, with
 /// `R_jj = −sign(a_jj)·‖x‖` (`+` sign for 0) so that forming the reflector never subtracts
 /// nearly equal numbers. `Q` is kept as its reflectors and never formed.
+///
+/// Every norm and every reflector is computed on its column scaled by a power of two near
+/// the column's size, so columns of any magnitude f64 can hold, from about 1e-300 to 1e300,
+/// factor without overflow or underflow. The scaling is exact, so it changes no rounding.
 ///
 /// # Examples
 ///
@@ -32,8 +39,8 @@ pub struct Qr {
     /// The factors, column-major, `rows` values per column. Column `j` holds `R[0..j, j]` in
     /// rows `0..j` and reflector `j`'s vector `v` in rows `j..rows`.
     factors: Vec<f64>,
-    /// Each reflector's `β`, so that it is `I − β·v·vᵀ`; 0 for a column that was already
-    /// zero from row `j` down, whose reflector is the identity.
+    /// Each reflector's `β`, so that it is `I − β·v·vᵀ`; between 1/8 and 1, or 0 for a column
+    /// that was already zero from row `j` down, whose reflector is the identity.
     betas: Vec<f64>,
     /// The diagonal of `R`.
     r_diagonal: Vec<f64>,
@@ -50,7 +57,8 @@ impl Qr {
     /// # Errors
     ///
     /// Returns [`Error::InvalidData`] if `a` is not two-dimensional, has more columns than
-    /// rows, holds a NaN or infinite value, or has a column whose norm overflows `f64`.
+    /// rows or holds a NaN or infinite value, and, naming the column, if a column's values
+    /// are so close to `f64::MAX` that its norm or an entry of `R` does not fit in f64.
     ///
     /// # Examples
     ///
@@ -63,39 +71,78 @@ impl Qr {
     /// ```
     pub fn new(a: TensorView<'_, f64>) -> Result<Qr, Error> {
         let (rows, cols) = matrix_dims(&a)?;
-        let data = a.data();
-        let mut factors = vec![0.0; rows * cols];
-        for (i, row) in data.chunks_exact(cols.max(1)).enumerate().take(rows) {
+        let mut columns = vec![0.0; rows * cols];
+        for (i, row) in a.data().chunks_exact(cols.max(1)).enumerate().take(rows) {
             for (j, &value) in row.iter().enumerate() {
-                factors[j * rows + i] = value;
+                columns[j * rows + i] = value;
             }
         }
+        Qr::factor(columns, rows, cols)
+    }
+
+    /// Factors a `[rows, cols]` matrix given column-major, as `rows` values of column 0,
+    /// then column 1, and so on, without copying it. For a matrix built column by column,
+    /// such as one with weighted rows or added columns, this saves the transposing copy
+    /// [`Qr::new`] makes; the factorisation is the same, bit for bit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if `data` does not hold `rows · cols` values, and for
+    /// the same problems as [`Qr::new`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_core::Tensor;
+    /// use cavitation_ml::linalg::Qr;
+    /// // The columns (1, 1, 1) and (0, 1, 2), the same matrix as [[1, 0], [1, 1], [1, 2]].
+    /// let qr = Qr::from_columns(vec![1.0, 1.0, 1.0, 0.0, 1.0, 2.0], 3, 2).unwrap();
+    /// let b = Tensor::from_vec(vec![1.0, 2.0, 4.0], &[3, 1]).unwrap();
+    /// let x = qr.solve(b.view()).unwrap();
+    /// assert!((x.data()[1] - 1.5).abs() < 1e-15);
+    /// ```
+    pub fn from_columns(data: Vec<f64>, rows: usize, cols: usize) -> Result<Qr, Error> {
+        check_columns(&data, rows, cols)?;
+        Qr::factor(data, rows, cols)
+    }
+
+    /// Factors the checked column-major matrix `factors` in place.
+    fn factor(mut factors: Vec<f64>, rows: usize, cols: usize) -> Result<Qr, Error> {
         let norms: Vec<f64> = (0..cols)
-            .map(|j| {
-                let column = &factors[j * rows..(j + 1) * rows];
-                dot(column, column).sqrt()
-            })
+            .map(|j| norm(&factors[j * rows..(j + 1) * rows]))
             .collect();
-        check_norms(&norms)?;
         let mut betas = vec![0.0; cols];
         let mut r_diagonal = vec![0.0; cols];
         for j in 0..cols {
             let (done, later) = factors.split_at_mut((j + 1) * rows);
             let v = &mut done[j * rows + j..];
-            let norm = dot(v, v).sqrt();
-            if norm == 0.0 {
+            let size = norm(v);
+            if size == 0.0 {
                 continue;
             }
-            let x0 = v[0];
-            let alpha = if x0 >= 0.0 { -norm } else { norm };
-            v[0] = x0 - alpha;
-            // vᵀv = 2‖x‖(‖x‖ + |x0|), so 2 / vᵀv is:
-            let beta = 1.0 / (norm * (norm + x0.abs()));
-            betas[j] = beta;
-            r_diagonal[j] = alpha;
-            for column in later.chunks_exact_mut(rows) {
-                reflect(v, beta, &mut column[j..]);
+            // Work on x·2^−e, with 2^e the power of two at or below ‖x‖: an exact scaling
+            // that brings the norm into [1, 2). Then v = x·2^−e − α·e0 with α = −sign·n, and
+            // β = 2 / vᵀv = 1 / (n·(n + |x0|)) lies between 1/8 and 1, whatever x's size.
+            let unit = 1.0 / power_of_two_below(size);
+            for value in v.iter_mut() {
+                *value *= unit;
             }
+            let (n, x0) = (size * unit, v[0]);
+            let sign = if x0 >= 0.0 { 1.0 } else { -1.0 };
+            v[0] = x0 + sign * n;
+            betas[j] = 1.0 / (n * (n + x0.abs()));
+            r_diagonal[j] = -sign * size;
+            for column in later.chunks_exact_mut(rows) {
+                reflect(v, betas[j], &mut column[j..]);
+            }
+        }
+        let bad = |values: &[f64]| values.iter().any(|v| !v.is_finite());
+        if let Some(j) = (0..cols).find(|&j| {
+            bad(&factors[j * rows..j * rows + j])
+                || !r_diagonal[j].is_finite()
+                || !norms[j].is_finite()
+        }) {
+            return Err(too_large_error(j));
         }
         Ok(Qr {
             rows,
@@ -110,13 +157,12 @@ impl Qr {
     /// The least-squares solution `x` (`[cols, k]`) of `a·x ≈ b` for `b` of shape
     /// `[rows, k]`: column `q` of `x` minimises `‖a·x_q − b_q‖`.
     ///
-    /// It divides by the diagonal of `R`, so check [`Qr::dependent_column`] first (as
-    /// [`lstsq`] does): with a dependent column the result is meaningless or not finite.
-    ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidData`] if `b` is not of shape `[rows, k]` or holds a NaN or
-    /// infinite value.
+    /// Returns [`Error::InvalidData`] if a column of `a` is a linear combination of the
+    /// columns before it ([`Qr::dependent_column`]), naming the column; if `b` is not of
+    /// shape `[rows, k]` or holds a NaN or infinite value; and if the solution does not fit
+    /// in f64.
     ///
     /// # Examples
     ///
@@ -129,8 +175,16 @@ impl Qr {
     /// let x = Qr::new(a.view()).unwrap().solve(b.view()).unwrap();
     /// assert_eq!(x.shape().dims(), &[1, 2]);
     /// assert!((x.data()[0] - 2.0).abs() < 1e-15 && (x.data()[1] - 20.0).abs() < 1e-14);
+    ///
+    /// // A repeated column has no unique solution.
+    /// let a = Tensor::from_vec(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0], &[3, 2]).unwrap();
+    /// let err = Qr::new(a.view()).unwrap().solve(b.view()).unwrap_err();
+    /// assert!(err.to_string().contains("column 1 is a linear combination"));
     /// ```
     pub fn solve(&self, b: TensorView<'_, f64>) -> Result<Tensor<f64>, Error> {
+        if let Some(j) = self.dependent_column() {
+            return Err(dependent_error(j));
+        }
         let (rows, cols) = (self.rows, self.cols);
         let k = rhs_columns(&b, rows)?;
         let data = b.data();
@@ -157,6 +211,13 @@ impl Qr {
             for (i, &x) in c[..cols].iter().enumerate() {
                 out[i * k + q] = x;
             }
+        }
+        if out.iter().any(|x| !x.is_finite()) {
+            return Err(Error::InvalidData(
+                "the least-squares solution does not fit in f64; rescale the matrix or the \
+                 right-hand side"
+                    .to_string(),
+            ));
         }
         Tensor::from_vec(out, &[cols, k])
     }
@@ -270,6 +331,34 @@ fn dot(x: &[f64], y: &[f64]) -> f64 {
     ((s[0] + s[1]) + (s[2] + s[3])) + tail
 }
 
+/// The Euclidean norm of `x`, computed on `x` divided by the power of two at or below its
+/// largest `|x_i|` (an exact scaling, as LAPACK's `dnrm2` scales), so that no square
+/// overflows or underflows. The sum runs in 4 partial sums like [`dot`]. 0 for an empty or
+/// zero `x`.
+fn norm(x: &[f64]) -> f64 {
+    let m = x.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    if m == 0.0 {
+        return 0.0;
+    }
+    let scale = power_of_two_below(m);
+    let unit = 1.0 / scale;
+    let (x4, tail) = x.as_chunks::<4>();
+    let mut s = [0.0f64; 4];
+    for a in x4 {
+        let (a0, a1, a2, a3) = (a[0] * unit, a[1] * unit, a[2] * unit, a[3] * unit);
+        s[0] += a0 * a0;
+        s[1] += a1 * a1;
+        s[2] += a2 * a2;
+        s[3] += a3 * a3;
+    }
+    let mut rest = 0.0;
+    for a in tail {
+        let a = a * unit;
+        rest += a * a;
+    }
+    (((s[0] + s[1]) + (s[2] + s[3])) + rest).sqrt() * scale
+}
+
 /// `y ← y + c·x` over `x`'s length.
 fn axpy(c: f64, x: &[f64], y: &mut [f64]) {
     for (yi, xi) in y.iter_mut().zip(x) {
@@ -301,6 +390,24 @@ mod tests {
         assert_eq!(dot(&[1.0, 2.0], &[3.0, 4.0, 100.0]), 11.0);
     }
 
+    /// The scaled norm is exact on Pythagorean data of every length up to a few chunks,
+    /// including the remainder cases, and far outside the range where squares fit in f64.
+    #[test]
+    fn norm_is_scaled() {
+        assert_eq!(norm(&[]), 0.0);
+        assert_eq!(norm(&[0.0, -0.0]), 0.0);
+        for n in 0..9 {
+            // n zeros, then 3 and 4 with the largest value 4: the norm is 5 exactly.
+            let mut x = vec![0.0; n];
+            x.extend([3.0, 4.0]);
+            assert_eq!(norm(&x), 5.0, "length {}", n + 2);
+        }
+        for scale in [1e300, 1e-300] {
+            let got = norm(&[3.0 * scale, -4.0 * scale]);
+            assert!((got - 5.0 * scale).abs() <= 1e-15 * 5.0 * scale, "{got:e}");
+        }
+    }
+
     /// `axpy` adds `c·x` to `y` element by element.
     #[test]
     fn axpy_adds_a_multiple() {
@@ -309,13 +416,14 @@ mod tests {
         assert_eq!(y, [3.0, 5.0, 7.0, 9.0, 11.0]);
     }
 
-    /// A reflector built by `new` maps its column onto `R_jj·e_0` and keeps lengths.
+    /// A reflector built by `new` maps its column onto `R_jj·e_0`, and its `β` is in [1/8, 1].
     #[test]
     fn reflector_zeroes_below_the_diagonal() {
         let x = [3.0, 4.0, 0.0, 12.0];
         let a = Tensor::from_vec(x.to_vec(), &[4, 1]).unwrap();
         let qr = Qr::new(a.view()).unwrap();
         assert_eq!(qr.r_diagonal(), &[-13.0]);
+        assert!((0.125..=1.0).contains(&qr.betas[0]));
         let mut y = x;
         reflect(&qr.factors, qr.betas[0], &mut y);
         assert!((y[0] + 13.0).abs() < 1e-14, "{y:?}");
@@ -332,6 +440,15 @@ mod tests {
         assert_eq!(qr.r_diagonal()[0], -1.0);
         assert_eq!(qr.factors[3], -2.0);
         assert_eq!(qr.r_diagonal()[1].abs(), 5.0);
+    }
+
+    /// Values near `f64::MAX` whose norm or `R` entries do not fit in f64 are refused,
+    /// naming the column, rather than factored into infinities.
+    #[test]
+    fn values_near_the_largest_f64_are_refused() {
+        let a = Tensor::from_vec(vec![1.0, f64::MAX, 1.0, f64::MAX], &[2, 2]).unwrap();
+        let err = Qr::new(a.view()).unwrap_err().to_string();
+        assert!(err.contains("column 1"), "{err}");
     }
 
     /// A matrix with no columns factors and solves to an empty result.

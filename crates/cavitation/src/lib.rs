@@ -4,7 +4,7 @@
 //! builds on the tensor and autograd core and the layers, optimisers and training
 //! crates.
 //!
-//! Both crates are re-exported by name (`cavitation::cavitation_core`,
+//! The core and nn crates are re-exported by name (`cavitation::cavitation_core`,
 //! `cavitation::cavitation_nn`), and [`prelude`] gathers the names most programs need.
 //! With the `ml` feature, on by default, the classic machine learning crate is re-exported
 //! too, as `cavitation::cavitation_ml`: least squares and regression in `f64`.

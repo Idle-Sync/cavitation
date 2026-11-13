@@ -271,3 +271,174 @@ fn bad_inputs_are_errors() {
         Err(Error::InvalidData(_))
     ));
 }
+
+/// A matrix whose column 1 is `scale` times a column independent of column 0, and the
+/// right-hand side `3·c0 + (7 / scale)·c1`, whose exact solution is `[3, 7 / scale]`.
+fn scaled_problem(scale: f64) -> (Tensor<f64>, Tensor<f64>) {
+    let u = [1.0, -2.0, 0.5, 3.0, -1.0];
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for (i, &ui) in u.iter().enumerate() {
+        let c0 = 1.0 + i as f64;
+        a.extend([c0, scale * ui]);
+        b.push(3.0 * c0 + 7.0 * ui);
+    }
+    (
+        Tensor::from_vec(a, &[u.len(), 2]).unwrap(),
+        Tensor::from_vec(b, &[u.len(), 1]).unwrap(),
+    )
+}
+
+/// Columns near the ends of f64's range factor and solve correctly: the norms and the
+/// reflectors are scaled by each column's largest value, so nothing overflows or underflows.
+/// Each coefficient has the right sign and is within 1e-12 relative of the exact answer.
+#[test]
+fn extreme_magnitude_columns_solve() {
+    for scale in [1.2e154, 1e200, 1e-160, 1e-300] {
+        let (a, b) = scaled_problem(scale);
+        let want = [3.0, 7.0 / scale];
+        let shipped = Qr::new(a.view()).unwrap();
+        let reference = qr_reference::Qr::new(a.view()).unwrap();
+        assert_eq!(shipped.dependent_column(), None, "scale {scale:e}");
+        assert_eq!(reference.dependent_column(), None, "scale {scale:e}");
+        for x in [
+            lstsq(a.view(), b.view()).unwrap(),
+            qr_reference::lstsq(a.view(), b.view()).unwrap(),
+        ] {
+            for (got, want) in x.data().iter().zip(want) {
+                assert!(
+                    (got - want).abs() <= 1e-12 * want.abs(),
+                    "scale {scale:e}: got {got:e}, want {want:e}"
+                );
+            }
+        }
+        // The same column first, alone with a zero second row.
+        let single = Tensor::from_vec(vec![scale, 0.0], &[2, 1]).unwrap();
+        let rhs = Tensor::from_vec(vec![1.0, 0.0], &[2, 1]).unwrap();
+        for x in [
+            lstsq(single.view(), rhs.view()).unwrap(),
+            qr_reference::lstsq(single.view(), rhs.view()).unwrap(),
+        ] {
+            let want = 1.0 / scale;
+            assert!(
+                (x.data()[0] - want).abs() <= 1e-12 * want,
+                "scale {scale:e}: got {:e}",
+                x.data()[0]
+            );
+        }
+    }
+}
+
+/// The column norms are exact for columns too large or too small to square in f64.
+#[test]
+fn column_norms_do_not_overflow_or_underflow() {
+    for scale in [1e300, 1e-300] {
+        let a = Tensor::from_vec(vec![3.0 * scale, 4.0 * scale], &[2, 1]).unwrap();
+        let want = 5.0 * scale;
+        let shipped = Qr::new(a.view()).unwrap().column_norms()[0];
+        let reference = qr_reference::Qr::new(a.view()).unwrap().column_norms()[0];
+        for got in [shipped, reference] {
+            assert!(
+                (got - want).abs() <= 1e-15 * want,
+                "{got:e} against {want:e}"
+            );
+        }
+    }
+}
+
+/// `solve` refuses a matrix with a dependent column, naming it, instead of returning
+/// infinities or NaN: a column equal to the one before it, and a zero column.
+#[test]
+fn solve_refuses_dependent_columns() {
+    let repeated = Tensor::from_vec(vec![1.0, 2.0, 1.0, 2.0, 1.0, 2.0], &[3, 2]).unwrap();
+    let repeated_twice = Tensor::from_vec(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0], &[3, 2]).unwrap();
+    let zero = Tensor::from_vec(vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0], &[3, 2]).unwrap();
+    let b = Tensor::from_vec(vec![1.0, 2.0, 3.0], &[3, 1]).unwrap();
+    for a in [&repeated, &repeated_twice, &zero] {
+        let shipped = Qr::new(a.view()).unwrap().solve(b.view());
+        let reference = qr_reference::Qr::new(a.view()).unwrap().solve(b.view());
+        for result in [shipped, reference] {
+            match result {
+                Err(Error::InvalidData(msg)) => {
+                    assert!(msg.contains("column 1 is a linear combination"), "{msg}")
+                }
+                other => panic!("expected InvalidData naming column 1, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// The dependence threshold is `rows · ε · ‖a_j‖`, not `ε` or a looser constant. With
+/// `c0 = e0` and `c1 = e0 + t·e1` in 100 rows, `|R_11| = t` exactly and `‖a_1‖ = 1`, so
+/// `t = 0.5 · 100ε` is dependent (it would not be under `ε`) and `t = 2 · 100ε` is not (it
+/// would be under 1e-8).
+#[test]
+fn dependence_threshold_is_rows_times_epsilon() {
+    let rows = 100;
+    let threshold = rows as f64 * f64::EPSILON;
+    for (t, want) in [(0.5 * threshold, Some(1)), (2.0 * threshold, None)] {
+        let mut data = vec![0.0; rows * 2];
+        data[0] = 1.0;
+        data[1] = 1.0;
+        data[3] = t;
+        let a = Tensor::from_vec(data, &[rows, 2]).unwrap();
+        let shipped = Qr::new(a.view()).unwrap();
+        let reference = qr_reference::Qr::new(a.view()).unwrap();
+        assert_eq!(shipped.r_diagonal()[1].abs(), t);
+        assert_eq!(shipped.dependent_column(), want, "t = {t:e}");
+        assert_eq!(reference.dependent_column(), want, "t = {t:e}");
+    }
+}
+
+/// A column dependent only through rounding (`c2 = 0.3·c0 + 0.7·c1` on 513 Gaussian rows)
+/// leaves `|R_22|` above `ε·‖a_2‖` but within `rows·ε·‖a_2‖`, so it is found.
+#[test]
+fn rounding_level_dependence_is_found() {
+    let rows = 513;
+    let mut rng = Rng::seed(11);
+    let mut data = Vec::new();
+    for _ in 0..rows {
+        let (c0, c1) = (rng.normal(), rng.normal());
+        data.extend([c0, c1, 0.3 * c0 + 0.7 * c1]);
+    }
+    let a = Tensor::from_vec(data, &[rows, 3]).unwrap();
+    assert_eq!(Qr::new(a.view()).unwrap().dependent_column(), Some(2));
+    assert_eq!(
+        qr_reference::Qr::new(a.view()).unwrap().dependent_column(),
+        Some(2)
+    );
+}
+
+/// `from_columns` takes the matrix already column-major and gives the same factorisation
+/// as `new` on the row-major copy, bit for bit, in both twins.
+#[test]
+fn from_columns_matches_new() {
+    let mut rng = Rng::seed(23);
+    let (rows, cols) = (64, 16);
+    let a = gaussian(&mut rng, rows, cols);
+    let b = gaussian(&mut rng, rows, 3);
+    let mut columns = vec![0.0; rows * cols];
+    for i in 0..rows {
+        for j in 0..cols {
+            columns[j * rows + i] = a.data()[i * cols + j];
+        }
+    }
+    let by_rows = Qr::new(a.view()).unwrap();
+    let by_columns = Qr::from_columns(columns.clone(), rows, cols).unwrap();
+    assert_eq!(by_rows.r_diagonal(), by_columns.r_diagonal());
+    assert_eq!(
+        by_rows.solve(b.view()).unwrap(),
+        by_columns.solve(b.view()).unwrap()
+    );
+    let reference_rows = qr_reference::Qr::new(a.view()).unwrap();
+    let reference_columns = qr_reference::Qr::from_columns(columns, rows, cols).unwrap();
+    assert_eq!(reference_rows.r_diagonal(), reference_columns.r_diagonal());
+    assert!(matches!(
+        Qr::from_columns(vec![1.0; 5], 3, 2),
+        Err(Error::InvalidData(_))
+    ));
+    assert!(matches!(
+        Qr::from_columns(vec![1.0; 6], 2, 3),
+        Err(Error::InvalidData(_))
+    ));
+}

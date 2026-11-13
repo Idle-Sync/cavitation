@@ -2,9 +2,11 @@
 //!
 //! [`Qr`] factors a tall matrix `a` (`[rows, cols]`, `rows ≥ cols`) as `Q·R` with
 //! Householder reflections, and [`Qr::solve`] finds the `x` that minimises `‖a·x − b‖` for
-//! each column of `b`. [`lstsq`] does both and refuses a matrix whose columns are not
-//! independent. QR works on `a` itself rather than on `aᵀa`, so it loses only as many digits
-//! as `a`'s condition number, where the normal equations lose twice that.
+//! each column of `b`. [`lstsq`] does both. Both refuse a matrix whose columns are not
+//! independent, naming the first column that depends on the ones before it. QR works on `a`
+//! itself rather than on `aᵀa`, so it loses only as many digits as `a`'s condition number,
+//! where the normal equations lose twice that. Norms and reflectors are scaled by each
+//! column's size, so columns from about 1e-300 to 1e300 factor without overflow or underflow.
 //!
 //! [`qr_reference`] is the same solver written as plainly as possible: the shipped [`Qr`] is
 //! tested against it.
@@ -39,21 +41,45 @@ fn matrix_dims(a: &TensorView<'_, f64>) -> Result<(usize, usize), Error> {
             "least squares needs a matrix of shape [rows, cols], found shape {dims:?}"
         )));
     };
+    check_tall(rows, cols)?;
+    if let Some(at) = a.data().iter().position(|v| !v.is_finite()) {
+        return Err(non_finite_error(a.data()[at], at / cols, at % cols));
+    }
+    Ok((rows, cols))
+}
+
+/// Checks that `data` holds a `[rows, cols]` matrix stored column-major that can be
+/// factored: `rows · cols` values, at least as many rows as columns, every value finite.
+fn check_columns(data: &[f64], rows: usize, cols: usize) -> Result<(), Error> {
+    if Some(data.len()) != rows.checked_mul(cols) {
+        return Err(Error::InvalidData(format!(
+            "a [{rows}, {cols}] matrix needs {rows} × {cols} values, found {}",
+            data.len()
+        )));
+    }
+    check_tall(rows, cols)?;
+    if let Some(at) = data.iter().position(|v| !v.is_finite()) {
+        return Err(non_finite_error(data[at], at % rows, at / rows));
+    }
+    Ok(())
+}
+
+/// Checks that a `[rows, cols]` matrix has at least as many rows as columns.
+fn check_tall(rows: usize, cols: usize) -> Result<(), Error> {
     if cols > rows {
         return Err(Error::InvalidData(format!(
             "the matrix of shape [{rows}, {cols}] has more columns than rows, so its \
              least-squares solution is not unique"
         )));
     }
-    if let Some(at) = a.data().iter().position(|v| !v.is_finite()) {
-        return Err(Error::InvalidData(format!(
-            "the matrix holds {} at row {}, column {}",
-            a.data()[at],
-            at / cols,
-            at % cols
-        )));
-    }
-    Ok((rows, cols))
+    Ok(())
+}
+
+/// The error for a NaN or infinite `value` at `row`, `col` of the matrix.
+fn non_finite_error(value: f64, row: usize, col: usize) -> Error {
+    Error::InvalidData(format!(
+        "the matrix holds {value} at row {row}, column {col}"
+    ))
 }
 
 /// Checks that `b` is a right-hand side for a matrix of `rows` rows: shape `[rows, k]`,
@@ -80,15 +106,23 @@ fn rhs_columns(b: &TensorView<'_, f64>, rows: usize) -> Result<usize, Error> {
     Ok(k)
 }
 
-/// Checks that no column norm overflowed: a column whose squared norm exceeds `f64::MAX`
-/// cannot be factored without rescaling.
-fn check_norms(norms: &[f64]) -> Result<(), Error> {
-    match norms.iter().position(|n| !n.is_finite()) {
-        Some(j) => Err(Error::InvalidData(format!(
-            "the norm of column {j} overflows f64; rescale the column"
-        ))),
-        None => Ok(()),
-    }
+/// The error for column `j` when its factorisation does not fit in f64. The norms and the
+/// reflectors are scaled, so this happens only for values within a small factor of
+/// `f64::MAX`, where a column's norm or an entry of `R` is itself larger than `f64::MAX`.
+fn too_large_error(j: usize) -> Error {
+    Error::InvalidData(format!(
+        "column {j} holds values too close to the largest f64 to factor; rescale the column"
+    ))
+}
+
+/// The power of two `2^e` with `2^e ≤ m < 2^(e+1)`, for `m > 0`; `f64::MIN_POSITIVE` for a
+/// subnormal `m`. Dividing or multiplying by it, or by its reciprocal (also representable),
+/// is exact, so scaling a column by it changes no digit, only the exponent: the scaled
+/// algorithm rounds exactly as the unscaled one wherever the unscaled one does not overflow
+/// or underflow.
+fn power_of_two_below(m: f64) -> f64 {
+    const EXPONENT: u64 = 0x7ff0_0000_0000_0000;
+    f64::from_bits(m.max(f64::MIN_POSITIVE).to_bits() & EXPONENT)
 }
 
 /// The first column `j` with `|R_jj| ≤ rows · ε · ‖a_j‖`. `|R_jj| / ‖a_j‖` is the sine of
@@ -102,10 +136,29 @@ fn first_dependent(r_diagonal: &[f64], norms: &[f64], rows: usize) -> Option<usi
         .position(|(r, n)| r.abs() <= scale * n)
 }
 
-/// The error [`lstsq`] returns for a dependent column `j`.
+/// The error [`lstsq`] and [`Qr::solve`] return for a dependent column `j`.
 fn dependent_error(j: usize) -> Error {
     Error::InvalidData(format!(
         "column {j} is a linear combination of the columns before it, so the least-squares \
          solution is not unique"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the shared helpers.
+
+    use super::*;
+
+    /// `power_of_two_below` gives the power of two at or below a positive value, and
+    /// `f64::MIN_POSITIVE` for a subnormal one.
+    #[test]
+    fn power_of_two_below_values() {
+        assert_eq!(power_of_two_below(1.0), 1.0);
+        assert_eq!(power_of_two_below(3.0), 2.0);
+        assert_eq!(power_of_two_below(0.75), 0.5);
+        assert_eq!(power_of_two_below(f64::MAX), 2f64.powi(1023));
+        assert_eq!(power_of_two_below(5e-324), f64::MIN_POSITIVE);
+        assert!(1.0 / power_of_two_below(f64::MAX) > 0.0);
+    }
 }
