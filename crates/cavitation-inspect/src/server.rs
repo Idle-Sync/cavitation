@@ -10,6 +10,7 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -19,6 +20,7 @@ use cavitation_core::Error;
 use cavitation_nn::Dataset;
 
 use crate::commands::{Command, CommandQueue, QUEUE_CAPACITY};
+use crate::export::{self, EXPORT_POLICY, PAGE, PAGE_POLICY};
 use crate::http::{self, Head, Method, Request};
 use crate::snapshot::Training;
 use crate::sse::Hub;
@@ -41,9 +43,12 @@ const COMMANDS: [&str; 10] = [
     "mask", "lr", "pause", "resume", "probe", "neuron", "ablate", "shrink", "cancel", "finish",
 ];
 
-/// The Content Security Policy of the documents the server sends: nothing may load and no
-/// script may run.
-const DOCUMENT_CSP: &str = "Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'\r\n";
+/// The `Content-Security-Policy` header line of a response carrying `policy`, with
+/// `frame-ancestors 'none'` added so no other site can show the page in a frame (a `<meta>`
+/// policy cannot carry that directive, so only the header has it).
+fn policy_header(policy: &str) -> String {
+    format!("Content-Security-Policy: {policy}; frame-ancestors 'none'\r\n")
+}
 
 /// How the inspector serves a run.
 ///
@@ -133,8 +138,6 @@ pub(crate) struct Shared {
     read_timeout: Duration,
     /// How long a write may make no progress.
     write_timeout: Duration,
-    /// The page's title.
-    title: String,
     /// The connection threads, joined on drop.
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// Connections still reading their request heads.
@@ -156,15 +159,23 @@ pub(crate) struct Shared {
 /// half-sent requests can keep the page from loading, though not read or change the run.
 ///
 /// Routes: `GET /` (the page), `GET /events?token=` (the event stream), `GET /export?token=`
-/// (a self-contained HTML document; the server writes no file), and the commands
+/// (the page with the run so far embedded, as a download; the server writes no file), and
+/// the commands
 /// `POST /api/{mask,lr,pause,resume,probe,neuron,ablate,shrink,cancel,finish}?token=…`,
 /// each answered 204, or 503 when 64 commands are already waiting.
 ///
 /// To train under it, call [`fit`](crate::fit) in place of `cavitation_nn::fit`; the event
 /// stream then carries the events [`wire`](crate::wire) describes.
 ///
-/// This version of the crate serves a placeholder page at `/`, which says that the server is
-/// running and where its event stream is; the export is a minimal document of the same kind.
+/// The page is one HTML file built into the crate, with its style and script inline. It
+/// reads the token from its own address, follows the event stream and sends the commands
+/// from its buttons; it loads nothing from anywhere else, and its Content Security Policy
+/// allows connections only to this server. It shows the speed and the loss, every layer's
+/// values for one probe row as a heat map (outputs, before the activation, gradients or
+/// the activation's slope), one neuron opened up with the chain rule written out, where a
+/// step's time goes, and in explore mode the ablation ranking and the shrink curve.
+/// [`export_html`](Self::export_html) saves the same page with the run so far in it, to
+/// open later with no server.
 ///
 /// # Examples
 ///
@@ -286,7 +297,6 @@ impl Inspector {
             hosts,
             read_timeout: config.read_timeout,
             write_timeout: config.write_timeout,
-            title: config.title.clone(),
             threads: Mutex::new(Vec::new()),
             pending: AtomicUsize::new(0),
             answering: AtomicUsize::new(0),
@@ -393,6 +403,40 @@ impl Inspector {
     /// ```
     pub fn snapshots_taken(&self) -> u64 {
         self.training.captures
+    }
+
+    /// Writes the inspector page to `path` as one self-contained HTML file, with everything
+    /// published so far embedded (the model, the latest statistics, probe row, neuron and
+    /// profile, the latest status, and the recent epochs, ablations and shrink levels, as
+    /// [`Hub::export_json`](crate::sse::Hub::export_json) gathers them). Opened in a
+    /// browser, it shows that snapshot with its controls off; a `<meta>` Content Security
+    /// Policy forbids it any connection. The JSON is written as the event stream's is, so
+    /// no title or name in it can end its `<script>` element.
+    ///
+    /// `GET /export?token=…` sends the same document as a download and writes no file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] naming `path` when the file cannot be written.
+    ///
+    /// ```
+    /// use cavitation_inspect::{Inspector, InspectorConfig};
+    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let inspector = Inspector::start(config)?;
+    /// let path = std::env::temp_dir().join(format!("inspector-doc-{}.html", std::process::id()));
+    /// inspector.export_html(&path)?;
+    /// let html = std::fs::read_to_string(&path).unwrap();
+    /// assert!(html.contains(r#"<script id="snapshot" type="application/json">"#));
+    /// std::fs::remove_file(&path).unwrap();
+    /// # Ok::<(), cavitation_core::Error>(())
+    /// ```
+    pub fn export_html(&self, path: impl AsRef<Path>) -> Result<(), Error> {
+        let path = path.as_ref();
+        let html = export::document(&self.shared.hub.export_json());
+        std::fs::write(path, html).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }
 
@@ -642,7 +686,7 @@ fn route(shared: &Shared, request: &Request) -> Outcome {
         _ => {}
     }
     if path == "/" {
-        return Outcome::Reply(document(200, &page(&shared.title), ""));
+        return Outcome::Reply(document(PAGE.to_string(), PAGE_POLICY, ""));
     }
     if !token_ok(shared, request) {
         return forbidden("a valid token is required");
@@ -650,8 +694,8 @@ fn route(shared: &Shared, request: &Request) -> Outcome {
     match command {
         None if path == "/events" => Outcome::Events,
         None => Outcome::Reply(document(
-            200,
-            &export(&shared.title),
+            export::document(&shared.hub.export_json()),
+            EXPORT_POLICY,
             "Content-Disposition: attachment; filename=\"inspector.html\"\r\n",
         )),
         Some(name) => match parse_command(name, request) {
@@ -667,58 +711,14 @@ fn route(shared: &Shared, request: &Request) -> Outcome {
     }
 }
 
-/// An HTML response with the documents' Content Security Policy and `extra` header lines.
-fn document(status: u16, html: &str, extra: &str) -> Reply {
+/// A 200 HTML response with the Content Security Policy `policy` and `extra` header lines.
+fn document(html: String, policy: &str, extra: &str) -> Reply {
     Reply {
-        status,
+        status: 200,
         content_type: "text/html; charset=utf-8",
-        extra: format!("{DOCUMENT_CSP}{extra}"),
-        body: html.to_string(),
+        extra: format!("{}{extra}", policy_header(policy)),
+        body: html,
     }
-}
-
-/// Escapes text for HTML element content and attribute values.
-fn escape_html(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// A minimal HTML document with a title and one paragraph.
-fn minimal_document(title: &str, text: &str) -> String {
-    let title = escape_html(title);
-    format!(
-        "<!doctype html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
-         <title>{title}</title>\n\
-         <style>body{{font-family:system-ui,sans-serif;max-width:40rem;margin:2rem auto;padding:0 1rem}}</style>\n\
-         </head>\n<body>\n<h1>{title}</h1>\n<p>{text}</p>\n</body>\n</html>\n"
-    )
-}
-
-/// The page served at `/`: a placeholder until the inspector page is built into the crate.
-fn page(title: &str) -> String {
-    minimal_document(
-        title,
-        "The inspector server is running. This version serves its live data as \
-         Server-Sent Events at <code>/events</code>, with the token from this page's \
-         address; the interactive page is not part of it.",
-    )
-}
-
-/// The document served at `/export`: a minimal one, since this version records no snapshot
-/// to embed.
-fn export(title: &str) -> String {
-    minimal_document(title, "No snapshot has been recorded.")
 }
 
 /// Reads query parameter `name` as a `T`, or says what is wrong with it.

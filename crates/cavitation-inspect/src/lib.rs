@@ -21,6 +21,8 @@
 //! - [`probe::Probe`]: one row run forward and backward beside training, on buffers of its
 //!   own, for the values of every layer and of one neuron.
 //! - [`wire`]: the JSON of every event, field by field.
+//! - [`Inspector::export_html`]: the page saved as one HTML file with the run so far in it,
+//!   to open with no server.
 //! - [`http`]: the request parser and the checks every request passes.
 //! - [`json::JsonWriter`]: JSON without NaN or infinity, safe inside an HTML `<script>`.
 //! - [`token::new_token`]: the per-run 128-bit token.
@@ -60,6 +62,7 @@
 //! ```
 
 pub mod commands;
+mod export;
 pub mod http;
 pub mod json;
 pub mod probe;

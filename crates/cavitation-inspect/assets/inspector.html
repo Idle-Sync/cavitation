@@ -1,0 +1,1025 @@
+<!doctype html><!-- The cavitation inspector page: served at / by cavitation-inspect, it follows /events and posts commands to /api/*; an export embeds a snapshot and shows it with the controls off. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cavitation inspector</title>
+<style>
+:root{
+  --bg:#edf0f4;--panel:#ffffff;--panel2:#e2e7ed;--ink:#0f1722;--muted:#566273;--line:#cfd7e0;
+  --pos:#0b6bcb;--neg:#c8245f;--off:#b3bcc7;
+  --f-display:"Arial Narrow","Roboto Condensed","Helvetica Neue",ui-sans-serif,system-ui,sans-serif;
+  --f-body:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --f-mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0a0e14;--panel:#111821;--panel2:#1a232e;--ink:#e8eef5;--muted:#8b98a8;--line:#243040;
+  --pos:#49b8ff;--neg:#ff5c8a;--off:#3a4655;color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0a0e14;--panel:#111821;--panel2:#1a232e;--ink:#e8eef5;--muted:#8b98a8;--line:#243040;
+  --pos:#49b8ff;--neg:#ff5c8a;--off:#3a4655;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--f-body);font-size:15px;line-height:1.5}
+.wrap{max-width:1040px;margin:0 auto;padding:18px max(16px,env(safe-area-inset-right,0px)) 56px max(16px,env(safe-area-inset-left,0px));display:flex;flex-direction:column;gap:16px}
+h1,h2{font-family:var(--f-display);font-stretch:75%;margin:0;line-height:1.05}
+h1{font-size:2.2rem;font-weight:800}
+h2{font-size:1.3rem;font-weight:700}
+p{margin:0}
+.mono{font-family:var(--f-mono);font-variant-numeric:tabular-nums}
+.k{font-family:var(--f-mono);font-size:.7rem;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.muted,.note{color:var(--muted)}
+.note{font-size:.82rem}
+.lede{color:var(--muted);font-size:.95rem;max-width:72ch}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;display:flex;flex-direction:column;gap:12px;min-width:0}
+.perf{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));border:1px solid var(--line);border-radius:10px;background:var(--panel);overflow:hidden}
+.perf>div{padding:12px 14px;display:flex;flex-direction:column;gap:2px;min-width:0;border-left:1px solid var(--line)}
+.perf>div:first-child{border-left:0}
+.big{font-family:var(--f-display);font-stretch:68%;font-weight:800;font-size:2rem;line-height:1;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.perf .sub{font-family:var(--f-mono);font-size:.7rem;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+@media (max-width:900px){.perf{grid-template-columns:repeat(3,minmax(0,1fr))}.perf>div:nth-child(4){border-left:0}.perf>div:nth-child(n+4){border-top:1px solid var(--line)}}
+@media (max-width:620px){.perf{grid-template-columns:repeat(2,minmax(0,1fr))}.perf>div:nth-child(4){border-left:1px solid var(--line)}.perf>div:nth-child(odd){border-left:0}.perf>div:nth-child(n+3){border-top:1px solid var(--line)}}
+.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.between{justify-content:space-between}
+button,select,input[type=number]{font:inherit;font-size:.85rem;border-radius:7px;border:1px solid var(--line);background:var(--panel2);color:var(--ink);padding:7px 11px}
+button{cursor:pointer}
+button:disabled,select:disabled,input:disabled{cursor:not-allowed;opacity:.55}
+button.primary,button[aria-pressed="true"]{background:var(--ink);color:var(--panel);border-color:var(--ink);font-weight:600}
+button:focus-visible,select:focus-visible,input:focus-visible,canvas:focus-visible{outline:2px solid var(--pos);outline-offset:2px}
+input[type=number]{width:8em;font-family:var(--f-mono)}
+label.ctl{display:flex;flex-direction:column;gap:3px}
+.badge{font-family:var(--f-mono);font-size:.72rem;border:1px solid var(--line);border-radius:999px;padding:2px 9px;color:var(--muted)}
+.badge.live{color:var(--pos);border-color:var(--pos)}
+.badge.bad{color:var(--neg);border-color:var(--neg)}
+.notice{font-family:var(--f-mono);font-size:.78rem;color:var(--neg);overflow-wrap:anywhere}
+.statusline{font-family:var(--f-mono);font-size:.78rem;color:var(--muted);border-top:1px dashed var(--line);padding-top:10px;overflow-wrap:anywhere}
+.layers{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start}
+.layer{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1 1 120px}
+.layer.wide{flex:2 1 220px}
+.layer canvas{display:block;border-radius:4px;cursor:pointer;touch-action:manipulation;max-width:100%}
+.scale{display:flex;justify-content:space-between;font-family:var(--f-mono);font-size:.68rem;color:var(--muted)}
+.ramp{height:6px;border-radius:3px}
+.outs{display:flex;flex-direction:column;gap:3px;font-family:var(--f-mono);font-size:.78rem;font-variant-numeric:tabular-nums}
+.out{display:grid;grid-template-columns:minmax(1.2em,auto) 1fr 5.6em;gap:6px;align-items:center;cursor:pointer;border-radius:4px;padding:1px 2px;background:none;border:0;color:inherit;font:inherit;text-align:left}
+.out .tr{height:12px;background:var(--panel2);border-radius:2px;position:relative;overflow:hidden}
+.out .fi{position:absolute;top:0;bottom:0;border-radius:2px}
+.out .v{text-align:right}
+.out.sel{outline:2px solid var(--ink)}
+.out.truth b{color:var(--pos)}
+.detail{display:grid;grid-template-columns:minmax(0,1.25fr) minmax(0,1fr);gap:16px}
+@media (max-width:760px){.detail{grid-template-columns:minmax(0,1fr)}}
+.col{display:flex;flex-direction:column;gap:10px;min-width:0}
+.vals{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:8px}
+.val{background:var(--panel2);border-radius:7px;padding:8px 10px;display:flex;flex-direction:column;gap:1px;min-width:0}
+.val .n{font-family:var(--f-mono);font-size:.68rem;color:var(--muted);letter-spacing:.04em}
+.val .x{font-family:var(--f-mono);font-size:1.05rem;font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.chain{font-family:var(--f-mono);font-size:.8rem;background:var(--panel2);border-radius:7px;padding:9px 11px;overflow-x:auto;white-space:nowrap}
+.wide-canvas{width:100%;display:block}
+.contrib{font-family:var(--f-mono);font-size:.76rem;display:flex;flex-direction:column;gap:2px;font-variant-numeric:tabular-nums}
+.contrib div{display:flex;justify-content:space-between;gap:8px;white-space:nowrap;overflow:hidden}
+.switch{display:flex;align-items:center;gap:8px;font-size:.9rem;font-weight:500}
+.switch input{width:20px;height:20px;accent-color:var(--ink)}
+.stack{display:flex;height:22px;border-radius:5px;overflow:hidden;background:var(--panel2)}
+.stack span{height:100%}
+.ptable{display:grid;grid-template-columns:1.2em minmax(0,1fr) auto auto;gap:4px 12px;font-family:var(--f-mono);font-size:.78rem;font-variant-numeric:tabular-nums;align-items:center}
+.ptable i{display:block;width:12px;height:12px;border-radius:2px}
+.ptable .r{text-align:right}
+.rank{display:grid;grid-template-columns:2.2em minmax(0,1fr) minmax(0,1.2fr) auto;gap:3px 10px;font-family:var(--f-mono);font-size:.76rem;font-variant-numeric:tabular-nums;align-items:center}
+.rank .tr{height:10px;background:var(--panel2);border-radius:2px;position:relative;overflow:hidden}
+.rank .fi{position:absolute;top:0;bottom:0;left:0;border-radius:2px}
+.rank .r{text-align:right}
+.two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+@media (max-width:760px){.two{grid-template-columns:minmax(0,1fr)}}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="col" style="gap:6px">
+    <div class="row"><span class="badge" id="conn">connecting</span><span class="badge" id="state">–</span></div>
+    <h1 id="title">Cavitation inspector</h1>
+    <p class="lede" id="lede">Waiting for the network.</p>
+  </header>
+
+  <section class="perf" aria-label="Performance">
+    <div><span class="k">Samples / s</span><span class="big" id="tSps">–</span><span class="sub">training steps only</span></div>
+    <div><span class="k">GFLOPS</span><span class="big" id="tGf">–</span><span class="sub" id="tGfSub">Linear layers</span></div>
+    <div><span class="k" id="tAccK">Accuracy</span><span class="big" id="tAcc">–</span><span class="sub" id="tAccSub">held-out rows</span></div>
+    <div><span class="k">Loss</span><span class="big" id="tLoss">–</span><span class="sub" id="tLossSub">last batch</span></div>
+    <div><span class="k">Epoch</span><span class="big" id="tEp">–</span><span class="sub" id="tEpSub">–</span></div>
+    <div><span class="k">Steps</span><span class="big" id="tSteps">–</span><span class="sub" id="tStepsSub">–</span></div>
+  </section>
+
+  <section class="panel" aria-label="Training controls">
+    <div class="row" style="align-items:flex-end">
+      <button class="primary" id="run" type="button">Pause</button>
+      <label class="ctl"><span class="k">Learning rate</span><input type="number" id="lr" step="any" min="0" max="10"></label>
+      <button id="lrSet" type="button">Set rate</button>
+    </div>
+    <p class="notice" id="notice" role="status" hidden></p>
+    <p class="statusline" id="statusLine" aria-live="polite">–</p>
+  </section>
+
+  <section class="panel" aria-label="Network">
+    <div class="row between">
+      <h2>The network, one row flowing through it</h2>
+      <div class="row" role="group" aria-label="What the cells show">
+        <button type="button" data-mode="a" aria-pressed="true">a, output</button>
+        <button type="button" data-mode="z" aria-pressed="false">z, before</button>
+        <button type="button" data-mode="d" aria-pressed="false">∂L/∂z</button>
+        <button type="button" data-mode="f" aria-pressed="false">f′(z)</button>
+      </div>
+    </div>
+    <div class="row">
+      <button id="prev" type="button" aria-label="Previous row">‹</button>
+      <span class="mono" id="probeLbl" style="font-size:.85rem">–</span>
+      <button id="next" type="button" aria-label="Next row">›</button>
+      <button id="wrong" type="button">Next mistake</button>
+    </div>
+    <div class="layers" id="layers"></div>
+    <p class="note">Tap a cell to open that neuron up. Crossed cells are switched off.</p>
+  </section>
+
+  <section class="panel" aria-live="polite" aria-label="Selected neuron">
+    <div class="row between">
+      <div class="col" style="gap:2px"><span class="k" id="nTag">–</span><h2 id="nTitle">No neuron yet</h2></div>
+      <label class="switch"><input type="checkbox" id="onoff" checked> Neuron on</label>
+    </div>
+    <div class="detail">
+      <div class="col">
+        <div class="vals" id="vals"></div>
+        <div class="chain" id="chain">–</div>
+        <div id="curveBox" class="col" style="gap:4px"><span class="k">Activation, its derivative, and the tangent at z</span><canvas class="wide-canvas" id="curve"></canvas></div>
+        <p class="note" id="curveNote" hidden></p>
+      </div>
+      <div class="col" style="gap:8px">
+        <span class="k" id="wLbl">Incoming weights</span>
+        <canvas id="wimg"></canvas>
+        <span class="k">Largest contributions to z for this row</span>
+        <div class="contrib" id="contrib"></div>
+      </div>
+    </div>
+  </section>
+
+  <div class="two">
+    <section class="panel" aria-label="Profiler">
+      <h2>Where the time goes</h2>
+      <p class="note">One sampled training step, layer by layer, forward and backward.</p>
+      <span class="mono note" id="profTot">No step profiled yet.</span>
+      <div class="stack" id="stack"></div>
+      <div class="ptable" id="ptable"></div>
+    </section>
+
+    <section class="panel" aria-label="Shrink lab">
+      <h2>How small can it get?</h2>
+      <p class="note" id="exploreNote">Explore mode: once a network is trained, rank its neurons by what switching each off costs, then shrink it level by level.</p>
+      <div class="row" style="align-items:flex-end">
+        <label class="ctl"><span class="k">Layer to rank</span><select id="abLinear"></select></label>
+        <button id="ablate" type="button">Rank neurons</button>
+        <button id="shrink" type="button">Shrink</button>
+        <button id="cancel" type="button">Cancel</button>
+        <button id="finish" type="button">Finish</button>
+      </div>
+      <span class="k" id="rankLbl">Ablation ranking</span>
+      <div class="rank" id="ranking"></div>
+      <span class="k" id="curveLbl">Size against validation accuracy</span>
+      <div id="chartBox"><canvas class="wide-canvas" id="chart"></canvas></div>
+      <p class="note" id="chosen"></p>
+    </section>
+  </div>
+</div>
+<!-- snapshot -->
+<script>
+'use strict';
+(function () {
+  const $ = (id) => document.getElementById(id);
+
+  // ---- State ------------------------------------------------------------------------
+  const S = {
+    model: null, stats: null, probe: null, neuron: null, profile: null, status: null,
+    epochs: [], ablations: new Map(), shrinks: new Map(),
+    mode: 'a', views: [], live: false, exported: false, connected: false,
+    pending: null, modelSeen: false,
+  };
+  const token = new URLSearchParams(location.search).get('token') || '';
+
+  // ---- Formatting -------------------------------------------------------------------
+  const ok = (v) => typeof v === 'number' && isFinite(v);
+  function fmt(v, d) {
+    if (!ok(v)) return '–';
+    if (d === undefined) d = 3;
+    const a = Math.abs(v);
+    const s = a !== 0 && (a < Math.pow(10, -d) || a >= 1e6) ? a.toExponential(2) : a.toFixed(d);
+    return (v < 0 ? '−' : '') + s;
+  }
+  const int = (v) => (ok(v) ? Math.round(v).toLocaleString('en-US') : '–');
+  const pct = (v) => (ok(v) ? (v * 100).toFixed(1) + '%' : '–');
+
+  // ---- DOM helpers: text only, never markup ---------------------------------------------
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = String(text);
+    return e;
+  }
+  function setText(id, text) { $(id).textContent = String(text); }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+  // A message of the page's own (a refused command, a value it will not send) in its own
+  // area for a few seconds, so the run's status line does not overwrite it.
+  let noticeTimer = 0;
+  function notice(text) {
+    const n = $('notice');
+    n.textContent = String(text);
+    n.hidden = false;
+    clearTimeout(noticeTimer);
+    noticeTimer = setTimeout(() => { n.hidden = true; n.textContent = ''; }, 6000);
+  }
+
+  // ---- Colours ----------------------------------------------------------------------
+  let PAL = null;
+  function css(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function rgb(c) {
+    const h = c.replace('#', '');
+    if (h.length !== 6) return [128, 128, 128];
+    return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16));
+  }
+  function palette() {
+    PAL = {
+      base: rgb(css('--panel2')), pos: rgb(css('--pos')), neg: rgb(css('--neg')), bg: rgb(css('--panel')),
+      off: css('--off'), ink: css('--ink'), muted: css('--muted'), line: css('--line'),
+      posC: css('--pos'), negC: css('--neg'),
+    };
+  }
+  const mix = (a, b, t) => 'rgb(' + a.map((v, i) => Math.round(v + (b[i] - v) * t)).join(',') + ')';
+  function heat(v, m, signed) {
+    if (!ok(v)) return PAL.off;
+    const t = Math.min(1, Math.abs(v) / m);
+    if (!signed) return mix(PAL.base, PAL.pos, Math.min(1, Math.max(0, v) / m));
+    return mix(PAL.base, v >= 0 ? PAL.pos : PAL.neg, Math.pow(t, 0.7));
+  }
+
+  // ---- Canvas helpers ---------------------------------------------------------------
+  function prepare(canvas, w, h) {
+    const dpr = Math.min(3, window.devicePixelRatio || 1);
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    const W = Math.max(1, Math.round(w * dpr)), H = Math.max(1, Math.round(h * dpr));
+    if (canvas.width !== W) canvas.width = W;
+    if (canvas.height !== H) canvas.height = H;
+    const x = canvas.getContext('2d');
+    x.setTransform(dpr, 0, 0, dpr, 0, 0);
+    x.clearRect(0, 0, w, h);
+    return x;
+  }
+  function gridCols(n) {
+    if (n <= 1) return 1;
+    let c = 1;
+    while (c * c < n) c *= 2;
+    return Math.min(c, n);
+  }
+  // Draws `vals` as a grid of cells; returns the scale used.
+  function drawGrid(canvas, cols, n, vals, off, selected, maxWidth) {
+    const rows = Math.ceil(n / cols);
+    const avail = Math.max(40, maxWidth || canvas.parentElement.clientWidth || 200);
+    const cell = Math.max(2, Math.min(36, Math.floor(avail / cols)));
+    const w = cell * cols, h = cell * rows;
+    const x = prepare(canvas, w, h);
+    let m = 1e-12, signed = false;
+    for (let k = 0; k < n; k++) {
+      const v = vals ? vals[k] : null;
+      if (!ok(v) || (off && off.has(k))) continue;
+      if (v < 0) signed = true;
+      m = Math.max(m, Math.abs(v));
+    }
+    const gap = cell > 6 ? 1 : 0;
+    for (let k = 0; k < n; k++) {
+      const cx = (k % cols) * cell, cy = Math.floor(k / cols) * cell;
+      if (off && off.has(k)) {
+        x.fillStyle = PAL.off;
+        x.fillRect(cx + gap / 2, cy + gap / 2, cell - gap, cell - gap);
+        x.strokeStyle = mix(PAL.bg, PAL.bg, 0);
+        x.lineWidth = 1;
+        x.beginPath(); x.moveTo(cx + gap + 1, cy + gap + 1); x.lineTo(cx + cell - gap - 1, cy + cell - gap - 1); x.stroke();
+        continue;
+      }
+      x.fillStyle = vals ? heat(vals[k], m, signed) : PAL.off;
+      x.fillRect(cx + gap / 2, cy + gap / 2, cell - gap, cell - gap);
+    }
+    if (selected !== null && selected !== undefined && selected < n) {
+      const cx = (selected % cols) * cell, cy = Math.floor(selected / cols) * cell;
+      x.strokeStyle = PAL.ink;
+      x.lineWidth = Math.max(1.5, Math.min(3, cell / 6));
+      x.strokeRect(cx + 1, cy + 1, cell - 2, cell - 2);
+    }
+    return { m: m, signed: signed, cell: cell, cols: cols, rows: rows };
+  }
+
+  // ---- Layer views ------------------------------------------------------------------
+  // A Linear followed by an activation is shown with it (its output is that layer's z);
+  // a Linear just before a final softmax is shown with the softmax.
+  function buildViews() {
+    const L = S.model.layers;
+    const views = [];
+    for (let i = 0; i < L.length; i++) {
+      const next = L[i + 1];
+      const final = next && i + 2 === L.length && (next.kind === 'softmax' || next.kind === 'log_softmax');
+      if (L[i].linear && next && (next.activation !== null || final)) continue;
+      const prev = L[i - 1];
+      views.push({ i: i, from: !L[i].linear && prev && prev.linear ? i - 1 : null });
+    }
+    S.views = views;
+    const layers = $('layers');
+    clear(layers);
+    const input = el('div', 'layer');
+    input.appendChild(el('span', 'k', S.model.input_image ? 'Input · ' + S.model.input_image[0] + '×' + S.model.input_image[1] : 'Input · ' + S.model.input_width));
+    const ci = el('canvas');
+    ci.setAttribute('aria-label', 'The probed row');
+    input.appendChild(ci);
+    layers.appendChild(input);
+    S.inputCanvas = ci;
+    views.forEach((v, n) => {
+      const layer = L[v.i];
+      const last = n === views.length - 1;
+      const box = el('div', last && layer.width <= 32 ? 'layer' : 'layer wide');
+      v.label = el('span', 'k');
+      box.appendChild(v.label);
+      if (last && layer.width <= 32) {
+        v.outs = el('div', 'outs');
+        v.rows = [];
+        for (let j = 0; j < layer.width; j++) {
+          const row = el('button', 'out');
+          row.type = 'button';
+          row.appendChild(el('b', null, className(j)));
+          const tr = el('span', 'tr');
+          const fi = el('span', 'fi');
+          tr.appendChild(fi);
+          row.appendChild(tr);
+          const val = el('span', 'v', '–');
+          row.appendChild(val);
+          row.addEventListener('click', () => send('neuron', 'layer=' + neuronLayer(v) + '&neuron=' + j));
+          v.outs.appendChild(row);
+          v.rows.push({ row: row, fi: fi, val: val });
+        }
+        box.appendChild(v.outs);
+      } else {
+        v.canvas = el('canvas');
+        v.canvas.setAttribute('aria-label', 'Layer ' + v.i + ' values');
+        v.canvas.addEventListener('click', (e) => pickCell(v, e));
+        box.appendChild(v.canvas);
+        v.ramp = el('div', 'ramp');
+        v.scale = el('div', 'scale');
+        box.appendChild(v.ramp);
+        box.appendChild(v.scale);
+      }
+      layers.appendChild(box);
+    });
+  }
+  // The layer whose neuron a click on view `v` selects: the activation for an activation
+  // view, otherwise the Linear it shows (the softmax has no neuron of its own).
+  function neuronLayer(v) {
+    const layer = S.model.layers[v.i];
+    if (layer.activation !== null || layer.linear || v.from === null) return v.i;
+    return v.from;
+  }
+  function viewValues(v) {
+    const P = S.probe && S.probe.layers;
+    if (!P || !P[v.i]) return null;
+    const me = P[v.i], src = v.from !== null ? P[v.from] : null, lin = S.model.layers[v.i].linear;
+    if (S.mode === 'a') return me.a;
+    if (S.mode === 'z') return me.z || (src && src.a) || (lin ? me.a : null);
+    if (S.mode === 'd') return me.grad_z || (src && src.grad_a) || (lin ? me.grad_a : null);
+    return me.df;
+  }
+  function offSet(v) {
+    const P = S.probe && S.probe.layers;
+    const off = new Set();
+    if (!P) return off;
+    (P[v.i] && P[v.i].masked || []).forEach((j) => off.add(j));
+    if (v.from !== null && P[v.from]) (P[v.from].masked || []).forEach((j) => off.add(j));
+    return off;
+  }
+  function selectedIn(v) {
+    const N = S.neuron;
+    if (!N) return null;
+    return N.layer === v.i || (v.from !== null && N.layer === v.from) ? N.neuron : null;
+  }
+  // Whether the run can take a neuron selection or a switch: connected and not finished.
+  function canAsk() { return S.live && state() !== 'finished'; }
+  function pickCell(v, e) {
+    if (!canAsk() || !v.grid) return;
+    const r = v.canvas.getBoundingClientRect();
+    const cx = Math.floor((e.clientX - r.left) / r.width * v.grid.cols);
+    const cy = Math.floor((e.clientY - r.top) / r.height * v.grid.rows);
+    const j = cy * v.grid.cols + cx;
+    if (cx < 0 || cy < 0 || cx >= v.grid.cols || j >= S.model.layers[v.i].width) return;
+    send('neuron', 'layer=' + neuronLayer(v) + '&neuron=' + j);
+  }
+  const MODE_NAMES = { a: 'a', z: 'z', d: '∂L/∂z', f: 'f′(z)' };
+  function className(j) {
+    const names = S.model && S.model.class_names;
+    return names && names[j] !== undefined ? names[j] : String(j);
+  }
+  function layerName(i) {
+    const L = S.model.layers[i];
+    return L.activation || L.kind;
+  }
+  function renderLayers() {
+    if (!S.model || !S.probe) return;
+    const P = S.probe;
+    const img = S.model.input_image;
+    const inWidth = Math.min(img ? 220 : 400, S.inputCanvas.parentElement.clientWidth || 200);
+    if (img && img[0] * img[1] === P.input.length) drawGrid(S.inputCanvas, img[1], P.input.length, P.input, null, null, inWidth);
+    else drawGrid(S.inputCanvas, gridCols(P.input.length), P.input.length, P.input, null, null, inWidth);
+    S.views.forEach((v) => {
+      const layer = S.model.layers[v.i];
+      const vals = viewValues(v);
+      const off = offSet(v);
+      const onCount = layer.width - off.size;
+      const what = v.from !== null ? layerName(v.i) + ' after linear' : layerName(v.i);
+      v.label.textContent = 'Layer ' + v.i + ' · ' + what + ' · ' + onCount + '/' + layer.width + ' on' + (vals ? '' : ' · no ' + MODE_NAMES[S.mode] + ' here');
+      if (v.outs) renderOutputs(v, vals);
+      else {
+        v.grid = drawGrid(v.canvas, gridCols(layer.width), layer.width, vals, off, selectedIn(v));
+        const g = v.grid;
+        v.ramp.style.background = g.signed
+          ? 'linear-gradient(90deg,' + mix(PAL.base, PAL.neg, 1) + ',' + mix(PAL.base, PAL.base, 0) + ',' + mix(PAL.base, PAL.pos, 1) + ')'
+          : 'linear-gradient(90deg,' + mix(PAL.base, PAL.base, 0) + ',' + mix(PAL.base, PAL.pos, 1) + ')';
+        clear(v.scale);
+        if (!vals) { v.scale.appendChild(el('span', null, '–')); return; }
+        if (g.signed) v.scale.appendChild(el('span', null, fmt(-g.m, 2)));
+        v.scale.appendChild(el('span', null, '0'));
+        v.scale.appendChild(el('span', null, fmt(g.m, 2)));
+      }
+    });
+  }
+  // Updates the output rows in place, so a press or keyboard focus survives a render.
+  function renderOutputs(v, vals) {
+    const sel = selectedIn(v);
+    const soft = S.model.layers[v.i].kind === 'softmax' && S.mode === 'a';
+    let m = 1e-12, signed = false;
+    if (vals) for (const x of vals) if (ok(x)) { m = Math.max(m, Math.abs(x)); if (x < 0) signed = true; }
+    v.rows.forEach((r, j) => {
+      const x = vals ? vals[j] : null;
+      r.row.classList.toggle('sel', j === sel);
+      r.row.classList.toggle('truth', S.probe.label === j);
+      r.row.disabled = !canAsk();
+      let w = 0, left = 0;
+      if (ok(x)) {
+        w = soft ? Math.min(1, Math.max(0, x)) * 100 : Math.abs(x) / m * (signed ? 50 : 100);
+        left = signed ? (x >= 0 ? 50 : 50 - w) : 0;
+      }
+      r.fi.style.left = left + '%';
+      r.fi.style.width = w + '%';
+      r.fi.style.background = ok(x) && x < 0 ? 'var(--neg)' : 'var(--pos)';
+      const text = soft ? pct(x) : fmt(x, 2);
+      if (r.val.textContent !== text) r.val.textContent = text;
+    });
+  }
+  function renderProbeLabel() {
+    const P = S.probe;
+    if (!P || !S.model) return;
+    let text = 'Row ' + (P.row + 1) + ' of ' + S.model.probe_rows + (S.model.probe_is_training ? ' (training rows)' : '');
+    if (P.label !== null) text += ' · label ' + className(P.label);
+    if (P.predicted !== null) text += ' · predicted ' + className(P.predicted);
+    if (P.target) text += ' · target ' + P.target.map((t) => fmt(t, 3)).join(', ');
+    text += ' · loss ' + fmt(P.loss, 4);
+    setText('probeLbl', text);
+  }
+
+  // ---- The neuron panel -------------------------------------------------------------
+  const sig = (z) => 1 / (1 + Math.exp(-z));
+  const softplus = (z) => (z > 20 ? z : Math.log1p(Math.exp(z)));
+  // The activations' shapes with their default parameters; the point and the slope drawn
+  // on the curve are the neuron's own values.
+  const ACT = {
+    relu: (z) => Math.max(0, z),
+    leaky_relu: (z) => (z > 0 ? z : 0.01 * z),
+    tanh: Math.tanh,
+    sigmoid: sig,
+    gelu: (z) => 0.5 * z * (1 + Math.tanh(0.7978845608 * (z + 0.044715 * z * z * z))),
+    elu: (z) => (z > 0 ? z : Math.expm1(z)),
+    selu: (z) => 1.0507009873554805 * (z > 0 ? z : 1.6732632423543772 * Math.expm1(z)),
+    celu: (z) => (z > 0 ? z : Math.expm1(z)),
+    silu: (z) => z * sig(z),
+    mish: (z) => z * Math.tanh(softplus(z)),
+    softplus: softplus,
+    softsign: (z) => z / (1 + Math.abs(z)),
+    hardtanh: (z) => Math.max(-1, Math.min(1, z)),
+    relu6: (z) => Math.max(0, Math.min(6, z)),
+    hardsigmoid: (z) => Math.max(0, Math.min(1, z / 6 + 0.5)),
+    hardswish: (z) => z * Math.max(0, Math.min(1, z / 6 + 0.5)),
+    log_sigmoid: (z) => -softplus(-z),
+  };
+  const slope = (f, z) => (f(z + 1e-4) - f(z - 1e-4)) / 2e-4;
+  function valueBox(name, value) {
+    const box = el('div', 'val');
+    box.appendChild(el('span', 'n', name));
+    box.appendChild(el('span', 'x', value));
+    return box;
+  }
+  function linearInfo(N) {
+    if (!S.model || N.linear === null) return null;
+    const L = S.model.layers;
+    let index = 0;
+    for (let i = 0; i < N.linear; i++) if (L[i].linear) index++;
+    let later = false;
+    for (let i = N.linear + 1; i < L.length; i++) if (L[i].linear) later = true;
+    return { index: index, output: !later };
+  }
+  function renderNeuron() {
+    const N = S.neuron;
+    if (!N || !S.model) return;
+    const layer = S.model.layers[N.layer];
+    const act = layer ? layer.activation : null;
+    const outputs = S.views.length && S.views[S.views.length - 1];
+    const isOutput = outputs && (outputs.i === N.layer || outputs.from === N.layer);
+    setText('nTag', 'Layer ' + N.layer + ' · ' + (layer ? layerName(N.layer) : '?') + (N.linear !== null ? ' · from linear layer ' + N.linear : ''));
+    setText('nTitle', isOutput ? 'Output ' + className(N.neuron) : 'Neuron ' + N.neuron);
+    const info = linearInfo(N);
+    const box = $('onoff');
+    // A switch the page asked for shows as asked until the neuron snapshot agrees, the
+    // command is refused (a failed request or a status message), or 5 s pass.
+    let on = !!N.on;
+    const P = S.pending;
+    if (P && P.layer === N.layer && P.neuron === N.neuron) {
+      if (on === P.on || Date.now() - P.at > 5000) S.pending = null;
+      else on = P.on;
+    }
+    box.checked = on;
+    box.disabled = !canAsk() || !info || info.output;
+    const vals = $('vals');
+    clear(vals);
+    vals.appendChild(valueBox('z · before activation', fmt(N.z)));
+    vals.appendChild(valueBox('a · output', fmt(N.a)));
+    vals.appendChild(valueBox('f′(z) · local slope', fmt(N.df)));
+    vals.appendChild(valueBox('∂L/∂a · from above', fmt(N.grad_a, 4)));
+    vals.appendChild(valueBox('∂L/∂z · gradient here', fmt(N.grad_z, 4)));
+    if (ok(N.outgoing_norm)) vals.appendChild(valueBox('outgoing weight norm', fmt(N.outgoing_norm)));
+    let chain;
+    if (!N.on) chain = 'Switched off: it outputs 0 and sends no gradient back.';
+    else if (ok(N.df) && ok(N.grad_a)) chain = '∂L/∂z = ∂L/∂a × f′(z) = ' + fmt(N.grad_a, 4) + ' × ' + fmt(N.df) + ' = ' + fmt(N.grad_z, 4);
+    else if (layer && layer.kind === 'softmax') chain = 'Softmax ties the outputs together, so there is no single f′(z) here.';
+    else if (ok(N.grad_a)) chain = '∂L/∂a = ' + fmt(N.grad_a, 4) + ' (a linear output: no activation between it and the loss).';
+    else chain = 'No gradient for this neuron.';
+    setText('chain', chain);
+    const f = act ? ACT[act] : null;
+    $('curveBox').hidden = !act;
+    const note = $('curveNote');
+    note.hidden = !!f && !!act;
+    note.textContent = act ? 'No curve is drawn for ' + act + '.' : '';
+    if (act && f) drawCurve(f, N);
+    drawWeights(N);
+    const contrib = $('contrib');
+    clear(contrib);
+    const first = N.linear !== null && S.model.layers[N.linear] && S.model.layers[N.linear].inputs === S.model.input_width && isFirstLinear(N.linear);
+    const img = S.model.input_image;
+    (N.top_inputs || []).forEach((t) => {
+      const row = el('div');
+      let name = (first ? 'input ' : 'neuron ') + t.input;
+      if (first && img) name = 'pixel ' + Math.floor(t.input / img[1]) + ',' + (t.input % img[1]);
+      row.appendChild(el('span', null, name + ': ' + fmt(t.x, 2) + ' × ' + fmt(t.weight, 2)));
+      const b = el('b', null, fmt(t.product, 3));
+      b.style.color = ok(t.product) && t.product < 0 ? 'var(--neg)' : 'var(--pos)';
+      row.appendChild(b);
+      contrib.appendChild(row);
+    });
+    const bias = el('div', 'muted');
+    bias.appendChild(el('span', null, 'bias'));
+    bias.appendChild(el('span', null, fmt(N.bias, 3)));
+    contrib.appendChild(bias);
+    const total = el('div', 'muted');
+    total.appendChild(el('span', null, 'bias + Σ w·x'));
+    total.appendChild(el('span', null, fmt(N.pre_activation, 3)));
+    contrib.appendChild(total);
+  }
+  function isFirstLinear(i) {
+    for (let k = 0; k < i; k++) if (S.model.layers[k].linear) return false;
+    return true;
+  }
+  function drawWeights(N) {
+    const canvas = $('wimg');
+    const w = N.weights || [];
+    const img = S.model.input_image;
+    const asImage = img && img[0] * img[1] === w.length && isFirstLinear(N.linear);
+    setText('wLbl', w.length === 0 ? 'No incoming weights' : asImage
+      ? 'Its ' + w.length + ' incoming weights as a ' + img[0] + '×' + img[1] + ' image'
+      : 'Its ' + w.length + ' incoming weights');
+    canvas.hidden = w.length === 0;
+    if (!w.length) return;
+    const avail = Math.min(260, canvas.parentElement.clientWidth || 260);
+    drawGrid(canvas, asImage ? img[1] : gridCols(w.length), w.length, w, null, null, avail);
+  }
+  function drawCurve(f, N) {
+    const canvas = $('curve');
+    const W = Math.max(200, canvas.parentElement.clientWidth || 340), H = Math.round(Math.min(220, W * 0.45));
+    const x = prepare(canvas, W, H);
+    const z = ok(N.z) ? N.z : 0;
+    const lo = Math.min(-4, Math.max(-50, z - 1)), hi = Math.max(4, Math.min(50, z + 1));
+    let ylo = Infinity, yhi = -Infinity;
+    const pts = [];
+    for (let k = 0; k <= 200; k++) {
+      const v = lo + (hi - lo) * k / 200;
+      const fv = f(v), dv = slope(f, v);
+      pts.push([v, fv, dv]);
+      ylo = Math.min(ylo, fv, dv); yhi = Math.max(yhi, fv, dv);
+    }
+    const pad = (yhi - ylo) * 0.08 || 1;
+    ylo -= pad; yhi += pad;
+    const L = 34, R = W - 8, T = 8, B = H - 20;
+    const X = (v) => L + (v - lo) / (hi - lo) * (R - L);
+    const Y = (v) => T + (yhi - v) / (yhi - ylo) * (B - T);
+    x.font = '10px ' + css('--f-mono');
+    x.fillStyle = PAL.muted;
+    x.strokeStyle = PAL.line;
+    x.lineWidth = 1;
+    x.beginPath();
+    if (ylo < 0 && yhi > 0) { x.moveTo(L, Y(0)); x.lineTo(R, Y(0)); }
+    if (lo < 0 && hi > 0) { x.moveTo(X(0), T); x.lineTo(X(0), B); }
+    x.stroke();
+    x.textAlign = 'center';
+    [lo, (lo + hi) / 2, hi].forEach((t) => x.fillText(fmt(t, 1), X(t), H - 6));
+    x.textAlign = 'right';
+    [ylo + pad, yhi - pad].forEach((t) => x.fillText(fmt(t, 1), L - 4, Y(t) + 3));
+    x.save();
+    x.beginPath(); x.rect(L, T, R - L, B - T); x.clip();
+    x.setLineDash([4, 3]);
+    x.strokeStyle = PAL.muted; x.lineWidth = 1.2;
+    x.beginPath(); pts.forEach((p, k) => (k ? x.lineTo(X(p[0]), Y(p[2])) : x.moveTo(X(p[0]), Y(p[2])))); x.stroke();
+    x.setLineDash([]);
+    x.strokeStyle = PAL.ink; x.lineWidth = 2;
+    x.beginPath(); pts.forEach((p, k) => (k ? x.lineTo(X(p[0]), Y(p[1])) : x.moveTo(X(p[0]), Y(p[1])))); x.stroke();
+    const fz = f(z), s = ok(N.df) ? N.df : slope(f, z), dx = (hi - lo) * 0.15;
+    x.strokeStyle = PAL.posC; x.lineWidth = 2.6;
+    x.beginPath(); x.moveTo(X(z - dx), Y(fz - s * dx)); x.lineTo(X(z + dx), Y(fz + s * dx)); x.stroke();
+    x.fillStyle = N.on ? PAL.ink : PAL.off;
+    x.beginPath(); x.arc(X(z), Y(fz), 4.5, 0, Math.PI * 2); x.fill();
+    x.restore();
+    x.fillStyle = PAL.ink;
+    const right = X(z) > (L + R) / 2;
+    x.textAlign = right ? 'right' : 'left';
+    x.fillText('z ' + fmt(z, 2) + ' · slope ' + fmt(s, 2), X(z) + (right ? -9 : 9), Math.max(T + 12, Y(fz) - 9));
+    x.textAlign = 'right';
+    x.fillStyle = PAL.muted;
+    x.fillText('— f(z)   - - f′(z)', R, T + 10);
+  }
+
+  // ---- The profiler -----------------------------------------------------------------
+  function renderProfile() {
+    const F = S.profile;
+    if (!F) return;
+    const parts = [];
+    const n = F.layers.length;
+    F.layers.forEach((l, k) => parts.push({ name: 'forward ' + l.index + ' ' + (l.kind || ''), us: l.forward_us, color: mix(PAL.base, PAL.pos, 1 - 0.6 * k / Math.max(1, n - 1)) }));
+    F.layers.slice().reverse().forEach((l, k) => parts.push({ name: 'backward ' + l.index + ' ' + (l.kind || ''), us: l.backward_us, color: mix(PAL.base, PAL.neg, 1 - 0.6 * k / Math.max(1, n - 1)) }));
+    parts.push({ name: 'loss', us: F.loss_us, color: PAL.muted });
+    parts.push({ name: 'loss backward', us: F.backward_loss_us, color: PAL.muted });
+    parts.push({ name: 'optimiser', us: F.optimizer_us, color: PAL.ink });
+    const counted = parts.reduce((a, p) => a + (ok(p.us) ? p.us : 0), 0);
+    const total = ok(F.total_us) ? F.total_us : counted;
+    if (ok(total) && total > counted) parts.push({ name: 'other', us: total - counted, color: PAL.off });
+    setText('profTot', 'Step ' + int(F.step) + ': ' + fmt(total, 1) + ' µs');
+    const stack = $('stack'), table = $('ptable');
+    clear(stack); clear(table);
+    parts.forEach((p) => {
+      if (!ok(p.us)) return;
+      const share = total > 0 ? p.us / total : 0;
+      const seg = el('span');
+      seg.style.width = (share * 100) + '%';
+      seg.style.background = p.color;
+      seg.title = p.name;
+      stack.appendChild(seg);
+      const sw = el('i');
+      sw.style.background = p.color;
+      table.appendChild(sw);
+      table.appendChild(el('span', null, p.name));
+      table.appendChild(el('span', 'r', fmt(p.us, 1) + ' µs'));
+      table.appendChild(el('span', 'r muted', (share * 100).toFixed(0) + '%'));
+    });
+  }
+
+  // ---- The shrink lab ---------------------------------------------------------------
+  function metric(e) {
+    if (ok(e.accuracy)) return { v: e.accuracy, name: 'accuracy', text: pct(e.accuracy) };
+    if (ok(e.r2)) return { v: e.r2, name: 'R²', text: fmt(e.r2, 3) };
+    return { v: ok(e.loss) ? -e.loss : null, name: 'loss', text: fmt(e.loss, 4) };
+  }
+  function renderRanking() {
+    const box = $('ranking');
+    clear(box);
+    const all = Array.from(S.ablations.values()).filter((a) => ok(a.drop));
+    all.sort((p, q) => p.drop - q.drop);
+    setText('rankLbl', all.length ? 'Ablation ranking · ' + all.length + ' neurons, cheapest to switch off first, with the drop each costs' : 'Ablation ranking · none yet');
+    const top = all.slice(0, 12);
+    let m = 1e-12;
+    top.forEach((a) => (m = Math.max(m, Math.abs(a.drop))));
+    top.forEach((a, k) => {
+      box.appendChild(el('span', 'muted', '#' + (k + 1)));
+      box.appendChild(el('span', null, 'layer ' + a.linear + ' · neuron ' + a.neuron));
+      const tr = el('span', 'tr'), fi = el('span', 'fi');
+      fi.style.width = (Math.abs(a.drop) / m * 100) + '%';
+      fi.style.background = a.drop > 0 ? 'var(--neg)' : 'var(--pos)';
+      tr.appendChild(fi);
+      box.appendChild(tr);
+      box.appendChild(el('span', 'r', fmt(a.drop, 2)));
+    });
+  }
+  function renderShrink() {
+    const levels = Array.from(S.shrinks.values()).sort((p, q) => p.removed_bp - q.removed_bp);
+    const canvas = $('chart');
+    canvas.hidden = levels.length === 0;
+    if (!levels.length) { setText('chosen', 'No shrink levels yet.'); return; }
+    let chosen = null;
+    levels.forEach((l) => { if (l.met) chosen = l; });
+    const pts = levels.map((l) => ({ l: l, m: metric(l), p: l.parameters }));
+    const name = pts[0].m.name;
+    setText('curveLbl', 'Size against validation ' + name);
+    const W = Math.max(200, $('chartBox').clientWidth || 340), H = Math.round(Math.min(240, W * 0.6));
+    const x = prepare(canvas, W, H);
+    const ys = pts.map((p) => p.m.v).filter(ok), ps = pts.map((p) => p.p);
+    let ylo = Math.min.apply(null, ys), yhi = Math.max.apply(null, ys);
+    if (!(yhi > ylo)) { ylo -= 0.01; yhi += 0.01; }
+    const pmin = Math.min.apply(null, ps), pmax = Math.max.apply(null, ps) || 1;
+    const L = 46, R = W - 24, T = 10, B = H - 30;
+    const X = (p) => (pmax > pmin ? R - (pmax - p) / (pmax - pmin) * (R - L) : (L + R) / 2);
+    const Y = (v) => T + (yhi - v) / (yhi - ylo) * (B - T);
+    x.font = '10px ' + css('--f-mono');
+    x.strokeStyle = PAL.line; x.fillStyle = PAL.muted; x.lineWidth = 1;
+    for (let k = 0; k <= 4; k++) {
+      const v = ylo + (yhi - ylo) * k / 4;
+      x.beginPath(); x.moveTo(L, Y(v)); x.lineTo(R, Y(v)); x.stroke();
+      x.textAlign = 'right';
+      x.fillText(name === 'accuracy' ? (v * 100).toFixed(1) + '%' : name === 'loss' ? fmt(-v, 3) : fmt(v, 3), L - 4, Y(v) + 3);
+    }
+    x.textAlign = 'center';
+    x.fillText(int(pmin), X(pmin), B + 14);
+    if (pmax > pmin) { x.textAlign = 'right'; x.fillText(int(pmax), W - 2, B + 14); x.textAlign = 'center'; }
+    x.fillText('parameters', (L + R) / 2, H - 4);
+    x.strokeStyle = PAL.ink; x.lineWidth = 1.8;
+    x.beginPath();
+    let started = false;
+    pts.forEach((p) => { if (!ok(p.m.v)) return; if (started) x.lineTo(X(p.p), Y(p.m.v)); else { x.moveTo(X(p.p), Y(p.m.v)); started = true; } });
+    x.stroke();
+    pts.forEach((p) => {
+      if (!ok(p.m.v)) return;
+      const isC = p.l === chosen;
+      x.beginPath(); x.arc(X(p.p), Y(p.m.v), isC ? 6 : 3.8, 0, Math.PI * 2);
+      x.fillStyle = isC ? PAL.posC : p.l.met ? PAL.ink : PAL.negC;
+      x.fill();
+    });
+    setText('chosen', chosen
+      ? 'Chosen: ' + (chosen.removed_bp / 100).toFixed(0) + '% of each layer removed, ' + int(chosen.parameters) + ' parameters, ' + metric(chosen).text + ' (kept ' + chosen.kept.join(' + ') + ' neurons). Red points miss the stop rule.'
+      : 'No level meets the stop rule yet. Red points miss it.');
+  }
+  function renderLinearChoice() {
+    const sel = $('abLinear');
+    const previous = sel.value;
+    clear(sel);
+    if (!S.model) return;
+    let k = 0;
+    const L = S.model.layers;
+    L.forEach((l, i) => {
+      if (!l.linear) return;
+      const later = L.slice(i + 1).some((m) => m.linear);
+      if (later) {
+        const o = el('option', null, 'linear ' + k + ' (layer ' + i + ', ' + l.width + ' neurons)');
+        o.value = String(k);
+        sel.appendChild(o);
+      }
+      k++;
+    });
+    if (previous) sel.value = previous;
+  }
+
+  // ---- The band, the controls and the status ---------------------------------------------
+  function latestEvaluation() {
+    for (let k = S.epochs.length - 1; k >= 0; k--) if (S.epochs[k].evaluation) return S.epochs[k].evaluation;
+    return null;
+  }
+  function renderBand() {
+    const st = S.stats;
+    const ev = latestEvaluation();
+    if (st) {
+      setText('tSps', int(st.samples_per_second));
+      setText('tGf', fmt(st.gflops, 2));
+      setText('tLoss', fmt(st.loss, 3));
+      setText('tEp', st.epoch + ' / ' + st.epochs);
+      setText('tSteps', int(st.step));
+      setText('tStepsSub', 'learning rate ' + fmt(st.learning_rate, 5));
+      const lr = $('lr');
+      if (document.activeElement !== lr && !lr.dataset.edited) lr.value = ok(st.learning_rate) ? String(st.learning_rate) : '';
+    }
+    if (S.model) setText('tGfSub', int(S.model.flops_per_sample) + ' FLOPs per sample');
+    const last = S.epochs[S.epochs.length - 1];
+    if (last) setText('tEpSub', 'epoch ' + last.epoch + ' mean loss ' + fmt(last.mean_loss, 4) + ' · ' + fmt(last.seconds, 2) + ' s');
+    if (ev) {
+      const r2 = !ok(ev.accuracy) && ok(ev.r2);
+      setText('tAccK', r2 ? 'R²' : 'Accuracy');
+      setText('tAcc', r2 ? fmt(ev.r2, 3) : pct(ev.accuracy));
+      setText('tAccSub', int(ev.rows) + ' held-out rows');
+      setText('tLossSub', 'last batch · held-out ' + fmt(ev.loss, 4));
+    }
+  }
+  function state() {
+    if (S.status) return S.status.state;
+    return S.stats && S.stats.paused ? 'paused' : 'training';
+  }
+  function renderControls() {
+    const st = state();
+    const paused = st === 'paused' || (S.stats && S.stats.paused && st !== 'finished');
+    const training = st === 'training' || st === 'paused';
+    const explore = st === 'explore';
+    const run = $('run');
+    run.textContent = paused ? 'Resume' : 'Pause';
+    run.disabled = !S.live || !training;
+    $('lr').disabled = !S.live || !training;
+    $('lrSet').disabled = !S.live || !training;
+    const probe = S.live && !!S.probe && !!S.model && st !== 'finished';
+    $('prev').disabled = !probe;
+    $('next').disabled = !probe;
+    const ev = latestEvaluation();
+    $('wrong').disabled = !probe || !ev || !ev.misclassified || !ev.misclassified.length;
+    ['ablate', 'shrink', 'cancel', 'finish', 'abLinear'].forEach((id) => { $(id).disabled = !S.live || !explore; });
+    if (!$('abLinear').options.length) $('ablate').disabled = true;
+    $('exploreNote').hidden = explore;
+    document.querySelectorAll('[data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === S.mode)));
+    const badge = $('state');
+    badge.textContent = st || '–';
+    if (S.status) setText('statusLine', S.status.message);
+  }
+  function renderHeader() {
+    if (!S.model) return;
+    document.title = S.model.title;
+    setText('title', S.model.title);
+    const sizes = [S.model.input_width].concat(S.model.layers.filter((l) => l.linear).map((l) => l.width));
+    let text = int(S.model.parameters) + ' parameters · ' + sizes.join(' → ') + ' · ' + S.model.layers.map((l) => l.activation || l.kind).join(', ');
+    if (S.exported) text += S.stats ? ' · saved at step ' + int(S.stats.step) + '; the controls are off.' : ' · saved; the controls are off.';
+    setText('lede', text);
+  }
+  function setConn(text, cls) {
+    const b = $('conn');
+    b.textContent = text;
+    b.className = 'badge' + (cls ? ' ' + cls : '');
+  }
+
+  // ---- Rendering --------------------------------------------------------------------
+  let dirty = false;
+  function render() {
+    dirty = false;
+    palette();
+    renderHeader();
+    renderBand();
+    renderControls();
+    renderProbeLabel();
+    renderLayers();
+    renderNeuron();
+    renderProfile();
+    renderRanking();
+    renderShrink();
+  }
+  function later() {
+    if (dirty) return;
+    dirty = true;
+    requestAnimationFrame(render);
+  }
+
+  // ---- Data in ----------------------------------------------------------------------
+  function keyOf(a) { return a.linear + ':' + a.neuron; }
+  const HANDLERS = {
+    model: (d) => {
+      // A second model on one connection, or a different one after a reconnect, is a new
+      // run: what the last run left is cleared. The same model replayed on reconnect keeps it.
+      const same = S.model !== null && JSON.stringify(S.model) === JSON.stringify(d);
+      if (S.modelSeen || !same) {
+        S.epochs = []; S.ablations.clear(); S.shrinks.clear();
+        S.stats = null; S.probe = null; S.neuron = null; S.profile = null; S.pending = null;
+      }
+      S.modelSeen = true;
+      S.model = d;
+      buildViews();
+      renderLinearChoice();
+    },
+    stats: (d) => { S.stats = d; },
+    probe: (d) => { S.probe = d; },
+    neuron: (d) => { S.neuron = d; },
+    profile: (d) => { S.profile = d; },
+    status: (d) => { S.status = d; S.pending = null; },
+    epoch: (d) => {
+      const last = S.epochs[S.epochs.length - 1];
+      if (last && last.epoch === d.epoch && last.mean_loss === d.mean_loss) return;
+      S.epochs.push(d);
+      if (S.epochs.length > 1000) S.epochs.shift();
+    },
+    ablation: (d) => { S.ablations.set(keyOf(d), d); },
+    shrink: (d) => { S.shrinks.set(d.removed_bp, d); },
+  };
+  function take(name, d) {
+    if (!d || typeof d !== 'object') return;
+    try { HANDLERS[name](d); } catch (e) { notice('Could not show a ' + name + ' event: ' + e.message); }
+    later();
+  }
+
+  // ---- Commands out -----------------------------------------------------------------
+  // Posts a command; `failed` runs when the server refuses it or cannot be reached.
+  function send(name, query, failed) {
+    if (!S.live) return;
+    const url = '/api/' + name + '?token=' + encodeURIComponent(token) + (query ? '&' + query : '');
+    const fail = (text) => { notice(text); if (failed) failed(); later(); };
+    fetch(url, { method: 'POST', cache: 'no-store', credentials: 'same-origin' })
+      .then((r) => (r.ok ? null : r.text().then((t) => fail('Refused (' + r.status + '): ' + t))))
+      .catch(() => fail('The command did not reach the server.'));
+  }
+  function wire() {
+    $('run').addEventListener('click', () => {
+      const paused = state() === 'paused' || (S.stats && S.stats.paused);
+      send(paused ? 'resume' : 'pause');
+    });
+    const lr = $('lr');
+    lr.addEventListener('input', () => { lr.dataset.edited = '1'; });
+    const setRate = () => {
+      const v = Number(lr.value);
+      delete lr.dataset.edited;
+      if (!(isFinite(v) && v > 0 && v <= 10)) { notice('The learning rate must be above 0 and at most 10.'); return; }
+      send('lr', 'value=' + encodeURIComponent(String(v)));
+    };
+    $('lrSet').addEventListener('click', setRate);
+    lr.addEventListener('keydown', (e) => { if (e.key === 'Enter') setRate(); });
+    const go = (k) => {
+      if (!S.probe || !S.model) return;
+      const n = S.model.probe_rows;
+      send('probe', 'index=' + (((S.probe.row + k) % n) + n) % n);
+    };
+    $('prev').addEventListener('click', () => go(-1));
+    $('next').addEventListener('click', () => go(1));
+    $('wrong').addEventListener('click', () => {
+      const ev = latestEvaluation();
+      const wrong = ev && ev.misclassified || [];
+      if (!wrong.length || !S.probe) return;
+      const nextOne = wrong.find((i) => i > S.probe.row);
+      send('probe', 'index=' + (nextOne === undefined ? wrong[0] : nextOne));
+    });
+    $('onoff').addEventListener('change', (e) => {
+      const N = S.neuron, info = N && linearInfo(N);
+      if (!info || info.output) return;
+      const on = e.target.checked;
+      S.pending = { layer: N.layer, neuron: N.neuron, on: on, at: Date.now() };
+      setTimeout(later, 5100);
+      send('mask', 'linear=' + info.index + '&neuron=' + N.neuron + '&on=' + (on ? 1 : 0), () => { S.pending = null; });
+    });
+    document.querySelectorAll('[data-mode]').forEach((b) => b.addEventListener('click', () => { S.mode = b.dataset.mode; later(); }));
+    $('ablate').addEventListener('click', () => { const v = $('abLinear').value; if (v !== '') send('ablate', 'linear=' + encodeURIComponent(v)); });
+    $('shrink').addEventListener('click', () => send('shrink'));
+    $('cancel').addEventListener('click', () => send('cancel'));
+    $('finish').addEventListener('click', () => send('finish'));
+    window.addEventListener('resize', later);
+    const dark = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+    if (dark && dark.addEventListener) dark.addEventListener('change', later);
+    new MutationObserver(later).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+  }
+
+  // ---- Start ------------------------------------------------------------------------
+  function fromSnapshot(node) {
+    let d;
+    try { d = JSON.parse(node.textContent); } catch (e) { setText('statusLine', 'The saved snapshot could not be read.'); return; }
+    S.exported = true;
+    S.live = false;
+    setConn('saved snapshot', null);
+    ['model', 'stats', 'probe', 'neuron', 'profile', 'status'].forEach((k) => { if (d[k]) take(k, d[k]); });
+    (d.epochs || []).forEach((e) => take('epoch', e));
+    (d.ablations || []).forEach((a) => take('ablation', a));
+    (d.shrinks || []).forEach((s) => take('shrink', s));
+    document.querySelectorAll('button, input, select').forEach((c) => { c.disabled = true; });
+    // The view switch only changes what is drawn, so it stays usable.
+    document.querySelectorAll('[data-mode]').forEach((c) => { c.disabled = false; });
+    later();
+  }
+  function connect() {
+    if (!/^[0-9a-f]{32}$/.test(token)) {
+      setConn('no token', 'bad');
+      setText('statusLine', 'This address has no valid token. Open the address the program printed.');
+      later();
+      return;
+    }
+    const source = new EventSource('/events?token=' + encodeURIComponent(token));
+    source.addEventListener('open', () => { S.live = true; S.modelSeen = false; setConn('live', 'live'); later(); });
+    source.addEventListener('error', () => {
+      S.live = false;
+      if (source.readyState === EventSource.CLOSED) setConn('disconnected', 'bad');
+      else setConn('reconnecting', 'bad');
+      later();
+    });
+    Object.keys(HANDLERS).forEach((name) => {
+      source.addEventListener(name, (e) => {
+        let d;
+        try { d = JSON.parse(e.data); } catch (err) { return; }
+        take(name, d);
+      });
+    });
+  }
+  wire();
+  const saved = $('snapshot');
+  if (saved) fromSnapshot(saved);
+  else connect();
+  later();
+})();
+</script>
+</body>
+</html>
