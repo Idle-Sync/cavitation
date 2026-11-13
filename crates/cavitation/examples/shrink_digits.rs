@@ -2,7 +2,8 @@
 //! it with `shrink` on the rest, compacts the result into a smaller dense network and saves
 //! it. With `--ablate` it first switches neurons off one at a time and reports what each
 //! costs; with `--lottery` it also retrains the found size twice from the start: once from
-//! the kept neurons' initial weights, once from new random weights.
+//! the kept neurons' initial weights, once from new random weights, each for as many epochs
+//! as the pruned network trained in all.
 //!
 //! The guide's chapter "Shrinking a network" walks through this file; the `ANCHOR`
 //! comments mark the parts it includes.
@@ -35,10 +36,16 @@ fn network(params: &mut ParamStore, hidden: [usize; 2], seed: u64) -> Sequential
         .push(he(hidden[1], 10))
 }
 
-/// The known result's training: Adam at 0.002, batch 32, 20 epochs, shuffle seed 7.
-fn train(net: &Sequential, params: &mut ParamStore, data: &Dataset) -> Result<(), Error> {
+/// The known result's training for `epochs` epochs (20 in the known result): Adam at 0.002,
+/// batch 32, shuffle seed 7.
+fn train(
+    net: &Sequential,
+    params: &mut ParamStore,
+    data: &Dataset,
+    epochs: usize,
+) -> Result<(), Error> {
     let config = FitConfig {
-        epochs: 20,
+        epochs,
         batch: 32,
         optimizer: OptimizerConfig::Adam {
             lr: 0.002,
@@ -104,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ANCHOR: initial
     let initial = params.clone();
     // ANCHOR_END: initial
-    train(&net, &mut params, &train_rows)?;
+    train(&net, &mut params, &train_rows, 20)?;
     println!(
         "unpruned: test {:.2}%",
         accuracy(&net, &params, &test, 128) * 100.0
@@ -151,10 +158,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if lottery {
+        // The chosen network trained 20 epochs, then 3 after each step up to the chosen one:
+        // give the two networks below as many epochs.
+        let epochs = 20 + 3 * (chosen + 1);
+        println!("training each of the two below for {epochs} epochs, as the chosen network");
         // ANCHOR: lottery
         // The kept neurons with the weights they started from, trained alone.
         let (ticket, mut ticket_params) = compact(&net, &initial)?;
-        train(&ticket, &mut ticket_params, &train_rows)?;
+        train(&ticket, &mut ticket_params, &train_rows, epochs)?;
         let ticket_acc = accuracy(&ticket, &ticket_params, &test, 128);
         println!(
             "kept neurons, initial weights, retrained: test {:.2}%",
@@ -164,7 +175,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // The same size from new random weights.
         let mut fresh_params = ParamStore::new();
         let fresh = network(&mut fresh_params, [kept[0], kept[1]], 1);
-        train(&fresh, &mut fresh_params, &train_rows)?;
+        train(&fresh, &mut fresh_params, &train_rows, epochs)?;
         let fresh_acc = accuracy(&fresh, &fresh_params, &test, 128);
         println!(
             "same size, new random weights: test {:.2}%",

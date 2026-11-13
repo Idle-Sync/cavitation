@@ -85,7 +85,7 @@ This is the curve of that run, with the test accuracy of every step's network be
 | 80% | 52 + 26 | 5,028 | 282/288 (97.92%) | 350/360 (97.22%) | no |
 | 85% | 39 + 20 | 3,545 | 280/288 (97.22%) | 348/360 (96.67%) | no |
 
-The run keeps 75%: 64 + 32 neurons, 6,570 parameters, 7.7 times fewer than the full network, at 351 of 360 test digits against 352 unpruned. At 80% it is 3 rows down on validation, one more than the 1-point line allows (1 point of 288 rows is 2.88 rows). The validation loss rises all the way, from 0.030 at 10% to 0.106 at 80%, while the accuracy holds; that is why the default criterion is an accuracy drop and not a loss rise, which would stop long before the answers change. For value targets, which have no accuracy, you give `Criterion::LossIncrease` yourself.
+The run keeps 75%: 64 + 32 neurons, 6,570 parameters, 7.7 times fewer than the full network, at 351 of 360 test digits against 352 unpruned. At 80% it is 3 rows down on validation, one more than the 1-point line allows (1 point of 288 rows is 2.88 rows). The validation loss rises more than threefold, from 0.030 at 10% to 0.106 at 80% (with a dip at 50%, to 0.039), while the accuracy holds; that is why the default criterion is an accuracy drop and not a loss rise, which would stop long before the answers change. For value targets, which have no accuracy, you give `Criterion::LossIncrease` yourself.
 
 The benchmark's run 1 ranks by outgoing-weight norm only (`dead_first: false`) and runs every level (`patience: None`). It also keeps 75%, at 354/360, and shows where the cliff is: 84.38% on validation at 90% removed, 53.82% at 95%. The figures are the same on every run, since the seeds are fixed; on a CPU with another kernel level (AVX2, NEON or Accelerate) the rounding differs and so can the curve. The known-result test `shrink_known_result` runs both and checks them:
 
@@ -103,7 +103,7 @@ A masked network is no faster: its matrices are as large as before, and the mask
 
 A switched-off neuron adds an exact 0 to every sum in the next layer, and adding 0 changes no rounding, so on the `reference` and `sse4.2` kernel levels the compacted network gives the masked one's outputs bit for bit through `InferenceModel::infer`, and through the batched paths as long as no sum is longer than 256 terms. On the other levels the vector kernels round by position, and the outputs agree within the rounding bound that `compact`'s documentation states. `cavitation-bench shrink` checks it on the 360 test digits: 0 of 3,600 outputs differ in their bits, through `infer` and through `infer_batch`, for the 80% step and for the chosen network.
 
-The same benchmark times one test digit through `InferenceModel::infer`, 20,000 warm-up calls per network, then 301 rounds of 1,000 calls of each network in turn. Measured on an Intel Celeron N5105 (4 cores), kernel `sse4.2`, pinned to one core with `taskset -c 2 target/release/cavitation-bench shrink` (the chosen network is run 1's, the same 64 + 32 size as the defaults choose):
+The same benchmark times one test digit through `InferenceModel::infer`, 20,000 warm-up calls per network, then 301 rounds of 1,000 calls of each network in turn. Measured on an Intel Celeron N5105 (4 cores; pinned to one, so 1 thread), kernel `sse4.2`, rustc 1.99.1, with `cargo build --release -p cavitation-bench && taskset -c 2 target/release/cavitation-bench shrink` (the chosen network is run 1's, the same 64 + 32 size as the defaults choose):
 
 | network | parameters | median µs per call (p10–p90) | speed-up |
 |---|---|---|---|
@@ -115,7 +115,7 @@ The compacted network has 7.7 times fewer parameters and is 6.77 times faster. T
 
 ## Is it the weights, or the size?
 
-The chosen network got its weights by training the full network and then retraining after every cut. Two other networks of the same size, 64 + 32, can be trained from the start with the same recipe, and the example's `--lottery` flag does both:
+The chosen network got its weights by training the full network for 20 epochs and then retraining for 3 epochs after each of the 8 cuts up to the one kept: 44 epochs in all. Two other networks of the same size, 64 + 32, can be trained from the start with the same recipe for the same 44 epochs, and the example's `--lottery` flag does both:
 
 - the kept neurons with the weights they had *before* training: `compact` applied to the initial parameters with the final masks, then trained alone;
 - a network of the same size from new random weights.
@@ -134,13 +134,13 @@ and the ticket is the final masks on those weights:
 
 Measured with the example's `--lottery` flag (the accuracies are the same on every run at kernel level `sse4.2`):
 
-| 64 + 32 network | test accuracy |
+| 64 + 32 network, 44 epochs of training in all | test accuracy |
 |---|---|
 | pruned with `shrink` and retrained | 351/360 (97.50%) |
-| kept neurons from their initial weights, trained alone | 347/360 (96.39%) |
-| new random weights, trained alone | 344/360 (95.56%) |
+| kept neurons from their initial weights, trained alone | 349/360 (96.94%) |
+| new random weights, trained alone | 351/360 (97.50%) |
 
-On this problem, with this seed and recipe, the pruned network is best, the ticket second and the fresh network third; the gaps are 4 and 3 digits. That is one seed of one problem, so read it as an example of the comparison, not a law. On other problems a network trained from scratch at the found size can match the pruned one, and then what pruning bought was the size. Run the comparison on your own problem before you settle on the pruned network.
+Given the same number of epochs, the network trained from new random weights matches the pruned one, and the ticket is 2 digits behind both. On this problem what pruning found was the size: once you know that 64 + 32 neurons are enough, you can train a network of that size directly. That is one seed of one problem, so read it as an example of the comparison, not a law; on other problems the pruned network can come out ahead. Run the comparison on your own problem, with equal training, before you settle on the pruned network. Compare the training too: an unequal number of epochs can make either side look better than it is.
 
 ## Try it
 

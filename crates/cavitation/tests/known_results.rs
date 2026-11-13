@@ -321,8 +321,8 @@ fn shrink_curve(name: &str, start: &ShrinkStart, config: ShrinkConfig) -> Shrink
 /// The digits known-result network, trained on the first 1,149 training rows, shrinks with
 /// the last 288 as its validation set: ranking by outgoing-weight norm without removing
 /// never-firing neurons first and running every level, it removes at least 75% of the 384
-/// hidden neurons; with the defaults, at least 70%. Each keeps test accuracy no more than 1 point below
-/// the unpruned network's. Both curves are printed.
+/// hidden neurons; with the defaults, at least 70%. Each keeps test accuracy no more than 1
+/// point below the unpruned network's. Both curves are printed.
 ///
 /// Run it with `cargo test --release -p cavitation --test known_results -- --ignored
 /// shrink_known_result --nocapture`.
