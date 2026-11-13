@@ -146,6 +146,8 @@ struct State {
     max_clients: usize,
     /// The most events one client's queue holds.
     queue_capacity: usize,
+    /// The longest a blocking event publish waits for room in a client's queue.
+    write_timeout: Duration,
     /// One slot per [`Snapshot`] kind.
     slots: [Slot; 4],
     /// Where an event's payload is written before it is copied to each queue.
@@ -176,7 +178,8 @@ impl State {
 ///
 /// ```
 /// use cavitation_inspect::sse::{Event, Hub, Snapshot};
-/// let hub = Hub::new(8, 256);
+/// use std::time::Duration;
+/// let hub = Hub::new(8, 256, Duration::from_secs(2));
 /// assert!(hub.publish_snapshot(Snapshot::Stats, |w| {
 ///     w.begin_object().key("step").uint(10).end_object();
 /// }));
@@ -196,18 +199,21 @@ pub struct Hub {
 
 impl Hub {
     /// A hub for at most `max_clients` clients at once, each with a queue of
-    /// `client_queue` events.
+    /// `client_queue` events. A blocking event publish waits at most `write_timeout` for a
+    /// client whose queue is full before dropping it; the server passes its own write
+    /// timeout.
     ///
     /// ```
-    /// let hub = cavitation_inspect::sse::Hub::new(8, 256);
+    /// let hub = cavitation_inspect::sse::Hub::new(8, 256, std::time::Duration::from_secs(2));
     /// assert_eq!(hub.clients(), 0);
     /// ```
-    pub fn new(max_clients: usize, client_queue: usize) -> Hub {
+    pub fn new(max_clients: usize, client_queue: usize, write_timeout: Duration) -> Hub {
         Hub {
             state: Mutex::new(State {
                 closed: false,
                 max_clients,
                 queue_capacity: client_queue,
+                write_timeout,
                 slots: Default::default(),
                 scratch: JsonWriter::new(),
                 model: None,
@@ -243,7 +249,8 @@ impl Hub {
     ///
     /// ```
     /// use cavitation_inspect::sse::{Hub, Snapshot};
-    /// let hub = Hub::new(8, 256);
+    /// use std::time::Duration;
+    /// let hub = Hub::new(8, 256, Duration::from_secs(2));
     /// assert!(hub.publish_snapshot(Snapshot::Probe, |w| { w.f32s(&[0.5, 1.0]); }));
     /// ```
     pub fn publish_snapshot(&self, which: Snapshot, fill: impl FnOnce(&mut JsonWriter)) -> bool {
@@ -271,16 +278,19 @@ impl Hub {
     /// holds up the training loop.
     ///
     /// With `blocking: true` the call waits for the lock, and while any client's queue is
-    /// full it waits for that client's writer to drain it (or for the client to be dropped
-    /// by its write timeout), so no client misses an event. Explore mode publishes this
-    /// way.
+    /// full it waits for that client's writer to drain it, so a client that keeps up misses
+    /// no event. Explore mode publishes this way. The wait is bounded: a client whose queue
+    /// is still full after the hub's write timeout (from the start of this call) is dropped,
+    /// so a client that reads a little at a time, and so never trips its writer's own
+    /// timeout, cannot hold the publisher longer than that.
     ///
     /// Either way the result is `false` once the hub is closed. A `model` event is also
     /// kept and sent first to every client that connects later.
     ///
     /// ```
     /// use cavitation_inspect::sse::{Event, Hub};
-    /// let hub = Hub::new(8, 256);
+    /// use std::time::Duration;
+    /// let hub = Hub::new(8, 256, Duration::from_secs(2));
     /// assert!(hub.publish_event(Event::Epoch, |w| {
     ///     w.begin_object().key("epoch").uint(1).end_object();
     /// }, true));
@@ -292,16 +302,23 @@ impl Hub {
         blocking: bool,
     ) -> bool {
         let mut state = if blocking {
+            let start = Instant::now();
             let mut state = self.lock();
             loop {
                 let capacity = state.queue_capacity;
                 if state.closed || state.clients.iter().all(|c| c.queue.len() < capacity) {
                     break state;
                 }
+                let left = state.write_timeout.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    // The clients still full are dropped below, before the event is queued.
+                    break state;
+                }
                 state = self
                     .changed
-                    .wait(state)
-                    .unwrap_or_else(PoisonError::into_inner);
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
             }
         } else {
             match self.try_lock() {
@@ -338,7 +355,8 @@ impl Hub {
     /// The number of connected clients.
     ///
     /// ```
-    /// assert_eq!(cavitation_inspect::sse::Hub::new(8, 256).clients(), 0);
+    /// let hub = cavitation_inspect::sse::Hub::new(8, 256, std::time::Duration::from_secs(2));
+    /// assert_eq!(hub.clients(), 0);
     /// ```
     pub fn clients(&self) -> usize {
         self.lock().clients.len()
@@ -349,7 +367,8 @@ impl Hub {
     ///
     /// ```
     /// use cavitation_inspect::sse::{Hub, Snapshot};
-    /// let hub = Hub::new(8, 256);
+    /// use std::time::Duration;
+    /// let hub = Hub::new(8, 256, Duration::from_secs(2));
     /// hub.close();
     /// assert!(!hub.publish_snapshot(Snapshot::Stats, |w| { w.null(); }));
     /// ```

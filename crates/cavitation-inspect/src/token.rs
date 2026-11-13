@@ -10,12 +10,15 @@ static MADE: AtomicU64 = AtomicU64::new(0);
 
 /// A new 128-bit secret as 32 lowercase hexadecimal digits.
 ///
-/// Each half is the output of a hasher from its own `std::collections::hash_map::RandomState`.
-/// The standard library seeds those hashers' 128-bit SipHash keys from the operating
-/// system's random number source, once per thread, and gives each new `RandomState`
-/// different keys; the hashed input adds the clock and a process-wide counter. This keeps
-/// the crate free of dependencies while giving every run a token another local user or
-/// another site cannot guess.
+/// Both halves come from SipHash keyed through `std::collections::hash_map::RandomState`.
+/// The standard library draws one 128-bit seed per thread from the operating system's
+/// random number source and gives each new `RandomState` that seed with one of its two key
+/// words increased by one, so the two hashers have related keys from the same seed, not
+/// independent ones. The token therefore carries the seed's 128 bits of entropy, the same
+/// seed the thread's `HashMap`s use (their outputs are never exposed). The hashed input
+/// adds a salt per half, a process-wide counter and the clock, so no two calls hash the
+/// same input. This keeps the crate free of dependencies while giving every run a token
+/// another local user or another site cannot guess.
 ///
 /// # Examples
 ///

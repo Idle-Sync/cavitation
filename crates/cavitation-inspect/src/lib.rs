@@ -27,6 +27,11 @@
 //! response carries `Access-Control-Allow-Origin`, `GET` never changes anything, and every
 //! connection has a time limit for its request and for each write.
 //!
+//! At most 32 connections may be sending their request at once, each within the read
+//! timeout (5 s by default); more are closed at once with no response. A program on the
+//! same machine that keeps 32 requests half-sent can therefore stop the page from loading,
+//! but it cannot read the run or change it.
+//!
 //! # Examples
 //!
 //! ```

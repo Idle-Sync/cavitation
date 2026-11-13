@@ -687,7 +687,7 @@ fn binds_loopback_by_default() {
 /// While another thread holds the hub's lock, a snapshot publish returns `false` at once.
 #[test]
 fn publish_never_blocks() {
-    let hub = Arc::new(Hub::new(8, 256));
+    let hub = Arc::new(Hub::new(8, 256, Duration::from_secs(2)));
     let (held_tx, held_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel::<()>();
     let holder = {
@@ -815,6 +815,64 @@ fn stalled_client_is_dropped() {
         false
     ));
     drop(stalled);
+}
+
+/// A blocking event publish waits at most about the write timeout for a client whose
+/// queue stays full, then drops that client, even when the client keeps reading a little
+/// at a time so its writer never times out.
+#[test]
+fn blocking_publish_drops_a_slow_client_after_write_timeout() {
+    let write_timeout = Duration::from_millis(300);
+    let inspector = Inspector::start(InspectorConfig {
+        write_timeout,
+        client_queue: 2,
+        ..config()
+    })
+    .unwrap();
+    let a = addr(&inspector);
+    let mut slow = connect(a);
+    slow.write_all(
+        format!(
+            "GET /events?token={} HTTP/1.1\r\nHost: {a}\r\n\r\n",
+            token(&inspector)
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || inspector.clients() == 1));
+    // Reads 64 KiB every 20 ms: progress within every write timeout, far slower than the
+    // publisher. It ends when the server closes the connection.
+    let reader = thread::spawn(move || {
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            match slow.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    });
+    let big = "x".repeat(8 << 20);
+    let mut slowest = Duration::ZERO;
+    let start = Instant::now();
+    while inspector.clients() > 0 && start.elapsed() < Duration::from_secs(10) {
+        let t = Instant::now();
+        assert!(inspector.hub().publish_event(
+            Event::Ablation,
+            |w| {
+                w.string(&big);
+            },
+            true
+        ));
+        slowest = slowest.max(t.elapsed());
+    }
+    assert_eq!(inspector.clients(), 0, "the slow client was never dropped");
+    // The wait is capped at the write timeout (300 ms); without the cap, one publish waits
+    // for the reader to take a 16 MiB batch at about 3 MB/s, several seconds. The bound allows a loaded
+    // machine 1.7 s of scheduling delay.
+    assert!(slowest < Duration::from_secs(2), "{slowest:?}");
+    println!("slowest blocking publish {slowest:?}");
+    drop(inspector);
+    reader.join().unwrap();
 }
 
 /// Garbage bytes are refused without stopping the server.

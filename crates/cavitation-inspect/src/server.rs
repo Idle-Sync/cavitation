@@ -50,6 +50,12 @@ const DOCUMENT_CSP: &str = "Content-Security-Policy: default-src 'none'; style-s
 pub struct InspectorConfig {
     /// Where to listen. By default `127.0.0.1:7878`, reachable only from this machine. Port
     /// 0 lets the system choose a free port, which [`Inspector::url`] reports.
+    ///
+    /// Only loopback addresses are intended. With another address the server answers only
+    /// requests whose `Host` names that exact address (or `127.0.0.1` or `localhost` with
+    /// the port), over unencrypted HTTP, so the token crosses the network in clear text.
+    /// With `0.0.0.0` the port is open to the network while every request from another
+    /// machine is refused, since its `Host` names an address other than `0.0.0.0`.
     pub address: SocketAddr,
     /// The most snapshots per second the training side captures; 4 by default.
     pub snapshot_hz: f64,
@@ -134,7 +140,9 @@ struct Shared {
 /// token made for this run, without which the event stream, the commands and the export are
 /// refused, and the server refuses any request whose `Host` is not its own address or whose
 /// `Origin` is another site, so neither other web pages nor other users of the machine can
-/// read the run or change it.
+/// read the run or change it. At most 32 connections may be sending their request at once,
+/// each within `read_timeout`; more are closed at once, so a local program that holds 32
+/// half-sent requests can keep the page from loading, though not read or change the run.
 ///
 /// Routes: `GET /` (the page), `GET /events?token=` (the event stream), `GET /export?token=`
 /// (a self-contained HTML document; the server writes no file), and the commands
@@ -241,7 +249,11 @@ impl Inspector {
             hosts.push(address.to_string().to_ascii_lowercase());
         }
         let shared = Arc::new(Shared {
-            hub: Hub::new(config.max_clients, config.client_queue),
+            hub: Hub::new(
+                config.max_clients,
+                config.client_queue,
+                config.write_timeout,
+            ),
             commands: CommandQueue::new(QUEUE_CAPACITY),
             token: new_token(),
             hosts,
