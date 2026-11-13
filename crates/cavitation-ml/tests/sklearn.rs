@@ -484,3 +484,199 @@ fn r2_score_matches() {
         );
     }
 }
+
+/// The fixture's rows as a classification data set of `T`: `x` as `[rows, features]` and
+/// `y` as class labels. For `f32` the inputs must be exactly representable, as in
+/// [`value_dataset`].
+fn class_dataset<T: cavitation_core::Real>(x: &Matrix, y: &Matrix) -> Dataset<T> {
+    use cavitation_core::Tensor;
+    let values: Vec<T> = x
+        .data
+        .iter()
+        .map(|&v| {
+            let t = T::from_f64(v);
+            assert_eq!(t.to_f64(), v, "{v} is not exactly representable");
+            t
+        })
+        .collect();
+    let labels = y
+        .data
+        .iter()
+        .map(|&l| {
+            assert!(l >= 0.0 && l.fract() == 0.0, "{l} is not a class label");
+            l as usize
+        })
+        .collect();
+    Dataset {
+        x: Tensor::from_vec(values, &x.shape).unwrap(),
+        targets: Targets::Classes(labels),
+    }
+}
+
+/// The `LogisticRegression` the fixture's parameters describe: `C` (`null` for no
+/// penalty) and `fit_intercept` (default true), with the default `max_iter` and `tol`.
+fn logistic_for(f: &Fixture) -> cavitation_ml::LogisticRegression {
+    let c = field(&f.params, "C", &f.name).as_f64();
+    let fit_intercept = f
+        .params
+        .get("fit_intercept")
+        .is_none_or(|v| v.as_bool().unwrap());
+    cavitation_ml::LogisticRegression {
+        fit_intercept,
+        c,
+        ..cavitation_ml::LogisticRegression::default()
+    }
+}
+
+/// The largest `|ours − sklearn| / max(1, |sklearn|)` over every coefficient and intercept,
+/// with the intercepts first shifted by each side's mean across classes when `centre` is
+/// true (a multinomial model's intercepts are only defined up to a common constant).
+fn largest_gap(model: &cavitation_ml::LogisticModel, f: &Fixture, centre: bool) -> f64 {
+    let coef = f.coef.as_ref().unwrap();
+    assert_eq!(
+        model.coef.shape().dims(),
+        coef.shape.as_slice(),
+        "{}",
+        f.name
+    );
+    let shift = |v: &[f64]| -> Vec<f64> {
+        let mean = if centre {
+            v.iter().sum::<f64>() / v.len() as f64
+        } else {
+            0.0
+        };
+        v.iter().map(|x| x - mean).collect()
+    };
+    let (ours, theirs) = (shift(&model.intercept), shift(&f.intercept));
+    let pairs = model
+        .coef
+        .data()
+        .iter()
+        .chain(&ours)
+        .zip(coef.data.iter().chain(&theirs));
+    pairs.fold(0.0f64, |worst, (&a, &b)| {
+        worst.max((a - b).abs() / b.abs().max(1.0))
+    })
+}
+
+/// Fits the binary logistic fixture pair `<base>-newton-cholesky` and `<base>-lbfgs` with
+/// the exact Newton path (as `f32` data when `f32_data` is true, otherwise `f64`) and checks:
+/// within `1e-8 · max(1, |sklearn|)` of `newton-cholesky`; within `1e-5 · max(1, |sklearn|)`
+/// of `lbfgs`, with our objective at most lbfgs's · (1 + 1e-9). Returns the model and the
+/// two largest gaps, which the test prints.
+fn check_logistic(base: &str, f32_data: bool) -> (cavitation_ml::LogisticModel, f64, f64) {
+    let newton = fixture(&format!("{base}-newton-cholesky"));
+    let lbfgs = fixture(&format!("{base}-lbfgs"));
+    let (x, y) = (newton.x.as_ref().unwrap(), newton.y.as_ref().unwrap());
+    let logistic = logistic_for(&newton);
+    let (model, objective) = if f32_data {
+        let data = class_dataset::<f32>(x, y);
+        let model = logistic.fit(&data).unwrap();
+        let objective = model.objective(&data).unwrap();
+        (model, objective)
+    } else {
+        let data = class_dataset::<f64>(x, y);
+        let model = logistic.fit(&data).unwrap();
+        let objective = model.objective(&data).unwrap();
+        (model, objective)
+    };
+    assert_eq!(model.classes, 2, "{base}");
+    let newton_gap = largest_gap(&model, &newton, false);
+    assert!(
+        newton_gap <= 1e-8,
+        "{base}: gap {newton_gap:e} to newton-cholesky"
+    );
+    let lbfgs_gap = largest_gap(&model, &lbfgs, false);
+    assert!(lbfgs_gap <= 1e-5, "{base}: gap {lbfgs_gap:e} to lbfgs");
+    let theirs = lbfgs.objective.unwrap();
+    assert!(
+        objective <= theirs * (1.0 + 1e-9),
+        "{base}: objective {objective} above lbfgs's {theirs}"
+    );
+    eprintln!(
+        "{base}: largest gap {newton_gap:e} to newton-cholesky, {lbfgs_gap:e} to lbfgs; \
+         objective {objective} against lbfgs's {theirs}; {} Newton iterations \
+         (newton-cholesky {}, lbfgs {})",
+        model.iterations,
+        newton.n_iter.unwrap(),
+        lbfgs.n_iter.unwrap()
+    );
+    (model, newton_gap, lbfgs_gap)
+}
+
+/// The exact Newton path matches scikit-learn's `newton-cholesky` within 1e-8 and `lbfgs`
+/// within 1e-5 (with an objective no worse) on the synthetic binary cases: no penalty,
+/// C = 0.5 and C = 1.
+#[test]
+fn logistic_fixtures_match() {
+    for base in ["logistic-none", "logistic-l2-0.5", "logistic-l2-1"] {
+        check_logistic(base, true);
+    }
+}
+
+/// The same on the standardised Breast Cancer training rows with C = 1, read as `f64`
+/// because they were standardised in `f64`.
+#[test]
+fn breast_cancer_logistic_matches() {
+    check_logistic("breast-cancer-logistic-l2-1", false);
+}
+
+/// `LogisticModel::objective` computes each fixture's `objective_form`: at scikit-learn's
+/// own coefficients it gives the fixture's `objective` within 1e-12 relative, for the
+/// binary forms with and without a penalty and the multinomial form.
+#[test]
+fn logistic_objective_matches_fixture_form() {
+    use cavitation_core::Tensor;
+    for name in [
+        "logistic-none-newton-cholesky",
+        "logistic-l2-0.5-lbfgs",
+        "breast-cancer-logistic-l2-1-newton-cholesky",
+        "multinomial-l2-1",
+    ] {
+        let f = fixture(name);
+        let coef = f.coef.as_ref().unwrap();
+        let classes = if coef.shape[0] == 1 { 2 } else { coef.shape[0] };
+        let model = cavitation_ml::LogisticModel {
+            coef: Tensor::from_vec(coef.data.clone(), &coef.shape).unwrap(),
+            intercept: f.intercept.clone(),
+            classes,
+            iterations: 0,
+            c: logistic_for(&f).c,
+        };
+        let data = class_dataset::<f64>(f.x.as_ref().unwrap(), f.y.as_ref().unwrap());
+        let ours = model.objective(&data).unwrap();
+        let theirs = f.objective.unwrap();
+        assert!(
+            (ours - theirs).abs() <= 1e-12 * theirs.abs(),
+            "{name}: objective {ours} against the fixture's {theirs}"
+        );
+    }
+}
+
+/// Three classes through the gradient path (softmax cross-entropy plus the penalty) match
+/// scikit-learn's multinomial `lbfgs` fit within `1e-3 · max(1, |sklearn|)`, the intercepts
+/// compared after subtracting each side's mean across classes.
+#[test]
+fn multinomial_gradient_matches() {
+    let f = fixture("multinomial-l2-1");
+    let data = class_dataset::<f32>(f.x.as_ref().unwrap(), f.y.as_ref().unwrap());
+    let start = std::time::Instant::now();
+    let (model, _) = logistic_for(&f)
+        .fit_gradient(&data, cavitation_ml::GradientConfig::default())
+        .unwrap();
+    let seconds = start.elapsed().as_secs_f64();
+    assert_eq!(model.classes, 3);
+    let gap = largest_gap(&model, &f, true);
+    assert!(gap <= 1e-3, "multinomial-l2-1: gap {gap:e}");
+    eprintln!("multinomial-l2-1: largest gap {gap:e} by the gradient path, {seconds:.2} s");
+}
+
+/// Newton's method converges quadratically: `logistic-l2-1` takes fewer than 15 iterations
+/// (scikit-learn's `newton-cholesky` took 5).
+#[test]
+fn newton_converges_in_few_iterations() {
+    let f = fixture("logistic-l2-1-newton-cholesky");
+    let data = class_dataset::<f32>(f.x.as_ref().unwrap(), f.y.as_ref().unwrap());
+    let model = logistic_for(&f).fit(&data).unwrap();
+    assert!(model.iterations < 15, "{} iterations", model.iterations);
+}
