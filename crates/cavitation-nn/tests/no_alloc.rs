@@ -679,6 +679,74 @@ fn trace_with_capacity_allocates_nothing() -> usize {
     made
 }
 
+/// The `training_step` scenario with Adam, on a trainer that profiled one step of its
+/// warm-up epoch (`Trainer::profile_next_step`): the second whole epoch, with no step asking
+/// for a profile, must allocate nothing. Returns its allocations.
+fn profiling_off_allocates_nothing() -> usize {
+    let data = synthetic_1437();
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut trainer = Trainer::new(&net, Adam::new(1e-3), Loss::CrossEntropy, 128);
+    let mut batcher = Batcher::new(data.len(), 128, Some(3));
+    let mut batch = Batch::new(&data, 128);
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for epoch in 0..2 {
+        if epoch == 1 {
+            before = allocations();
+        }
+        batcher.epoch();
+        for (i, range) in batcher.batches().enumerate() {
+            if epoch == 0 && i == 2 {
+                trainer.profile_next_step();
+            }
+            let view = batcher.gather(&data, range, &mut batch);
+            sink += trainer.step(&net, &mut params, view).unwrap();
+            assert_eq!(trainer.last_profile().is_some(), epoch == 0 && i == 2);
+        }
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite() && sink > 0.0);
+    made
+}
+
+/// The `training_step` scenario with Adam, profiling one step in each epoch: after the
+/// warm-up epoch, whose profiled step makes the profile's buffers, a second whole epoch with
+/// one profiled step must allocate nothing, as the profile reuses its buffers. Returns its
+/// allocations.
+fn profiled_step_reuses_buffers() -> usize {
+    let data = synthetic_1437();
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut trainer = Trainer::new(&net, Adam::new(1e-3), Loss::CrossEntropy, 128);
+    let mut batcher = Batcher::new(data.len(), 128, Some(3));
+    let mut batch = Batch::new(&data, 128);
+    let mut sink = 0.0f32;
+    let mut total = Duration::ZERO;
+    let mut before = 0;
+    for epoch in 0..2 {
+        if epoch == 1 {
+            before = allocations();
+        }
+        batcher.epoch();
+        for (i, range) in batcher.batches().enumerate() {
+            if i == 4 {
+                trainer.profile_next_step();
+            }
+            let view = batcher.gather(&data, range, &mut batch);
+            sink += trainer.step(&net, &mut params, view).unwrap();
+            if let Some(profile) = trainer.last_profile() {
+                assert_eq!(profile.forward.len(), net.len());
+                assert_eq!(profile.backward.len(), net.len());
+                total += profile.total;
+            }
+        }
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite() && sink > 0.0 && total > Duration::ZERO);
+    made
+}
+
 /// The manual training loop of [`manual_loop`] with Adam, through `forward_traced` with a
 /// trace whose timing was on for the warm-up epoch and is then switched off: the second
 /// epoch, with timing off, must allocate nothing. Returns its allocations.
@@ -956,7 +1024,7 @@ fn evaluator_neuron_mask_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 20] = [
+    let scenarios: [Scenario; 22] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -986,6 +1054,11 @@ fn main() -> ExitCode {
             forward_timing_off_allocates_nothing,
         ),
         ("timed_step_allocates_nothing", timed_step_allocates_nothing),
+        (
+            "profiling_off_allocates_nothing",
+            profiling_off_allocates_nothing,
+        ),
+        ("profiled_step_reuses_buffers", profiled_step_reuses_buffers),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

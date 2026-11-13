@@ -1,15 +1,16 @@
-//! The training step ([`Trainer`]), the losses it minimises, [`fit`] (with and without
-//! hooks) and [`accuracy`].
+//! The training step ([`Trainer`]) with its optional per-layer [`StepProfile`], the losses
+//! it minimises, [`fit`] (with and without hooks), [`fit_controlled`] with a [`StepControl`]
+//! between steps, and [`accuracy`].
 
 use std::fmt;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Reduction, Tape, TensorView, Var};
 
-use super::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
+use super::{Batch, BatchView, Batcher, Dataset, Flow, Targets, TargetsView};
 use crate::{
-    Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, Optimizer, Sequential, Sgd,
-    StepInputs, Trace,
+    Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, NeuronMask, Optimizer, Sequential,
+    Sgd, StepInputs, Trace,
 };
 
 /// The loss [`Trainer`] and [`fit`] minimise, always averaged over the batch.
@@ -238,6 +239,11 @@ pub struct Trainer {
     health: HealthMonitor,
     /// The model's parameter names, for the health checks' messages.
     names: Vec<(String, ParamId)>,
+    /// The step profile's state: asked for, last result and reused buffers.
+    profiler: Profiler,
+    /// Whether [`override_learning_rate`](Self::override_learning_rate) has stopped the
+    /// learning-rate schedule for the rest of the run.
+    schedule_stopped: bool,
 }
 
 impl Trainer {
@@ -283,6 +289,8 @@ impl Trainer {
             steps: 0,
             health: HealthMonitor::new(Health::default()).with_loss(loss),
             names: model.parameter_names(),
+            profiler: Profiler::default(),
+            schedule_stopped: false,
         }
     }
 
@@ -426,6 +434,10 @@ impl Trainer {
     /// The step behind [`step_with_hooks`](Self::step_with_hooks): returns the batch's loss
     /// and the health checks' verdict. When the tape checks fail the optimiser step is
     /// skipped; the gradients are marked stale and the step is counted either way.
+    ///
+    /// A step that was asked for a profile ([`profile_next_step`](Self::profile_next_step))
+    /// times its parts into the profile's buffers; any other step reads no clock and only
+    /// marks the last profile as absent.
     fn checked_step(
         &mut self,
         model: &Sequential,
@@ -437,14 +449,39 @@ impl Trainer {
         self.loss.check_targets(batch.targets);
         hooks.check_layers(model);
         let step = self.steps + 1;
+        let profiling = std::mem::take(&mut self.profiler.asked);
+        self.profiler.valid = false;
+        let start = profiling.then(Instant::now);
         let (value, mut checked) = {
             let mut tape = self.graph.tape(&params.values);
             let x = tape.input(batch.x);
+            self.trace.set_timing(profiling);
             let out = model.forward_traced(&mut tape, x, &mut self.trace);
+            self.trace.set_timing(false);
             hooks.run_forward(&tape, &self.trace, model);
+            let loss_start = profiling.then(Instant::now);
             let loss = self.loss.record(&mut tape, out, batch.targets);
             let value = tape.value(loss).data()[0];
-            tape.backward(loss, &mut params.grads);
+            if let Some(loss_start) = loss_start {
+                let profile = &mut self.profiler.profile;
+                profile.loss = loss_start.elapsed();
+                profile.forward.clear();
+                profile
+                    .forward
+                    .extend((0..self.trace.len()).map(|i| self.trace.forward_time(i)));
+                let marks = &mut self.profiler.marks;
+                marks.clear();
+                marks.extend((0..self.trace.len()).map(|i| self.trace.output(i)));
+                let times = &mut self.profiler.times;
+                times.clear();
+                times.resize(marks.len() + 1, Duration::ZERO);
+                tape.backward_timed(loss, &mut params.grads, marks, times);
+                profile.backward.clear();
+                profile.backward.extend_from_slice(&times[..marks.len()]);
+                profile.backward_loss = times[marks.len()];
+            } else {
+                tape.backward(loss, &mut params.grads);
+            }
             hooks.run_backward(&tape, &self.trace, model);
             let inputs = StepInputs {
                 x: batch.x,
@@ -457,14 +494,124 @@ impl Trainer {
             (value, checked)
         };
         if checked.is_ok() {
+            let update_start = profiling.then(Instant::now);
             self.optimizer.step(params);
+            if let Some(update_start) = update_start {
+                self.profiler.profile.optimizer = update_start.elapsed();
+            }
             checked = self
                 .health
                 .after_update(step, self.optimizer.last_stats(), &self.names);
+        } else if profiling {
+            self.profiler.profile.optimizer = Duration::ZERO;
         }
         params.zero_grad();
         self.steps = step;
+        if let Some(start) = start {
+            self.profiler.profile.total = start.elapsed();
+            self.profiler.valid = true;
+        }
         (value, checked)
+    }
+
+    /// Asks the next step to record a [`StepProfile`]: each layer's forward and backward
+    /// time, the loss, the optimiser step and the whole step, read afterwards with
+    /// [`last_profile`](Self::last_profile). Only that one step is profiled; a step that was
+    /// not asked reads no clock and does no extra work.
+    ///
+    /// The profile's buffers are made by the first profiled step and reused by every later
+    /// one, so after one profiled step a profiled step allocates no more than any other.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Relu, Sequential, Sgd, Targets, Trainer};
+    /// let data = Dataset { x: Tensor::full(&[4, 2], 0.5f32), targets: Targets::Classes(vec![0, 1, 0, 1]) };
+    /// let mut params = ParamStore::new();
+    /// let mut rng = Rng::seed(0);
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 8, &mut rng))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 8, 2, &mut rng));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 4);
+    /// let mut batch = Batch::new(&data, 4);
+    /// let batcher = Batcher::new(4, 4, None);
+    /// trainer.profile_next_step();
+    /// trainer.step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch)).unwrap();
+    /// let profile = trainer.last_profile().unwrap();
+    /// assert_eq!((profile.forward.len(), profile.backward.len()), (3, 3));
+    /// // The next step was not asked, so it has no profile.
+    /// trainer.step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch)).unwrap();
+    /// assert!(trainer.last_profile().is_none());
+    /// ```
+    pub fn profile_next_step(&mut self) {
+        self.profiler.asked = true;
+    }
+
+    /// The profile of the last step, if that step was asked for one with
+    /// [`profile_next_step`](Self::profile_next_step); `None` after any step that was not,
+    /// and before the first step.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 8);
+    /// trainer.profile_next_step();
+    /// // Asking is not enough: the profile comes from the step that runs next.
+    /// assert!(trainer.last_profile().is_none());
+    /// ```
+    pub fn last_profile(&self) -> Option<&StepProfile> {
+        self.profiler.valid.then_some(&self.profiler.profile)
+    }
+
+    /// Sets the optimiser's learning rate to `lr` for every later step, and stops
+    /// [`fit_controlled`]'s learning-rate schedule ([`FitConfig::schedule`]) for the rest of
+    /// the run, so that no later epoch sets the rate again. Called between the steps of an
+    /// epoch, it applies from the next step on. Outside a run (a loop of
+    /// [`step`](Self::step) calls) it only sets the rate.
+    ///
+    /// Only the optimiser's rate changes: the rest of its state carries on. [`Adam`] and
+    /// [`AdamW`] keep their moments and their per-parameter step counts (so the bias
+    /// correction does not restart), and [`Sgd`] keeps its momentum buffers, which the new
+    /// rate then scales. An optimiser of your own that changes its rate inside
+    /// [`Optimizer::step`] may move it again on the next step;
+    /// [`learning_rate`](Self::learning_rate) always reports the optimiser's own value.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `lr` is negative, NaN or infinite.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Adam, Linear, Loss, Sequential, Trainer};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Adam::new(1e-3), Loss::Mse, 8);
+    /// trainer.override_learning_rate(5e-4);
+    /// assert_eq!(trainer.learning_rate(), 5e-4);
+    /// ```
+    pub fn override_learning_rate(&mut self, lr: f64) {
+        assert!(
+            lr.is_finite() && lr >= 0.0,
+            "Trainer::override_learning_rate: the learning rate must be finite and at least 0, \
+             got {lr}"
+        );
+        self.optimizer.set_learning_rate(lr);
+        self.schedule_stopped = true;
+    }
+
+    /// The optimiser's current learning rate: the rate the next step trains at.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// assert_eq!(Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 8).learning_rate(), 0.1);
+    /// ```
+    pub fn learning_rate(&self) -> f64 {
+        self.optimizer.learning_rate()
     }
 
     /// The number of steps taken so far.
@@ -480,42 +627,391 @@ impl Trainer {
         self.steps
     }
 
-    /// Runs one epoch over `data` in the batches of `batcher` (reshuffled first), running
-    /// `hooks` and the health checks on every step, and returns the mean loss over the
-    /// epoch's rows: each batch's loss weighted by its row count.
+    /// Runs epoch `epoch` over `data` in the batches of `batcher` (reshuffled first), running
+    /// `hooks` and the health checks on every step and, for a controlled run, the control
+    /// after every step. Returns the mean loss over the rows the epoch trained on (each
+    /// batch's loss weighted by its row count) and whether the control stopped the run.
     ///
     /// # Errors
     ///
     /// Returns the first error of the health checks, at the step that met it.
     fn run_epoch(
         &mut self,
-        model: &Sequential,
+        run: &mut Run<'_, '_>,
         params: &mut ParamStore,
         data: &Dataset,
         batcher: &mut Batcher,
         hooks: &mut Hooks<'_>,
-    ) -> Result<f64, Error> {
+        epoch: usize,
+    ) -> Result<EpochEnd, Error> {
         let mut batch = self
             .batch
             .take()
             .unwrap_or_else(|| Batch::new(data, self.batch_size));
         batcher.epoch();
         let mut total = 0.0f64;
+        let mut trained = 0usize;
         let mut checked = Ok(());
+        let mut stopped = false;
         for range in batcher.batches() {
-            let rows = range.len() as f64;
+            // Only a control reads the step's time, so only a controlled run reads the clock.
+            let start = matches!(run, Run::Controlled(..)).then(Instant::now);
+            let rows = range.len();
             let view = batcher.gather(data, range.clone(), &mut batch);
             let rows_of_batch = &batcher.order()[range];
             let (loss, step_checked) =
-                self.checked_step(model, params, view, Some(rows_of_batch), hooks);
-            total += f64::from(loss) * rows;
+                self.checked_step(run.model(), params, view, Some(rows_of_batch), hooks);
+            total += f64::from(loss) * rows as f64;
+            trained += rows;
             if step_checked.is_err() {
                 checked = step_checked;
                 break;
             }
+            if let (Run::Controlled(model, control), Some(start)) = (&mut *run, start) {
+                let info = StepInfo {
+                    step: self.steps,
+                    epoch,
+                    loss,
+                    rows,
+                    seconds: start.elapsed().as_secs_f64(),
+                };
+                let mut handle = ModelHandle::new(model);
+                if control.after_step(&info, &mut handle, params, self) == Flow::Stop {
+                    stopped = true;
+                    break;
+                }
+            }
         }
         self.batch = Some(batch);
-        checked.map(|()| total / data.len() as f64)
+        checked.map(|()| EpochEnd {
+            mean_loss: total / trained as f64,
+            stopped,
+        })
+    }
+}
+
+/// How an epoch of [`Trainer::run_epoch`] ended without an error.
+#[derive(Debug)]
+struct EpochEnd {
+    /// The mean loss over the rows the epoch trained on.
+    mean_loss: f64,
+    /// Whether the control stopped the run during the epoch.
+    stopped: bool,
+}
+
+/// The model a run trains, and the control between its steps, if it has one.
+enum Run<'m, 'c> {
+    /// [`fit`] and [`fit_with_hooks`]: the model is only read and nothing runs between steps.
+    Plain(&'m Sequential),
+    /// [`fit_controlled`]: the control runs after each step and each epoch and may change
+    /// the model's neuron masks through a [`ModelHandle`].
+    Controlled(&'m mut Sequential, &'c mut dyn StepControl),
+}
+
+impl Run<'_, '_> {
+    /// The model, to read.
+    fn model(&self) -> &Sequential {
+        match self {
+            Run::Plain(model) => model,
+            Run::Controlled(model, _) => model,
+        }
+    }
+}
+
+/// The step profile's state inside a [`Trainer`]: whether the next step should be profiled,
+/// whether the last one was, the profile and the reused buffers of the timed backward pass.
+#[derive(Default)]
+struct Profiler {
+    /// Whether the next step records a profile.
+    asked: bool,
+    /// Whether `profile` holds the last step's profile.
+    valid: bool,
+    /// The last profiled step's profile; its vectors are reused.
+    profile: StepProfile,
+    /// Each layer's output on the profiled step's tape, the marks of the timed backward pass.
+    marks: Vec<Var>,
+    /// The timed backward pass's times: one per layer, then the loss's.
+    times: Vec<Duration>,
+}
+
+/// Where the time of one training step went, taken by [`Trainer`] on a step asked for with
+/// [`Trainer::profile_next_step`] and read with [`Trainer::last_profile`].
+///
+/// Every entry is wall-clock time read from [`Instant`], so it includes whatever else the
+/// machine did meanwhile; the parts never add up to more than [`total`](Self::total).
+///
+/// What each entry includes:
+/// - `forward[i]`: layer `i`'s forward pass, and its neuron mask when it has one (the mask's
+///   condition is recorded as an input and applied with a select, both counted in the layer).
+/// - `loss`: recording the loss on the network's output (the targets, when they are values,
+///   become an input there) and reading its value.
+/// - `backward[i]`: the backward pass through the nodes layer `i` recorded: its operations,
+///   its parameters and its mask's nodes. `backward[0]` also covers the batch's input node,
+///   recorded just before layer 0. Parameters and inputs take no work in the backward pass
+///   beyond being skipped, so they add little.
+/// - `backward_loss`: the backward pass through the loss's nodes, from the loss down to the
+///   network's output.
+/// - `optimizer`: the optimiser's update (0 when the health checks stopped the step before
+///   it).
+/// - `total`: the whole step, from before the batch's input is recorded to after the
+///   gradients are marked stale, including the hooks and the health checks, which no other
+///   entry counts.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use cavitation_nn::StepProfile;
+/// let profile = StepProfile::default();
+/// assert!(profile.forward.is_empty() && profile.total == Duration::ZERO);
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepProfile {
+    /// Each layer's forward time, in layer order.
+    pub forward: Vec<Duration>,
+    /// The time to record the loss and read its value.
+    pub loss: Duration,
+    /// Each layer's backward time, in layer order.
+    pub backward: Vec<Duration>,
+    /// The backward time of the loss's nodes.
+    pub backward_loss: Duration,
+    /// The optimiser's update.
+    pub optimizer: Duration,
+    /// The whole step.
+    pub total: Duration,
+}
+
+/// What a [`StepControl`] may change in the model during [`fit_controlled`]: the neuron
+/// masks, and nothing else. The trainer has sized its buffers for the model's layers, so the
+/// layers themselves stay as they are; a mask changes which neurons pass their output, not
+/// any shape.
+///
+/// A change made between two steps applies from the next step on, and stays on the model
+/// after the run.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng};
+/// use cavitation_nn::{Linear, ModelHandle, Relu, Sequential};
+/// let mut params = ParamStore::new();
+/// let mut net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+///     .push(Relu);
+/// let mut handle = ModelHandle::new(&mut net);
+/// handle.set_neuron(0, 1, false);
+/// assert_eq!(handle.model().neuron_mask(0).unwrap().off().collect::<Vec<_>>(), [1]);
+/// ```
+pub struct ModelHandle<'a> {
+    /// The model whose masks the handle changes.
+    model: &'a mut Sequential,
+}
+
+impl<'a> ModelHandle<'a> {
+    /// A handle on `model`, for testing a [`StepControl`] outside a run; [`fit_controlled`]
+    /// makes its own.
+    ///
+    /// ```
+    /// use cavitation_nn::{ModelHandle, Sequential};
+    /// let mut net = Sequential::new();
+    /// assert!(ModelHandle::new(&mut net).model().is_empty());
+    /// ```
+    pub fn new(model: &'a mut Sequential) -> ModelHandle<'a> {
+        ModelHandle { model }
+    }
+
+    /// The model, to read: its layers, masks and parameter names.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, ModelHandle, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// assert_eq!(ModelHandle::new(&mut net).model().len(), 1);
+    /// ```
+    pub fn model(&self) -> &Sequential {
+        self.model
+    }
+
+    /// Switches neuron `neuron` of the `Linear` at layer `linear` on or off, as
+    /// [`Sequential::set_neuron`] does: the mask goes on
+    /// [`neuron_layer`](Sequential::neuron_layer), the last layer of the element-wise run
+    /// after the `Linear`.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Sequential::set_neuron`] does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, ModelHandle, Sequential, Tanh};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 4, &mut Rng::seed(0)))
+    ///     .push(Tanh);
+    /// ModelHandle::new(&mut net).set_neuron(0, 3, false);
+    /// assert!(net.mask(1).is_some());
+    /// ```
+    pub fn set_neuron(&mut self, linear: usize, neuron: usize, on: bool) {
+        self.model.set_neuron(linear, neuron, on);
+    }
+
+    /// Puts `mask` on the neurons of the `Linear` at layer `linear`, as
+    /// [`Sequential::set_neuron_mask`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Sequential::set_neuron_mask`] does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, ModelHandle, NeuronMask, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// ModelHandle::new(&mut net).set_neuron_mask(0, NeuronMask::from_off(3, &[0, 2]));
+    /// assert_eq!(net.neuron_mask(0).unwrap().off().collect::<Vec<_>>(), [0, 2]);
+    /// ```
+    pub fn set_neuron_mask(&mut self, linear: usize, mask: NeuronMask) {
+        self.model.set_neuron_mask(linear, mask);
+    }
+
+    /// Removes the mask from the neurons of the `Linear` at layer `linear`, as
+    /// [`Sequential::clear_neuron_mask`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`Sequential::clear_neuron_mask`] does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, ModelHandle, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// net.set_neuron(0, 1, false);
+    /// ModelHandle::new(&mut net).clear_neuron_mask(0);
+    /// assert!(net.neuron_mask(0).is_none());
+    /// ```
+    pub fn clear_neuron_mask(&mut self, linear: usize) {
+        self.model.clear_neuron_mask(linear);
+    }
+}
+
+/// What one step of [`fit_controlled`] did, as its [`StepControl`] sees it.
+///
+/// # Examples
+///
+/// ```
+/// let info = cavitation_nn::StepInfo { step: 1, epoch: 1, loss: 0.7, rows: 32, seconds: 0.002 };
+/// assert_eq!(info.rows as f64 / info.seconds, 16_000.0);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StepInfo {
+    /// The step's number in the run, counting from 1 (the trainer's
+    /// [`steps`](Trainer::steps) after it).
+    pub step: u64,
+    /// The epoch the step belongs to, counting from 1.
+    pub epoch: usize,
+    /// The batch's loss (its mean over the batch's rows).
+    pub loss: f32,
+    /// The batch's row count; the last batch of an epoch may be smaller.
+    pub rows: usize,
+    /// The step's wall-clock time in seconds: gathering the batch and the training step,
+    /// hooks and health checks included, the control's own time not.
+    pub seconds: f64,
+}
+
+/// What runs between the steps of [`fit_controlled`]: after each step and after each epoch,
+/// with a [`ModelHandle`] to change the model's neuron masks, the parameters to read, and the
+/// [`Trainer`], to ask for the next step's profile ([`Trainer::profile_next_step`]), read the
+/// last one ([`Trainer::last_profile`]) or override the learning rate
+/// ([`Trainer::override_learning_rate`]). Both methods do nothing by default, so a control
+/// implements only what it needs. Returning [`Flow::Stop`] ends the run.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::{
+///     Dataset, FitConfig, Flow, Health, Hooks, Linear, Loss, ModelHandle, Sequential, StepControl,
+///     StepInfo, Targets, Trainer, fit_controlled,
+/// };
+/// /// Stops once the loss is below a threshold.
+/// struct StopBelow(f32);
+/// impl StepControl for StopBelow {
+///     fn after_step(
+///         &mut self,
+///         info: &StepInfo,
+///         _model: &mut ModelHandle<'_>,
+///         _params: &ParamStore,
+///         _trainer: &mut Trainer,
+///     ) -> Flow {
+///         if info.loss < self.0 { Flow::Stop } else { Flow::Continue }
+///     }
+/// }
+/// let data = Dataset {
+///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
+///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
+/// };
+/// let mut params = ParamStore::new();
+/// let mut net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+/// let config = FitConfig { epochs: 10_000, batch: 4, loss: Loss::Mse, health: Health::quiet(), ..FitConfig::default() };
+/// let history =
+///     fit_controlled(&mut net, &mut params, &data, config, &mut Hooks::new(), &mut StopBelow(0.01))
+///         .unwrap();
+/// assert!(history.epochs.len() < 10_000);
+/// ```
+pub trait StepControl {
+    /// Runs after each step that the health checks passed, before the next step. Changes to
+    /// the masks through `model` apply from the next step.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Flow, Linear, Loss, ModelHandle, Sequential, Sgd, StepControl, StepInfo, Trainer};
+    /// struct Nothing;
+    /// impl StepControl for Nothing {}
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
+    /// let info = StepInfo { step: 1, epoch: 1, loss: 0.5, rows: 4, seconds: 0.001 };
+    /// let flow = Nothing.after_step(&info, &mut ModelHandle::new(&mut net), &params, &mut trainer);
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    fn after_step(
+        &mut self,
+        info: &StepInfo,
+        model: &mut ModelHandle<'_>,
+        params: &ParamStore,
+        trainer: &mut Trainer,
+    ) -> Flow {
+        let _ = (info, model, params, trainer);
+        Flow::Continue
+    }
+
+    /// Runs after each whole epoch, after [`FitConfig::on_epoch`], with the epoch's report.
+    /// A learning rate overridden here applies from the next epoch, and the schedule no
+    /// longer sets it.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{EpochReport, Flow, Linear, Loss, ModelHandle, Sequential, Sgd, StepControl, Trainer};
+    /// struct Nothing;
+    /// impl StepControl for Nothing {}
+    /// let mut params = ParamStore::new();
+    /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
+    /// let report = EpochReport { epoch: 1, mean_loss: 0.5, seconds: 0.01 };
+    /// let flow = Nothing.after_epoch(&report, &mut ModelHandle::new(&mut net), &params, &mut trainer);
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    fn after_epoch(
+        &mut self,
+        report: &EpochReport,
+        model: &mut ModelHandle<'_>,
+        params: &ParamStore,
+        trainer: &mut Trainer,
+    ) -> Flow {
+        let _ = (report, model, params, trainer);
+        Flow::Continue
     }
 }
 
@@ -995,14 +1491,112 @@ pub fn fit_with_hooks(
     model: &Sequential,
     params: &mut ParamStore,
     train: &Dataset,
+    config: FitConfig,
+    hooks: &mut Hooks<'_>,
+) -> Result<History, Error> {
+    run_fit(Run::Plain(model), params, train, config, hooks)
+}
+
+/// Like [`fit_with_hooks`], and runs `control` between steps: [`StepControl::after_step`]
+/// after every step and [`StepControl::after_epoch`] after every epoch (after
+/// `config.on_epoch`). Through a [`ModelHandle`] the control can switch neurons and change or
+/// clear neuron masks, which apply from the next step and stay on `model` after the run;
+/// through the [`Trainer`] it can ask for the next step's [`StepProfile`] or override the
+/// learning rate, which stops `config.schedule` for the rest of the run. With a control that
+/// changes nothing, the same seeds train to the same parameters as [`fit`], bit for bit.
+///
+/// Each step reads the clock twice for [`StepInfo::seconds`]; [`fit`] and [`fit_with_hooks`]
+/// run the same loop without a control and read no clock per step.
+///
+/// A control that returns [`Flow::Stop`] ends the run there and gets the history so far.
+/// Stopped from [`after_epoch`](StepControl::after_epoch), the history ends with that
+/// epoch. Stopped from [`after_step`](StepControl::after_step), it ends with a report for
+/// the epoch in progress, even when that epoch is partial: its `mean_loss` is the mean over
+/// the rows of the steps it ran (each batch's loss weighted by its row count) and its
+/// `seconds` the time up to the stop; the end of that epoch's health checks,
+/// `config.on_epoch` and `after_epoch` do not run for it. A partial epoch's report looks
+/// like any other; the control that stopped the run knows where it stopped.
+///
+/// # Errors
+///
+/// Returns the same errors as [`fit`]. A step that meets a health-check error ends the run
+/// with that error before the control sees it.
+///
+/// # Panics
+///
+/// Panics as [`fit_with_hooks`] does, and as the [`ModelHandle`] methods do when the control
+/// addresses a layer or neuron the model does not have.
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::{
+///     Dataset, FitConfig, Flow, Hooks, Linear, Loss, ModelHandle, Sequential, StepControl,
+///     StepInfo, Tanh, Targets, Trainer, fit_controlled,
+/// };
+/// /// Switches neuron 0 of the first `Linear` off after step 2.
+/// struct SwitchOff;
+/// impl StepControl for SwitchOff {
+///     fn after_step(
+///         &mut self,
+///         info: &StepInfo,
+///         model: &mut ModelHandle<'_>,
+///         _params: &ParamStore,
+///         _trainer: &mut Trainer,
+///     ) -> Flow {
+///         if info.step == 2 {
+///             model.set_neuron(0, 0, false);
+///         }
+///         Flow::Continue
+///     }
+/// }
+/// let data = Dataset { x: Tensor::full(&[8, 2], 0.5f32), targets: Targets::Classes(vec![0, 1, 0, 1, 0, 1, 0, 1]) };
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let mut net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 4, &mut rng))
+///     .push(Tanh)
+///     .push(Linear::new(&mut params, 4, 2, &mut rng));
+/// let config = FitConfig { epochs: 2, batch: 4, loss: Loss::CrossEntropy, ..FitConfig::default() };
+/// let history =
+///     fit_controlled(&mut net, &mut params, &data, config, &mut Hooks::new(), &mut SwitchOff).unwrap();
+/// assert_eq!(history.epochs.len(), 2);
+/// assert_eq!(net.neuron_mask(0).unwrap().off().collect::<Vec<_>>(), [0]);
+/// ```
+pub fn fit_controlled(
+    model: &mut Sequential,
+    params: &mut ParamStore,
+    train: &Dataset,
+    config: FitConfig,
+    hooks: &mut Hooks<'_>,
+    control: &mut dyn StepControl,
+) -> Result<History, Error> {
+    run_fit(
+        Run::Controlled(model, control),
+        params,
+        train,
+        config,
+        hooks,
+    )
+}
+
+/// The loop behind [`fit`], [`fit_with_hooks`] and [`fit_controlled`]: checks the data, then
+/// trains epoch by epoch, running the control between steps and epochs when `run` has one.
+fn run_fit(
+    mut run: Run<'_, '_>,
+    params: &mut ParamStore,
+    train: &Dataset,
     mut config: FitConfig,
     hooks: &mut Hooks<'_>,
 ) -> Result<History, Error> {
     check_dataset(train)?;
-    check_model_and_loss(model, config.loss, train)?;
+    check_model_and_loss(run.model(), config.loss, train)?;
     check_finite(train)?;
-    let mut trainer =
-        Trainer::with_boxed(model, config.optimizer.build(), config.loss, config.batch);
+    let mut trainer = Trainer::with_boxed(
+        run.model(),
+        config.optimizer.build(),
+        config.loss,
+        config.batch,
+    );
     trainer.set_health(config.health);
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut history = History {
@@ -1011,22 +1605,38 @@ pub fn fit_with_hooks(
     params.zero_grad();
     let initial_lr = trainer.optimizer.learning_rate();
     for epoch in 1..=config.epochs {
-        let lr = config
-            .schedule
-            .learning_rate(initial_lr, epoch - 1, config.epochs);
-        trainer.optimizer.set_learning_rate(lr);
+        if !trainer.schedule_stopped {
+            let lr = config
+                .schedule
+                .learning_rate(initial_lr, epoch - 1, config.epochs);
+            trainer.optimizer.set_learning_rate(lr);
+        }
         let start = Instant::now();
-        let mean_loss = trainer.run_epoch(model, params, train, &mut batcher, hooks)?;
+        let end = trainer.run_epoch(&mut run, params, train, &mut batcher, hooks, epoch)?;
+        if end.stopped {
+            history.epochs.push(EpochReport {
+                epoch,
+                mean_loss: end.mean_loss,
+                seconds: start.elapsed().as_secs_f64(),
+            });
+            break;
+        }
         trainer.end_epoch(epoch)?;
         let report = EpochReport {
             epoch,
-            mean_loss,
+            mean_loss: end.mean_loss,
             seconds: start.elapsed().as_secs_f64(),
         };
         if let Some(on_epoch) = config.on_epoch.as_mut() {
-            on_epoch(&report, model, params);
+            on_epoch(&report, run.model(), params);
         }
         history.epochs.push(report);
+        if let Run::Controlled(model, control) = &mut run {
+            let mut handle = ModelHandle::new(model);
+            if control.after_epoch(&report, &mut handle, params, &mut trainer) == Flow::Stop {
+                break;
+            }
+        }
     }
     Ok(history)
 }
@@ -2147,7 +2757,14 @@ mod tests {
         shuffled.epoch();
         let at = shuffled.order().iter().position(|&r| r == 5).unwrap();
         let err = trainer
-            .run_epoch(&net, &mut params, &data, &mut batcher, &mut Hooks::new())
+            .run_epoch(
+                &mut Run::Plain(&net),
+                &mut params,
+                &data,
+                &mut batcher,
+                &mut Hooks::new(),
+                1,
+            )
             .unwrap_err();
         let text = err.to_string();
         let expected = format!(
@@ -2156,5 +2773,386 @@ mod tests {
         );
         assert!(text.ends_with(&expected), "{text}");
         assert_eq!(trainer.steps(), at as u64 / 4 + 1);
+    }
+
+    /// The 64-row, 4-feature, 2-class set and the 4 → 16 → tanh → 2 network the control
+    /// tests train: batch 16 gives 4 steps per epoch.
+    fn control_setup() -> (Dataset<f32>, ParamStore, Sequential) {
+        let data = synthetic_classes(64, 4, 2, 21);
+        let mut params = ParamStore::new();
+        let net = small_classifier(&mut params, 4, 2, 22);
+        (data, params, net)
+    }
+
+    /// The configuration of the control tests: `epochs` epochs at batch 16, Adam, shuffled,
+    /// with quiet health checks.
+    fn control_config(epochs: usize) -> FitConfig {
+        FitConfig {
+            epochs,
+            batch: 16,
+            shuffle_seed: Some(4),
+            health: Health::quiet(),
+            ..FitConfig::default()
+        }
+    }
+
+    /// A control that changes nothing.
+    struct NoOp;
+
+    impl StepControl for NoOp {}
+
+    /// `last_profile` is `None` after every step that did not ask for a profile and `Some`,
+    /// with one forward and one backward entry per layer, after the step that did; its parts
+    /// never add up to more than its total.
+    #[test]
+    fn profile_only_when_asked() {
+        /// Asks for a profile after steps 3 and 9, and records what `last_profile` holds
+        /// after each step.
+        struct AskTwice {
+            /// Each step's number and, when profiled, its entry counts.
+            seen: Vec<(u64, Option<(usize, usize)>)>,
+        }
+
+        impl StepControl for AskTwice {
+            fn after_step(
+                &mut self,
+                info: &StepInfo,
+                _model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                trainer: &mut Trainer,
+            ) -> Flow {
+                let profile = trainer.last_profile();
+                if let Some(p) = profile {
+                    let parts = p.forward.iter().sum::<Duration>()
+                        + p.loss
+                        + p.backward.iter().sum::<Duration>()
+                        + p.backward_loss
+                        + p.optimizer;
+                    assert!(parts <= p.total, "step {}: {p:?}", info.step);
+                    assert!(p.total > Duration::ZERO, "step {}: {p:?}", info.step);
+                }
+                self.seen.push((
+                    info.step,
+                    profile.map(|p| (p.forward.len(), p.backward.len())),
+                ));
+                if info.step == 3 || info.step == 9 {
+                    trainer.profile_next_step();
+                }
+                Flow::Continue
+            }
+        }
+
+        let (data, mut params, mut net) = control_setup();
+        let mut control = AskTwice { seen: Vec::new() };
+        fit_controlled(
+            &mut net,
+            &mut params,
+            &data,
+            control_config(3),
+            &mut Hooks::new(),
+            &mut control,
+        )
+        .unwrap();
+        assert_eq!(control.seen.len(), 12);
+        for &(step, profile) in &control.seen {
+            let expected = (step == 4 || step == 10).then_some((3, 3));
+            assert_eq!(profile, expected, "step {step}");
+        }
+
+        // The same through `Trainer::step` directly.
+        let mut trainer = Trainer::new(&net, Sgd::new(0.01), Loss::CrossEntropy, 16);
+        let mut batch = Batch::new(&data, 16);
+        let batcher = Batcher::new(64, 16, None);
+        assert!(trainer.last_profile().is_none());
+        trainer.profile_next_step();
+        trainer
+            .step(&net, &mut params, batcher.gather(&data, 0..16, &mut batch))
+            .unwrap();
+        let profile = trainer.last_profile().unwrap();
+        assert_eq!((profile.forward.len(), profile.backward.len()), (3, 3));
+        trainer
+            .step(&net, &mut params, batcher.gather(&data, 16..32, &mut batch))
+            .unwrap();
+        assert!(trainer.last_profile().is_none());
+    }
+
+    /// A control that switches neuron 3 of the `Linear` at layer 0 off after step 5: the
+    /// hooks on layer 1 (the tanh, which holds that `Linear`'s neurons) see column 3 nonzero
+    /// on steps 1 to 5 and exactly 0 on every step from 6 on.
+    #[test]
+    fn control_can_switch_a_neuron_between_steps() {
+        /// Switches neuron 3 of `Linear` 0 off after step 5.
+        struct SwitchOff;
+
+        impl StepControl for SwitchOff {
+            fn after_step(
+                &mut self,
+                info: &StepInfo,
+                model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                _trainer: &mut Trainer,
+            ) -> Flow {
+                if info.step == 5 {
+                    model.set_neuron(0, 3, false);
+                    assert_eq!(model.model().neuron_layer(0), 1);
+                }
+                Flow::Continue
+            }
+        }
+
+        let (data, mut params, mut net) = control_setup();
+        let mut zero = Vec::new();
+        {
+            let mut hooks = Hooks::new();
+            hooks.on_forward(1, |e| {
+                zero.push(e.output.data().chunks(16).all(|row| row[3] == 0.0));
+            });
+            fit_controlled(
+                &mut net,
+                &mut params,
+                &data,
+                control_config(3),
+                &mut hooks,
+                &mut SwitchOff,
+            )
+            .unwrap();
+        }
+        assert_eq!(zero.len(), 12);
+        assert_eq!(&zero[..5], &[false; 5]);
+        assert_eq!(&zero[5..], &[true; 7]);
+        let off: Vec<usize> = net.neuron_mask(0).unwrap().off().collect();
+        assert_eq!(off, [3]);
+    }
+
+    /// Under a cosine schedule, a control that overrides the learning rate to 0.05 after
+    /// epoch 1 makes every later epoch train at 0.05, read back from the parameters as
+    /// `rates_fit_trains_at` does and from `Trainer::learning_rate` after each step.
+    #[test]
+    fn override_replaces_schedule() {
+        /// Overrides the rate after epoch 1; records the bias's distance from its target
+        /// after each epoch and the trainer's rate after each step.
+        struct Override {
+            /// The bias parameter.
+            bias: ParamId,
+            /// `1 − b` before training and after each epoch.
+            distances: Vec<f64>,
+            /// `Trainer::learning_rate` after each step.
+            rates: Vec<f64>,
+        }
+
+        impl StepControl for Override {
+            fn after_step(
+                &mut self,
+                _info: &StepInfo,
+                _model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                trainer: &mut Trainer,
+            ) -> Flow {
+                self.rates.push(trainer.learning_rate());
+                Flow::Continue
+            }
+
+            fn after_epoch(
+                &mut self,
+                report: &EpochReport,
+                _model: &mut ModelHandle<'_>,
+                params: &ParamStore,
+                trainer: &mut Trainer,
+            ) -> Flow {
+                let b = f64::from(params.value(self.bias).data()[0]);
+                self.distances.push(1.0 - b);
+                if report.epoch == 1 {
+                    trainer.override_learning_rate(0.05);
+                    assert_eq!(trainer.learning_rate(), 0.05);
+                }
+                Flow::Continue
+            }
+        }
+
+        let data = Dataset {
+            x: Tensor::zeros(&[1, 1]),
+            targets: Targets::Values(Tensor::full(&[1, 1], 1.0f32)),
+        };
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
+        let bias = layer.bias();
+        let mut net = Sequential::new().push(layer);
+        let config = FitConfig {
+            epochs: 4,
+            batch: 1,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.1,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            schedule: LrSchedule::Cosine { min_lr: 0.01 },
+            health: Health::quiet(),
+            ..FitConfig::default()
+        };
+        let mut control = Override {
+            bias,
+            distances: vec![1.0],
+            rates: Vec::new(),
+        };
+        fit_controlled(
+            &mut net,
+            &mut params,
+            &data,
+            config,
+            &mut Hooks::new(),
+            &mut control,
+        )
+        .unwrap();
+        assert_eq!(control.rates, [0.1, 0.05, 0.05, 0.05]);
+        let rates: Vec<f64> = control
+            .distances
+            .windows(2)
+            .map(|w| (1.0 - w[1] / w[0]) / 2.0)
+            .collect();
+        assert_eq!(rates.len(), 4);
+        for (e, (got, want)) in rates.iter().zip([0.1, 0.05, 0.05, 0.05]).enumerate() {
+            // The bias is f32, so the recovered rate carries its rounding.
+            assert!((got - want).abs() < 1e-6, "epoch {e}: {got} vs {want}");
+        }
+    }
+
+    /// `Flow::Stop` after step 7 (epoch 2, step 3 of 4) ends training there: 7 steps ran,
+    /// and the history holds epoch 1 and the partial epoch 2, whose mean loss is over the
+    /// rows of its 3 steps. `Flow::Stop` from `after_epoch` ends the run after that epoch.
+    #[test]
+    fn control_stop_ends_training() {
+        /// Stops after step `at_step` or after epoch `at_epoch`; records each step's loss
+        /// and rows and the epochs it saw end.
+        struct StopAt {
+            /// The step after which to stop.
+            at_step: u64,
+            /// The epoch after which to stop.
+            at_epoch: usize,
+            /// Each step's number, the trainer's count, its loss and its rows.
+            steps: Vec<(u64, u64, f32, usize)>,
+            /// The epochs `after_epoch` saw.
+            epochs: Vec<usize>,
+        }
+
+        impl StepControl for StopAt {
+            fn after_step(
+                &mut self,
+                info: &StepInfo,
+                _model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                trainer: &mut Trainer,
+            ) -> Flow {
+                assert!(info.seconds >= 0.0);
+                self.steps
+                    .push((info.step, trainer.steps(), info.loss, info.rows));
+                if info.step == self.at_step {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                }
+            }
+
+            fn after_epoch(
+                &mut self,
+                report: &EpochReport,
+                _model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                _trainer: &mut Trainer,
+            ) -> Flow {
+                self.epochs.push(report.epoch);
+                if report.epoch == self.at_epoch {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                }
+            }
+        }
+
+        let (data, mut params, mut net) = control_setup();
+        let mut backward = 0;
+        let mut control = StopAt {
+            at_step: 7,
+            at_epoch: 0,
+            steps: Vec::new(),
+            epochs: Vec::new(),
+        };
+        let history = {
+            let mut hooks = Hooks::new();
+            hooks.on_backward(0, |_| backward += 1);
+            fit_controlled(
+                &mut net,
+                &mut params,
+                &data,
+                control_config(5),
+                &mut hooks,
+                &mut control,
+            )
+            .unwrap()
+        };
+        assert_eq!(backward, 7);
+        let numbers: Vec<(u64, u64)> = control.steps.iter().map(|s| (s.0, s.1)).collect();
+        assert_eq!(numbers, (1..=7).map(|s| (s, s)).collect::<Vec<_>>());
+        assert_eq!(control.epochs, [1]);
+        let epochs: Vec<usize> = history.epochs.iter().map(|r| r.epoch).collect();
+        assert_eq!(epochs, [1, 2]);
+        let partial = &control.steps[4..];
+        let rows: usize = partial.iter().map(|s| s.3).sum();
+        assert_eq!(rows, 48);
+        let total: f64 = partial.iter().map(|s| f64::from(s.2) * s.3 as f64).sum();
+        assert_eq!(history.epochs[1].mean_loss, total / rows as f64);
+
+        let (data, mut params, mut net) = control_setup();
+        let mut control = StopAt {
+            at_step: 0,
+            at_epoch: 2,
+            steps: Vec::new(),
+            epochs: Vec::new(),
+        };
+        let history = fit_controlled(
+            &mut net,
+            &mut params,
+            &data,
+            control_config(5),
+            &mut Hooks::new(),
+            &mut control,
+        )
+        .unwrap();
+        assert_eq!(control.steps.len(), 8);
+        assert_eq!(control.epochs, [1, 2]);
+        assert_eq!(history.epochs.len(), 2);
+    }
+
+    /// `fit_controlled` with a control that changes nothing trains to bit-identical
+    /// parameters and the same epoch losses as `fit`, under a cosine schedule.
+    #[test]
+    fn fit_controlled_matches_fit() {
+        let config = || FitConfig {
+            schedule: LrSchedule::Cosine { min_lr: 1e-4 },
+            ..control_config(3)
+        };
+        let (data, mut params, net) = control_setup();
+        let plain = fit(&net, &mut params, &data, config()).unwrap();
+        let (_, mut controlled_params, mut controlled_net) = control_setup();
+        let controlled = fit_controlled(
+            &mut controlled_net,
+            &mut controlled_params,
+            &data,
+            config(),
+            &mut Hooks::new(),
+            &mut NoOp,
+        )
+        .unwrap();
+        assert_eq!(
+            parameter_bits(&net, &params),
+            parameter_bits(&controlled_net, &controlled_params)
+        );
+        let losses = |h: &History| {
+            h.epochs
+                .iter()
+                .map(|r| r.mean_loss.to_bits())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(losses(&plain), losses(&controlled));
     }
 }

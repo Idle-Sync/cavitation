@@ -94,6 +94,7 @@ pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
     Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,
-    History, Loss, LrSchedule, OptimizerConfig, Standardizer, Targets, TargetsView, Trainer,
-    accuracy, evaluate, fit, fit_with_hooks,
+    History, Loss, LrSchedule, ModelHandle, OptimizerConfig, Standardizer, StepControl, StepInfo,
+    StepProfile, Targets, TargetsView, Trainer, accuracy, evaluate, fit, fit_controlled,
+    fit_with_hooks,
 };
