@@ -7,7 +7,10 @@
 //! The core and nn crates are re-exported by name (`cavitation::cavitation_core`,
 //! `cavitation::cavitation_nn`), and [`prelude`] gathers the names most programs need.
 //! With the `ml` feature, on by default, the classic machine learning crate is re-exported
-//! too, as `cavitation::cavitation_ml`: least squares and regression in `f64`.
+//! too, as `cavitation::cavitation_ml`: least squares and regression in `f64`. With the
+//! `inspect` feature, off by default, the inspector crate is re-exported as
+//! `cavitation::cavitation_inspect`: a server on this machine that shows a run in the
+//! browser.
 //!
 //! # Three levels of use
 //!
@@ -120,6 +123,18 @@
 //! [`Layer`]: cavitation_nn::Layer
 
 pub use cavitation_core;
+/// A live view of a training run in the browser: an HTTP and Server-Sent Events server on
+/// this machine, built on `std::net` alone. Present with the `inspect` feature, which is off
+/// by default.
+///
+/// ```
+/// use cavitation::cavitation_inspect::{Inspector, InspectorConfig};
+/// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+/// let inspector = Inspector::start(config).unwrap();
+/// assert!(inspector.url().starts_with("http://127.0.0.1:"));
+/// ```
+#[cfg(feature = "inspect")]
+pub use cavitation_inspect;
 /// Classic machine learning in `f64`: least squares by Householder QR, and the regression
 /// models built on it. Present with the `ml` feature, which is on by default.
 ///

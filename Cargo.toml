@@ -9,6 +9,7 @@ members = [
     "crates/cavitation-datasets",
     "crates/cavitation-bench",
     "crates/cavitation-ml",
+    "crates/cavitation-inspect",
 ]
 
 [workspace.package]

@@ -55,6 +55,13 @@ pub enum Error {
     InvalidData(String),
     /// The request is valid but not supported.
     Unsupported(String),
+    /// A network operation failed, for example listening on an address already in use.
+    Net {
+        /// The address involved, as `ip:port`.
+        address: String,
+        /// The underlying error.
+        source: std::io::Error,
+    },
 }
 
 impl fmt::Display for Error {
@@ -85,12 +92,14 @@ impl fmt::Display for Error {
             }
             Error::InvalidData(msg) => write!(f, "invalid data: {msg}"),
             Error::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            Error::Net { address, source } => write!(f, "network error on {address}: {source}"),
         }
     }
 }
 
 impl std::error::Error for Error {
-    /// The underlying I/O error for [`Error::Io`], `None` for every other variant.
+    /// The underlying I/O error for [`Error::Io`] and [`Error::Net`], `None` for every other
+    /// variant.
     ///
     /// ```
     /// use std::error::Error as _;
@@ -99,7 +108,7 @@ impl std::error::Error for Error {
     /// ```
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Io { source, .. } => Some(source),
+            Error::Io { source, .. } | Error::Net { source, .. } => Some(source),
             _ => None,
         }
     }
@@ -211,5 +220,27 @@ impl fmt::Display for KeyErrors {
             write!(f, "\n  the file holds: {}", self.file_keys.join(", "))?;
         }
         Ok(())
+    }
+}
+
+/// Tests for the `Error` variants that carry an underlying error.
+#[cfg(test)]
+mod tests {
+    use super::Error;
+    use std::error::Error as _;
+
+    /// `Error::Net` names the address in its message and gives the I/O error as its source.
+    #[test]
+    fn net_error_names_address_and_has_source() {
+        let e = Error::Net {
+            address: "127.0.0.1:7878".to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "address in use"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "network error on 127.0.0.1:7878: address in use"
+        );
+        let source = e.source().expect("a source");
+        assert_eq!(source.to_string(), "address in use");
     }
 }

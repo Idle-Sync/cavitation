@@ -1,0 +1,19 @@
+# Package manifest for cavitation-inspect: a std-only HTTP and Server-Sent Events server that shows a training run in the browser.
+
+[package]
+name = "cavitation-inspect"
+description = "A live view of a cavitation training run in the browser: a std-only HTTP and Server-Sent Events server on localhost."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# `Error`, which a failed bind is reported as (`Error::Net`).
+cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
+# `Dataset`, the probe rows the configuration can name.
+cavitation-nn = { path = "../cavitation-nn", version = "0.1.0" }
