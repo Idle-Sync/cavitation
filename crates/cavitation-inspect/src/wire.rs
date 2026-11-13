@@ -14,6 +14,7 @@
 //! | `probe` | snapshot | on each sampled step: the probed row through every layer |
 //! | `neuron` | snapshot | with each `probe`: the chosen neuron |
 //! | `profile` | snapshot | on the step after each sampled step: where its time went |
+//! | `network` | snapshot | in explore mode: the size of the network a shrink run kept |
 //! | `status` | event | when the run's state changes, or a command cannot be carried out; the latest also when a client connects |
 //! | `ablation` | event | in explore mode, one per neuron switched off |
 //! | `shrink` | event | in explore mode, one per level of the shrink tool |
@@ -128,8 +129,24 @@
 //! - `state` (string): `training`, `paused`, `explore` or `finished`.
 //! - `message` (string): what happened, in plain words.
 //!
+//! # `network`
+//!
+//! Sent when explore mode starts and when a shrink run keeps a level (and, with every field
+//! `null`, when a training run starts), so the page can show the size of the network it
+//! is looking at. Shrinking switches neurons off and leaves the layers' widths and the
+//! stored parameters as they were.
+//!
+//! - `parameters` (integer or `null`): the parameters the network uses once its off
+//!   neurons are removed, from the level the last shrink run kept; `null` when no shrink
+//!   run has kept one in this explore mode.
+//! - `removed_bp` (integer or `null`): that level, in basis points of each layer's width.
+//! - `kept` (array of integers): the neurons left on in each shrunk `Linear`; empty when
+//!   `parameters` is `null`.
+//!
 //! # `ablation`
 //!
+//! - `sweep` (integer): which ranking the neuron belongs to: the same for every neuron of
+//!   one ranking, different for each ranking and shrink run, and larger for a later one.
 //! - `linear` (integer), `neuron` (integer): the neuron switched off.
 //! - `drop` (number): what switching it off costs, as [`Ablation::drop`] defines it.
 //! - `loss` (number), `accuracy` (number or `null`), `r2` (number or `null`): the
@@ -137,6 +154,8 @@
 //!
 //! # `shrink`
 //!
+//! - `run` (integer): which shrink run the level belongs to, numbered with the rankings'
+//!   `sweep`, so a ranking with a smaller number was measured before this run.
 //! - `removed_bp` (integer): the share of each layer's width removed, in basis points.
 //! - `kept` (array of integers): the neurons left on in each shrunk `Linear`.
 //! - `parameters` (integer): the parameters the network has at this level.
@@ -769,11 +788,13 @@ fn measures(w: &mut JsonWriter, e: &Evaluation) {
 /// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0; 4]) };
 /// let all = ablate(&net, &params, &data, &[0], Loss::CrossEntropy, 4).unwrap();
 /// let mut w = JsonWriter::new();
-/// wire::ablation(&mut w, &all[0]);
-/// assert!(w.as_str().starts_with(r#"{"linear":0,"neuron":"#));
+/// wire::ablation(&mut w, &all[0], 7);
+/// assert!(w.as_str().starts_with(r#"{"sweep":7,"linear":0,"neuron":"#));
 /// ```
-pub fn ablation(w: &mut JsonWriter, a: &Ablation) {
+pub fn ablation(w: &mut JsonWriter, a: &Ablation, sweep: u64) {
     w.begin_object()
+        .key("sweep")
+        .uint(sweep)
         .key("linear")
         .uint(a.linear as u64)
         .key("neuron")
@@ -792,13 +813,15 @@ pub fn ablation(w: &mut JsonWriter, a: &Ablation) {
 /// use cavitation_nn::shrink::ShrinkStep;
 /// fn write(step: &ShrinkStep) -> String {
 ///     let mut w = JsonWriter::new();
-///     wire::shrink(&mut w, step);
+///     wire::shrink(&mut w, step, 3);
 ///     w.as_str().to_string()
 /// }
 /// # let _ = write;
 /// ```
-pub fn shrink(w: &mut JsonWriter, step: &ShrinkStep) {
+pub fn shrink(w: &mut JsonWriter, step: &ShrinkStep, run: u64) {
     w.begin_object()
+        .key("run")
+        .uint(run)
         .key("removed_bp")
         .uint(u64::from(step.removed_bp))
         .key("kept")
@@ -813,4 +836,33 @@ pub fn shrink(w: &mut JsonWriter, step: &ShrinkStep) {
         .bool(step.met);
     measures(w, &step.validation);
     w.end_object();
+}
+
+/// Writes the `network` snapshot: the size of the network `kept`, the level a shrink run
+/// kept, or `null` fields when there is none.
+///
+/// ```
+/// use cavitation_inspect::json::JsonWriter;
+/// use cavitation_inspect::wire;
+/// let mut w = JsonWriter::new();
+/// wire::network(&mut w, None);
+/// assert_eq!(w.as_str(), r#"{"parameters":null,"removed_bp":null,"kept":[]}"#);
+/// ```
+pub fn network(w: &mut JsonWriter, kept: Option<&ShrinkStep>) {
+    w.begin_object().key("parameters");
+    match kept {
+        Some(step) => {
+            w.uint(step.parameters as u64)
+                .key("removed_bp")
+                .uint(u64::from(step.removed_bp));
+        }
+        None => {
+            w.null().key("removed_bp").null();
+        }
+    }
+    w.key("kept").begin_array();
+    for &k in kept.map_or(&[][..], |s| &s.kept[..]) {
+        w.uint(k as u64);
+    }
+    w.end_array().end_object();
 }

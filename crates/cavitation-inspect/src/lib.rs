@@ -18,6 +18,9 @@
 //!   commands and, while a client is connected, captures snapshots at most `snapshot_hz`
 //!   times a second; at epoch ends it runs a held-out evaluation when the time budget
 //!   allows.
+//! - [`Inspector::explore`]: explore mode, after training. The page switches the trained
+//!   network's neurons, ranks a hidden layer's neurons by what switching each off costs,
+//!   and shrinks the network with the shrink tool, level by level, until it says it is done.
 //! - [`probe::Probe`]: one row run forward and backward beside training, on buffers of its
 //!   own, for the values of every layer and of one neuron.
 //! - [`wire`]: the JSON of every event, field by field.
@@ -62,6 +65,7 @@
 //! ```
 
 pub mod commands;
+mod explore;
 mod export;
 pub mod http;
 pub mod json;
@@ -72,5 +76,6 @@ pub mod sse;
 pub mod token;
 pub mod wire;
 
+pub use explore::ExploreConfig;
 pub use server::{Inspector, InspectorConfig};
 pub use snapshot::fit;

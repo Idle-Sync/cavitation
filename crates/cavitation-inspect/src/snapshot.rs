@@ -33,6 +33,11 @@ fn far_future(now: Instant) -> Instant {
     now + Duration::from_secs(100 * 365 * 24 * 3600)
 }
 
+/// `n` followed by the singular or the plural noun: "1 level", "2 levels".
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 /// An event that could not be published yet (the hub's lock was busy), kept to retry at the
 /// next step.
 #[derive(Debug)]
@@ -63,11 +68,11 @@ pub(crate) struct Training {
     /// The width of an input row.
     input_width: usize,
     /// Each layer's output width.
-    widths: Vec<usize>,
+    pub(crate) widths: Vec<usize>,
     /// The layer index of every `Linear`, whose neurons the evaluator can switch.
     linears: Vec<usize>,
     /// The first training rows, the probe rows when the configuration names none.
-    own_probe: Option<Dataset>,
+    pub(crate) own_probe: Option<Dataset>,
     /// The first `eval_rows` probe rows, made when there are more probe rows than that.
     eval_set: Option<Dataset>,
     /// The time between captures.
@@ -91,7 +96,7 @@ pub(crate) struct Training {
     /// The last throughput measured, kept for snapshots taken while paused.
     samples_per_second: f64,
     /// The last step's number.
-    step: u64,
+    pub(crate) step: u64,
     /// The epoch in progress.
     epoch: usize,
     /// The last step's batch loss.
@@ -290,11 +295,15 @@ impl Training {
     /// Checks a page's request to switch neuron `neuron` of the `linear`-th `Linear`
     /// (counting only `Linear`s), and returns the `Linear`'s layer index, or why it cannot
     /// be switched.
-    fn mask_target(model: &Sequential, linear: usize, neuron: usize) -> Result<usize, String> {
+    pub(crate) fn mask_target(
+        model: &Sequential,
+        linear: usize,
+        neuron: usize,
+    ) -> Result<usize, String> {
         let Some((layer, lin)) = model.linears().nth(linear) else {
             return Err(format!(
-                "cannot switch a neuron of Linear layer {linear}: the model has {} Linear layers",
-                model.linears().count()
+                "cannot switch a neuron of Linear layer {linear}: the model has {}",
+                plural(model.linears().count(), "Linear layer", "Linear layers")
             ));
         };
         let width = lin.outputs();
@@ -387,7 +396,9 @@ impl Training {
                     self.capture_now = true;
                 } else {
                     self.say(format!(
-                        "there is no probe row {index}: there are {rows} probe rows"
+                        "there is no probe row {index}: there {} {}",
+                        if rows == 1 { "is" } else { "are" },
+                        plural(rows, "probe row", "probe rows")
                     ));
                 }
             }
@@ -400,8 +411,8 @@ impl Training {
                     "there is no neuron {neuron} in layer {layer}: it has width {width}"
                 )),
                 None => self.say(format!(
-                    "there is no layer {layer}: the model has {} layers",
-                    self.widths.len()
+                    "there is no layer {layer}: the model has {}",
+                    plural(self.widths.len(), "layer", "layers")
                 )),
             },
             Command::Ablate { .. } | Command::Shrink | Command::Cancel | Command::Finish => {
@@ -528,7 +539,11 @@ impl Training {
 }
 
 /// Checks the configuration's probe set against the training data and the loss.
-fn check_probe(probe: &Dataset, train: Option<&Dataset>, loss: Loss) -> Result<(), Error> {
+pub(crate) fn check_probe(
+    probe: &Dataset,
+    train: Option<&Dataset>,
+    loss: Loss,
+) -> Result<(), Error> {
     let bad = |why: String| Err(Error::InvalidData(format!("inspector probe set: {why}")));
     let dims = probe.x.shape().dims();
     if dims.len() != 2 || dims[0] == 0 {
@@ -572,7 +587,7 @@ fn check_probe(probe: &Dataset, train: Option<&Dataset>, loss: Loss) -> Result<(
 
 /// Whether `data` has the shape training needs (a matrix with rows, one target per row), so
 /// its first rows can be copied; `fit` reports the problem when it does not.
-fn trainable(data: &Dataset) -> bool {
+pub(crate) fn trainable(data: &Dataset) -> bool {
     let dims = data.x.shape().dims();
     let targets = match &data.targets {
         Targets::Classes(labels) => labels.len(),
@@ -633,7 +648,15 @@ impl Inspector {
         t.flops = wire::flops_per_sample(model);
         t.parameters = wire::parameter_count(model, params);
         t.pending.push_back(Pending::Model);
-        t.say(format!("training started: {} epochs", fit.epochs));
+        t.say(format!(
+            "training started: {}",
+            plural(fit.epochs, "epoch", "epochs")
+        ));
+        // A new run: a page that connects later must not see an earlier explore mode's
+        // shrink result. A refused lock leaves the old one, which the page drops on `model`.
+        shared
+            .hub
+            .publish_snapshot(Snapshot::Network, |w| wire::network(w, None));
         t.flush(config, &shared.hub, model, false);
         Ok(())
     }
@@ -649,7 +672,10 @@ impl Inspector {
         } = self;
         t.paused = false;
         let message = match result {
-            Ok(history) => format!("training finished after {} epochs", history.epochs.len()),
+            Ok(history) => format!(
+                "training finished after {}",
+                plural(history.epochs.len(), "epoch", "epochs")
+            ),
             Err(e) => format!("training stopped: {e}"),
         };
         t.pending

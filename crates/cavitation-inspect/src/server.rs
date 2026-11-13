@@ -35,6 +35,10 @@ pub(crate) const MAX_PENDING: usize = 32;
 /// the server's threads without letting answered connections block new requests.
 pub(crate) const MAX_ANSWERING: usize = 128;
 
+/// The longest `Drop` waits for the clients to read what is queued for them, when the
+/// write timeout is longer.
+const FLUSH_BOUND: Duration = Duration::from_millis(500);
+
 /// How long `Drop` waits for its wake-up connection to the accept thread.
 const WAKE_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -441,10 +445,14 @@ impl Inspector {
 }
 
 impl Drop for Inspector {
-    /// Stops the server: closes the hub (every writer and every waiting publisher wakes),
+    /// Stops the server: first lets every client's writer send what is already queued for
+    /// it, for at most the smaller of `write_timeout` and 500 ms (so a program that ends
+    /// right after [`fit`](crate::fit) or [`explore`](Self::explore) still shows its last
+    /// `status` on the page), then closes the hub (every writer and every waiting publisher wakes),
     /// wakes the accept thread with a connection to its own port, and joins every thread.
-    /// Every thread notices the shutdown within a few milliseconds, so this returns well
-    /// within 1 s, even with a client that stopped reading or a half-sent request.
+    /// Every thread notices the shutdown within a few milliseconds, so after the flush this
+    /// returns within 1 s in all, even with a client that stopped reading or a half-sent
+    /// request.
     ///
     /// If the wake-up connection cannot be made (a firewall refusing loopback connections),
     /// the accept thread is left to end at the next connection instead of being waited for.
@@ -454,7 +462,11 @@ impl Drop for Inspector {
     /// ends when the hub closes, when the page resumes it, or when no client has been
     /// connected for `idle_resume`.
     fn drop(&mut self) {
-        self.shared.hub.close();
+        // Let the clients read what is already queued (a run's final `status`, say), for
+        // at most the write timeout or 500 ms, whichever is shorter.
+        let hub = &self.shared.hub;
+        hub.flush(self.config.write_timeout.min(FLUSH_BOUND));
+        hub.close();
         let wake = match self.address.ip() {
             IpAddr::V4(ip) if ip.is_unspecified() => {
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), self.address.port())

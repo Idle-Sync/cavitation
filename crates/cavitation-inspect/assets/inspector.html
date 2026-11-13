@@ -197,6 +197,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
   const S = {
     model: null, stats: null, probe: null, neuron: null, profile: null, status: null,
     epochs: [], ablations: new Map(), shrinks: new Map(),
+    abSweep: null, shrinkRun: null, network: null, explored: false,
     mode: 'a', views: [], live: false, exported: false, connected: false,
     pending: null, modelSeen: false,
   };
@@ -707,7 +708,8 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     clear(box);
     const all = Array.from(S.ablations.values()).filter((a) => ok(a.drop));
     all.sort((p, q) => p.drop - q.drop);
-    setText('rankLbl', all.length ? 'Ablation ranking · ' + all.length + ' neurons, cheapest to switch off first, with the drop each costs' : 'Ablation ranking · none yet');
+    const onTraining = S.model && S.model.probe_is_training ? ', measured on training rows' : '';
+    setText('rankLbl', all.length ? 'Ablation ranking · ' + all.length + (all.length === 1 ? ' neuron' : ' neurons') + ', cheapest to switch off first, with the drop each costs' + onTraining : 'Ablation ranking · none yet');
     const top = all.slice(0, 12);
     let m = 1e-12;
     top.forEach((a) => (m = Math.max(m, Math.abs(a.drop))));
@@ -814,7 +816,10 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       const r2 = !ok(ev.accuracy) && ok(ev.r2);
       setText('tAccK', r2 ? 'R²' : 'Accuracy');
       setText('tAcc', r2 ? fmt(ev.r2, 3) : pct(ev.accuracy));
-      setText('tAccSub', int(ev.rows) + ' held-out rows');
+      // In explore mode the evaluation is the training run's last, made before any switch
+      // or shrink.
+      const shrunk = S.network && ok(S.network.parameters);
+      setText('tAccSub', int(ev.rows) + ' held-out rows' + (S.explored ? ' · from training' + (shrunk ? ', before shrinking' : '') : ''));
       setText('tLossSub', 'last batch · held-out ' + fmt(ev.loss, 4));
     }
   }
@@ -850,7 +855,13 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     document.title = S.model.title;
     setText('title', S.model.title);
     const sizes = [S.model.input_width].concat(S.model.layers.filter((l) => l.linear).map((l) => l.width));
-    let text = int(S.model.parameters) + ' parameters · ' + sizes.join(' → ') + ' · ' + S.model.layers.map((l) => l.activation || l.kind).join(', ');
+    // After a shrink the layers keep their widths and the store its values; the network
+    // in use is the kept level's size.
+    const N = S.network;
+    const size = N && ok(N.parameters)
+      ? int(N.parameters) + ' parameters after shrinking (' + int(S.model.parameters) + ' stored)'
+      : int(S.model.parameters) + ' parameters';
+    let text = size + ' · ' + sizes.join(' → ') + ' · ' + S.model.layers.map((l) => l.activation || l.kind).join(', ');
     if (S.exported) text += S.stats ? ' · saved at step ' + int(S.stats.step) + '; the controls are off.' : ' · saved; the controls are off.';
     setText('lede', text);
   }
@@ -889,7 +900,8 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       // run: what the last run left is cleared. The same model replayed on reconnect keeps it.
       const same = S.model !== null && JSON.stringify(S.model) === JSON.stringify(d);
       if (S.modelSeen || !same) {
-        S.epochs = []; S.ablations.clear(); S.shrinks.clear();
+        S.epochs = []; S.ablations.clear(); S.shrinks.clear(); S.abSweep = null; S.shrinkRun = null;
+        S.network = null; S.explored = false;
         S.stats = null; S.probe = null; S.neuron = null; S.profile = null; S.pending = null;
       }
       S.modelSeen = true;
@@ -901,15 +913,30 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     probe: (d) => { S.probe = d; },
     neuron: (d) => { S.neuron = d; },
     profile: (d) => { S.profile = d; },
-    status: (d) => { S.status = d; S.pending = null; },
+    status: (d) => { S.status = d; S.pending = null; if (d.state === 'explore') S.explored = true; },
     epoch: (d) => {
       const last = S.epochs[S.epochs.length - 1];
       if (last && last.epoch === d.epoch && last.mean_loss === d.mean_loss) return;
       S.epochs.push(d);
       if (S.epochs.length > 1000) S.epochs.shift();
     },
-    ablation: (d) => { S.ablations.set(keyOf(d), d); },
-    shrink: (d) => { S.shrinks.set(d.removed_bp, d); },
+    ablation: (d) => {
+      // The ranking shows one sweep: a new sweep number replaces the last one's entries,
+      // whether that sweep finished or was cancelled.
+      if (d.sweep !== S.abSweep) { S.ablations.clear(); S.abSweep = d.sweep; }
+      S.ablations.set(keyOf(d), d);
+    },
+    shrink: (d) => {
+      // A new run replaces the last run's curve, and a ranking measured before it (a
+      // smaller sweep number) no longer describes the network.
+      if (d.run !== S.shrinkRun) {
+        S.shrinks.clear();
+        S.shrinkRun = d.run;
+        if (S.abSweep !== null && S.abSweep < d.run) { S.ablations.clear(); S.abSweep = null; }
+      }
+      S.shrinks.set(d.removed_bp, d);
+    },
+    network: (d) => { S.network = d; },
   };
   function take(name, d) {
     if (!d || typeof d !== 'object') return;
@@ -982,7 +1009,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
     S.exported = true;
     S.live = false;
     setConn('saved snapshot', null);
-    ['model', 'stats', 'probe', 'neuron', 'profile', 'status'].forEach((k) => { if (d[k]) take(k, d[k]); });
+    ['model', 'stats', 'probe', 'neuron', 'profile', 'network', 'status'].forEach((k) => { if (d[k]) take(k, d[k]); });
     (d.epochs || []).forEach((e) => take('epoch', e));
     (d.ablations || []).forEach((a) => take('ablation', a));
     (d.shrinks || []).forEach((s) => take('shrink', s));

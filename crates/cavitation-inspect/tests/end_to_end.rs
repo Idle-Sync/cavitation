@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use cavitation_core::kernels::set_threads;
 use cavitation_core::{ParamStore, Rng, Tensor};
-use cavitation_inspect::{Inspector, InspectorConfig};
+use cavitation_inspect::{ExploreConfig, Inspector, InspectorConfig};
+use cavitation_nn::shrink::{Criterion, RetrainConfig, ShrinkConfig, Validation, shrink};
 use cavitation_nn::{
     Dataset, FitConfig, Health, Linear, Loss, LrSchedule, OptimizerConfig, Relu, Sequential,
     Softmax, Tanh, Targets,
@@ -939,4 +940,514 @@ fn bad_commands_get_a_status_message() {
     });
     assert!(model.neuron_mask(0).is_none());
     assert!(model.neuron_mask(2).is_none());
+}
+
+// ---- Explore mode ----------------------------------------------------------------------
+
+/// The 64 → `hidden` → tanh → 10 network of [`network`], trained for 3 epochs on
+/// `digits(512, 11)`, with that training set.
+fn trained(hidden: usize) -> (Sequential, ParamStore, Dataset) {
+    let data = digits(512, 11);
+    let mut params = ParamStore::new();
+    let model = network(&mut params, hidden);
+    cavitation_nn::fit(&model, &mut params, &data, fit_config(3)).unwrap();
+    (model, params, data)
+}
+
+/// A small shrink run: levels 1,000 bp to `max_bp` by 1,000, every level run (no
+/// patience), one retraining epoch per level, measured on 300 held-out rows, and a stop rule
+/// every level meets (100 accuracy points), so the kept level is the last one run.
+fn shrink_config(max_bp: u32) -> ShrinkConfig {
+    ShrinkConfig {
+        max_removed_bp: max_bp,
+        patience: None,
+        criterion: Some(Criterion::AccuracyDrop { points: 100.0 }),
+        validation: Some(Validation::Given(digits(300, 12))),
+        retrain: RetrainConfig {
+            epochs: 1,
+            ..RetrainConfig::default()
+        },
+        ..ShrinkConfig::default()
+    }
+}
+
+/// An explore configuration with cross-entropy, these training rows, and a shrink factory
+/// for [`shrink_config`]`(max_bp)` when `max_bp` is given.
+fn explore_config(train: Option<Dataset>, max_bp: Option<u32>) -> ExploreConfig {
+    ExploreConfig {
+        loss: Loss::CrossEntropy,
+        train,
+        shrink: max_bp
+            .map(|bp| Box::new(move || shrink_config(bp)) as Box<dyn FnMut() -> ShrinkConfig>),
+    }
+}
+
+impl Client {
+    /// Every event up to the first `status` whose message starts with `prefix`, that one
+    /// included.
+    fn until_status(&self, prefix: &str) -> Vec<Message> {
+        let start = Instant::now();
+        let mut out = Vec::new();
+        loop {
+            assert!(start.elapsed() < DEADLINE, "no status starting {prefix:?}");
+            let m = self.next(prefix);
+            let done = m.name == "status" && m.json.get("message").str().starts_with(prefix);
+            out.push(m);
+            if done {
+                return out;
+            }
+        }
+    }
+
+    /// Waits for explore mode to begin: its `status` event in state `explore`.
+    fn exploring(&self) -> Message {
+        self.wait_for("status", |j| j.get("state").str() == "explore")
+    }
+}
+
+/// The `shrink` events in `events`, in order.
+fn shrink_events(events: &[Message]) -> Vec<&Json> {
+    events
+        .iter()
+        .filter(|m| m.name == "shrink")
+        .map(|m| &m.json)
+        .collect()
+}
+
+/// The numbers in a JSON array.
+fn numbers(j: &Json) -> Vec<f64> {
+    j.arr().iter().map(Json::num).collect()
+}
+
+/// The neurons the neuron mask of `Linear` layer `linear` switches off.
+fn off(model: &Sequential, linear: usize) -> Vec<usize> {
+    model
+        .neuron_mask(linear)
+        .map(|m| m.off().collect())
+        .unwrap_or_default()
+}
+
+/// Switching neuron 5 of `Linear` 0 off in explore mode publishes a probe at once with it
+/// at exactly 0 and every other value of its layer unchanged, and the chosen neuron's panel
+/// shows it off.
+#[test]
+fn explore_switch_recomputes_probe() {
+    let (mut model, mut params, data) = trained(32);
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        // Opened inside the scope: a failure closes it while unwinding, explore mode
+        // returns after `idle_resume`, and the scope's join ends.
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), None),
+            )
+        });
+        client.exploring();
+        // The probe explore mode publishes when it starts.
+        let before = client.wait_for("probe", |_| true);
+        let a_before = numbers(before.json.get("layers").at(1).get("a"));
+        assert_ne!(a_before[5], 0.0);
+        assert_eq!(post(addr, &token, "neuron", "layer=1&neuron=5"), 204);
+        client.wait_for("neuron", |j| j.get("neuron").num() == 5.0);
+        assert_eq!(post(addr, &token, "mask", "linear=0&neuron=5&on=0"), 204);
+        let after = client.wait_for("probe", |j| {
+            numbers(j.get("layers").at(1).get("masked")) == [5.0]
+        });
+        let a_after = numbers(after.json.get("layers").at(1).get("a"));
+        assert_eq!(a_after[5], 0.0);
+        for (j, (x, y)) in a_before.iter().zip(&a_after).enumerate() {
+            if j != 5 {
+                assert_eq!(x, y, "neuron {j}");
+            }
+        }
+        let neuron = client.wait_for("neuron", |j| !j.get("on").boolean());
+        assert_eq!(neuron.json.get("neuron").num(), 5.0);
+        assert_eq!(neuron.json.get("a").num(), 0.0);
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        run.join().unwrap().unwrap();
+        client.close();
+    });
+    assert_eq!(off(&model, 0), [5]);
+}
+
+/// Ranking a 16-wide hidden layer streams 16 `ablation` events in neuron order, then a
+/// `status` with the ranking.
+#[test]
+fn explore_ablation_streams_every_neuron() {
+    let (mut model, mut params, data) = trained(16);
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), None),
+            )
+        });
+        client.exploring();
+        assert_eq!(post(addr, &token, "ablate", "linear=0"), 204);
+        let events = client.until_status("ranked");
+        let ablations: Vec<&Json> = events
+            .iter()
+            .filter(|m| m.name == "ablation")
+            .map(|m| &m.json)
+            .collect();
+        let neurons: Vec<f64> = ablations.iter().map(|j| j.get("neuron").num()).collect();
+        let want: Vec<f64> = (0..16).map(f64::from).collect();
+        assert_eq!(neurons, want);
+        assert!(ablations.iter().all(|j| j.get("linear").num() == 0.0));
+        assert!(ablations.iter().all(|j| !j.get("loss").is_null()));
+        // One ranking, one sweep number.
+        let sweep = ablations[0].get("sweep").num();
+        assert!(ablations.iter().all(|j| j.get("sweep").num() == sweep));
+        let ranking = events.last().unwrap();
+        assert_eq!(ranking.json.get("state").str(), "explore");
+        let message = ranking.json.get("message").str();
+        assert!(message.contains("16 neurons"), "{message}");
+        // No probe set was configured: the rows are training rows, and the message says so.
+        assert!(message.contains("training rows"), "{message}");
+        // A second ranking is a new sweep, so the page does not mix the two.
+        assert_eq!(post(addr, &token, "ablate", "linear=0"), 204);
+        let again = client.until_status("ranked");
+        let second = find(&again, "ablation").json.get("sweep").num();
+        assert!(second > sweep, "{second} after {sweep}");
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        run.join().unwrap().unwrap();
+        client.close();
+    });
+    // The sweep leaves the model as it was.
+    assert!(model.neuron_mask(0).is_none());
+}
+
+/// A shrink run streams one `shrink` event per level, the same levels a plain `shrink`
+/// run finds, and leaves the model and its parameters at the kept level, bit for bit.
+#[test]
+fn explore_shrink_streams_steps() {
+    let (mut model, mut params, data) = trained(32);
+    let (mut plain, mut plain_params) = (model.clone(), params.clone());
+    let report = shrink(&mut plain, &mut plain_params, &data, shrink_config(3000)).unwrap();
+    assert_eq!(report.steps.len(), 3);
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), Some(3000)),
+            )
+        });
+        client.exploring();
+        assert_eq!(post(addr, &token, "shrink", ""), 204);
+        let events = client.until_status("shrink finished");
+        let levels = shrink_events(&events);
+        assert_eq!(levels.len(), 3);
+        for (level, step) in levels.iter().zip(&report.steps) {
+            assert_eq!(level.get("removed_bp").num(), f64::from(step.removed_bp));
+            let kept: Vec<usize> = level
+                .get("kept")
+                .arr()
+                .iter()
+                .map(|k| k.num() as usize)
+                .collect();
+            assert_eq!(kept, step.kept);
+            assert_eq!(level.get("met").boolean(), step.met);
+        }
+        let number = levels[0].get("run").num();
+        assert!(levels.iter().all(|j| j.get("run").num() == number));
+        // The network's size and the page's view of switched-off neurons follow the kept
+        // level: a `network` snapshot with its parameter count and a probe with its masked
+        // neurons, in either order.
+        let chosen = &report.steps[report.chosen.unwrap()];
+        let masked = off(&plain, 0).len();
+        let (mut sized, mut probed) = (false, false);
+        let start = Instant::now();
+        while !(sized && probed) {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "network {sized}, probe {probed}"
+            );
+            let m = client.next("the kept level");
+            match m.name.as_str() {
+                "network" => {
+                    let p = m.json.get("parameters");
+                    sized |= !p.is_null() && p.num() == chosen.parameters as f64;
+                }
+                "probe" => {
+                    probed |= m.json.get("layers").at(1).get("masked").arr().len() == masked;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        run.join().unwrap().unwrap();
+        client.close();
+    });
+    assert_eq!(off(&model, 0), off(&plain, 0));
+    assert!(!off(&model, 0).is_empty());
+    assert_eq!(bits(&model, &params), bits(&plain, &plain_params));
+}
+
+/// `Cancel` ends a shrink run after the level in progress and keeps the best level so far:
+/// the model is the one a plain run of that one level gives. A command that cannot run
+/// beside a shrink run is answered with a `status` message.
+#[test]
+fn explore_shrink_cancel_keeps_best() {
+    let (mut model, mut params, data) = trained(32);
+    let (mut plain, mut plain_params) = (model.clone(), params.clone());
+    shrink(&mut plain, &mut plain_params, &data, shrink_config(1000)).unwrap();
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        // Queued before explore mode starts, so the run reads the switch and the cancel
+        // after its first level, whatever the machine's speed.
+        assert_eq!(post(addr, &token, "shrink", ""), 204);
+        assert_eq!(post(addr, &token, "mask", "linear=0&neuron=1&on=0"), 204);
+        assert_eq!(post(addr, &token, "cancel", ""), 204);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), Some(9500)),
+            )
+        });
+        let events = client.until_status("shrink cancelled");
+        assert_eq!(shrink_events(&events).len(), 1);
+        // The cancel is acknowledged before the level in progress ends.
+        let ack = events
+            .iter()
+            .position(|m| {
+                m.name == "status" && m.json.get("message").str().starts_with("cancelling")
+            })
+            .expect("a cancelling status");
+        let level = events.iter().position(|m| m.name == "shrink").unwrap();
+        assert!(ack < level, "acknowledged at {ack}, level at {level}");
+        assert!(events.iter().any(|m| {
+            m.name == "status" && m.json.get("message").str().contains("in progress")
+        }));
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        run.join().unwrap().unwrap();
+        client.close();
+    });
+    assert_eq!(off(&model, 0), off(&plain, 0));
+    assert_eq!(bits(&model, &params), bits(&plain, &plain_params));
+}
+
+/// The shrink lab runs again on a later click, on the network the first run left.
+#[test]
+fn explore_shrink_runs_twice() {
+    let (mut model, mut params, data) = trained(32);
+    let (mut plain, mut plain_params) = (model.clone(), params.clone());
+    shrink(&mut plain, &mut plain_params, &data, shrink_config(2000)).unwrap();
+    shrink(&mut plain, &mut plain_params, &data, shrink_config(2000)).unwrap();
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), Some(2000)),
+            )
+        });
+        client.exploring();
+        for _ in 0..2 {
+            assert_eq!(post(addr, &token, "shrink", ""), 204);
+            let events = client.until_status("shrink finished");
+            let levels: Vec<f64> = shrink_events(&events)
+                .iter()
+                .map(|j| j.get("removed_bp").num())
+                .collect();
+            assert_eq!(levels, [1000.0, 2000.0]);
+        }
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        run.join().unwrap().unwrap();
+        client.close();
+    });
+    assert_eq!(off(&model, 0), off(&plain, 0));
+    assert_eq!(bits(&model, &params), bits(&plain, &plain_params));
+}
+
+/// Without training rows, or without a shrink factory, `Shrink` is answered with a `status`
+/// message naming what is missing, and the model is left alone.
+#[test]
+fn explore_without_train_refuses_shrink() {
+    let (mut model, mut params, data) = trained(16);
+    let before = bits(&model, &params);
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    for (train, max_bp, missing) in [
+        (None, Some(2000), "ExploreConfig::train"),
+        (Some(data.clone()), None, "ExploreConfig::shrink"),
+    ] {
+        thread::scope(|s| {
+            let client = Client::open(addr, &token);
+            wait_clients(&inspector, 1);
+            let (model, params, inspector) = (&mut model, &mut params, &mut inspector);
+            // The configuration holds a callback that is not `Send`: it is made on the
+            // thread that explores.
+            let run =
+                s.spawn(move || inspector.explore(model, params, explore_config(train, max_bp)));
+            client.exploring();
+            assert_eq!(post(addr, &token, "shrink", ""), 204);
+            let events = client.until_status("cannot shrink");
+            assert!(shrink_events(&events).is_empty());
+            let refusal = events.last().unwrap();
+            assert_eq!(refusal.json.get("state").str(), "explore");
+            assert!(
+                refusal.json.get("message").str().contains(missing),
+                "{}",
+                refusal.raw
+            );
+            assert_eq!(post(addr, &token, "finish", ""), 204);
+            run.join().unwrap().unwrap();
+            client.wait_for("status", |j| j.get("state").str() == "finished");
+            client.close();
+        });
+    }
+    assert!(model.neuron_mask(0).is_none());
+    assert_eq!(bits(&model, &params), before);
+}
+
+/// `Finish` from the page ends explore mode: `explore` returns and the page is told.
+#[test]
+fn explore_finish_returns() {
+    let (mut model, mut params, data) = trained(16);
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), None),
+            )
+        });
+        client.exploring();
+        // Commands for training only are answered, and explore mode goes on.
+        assert_eq!(post(addr, &token, "pause", ""), 204);
+        let m = client.wait_for("status", |_| true);
+        assert_eq!(m.json.get("state").str(), "explore");
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        let start = Instant::now();
+        run.join().unwrap().unwrap();
+        assert!(start.elapsed() < Duration::from_secs(5));
+        client.wait_for("status", |j| j.get("state").str() == "finished");
+        client.close();
+    });
+}
+
+/// With no client for `idle_resume`, `explore` returns on its own.
+#[test]
+fn explore_returns_when_idle() {
+    let (mut model, mut params, data) = trained(16);
+    let mut inspector = Inspector::start(InspectorConfig {
+        idle_resume: Duration::from_millis(300),
+        ..inspector_config()
+    })
+    .unwrap();
+    let start = Instant::now();
+    inspector
+        .explore(&mut model, &mut params, explore_config(Some(data), None))
+        .unwrap();
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(300), "{took:?}");
+    assert!(took < Duration::from_secs(1), "{took:?}");
+}
+
+/// Ranking the neurons of a model with no hidden `Linear` is answered with a `status`
+/// message in the library's words, as is a `Linear` the model does not have; explore mode
+/// goes on.
+#[test]
+fn ablate_on_model_without_hidden_linear_reports_status() {
+    let data = digits(256, 13);
+    let mut params = ParamStore::new();
+    let mut model = Sequential::new().push(Linear::new(&mut params, 64, 10, &mut Rng::seed(2)));
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        let run = s.spawn(|| {
+            inspector.explore(
+                &mut model,
+                &mut params,
+                explore_config(Some(data.clone()), None),
+            )
+        });
+        client.exploring();
+        for (query, words) in [
+            ("linear=0", "last Linear layer"),
+            ("linear=3", "1 Linear layer"),
+        ] {
+            assert_eq!(post(addr, &token, "ablate", query), 204);
+            let events = client.until_status("cannot rank");
+            assert!(events.iter().all(|m| m.name != "ablation"));
+            let m = events.last().unwrap();
+            assert_eq!(m.json.get("state").str(), "explore");
+            assert!(m.json.get("message").str().contains(words), "{}", m.raw);
+            assert!(
+                !m.json.get("message").str().contains("1 Linear layers"),
+                "{}",
+                m.raw
+            );
+        }
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        run.join().unwrap().unwrap();
+        client.close();
+    });
+}
+
+/// A program that drops the inspector as soon as explore mode returns still gets its last
+/// `status` to the page: `Drop` lets the clients read what is queued before it closes.
+#[test]
+fn explore_finished_reaches_the_page_before_drop() {
+    let (mut model, mut params, data) = trained(16);
+    let inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        let (model, params) = (&mut model, &mut params);
+        let run = s.spawn(move || {
+            let mut inspector = inspector;
+            let config = ExploreConfig {
+                train: Some(data),
+                ..ExploreConfig::default()
+            };
+            let result = inspector.explore(model, params, config);
+            let start = Instant::now();
+            drop(inspector);
+            (result, start.elapsed())
+        });
+        let finished = client.wait_for("status", |j| j.get("state").str() == "finished");
+        assert!(
+            finished
+                .json
+                .get("message")
+                .str()
+                .contains("finished from the page")
+        );
+        let (result, dropping) = run.join().unwrap();
+        result.unwrap();
+        assert!(dropping < Duration::from_secs(1), "{dropping:?}");
+        client.close();
+    });
 }
