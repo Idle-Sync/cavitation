@@ -750,7 +750,8 @@ fn backward_timed_is_bit_identical() {
 
 /// A backward pass into a second gradient set made with `ParamGrads::like` leaves the
 /// store's own gradients as they were: stale while stale, and unchanged once written. The
-/// second set gets the same gradients a backward into the store's gives.
+/// second set, cleared with its own `zero_grad` and reused, gets the same gradients a
+/// backward into the store's gives.
 #[test]
 fn second_gradient_set_leaves_the_store() {
     let mut d = Digits::new();
@@ -776,9 +777,9 @@ fn second_gradient_set_leaves_the_store() {
         .map(|&id| bits(d.params.grad(id).data()))
         .collect();
 
-    // Another pass into the second set, after it was marked stale, leaves the store's
-    // current gradients untouched.
-    let mut second = ParamGrads::like(&d.params.values);
+    // The first set reused after `zero_grad`: another pass into it leaves the store's
+    // current gradients untouched and overwrites (not adds to) the set's own.
+    second.zero_grad();
     let mut tape = graph.tape(&d.params.values);
     let (loss, _) = d.record(&mut tape);
     tape.backward(loss, &mut second);

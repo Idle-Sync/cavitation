@@ -87,17 +87,25 @@ impl Trace {
     /// clock is read and nothing is allocated for times.
     ///
     /// ```
+    /// use std::time::Duration;
     /// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
-    /// use cavitation_nn::{Linear, Sequential, Trace};
+    /// use cavitation_nn::{Linear, Relu, Sequential, Trace};
     /// let mut params = ParamStore::new();
-    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Relu);
     /// let mut graph = Graph::new();
     /// let mut tape = graph.tape(&params.values);
     /// let x = tape.input(Tensor::full(&[4, 2], 1.0f32).view());
     /// let mut trace = Trace::new();
     /// trace.set_timing(true);
     /// net.forward_traced(&mut tape, x, &mut trace);
-    /// let _took = trace.forward_time(0);
+    /// let total: Duration = (0..trace.len()).map(|i| trace.forward_time(i)).sum();
+    /// assert_eq!(trace.len(), 2);
+    /// assert!(total >= trace.forward_time(0));
+    /// trace.set_timing(false);
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// assert_eq!(trace.forward_time(0), Duration::ZERO);
     /// ```
     pub fn set_timing(&mut self, on: bool) {
         self.timing = on;

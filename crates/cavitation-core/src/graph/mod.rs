@@ -642,6 +642,23 @@ impl<T: Real> Tape<'_, T> {
         marks: &[Var],
         times: &mut [Duration],
     ) {
+        self.backward_timed_with(loss, grads, marks, times, Instant::now);
+    }
+
+    /// [`backward_timed`](Tape::backward_timed) reading the clock through `now`, so a test
+    /// can count the reads; `backward_timed` passes `Instant::now`.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the conditions `backward_timed` lists.
+    fn backward_timed_with(
+        &mut self,
+        loss: Var,
+        grads: &mut ParamGrads<T>,
+        marks: &[Var],
+        times: &mut [Duration],
+        now: impl FnMut() -> Instant,
+    ) {
         let shape = self.shape(loss);
         assert!(
             shape.len() == 1,
@@ -666,7 +683,7 @@ impl<T: Real> Tape<'_, T> {
             );
             previous = index;
         }
-        self.backward_pass(loss, &[T::ONE], grads, Some((marks, times)));
+        self.backward_pass(loss, &[T::ONE], grads, Some((marks, times, now)));
     }
 
     /// Like [`backward`](Tape::backward) for an output of any size: seeds the gradient of
@@ -679,14 +696,15 @@ impl<T: Real> Tape<'_, T> {
     /// on this tape, or if `grads` belongs to another [`ParamStore`] than the values this
     /// tape reads.
     pub(crate) fn backward_seeded(&mut self, out: Var, seed: &[T], grads: &mut ParamGrads<T>) {
-        self.backward_pass(out, seed, grads, None);
+        self.backward_pass(out, seed, grads, None::<(_, _, fn() -> Instant)>);
     }
 
     /// The reverse pass behind [`backward`](Tape::backward), `backward_seeded` and
     /// [`backward_timed`](Tape::backward_timed): seeds `out`'s gradient with `seed` and
     /// walks the nodes from `out` down to the first. With `timing`, the walk is split at the
-    /// marks (already checked to be in recording order) and each segment's time is added to
-    /// its entry; the node loop is the same either way.
+    /// marks (already checked to be in recording order) as [`segments`] gives them, and
+    /// each segment's time is added to its entry; the node loop is the same either way. The
+    /// clock, `now`, is read once before the walk and once after each segment.
     ///
     /// # Panics
     ///
@@ -696,7 +714,7 @@ impl<T: Real> Tape<'_, T> {
         out: Var,
         seed: &[T],
         grads: &mut ParamGrads<T>,
-        timing: Option<(&[Var], &mut [Duration])>,
+        timing: Option<(&[Var], &mut [Duration], impl FnMut() -> Instant)>,
     ) {
         assert!(
             grads.store_id() == self.params.store_id(),
@@ -759,27 +777,16 @@ impl<T: Real> Tape<'_, T> {
                 nodes[i].op.backward(this, out_grad, &mut ctx);
             }
         };
-        let Some((marks, times)) = timing else {
+        let Some((marks, times, mut now)) = timing else {
             walk(0..loss_index + 1);
             return;
         };
-        // Segment `j` is the nodes after mark `j - 1` up to mark `j`; the last runs to the
-        // loss. Walked from the last segment down, each ends where the one below begins.
-        let mut end = loss_index + 1;
-        let mut clock = Instant::now();
-        for j in (0..=marks.len()).rev() {
-            let start = match j {
-                0 => 0,
-                _ => marks[j - 1].index_on(tape) + 1,
-            };
-            if start >= end {
-                continue;
-            }
-            walk(start..end);
-            end = start;
-            let now = Instant::now();
-            times[j] += now - clock;
-            clock = now;
+        let mut clock = now();
+        for (j, range) in segments(marks, tape, loss_index) {
+            walk(range);
+            let t = now();
+            times[j] += t - clock;
+            clock = t;
         }
     }
 
@@ -846,6 +853,34 @@ impl<T: Real> Tape<'_, T> {
             tape: self.id,
         }
     }
+}
+
+/// The non-empty segments of a timed backward pass over a tape whose loss is node
+/// `loss_index`, in the order the pass walks them (last first): each segment's entry in
+/// `times` and its node range. Segment `j` is the nodes after `marks[j - 1]` up to and
+/// including `marks[j]` (from node 0 for `j = 0`); segment `marks.len()` is the nodes after
+/// the last mark up to the loss. Nodes after the loss belong to no segment, so a segment
+/// that would hold only such nodes, or none (between equal marks), is left out. `marks`
+/// must be in recording order, on the tape with id `tape`.
+fn segments(
+    marks: &[Var],
+    tape: u32,
+    loss_index: usize,
+) -> impl Iterator<Item = (usize, std::ops::Range<usize>)> + '_ {
+    // Each segment ends where the one above it began.
+    let mut end = loss_index + 1;
+    (0..=marks.len()).rev().filter_map(move |j| {
+        let start = match j {
+            0 => 0,
+            _ => marks[j - 1].index_on(tape) + 1,
+        };
+        if start >= end {
+            return None;
+        }
+        let range = start..end;
+        end = start;
+        Some((j, range))
+    })
 }
 
 impl<T: Real> Drop for Tape<'_, T> {
@@ -1037,6 +1072,64 @@ mod tests {
             Duration::ZERO,
             "the segment after a mark past the loss"
         );
+    }
+
+    /// `Var`s at the given node positions of tape 0, as marks for [`super::segments`].
+    fn at(indices: &[u32]) -> Vec<super::Var> {
+        indices
+            .iter()
+            .map(|&index| super::Var { index, tape: 0 })
+            .collect()
+    }
+
+    /// The segments of a timed pass, case by case: each mark's own node is in its segment,
+    /// equal marks and marks at or past the loss leave segments out, and no marks give one
+    /// segment of every node up to the loss.
+    #[test]
+    fn segments_cover_each_node_once() {
+        let seg = |marks: &[u32], loss| super::segments(&at(marks), 0, loss).collect::<Vec<_>>();
+        // Layers end at nodes 2, 5 and 7; the loss is node 9.
+        assert_eq!(
+            seg(&[2, 5, 7], 9),
+            [(3, 8..10), (2, 6..8), (1, 3..6), (0, 0..3)]
+        );
+        // Equal marks: segment 1 holds nothing.
+        assert_eq!(seg(&[2, 2, 7], 9), [(3, 8..10), (2, 3..8), (0, 0..3)]);
+        // A mark at the loss: nothing after it.
+        assert_eq!(seg(&[2, 9], 9), [(1, 3..10), (0, 0..3)]);
+        // A mark after the loss: its segment is cut at the loss, the one after is empty.
+        assert_eq!(seg(&[2, 12], 9), [(1, 3..10), (0, 0..3)]);
+        // A first mark at node 0.
+        assert_eq!(seg(&[0, 4], 6), [(2, 5..7), (1, 1..5), (0, 0..1)]);
+        // No marks.
+        assert_eq!(seg(&[], 4), [(0, 0..5)]);
+    }
+
+    /// The timed pass reads the clock once before the walk and once after each non-empty
+    /// segment, never per node, and each segment gets the time between its two reads.
+    #[test]
+    fn backward_timed_reads_the_clock_at_boundaries_only() {
+        let (mut store, p, mut graph) = square_store();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(p); // node 0
+        let a = tape.mul(v, v); // 1
+        let b = tape.add(a, a); // 2
+        let c = tape.mul(b, b); // 3
+        let d = tape.add(c, c); // 4
+        let loss = tape.sum(d); // 5
+        let base = std::time::Instant::now();
+        let mut reads = 0u32;
+        // Each read is one millisecond after the last.
+        let clock = || {
+            reads += 1;
+            base + Duration::from_millis(u64::from(reads))
+        };
+        let mut times = [Duration::ZERO; 5];
+        // Segments: 4 = 5..6, 3 = 3..5, 2 = empty (equal marks), 1 = 2..3, 0 = 0..2.
+        tape.backward_timed_with(loss, &mut store.grads, &[a, b, b, d], &mut times, clock);
+        let ms = Duration::from_millis(1);
+        assert_eq!(times, [ms, ms, Duration::ZERO, ms, ms]);
+        assert_eq!(reads, 4 + 1);
     }
 
     /// The timed pass checks the loss's size as `backward` does.

@@ -187,6 +187,9 @@ impl<T: Real> ParamGrads<T> {
     /// then on. Making the set allocates its bookkeeping and one zero buffer as long as the
     /// largest parameter, nothing per parameter.
     ///
+    /// Clear it with [`zero_grad`](Self::zero_grad) between passes, as a store is cleared;
+    /// otherwise each pass adds to the last.
+    ///
     /// A parameter added to the store afterwards has no gradient here: a backward pass that
     /// reaches it panics. Make a new set after adding parameters.
     ///
@@ -214,6 +217,31 @@ impl<T: Real> ParamGrads<T> {
             stale: vec![true; values.tensors.len()],
             zeros: vec![T::ZERO; largest.unwrap_or(0)],
         }
+    }
+
+    /// Marks every gradient in this set stale, so each reads as zeros and its next
+    /// contribution overwrites it. Writes nothing to the buffers and allocates nothing.
+    /// [`ParamStore::zero_grad`] does this for the store's own set; call it directly on a
+    /// set made with [`like`](Self::like).
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamGrads, ParamStore, Tensor};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 3.0f32));
+    /// let mut second = ParamGrads::like(&store.values);
+    /// let mut graph = Graph::new();
+    /// for _ in 0..2 {
+    ///     second.zero_grad();
+    ///     let mut tape = graph.tape(&store.values);
+    ///     let v = tape.param(p);
+    ///     let loss = tape.mul(v, v);
+    ///     tape.backward(loss, &mut second);
+    /// }
+    /// // The second pass overwrote the first instead of adding to it.
+    /// assert_eq!(second.accumulate(p).0.data(), &[6.0]);
+    /// ```
+    pub fn zero_grad(&mut self) {
+        self.stale.fill(true);
     }
 
     /// The position of `id` in this set.
@@ -458,7 +486,7 @@ impl<T: Real> ParamStore<T> {
     /// assert_eq!(store.grad(p).data(), &[0.0]);
     /// ```
     pub fn zero_grad(&mut self) {
-        self.grads.stale.fill(true);
+        self.grads.zero_grad();
     }
 
     /// The value of parameter `id`.
