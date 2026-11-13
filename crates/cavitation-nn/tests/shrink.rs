@@ -1,9 +1,13 @@
-//! Tests of `shrink::shrink` (the shrink tool, at the end), `shrink::ablate` (the ablation
-//! sweep, before it) and `shrink::compact`: a masked network rebuilt without its off
-//! neurons gives the masked network's outputs (bit for bit on the kernel levels whose sums do not depend on an
-//! output's position, within the documented rounding bound on the others), and the masks
-//! and layers it cannot compact are refused with a message that says what to do. The kernel
-//! level is the one `CAVITATION_KERNEL` sets for the test process, except in
+//! Tests of the shrinking tools.
+//!
+//! - `shrink::compact`: a masked network rebuilt without its off neurons gives the masked
+//!   network's outputs, bit for bit on the kernel levels whose sums do not depend on an
+//!   output's position and within the documented rounding bound on the others; the masks
+//!   and layers it cannot compact are refused with a message that says what to do.
+//! - `shrink::ablate`: the ablation sweep, after the compaction tests.
+//! - `shrink::shrink`: the shrink tool, at the end.
+//!
+//! The kernel level is the one `CAVITATION_KERNEL` sets for the test process, except in
 //! `matvec_drops_zero_terms_at_every_level`, which names each level it runs.
 
 use cavitation_core::kernels::matvec::matvec_f32_with;
@@ -11,7 +15,7 @@ use cavitation_core::kernels::{Level, MatRef, supported};
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
 use cavitation_nn::shrink::{
     Ablation, Criterion, Ranking, RetrainConfig, ShrinkConfig, ShrinkStep, ShrinkWarning,
-    Validation, ablate, ablate_with, compact, shrink,
+    Validation, ablate, ablate_with, activity, compact, shrink,
 };
 use cavitation_nn::{
     Activation, ActivationLayer, Dataset, Evaluator, Flow, InferenceModel, Layer, Linear, Loss,
@@ -1573,23 +1577,24 @@ fn model_left_at_chosen_step() {
     let mut params = ParamStore::new();
     let (mut net, train) = trained(&mut params);
     let config = ShrinkConfig {
-        max_removed_bp: 5000,
+        patience: None,
         ..quick(clusters(200, 8, 9))
     };
     let report = shrink(&mut net, &mut params, &train, config).unwrap();
     let chosen = report.chosen.expect("a step meets the criterion");
+    // A later step missed, so keeping the last step instead would show below.
+    assert!(chosen + 1 < report.steps.len(), "chosen {chosen}");
     let (masks, store) = report.steps[chosen].checkpoint.as_ref().unwrap();
     assert_eq!(masks.len(), 1);
     for (linear, mask) in masks {
         assert_eq!(net.neuron_mask(*linear), Some(mask));
     }
     assert_same_store(&net, &params, store);
-    // A later step's store differs, so the comparison above is not empty.
-    if let Some(later) = report.steps.get(chosen + 1) {
-        let (_, other) = later.checkpoint.as_ref().unwrap();
-        let w = net.linear(0).unwrap().weight();
-        assert_ne!(other.value(w).data(), params.value(w).data());
-    }
+    // The last step's network differs, so the comparison above tells them apart.
+    let (last_masks, last) = report.steps.last().unwrap().checkpoint.as_ref().unwrap();
+    assert_ne!(last_masks, masks);
+    let w = net.linear(0).unwrap().weight();
+    assert_ne!(last.value(w).data(), params.value(w).data());
 }
 
 /// Removing 99.9% of 8 neurons keeps one: no level leaves a layer empty.
@@ -1723,6 +1728,16 @@ fn carve_holds_out_the_last_rows() {
     let want = cavitation_nn::evaluate(&net, &params, &held, Loss::CrossEntropy, 256).unwrap();
     let report = shrink(&mut net, &mut params, &train, config).unwrap();
     assert_eq!(report.baseline, want);
+    // 0.07 of 100 rows is 7 rows, though 0.07 · 100.0 is just above 7 in binary.
+    let config = ShrinkConfig {
+        validation: Some(Validation::Carve { share: 0.07 }),
+        max_removed_bp: 1000,
+        ..quick(clusters(1, 4, 1))
+    };
+    let seven = train.subset(93..100);
+    let want = cavitation_nn::evaluate(&net, &params, &seven, Loss::CrossEntropy, 256).unwrap();
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert_eq!(report.baseline, want);
     for share in [0.0, 1.0, -0.5, f64::NAN] {
         let config = ShrinkConfig {
             validation: Some(Validation::Carve { share }),
@@ -1801,5 +1816,169 @@ fn bad_data_is_invalid_data() {
             panic!("expected InvalidData, got {err:?}");
         };
         assert!(msg.contains(words) && msg.contains("29 labels"), "{msg}");
+    }
+}
+
+/// `Validation::Carve` measures activity and retrains on the rows it does not hold out:
+/// the ranking sees the activity of the first 74 rows, and the step's parameters are those
+/// of `fit` on those rows with the step's masks, bit for bit.
+#[test]
+fn carve_retrains_on_the_rest() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 8);
+    let (start_net, start) = (net.clone(), params.clone());
+    let train = clusters(100, 4, 7);
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let log = seen.clone();
+    let config = ShrinkConfig {
+        validation: Some(Validation::Carve { share: 0.26 }),
+        ranking: Ranking::Custom(Box::new(move |ctx| {
+            log.borrow_mut().push(ctx.activity.clone());
+            ctx.on.iter().map(|&j| j as f64).collect()
+        })),
+        step_bp: 2000,
+        max_removed_bp: 2000,
+        ..quick(clusters(1, 4, 1))
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    let rest = train.subset(0..74);
+    let want = activity(&start_net, &start, &rest, &[0], 256).unwrap();
+    assert_eq!(*seen.borrow(), want);
+    let (masks, store) = report.steps[0].checkpoint.as_ref().unwrap();
+    let (mut by_hand, mut values) = (start_net.clone(), start.clone());
+    by_hand.set_neuron_mask(0, masks[0].1.clone());
+    let retrain = RetrainConfig::default();
+    let config = cavitation_nn::FitConfig {
+        epochs: 1,
+        batch: retrain.batch,
+        optimizer: retrain.optimizer,
+        loss: retrain.loss,
+        shuffle_seed: retrain.shuffle_seed,
+        health: cavitation_nn::Health::quiet(),
+        ..cavitation_nn::FitConfig::default()
+    };
+    cavitation_nn::fit(&by_hand, &mut values, &rest, config).unwrap();
+    assert_same_store(&by_hand, store, &values);
+}
+
+/// A 4 → 10 → Tanh → 3 network whose neuron 4 is always about −1 (bias −5, no incoming
+/// weight): it never fires but its output is far from 0, so it is not dead, and its mean
+/// is the lowest while its mean |a| is the highest. Its outgoing weights are the largest.
+fn tanh_network(params: &mut ParamStore) -> Sequential {
+    let mut rng = Rng::seed(3);
+    let net = Sequential::new()
+        .push(linear(params, 4, 10, &mut rng))
+        .push(Tanh)
+        .push(linear(params, 10, 3, &mut rng));
+    let first = net.linear(0).unwrap();
+    params.value_mut(first.bias()).data_mut()[4] = -5.0;
+    for w in &mut params.value_mut(first.weight()).data_mut()[16..20] {
+        *w = 0.0;
+    }
+    let last = net.linear(2).unwrap().weight();
+    for row in params.value_mut(last).data_mut().chunks_mut(10) {
+        row[4] = 10.0;
+    }
+    net
+}
+
+/// The two neurons with the lowest `key`, in increasing order.
+fn lowest_two(key: impl Fn(usize) -> f64) -> Vec<usize> {
+    let mut all: Vec<usize> = (0..10).collect();
+    all.sort_by(|&a, &b| key(a).total_cmp(&key(b)));
+    let mut two = all[..2].to_vec();
+    two.sort_unstable();
+    two
+}
+
+/// On a Tanh network, a neuron that never fires but outputs about −1 is not dead: with
+/// `dead_first` and the out-norm ranking it stays, and the two lowest out-norms go.
+/// `Ranking::Activity` ranks by mean |a|, not the mean: the two lowest mean |a| go, and
+/// the neuron with the lowest mean stays.
+#[test]
+fn tanh_neurons_rank_by_output_size() {
+    let mut params = ParamStore::new();
+    let net = tanh_network(&mut params);
+    let train = clusters(32, 4, 4);
+    let stats = activity(&net, &params, &train, &[0], 256)
+        .unwrap()
+        .remove(0);
+    assert_eq!(stats.firing[4], 0.0);
+    assert!(stats.mean_abs[4] > 0.99 && stats.mean[4] < -0.99);
+    let w = params
+        .value(net.linear(2).unwrap().weight())
+        .data()
+        .to_vec();
+    let norm = |j: usize| {
+        (0..3)
+            .map(|r| f64::from(w[r * 10 + j]).powi(2))
+            .sum::<f64>()
+    };
+    for (ranking, want) in [
+        (Ranking::OutNorm, lowest_two(norm)),
+        (Ranking::Activity, lowest_two(|j| stats.mean_abs[j])),
+    ] {
+        let (mut net, mut params) = (net.clone(), params.clone());
+        let config = ShrinkConfig {
+            ranking,
+            ..one_level(clusters(30, 4, 5), true)
+        };
+        let report = shrink(&mut net, &mut params, &train, config).unwrap();
+        let off = off_in(&report.steps[0], 0);
+        assert_eq!(off, want);
+        assert!(!off.contains(&4));
+    }
+}
+
+/// A NaN score goes last whatever its sign bit: one computed at run time (`0.0 / 0.0`,
+/// which has the sign bit set on common hardware) and `-NAN` are both kept, while the
+/// lowest numbers go.
+#[test]
+fn nan_scores_go_last() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 10);
+    let config = ShrinkConfig {
+        ranking: Ranking::Custom(Box::new(|ctx| {
+            let computed = std::hint::black_box(0.0_f64) / std::hint::black_box(0.0);
+            ctx.on
+                .iter()
+                .map(|&j| match j {
+                    0 => computed,
+                    1 => -f64::NAN,
+                    _ => j as f64,
+                })
+                .collect()
+        })),
+        step_bp: 5000,
+        max_removed_bp: 5000,
+        dead_first: false,
+        criterion: Some(ALWAYS),
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    assert_eq!(off_in(&report.steps[0], 0), [2, 3, 4, 5, 6]);
+}
+
+/// With no retraining epochs each step only masks: its parameters are the ones given, bit
+/// for bit.
+#[test]
+fn zero_epochs_leave_the_parameters() {
+    let mut params = ParamStore::new();
+    let mut net = hidden_network(&mut params, 4, 10);
+    let before = params.clone();
+    let config = ShrinkConfig {
+        criterion: Some(ALWAYS),
+        max_removed_bp: 3000,
+        retrain: RetrainConfig {
+            epochs: 0,
+            ..RetrainConfig::default()
+        },
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
+    assert_eq!(report.steps.len(), 3);
+    for step in &report.steps {
+        let (_, store) = step.checkpoint.as_ref().unwrap();
+        assert_same_store(&net, store, &before);
     }
 }

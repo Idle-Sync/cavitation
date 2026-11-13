@@ -7,7 +7,7 @@ use std::fmt;
 
 use cavitation_core::{Error, ParamStore, Rng};
 
-use super::ablate::{check_hidden, points_lost, relative_increase};
+use super::ablate::{check_hidden, points_lost};
 use super::{LayerActivity, activity, neurons_on};
 use crate::train::check_dataset;
 use crate::{
@@ -22,9 +22,9 @@ const EVAL_BATCH: usize = 256;
 const FULL_BP: u32 = 10_000;
 
 /// How [`shrink`] orders the neurons of a layer for removal: each neuron gets a score, and
-/// the lowest scores go first (ties by neuron index, lowest first; a NaN score sorts above
-/// every number, so it goes last). Every ranking is computed again at each step, on the
-/// network as the previous step's retraining left it.
+/// the lowest scores go first (ties by neuron index, lowest first; a NaN score, whatever
+/// its sign bit, sorts above every number, so it goes last). Every ranking is computed
+/// again at each step, on the network as the previous step's retraining left it.
 ///
 /// ```
 /// use cavitation_nn::shrink::{RankContext, Ranking, ShrinkConfig};
@@ -146,7 +146,14 @@ impl Criterion {
                 _ => false,
             },
             Criterion::LossIncrease { relative } => {
-                !now.loss.is_nan() && relative_increase(base.loss, now.loss) <= relative
+                // The documented inequality itself; a zero baseline allows no rise, and the
+                // product is left out so that an infinite `relative` does not give NaN.
+                let limit = if base.loss == 0.0 {
+                    base.loss
+                } else {
+                    base.loss + relative * base.loss.abs()
+                };
+                !now.loss.is_nan() && now.loss <= limit
             }
         }
     }
@@ -174,7 +181,8 @@ pub enum Validation {
     /// runs on the rest). The model must not have seen those rows: carve the same rows off
     /// before the first training, or the baseline and every step are measured on rows the
     /// network learned, and the stop rule cannot tell what pruning cost. `share` is above
-    /// 0 and below 1, and both parts keep at least one row.
+    /// 0 and below 1, and both parts keep at least one row. The share is read as the
+    /// decimal you wrote, so `0.07` of 100 rows holds out exactly 7.
     Carve {
         /// The share of the training rows to hold out, above 0 and below 1.
         share: f64,
@@ -343,7 +351,8 @@ impl fmt::Debug for ShrinkConfig {
 /// use cavitation_nn::Flow;
 /// let config = ShrinkConfig {
 ///     on_step: Some(Box::new(|step: &ShrinkStep| {
-///         println!("{} bp: kept {:?}, {} parameters", step.removed_bp, step.kept, step.parameters);
+///         let (bp, kept, parameters) = (step.removed_bp, &step.kept, step.parameters);
+///         println!("{bp} bp: kept {kept:?}, {parameters} parameters");
 ///         Flow::Continue
 ///     })),
 ///     ..ShrinkConfig::default()
@@ -537,7 +546,10 @@ pub struct ShrinkReport {
 /// let mut rng = Rng::seed(1);
 /// let x: Vec<f32> = (0..400).map(|_| rng.range(-1.0, 1.0) as f32).collect();
 /// let labels = x.chunks(2).map(|r| usize::from(r[0] > 0.0)).collect();
-/// let data = Dataset { x: Tensor::from_vec(x, &[200, 2]).unwrap(), targets: Targets::Classes(labels) };
+/// let data = Dataset {
+///     x: Tensor::from_vec(x, &[200, 2]).unwrap(),
+///     targets: Targets::Classes(labels),
+/// };
 /// let (train, held_out) = data.split_at(100);
 /// let mut params = ParamStore::new();
 /// let mut net = Sequential::new()
@@ -798,6 +810,7 @@ impl Run<'_, '_> {
         order.sort_by(|&a, &b| {
             dead(b)
                 .cmp(&dead(a))
+                .then(scores[a].is_nan().cmp(&scores[b].is_nan()))
                 .then(scores[a].total_cmp(&scores[b]))
                 .then(on[a].cmp(&on[b]))
         });
@@ -908,7 +921,7 @@ fn split(
                      0 and below 1 of the training rows; {carve_rule}"
                 )));
             }
-            let held = (share * n as f64).ceil() as usize;
+            let held = carved_rows(share, n);
             if held >= n {
                 return Err(Error::InvalidData(format!(
                     "shrink: Validation::Carve {{ share: {share} }} holds out {held} of the {n} \
@@ -918,6 +931,30 @@ fn split(
             let (rest, held_out) = train.split_at(n - held);
             Ok((Cow::Owned(rest), held_out))
         }
+    }
+}
+
+/// The rows `Validation::Carve { share }` holds out of `n`: `ceil(share · n)`, with `share`
+/// read as the shortest decimal that prints as it (`0.07` is 7/100, not the binary value
+/// just above it), so that `0.07` of 100 rows is 7 rows. The arithmetic is in integers;
+/// a share whose decimal has more than 30 digits after the point, or a product too large
+/// for them, falls back to the floating-point product.
+fn carved_rows(share: f64, n: usize) -> usize {
+    let text = share.to_string();
+    let digits = text.split_once('.').map_or("", |(_, frac)| frac);
+    let exact = (digits.len() <= 30)
+        .then(|| digits.parse::<u128>().ok())
+        .flatten()
+        .and_then(|num| {
+            let den = 10u128.pow(digits.len() as u32);
+            let whole = text.split_once('.').map_or(text.as_str(), |(w, _)| w);
+            let whole = whole.parse::<u128>().ok()?;
+            let scaled = whole.checked_mul(den)?.checked_add(num)?;
+            Some(scaled.checked_mul(n as u128)?.div_ceil(den))
+        });
+    match exact {
+        Some(rows) => usize::try_from(rows).unwrap_or(usize::MAX),
+        None => (share * n as f64).ceil() as usize,
     }
 }
 
@@ -1186,6 +1223,71 @@ mod tests {
             relative: f64::INFINITY,
         };
         assert!(!any.met(&base, &eval(f64::NAN, None), 100));
+        // A zero baseline allows no rise, but a loss at or below 0 meets it, for any
+        // `relative`.
+        let zero = eval(0.0, None);
+        for c in [loss, any] {
+            assert!(c.met(&zero, &eval(-0.1, None), 100));
+            assert!(c.met(&zero, &eval(0.0, None), 100));
+            assert!(!c.met(&zero, &eval(0.1, None), 100));
+        }
+    }
+
+    /// `Carve` reads the share as its decimal: 0.07 of 100 rows is 7, though
+    /// `0.07 * 100.0` is `7.000000000000001`; other shares round up.
+    #[test]
+    fn carved_rows_are_exact() {
+        assert_eq!(0.07 * 100.0, 7.000000000000001);
+        assert_eq!(carved_rows(0.07, 100), 7);
+        assert_eq!(carved_rows(0.255, 100), 26);
+        assert_eq!(carved_rows(0.2, 48), 10);
+        assert_eq!(carved_rows(0.5, 3), 2);
+        assert_eq!(carved_rows(0.1, 1_000_000), 100_000);
+        assert_eq!(carved_rows(1e-40, 10), 1);
+    }
+
+    /// With validation accuracies scripted as met, met, miss and `Flow::Stop` at the miss,
+    /// the run ends there and keeps step 2: the model holds step 2's masks and store, not
+    /// those of the step it stopped at.
+    #[test]
+    fn stop_at_a_miss_keeps_the_earlier_best() {
+        let mut params = ParamStore::new();
+        let (mut net, train) = small(&mut params);
+        let validation = Dataset {
+            x: Tensor::zeros(&[100, 4]),
+            targets: Targets::Classes(vec![0; 100]),
+        };
+        let mut script = vec![0.90, 0.90, 0.90, 0.50].into_iter();
+        let mut measure = |_: &Sequential, _: &ParamStore, _: &Dataset| {
+            Ok(eval(
+                1.0,
+                Some(script.next().expect("no more than 3 steps")),
+            ))
+        };
+        let config = ShrinkConfig {
+            validation: Some(Validation::Given(validation)),
+            keep_checkpoints: true,
+            retrain: RetrainConfig {
+                epochs: 1,
+                ..RetrainConfig::default()
+            },
+            on_step: Some(Box::new(
+                |step: &ShrinkStep| {
+                    if step.met { Flow::Continue } else { Flow::Stop }
+                },
+            )),
+            ..ShrinkConfig::default()
+        };
+        let report = run(&mut net, &mut params, &train, config, &mut measure).unwrap();
+        assert_eq!(report.steps.len(), 3);
+        assert_eq!(report.chosen, Some(1));
+        let (masks, store) = report.steps[1].checkpoint.as_ref().unwrap();
+        let (last_masks, last_store) = report.steps[2].checkpoint.as_ref().unwrap();
+        assert_ne!(masks, last_masks);
+        assert_eq!(net.neuron_mask(0), Some(&masks[0].1));
+        let w = net.linear(0).unwrap().weight();
+        assert_eq!(params.value(w).data(), store.value(w).data());
+        assert_ne!(params.value(w).data(), last_store.value(w).data());
     }
 
     /// A 4 → 8 → ReLU → 3 network and 30 rows of seeded class data.

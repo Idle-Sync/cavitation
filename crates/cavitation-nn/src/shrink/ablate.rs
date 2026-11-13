@@ -224,7 +224,7 @@ pub(super) fn points_lost(before: f64, after: f64, rows: usize) -> f64 {
 
 /// The relative increase from the loss `base` to `loss`, `(loss - base) / |base|`: 0 if
 /// both are 0, infinity for a rise from 0 or a NaN `loss`.
-pub(super) fn relative_increase(base: f64, loss: f64) -> f64 {
+fn relative_increase(base: f64, loss: f64) -> f64 {
     if loss.is_nan() {
         f64::INFINITY
     } else if base != 0.0 {
