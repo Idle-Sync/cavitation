@@ -1105,9 +1105,20 @@ fn explore_ablation_streams_every_neuron() {
         assert_eq!(neurons, want);
         assert!(ablations.iter().all(|j| j.get("linear").num() == 0.0));
         assert!(ablations.iter().all(|j| !j.get("loss").is_null()));
+        // One ranking, one sweep number.
+        let sweep = ablations[0].get("sweep").num();
+        assert!(ablations.iter().all(|j| j.get("sweep").num() == sweep));
         let ranking = events.last().unwrap();
         assert_eq!(ranking.json.get("state").str(), "explore");
-        assert!(ranking.json.get("message").str().contains("16 neurons"));
+        let message = ranking.json.get("message").str();
+        assert!(message.contains("16 neurons"), "{message}");
+        // No probe set was configured: the rows are training rows, and the message says so.
+        assert!(message.contains("training rows"), "{message}");
+        // A second ranking is a new sweep, so the page does not mix the two.
+        assert_eq!(post(addr, &token, "ablate", "linear=0"), 204);
+        let again = client.until_status("ranked");
+        let second = find(&again, "ablation").json.get("sweep").num();
+        assert!(second > sweep, "{second} after {sweep}");
         assert_eq!(post(addr, &token, "finish", ""), 204);
         run.join().unwrap().unwrap();
         client.close();
@@ -1152,11 +1163,32 @@ fn explore_shrink_streams_steps() {
             assert_eq!(kept, step.kept);
             assert_eq!(level.get("met").boolean(), step.met);
         }
-        // The page's view follows the kept level: a probe with the masked neurons.
+        let number = levels[0].get("run").num();
+        assert!(levels.iter().all(|j| j.get("run").num() == number));
+        // The network's size and the page's view of switched-off neurons follow the kept
+        // level: a `network` snapshot with its parameter count and a probe with its masked
+        // neurons, in either order.
+        let chosen = &report.steps[report.chosen.unwrap()];
         let masked = off(&plain, 0).len();
-        client.wait_for("probe", |j| {
-            j.get("layers").at(1).get("masked").arr().len() == masked
-        });
+        let (mut sized, mut probed) = (false, false);
+        let start = Instant::now();
+        while !(sized && probed) {
+            assert!(
+                start.elapsed() < DEADLINE,
+                "network {sized}, probe {probed}"
+            );
+            let m = client.next("the kept level");
+            match m.name.as_str() {
+                "network" => {
+                    let p = m.json.get("parameters");
+                    sized |= !p.is_null() && p.num() == chosen.parameters as f64;
+                }
+                "probe" => {
+                    probed |= m.json.get("layers").at(1).get("masked").arr().len() == masked;
+                }
+                _ => {}
+            }
+        }
         assert_eq!(post(addr, &token, "finish", ""), 204);
         run.join().unwrap().unwrap();
         client.close();
@@ -1193,6 +1225,15 @@ fn explore_shrink_cancel_keeps_best() {
         });
         let events = client.until_status("shrink cancelled");
         assert_eq!(shrink_events(&events).len(), 1);
+        // The cancel is acknowledged before the level in progress ends.
+        let ack = events
+            .iter()
+            .position(|m| {
+                m.name == "status" && m.json.get("message").str().starts_with("cancelling")
+            })
+            .expect("a cancelling status");
+        let level = events.iter().position(|m| m.name == "shrink").unwrap();
+        assert!(ack < level, "acknowledged at {ack}, level at {level}");
         assert!(events.iter().any(|m| {
             m.name == "status" && m.json.get("message").str().contains("in progress")
         }));
@@ -1361,9 +1402,52 @@ fn ablate_on_model_without_hidden_linear_reports_status() {
             let m = events.last().unwrap();
             assert_eq!(m.json.get("state").str(), "explore");
             assert!(m.json.get("message").str().contains(words), "{}", m.raw);
+            assert!(
+                !m.json.get("message").str().contains("1 Linear layers"),
+                "{}",
+                m.raw
+            );
         }
         assert_eq!(post(addr, &token, "finish", ""), 204);
         run.join().unwrap().unwrap();
+        client.close();
+    });
+}
+
+/// A program that drops the inspector as soon as explore mode returns still gets its last
+/// `status` to the page: `Drop` lets the clients read what is queued before it closes.
+#[test]
+fn explore_finished_reaches_the_page_before_drop() {
+    let (mut model, mut params, data) = trained(16);
+    let inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    thread::scope(|s| {
+        let client = Client::open(addr, &token);
+        wait_clients(&inspector, 1);
+        assert_eq!(post(addr, &token, "finish", ""), 204);
+        let (model, params) = (&mut model, &mut params);
+        let run = s.spawn(move || {
+            let mut inspector = inspector;
+            let config = ExploreConfig {
+                train: Some(data),
+                ..ExploreConfig::default()
+            };
+            let result = inspector.explore(model, params, config);
+            let start = Instant::now();
+            drop(inspector);
+            (result, start.elapsed())
+        });
+        let finished = client.wait_for("status", |j| j.get("state").str() == "finished");
+        assert!(
+            finished
+                .json
+                .get("message")
+                .str()
+                .contains("finished from the page")
+        );
+        let (result, dropping) = run.join().unwrap();
+        result.unwrap();
+        assert!(dropping < Duration::from_secs(1), "{dropping:?}");
         client.close();
     });
 }

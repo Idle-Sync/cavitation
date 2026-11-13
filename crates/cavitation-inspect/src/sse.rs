@@ -75,15 +75,18 @@ pub enum Snapshot {
     Neuron,
     /// The time spent in each layer of a profiled step.
     Profile,
+    /// In explore mode, the size of the network the last shrink run kept.
+    Network,
 }
 
 impl Snapshot {
     /// Every kind, in slot order.
-    const ALL: [Snapshot; 4] = [
+    const ALL: [Snapshot; 5] = [
         Snapshot::Stats,
         Snapshot::Probe,
         Snapshot::Neuron,
         Snapshot::Profile,
+        Snapshot::Network,
     ];
 
     /// The event name the page listens for.
@@ -97,6 +100,7 @@ impl Snapshot {
             Snapshot::Probe => "probe",
             Snapshot::Neuron => "neuron",
             Snapshot::Profile => "profile",
+            Snapshot::Network => "network",
         }
     }
 
@@ -161,6 +165,9 @@ struct Client {
     id: u64,
     /// Events waiting for the client's writer, oldest first.
     queue: VecDeque<(Event, String)>,
+    /// Whether the client's writer has taken events or snapshots out and not yet finished
+    /// writing them, so [`Hub::flush`] knows they are not delivered yet.
+    writing: bool,
 }
 
 /// Everything behind the hub's lock.
@@ -175,7 +182,7 @@ struct State {
     /// The longest a blocking event publish waits for room in a client's queue.
     write_timeout: Duration,
     /// One slot per [`Snapshot`] kind.
-    slots: [Slot; 4],
+    slots: [Slot; 5],
     /// Where an event's payload is written before it is copied to each queue.
     scratch: JsonWriter,
     /// The latest `model` event's payload, queued first for every new client.
@@ -400,8 +407,8 @@ impl Hub {
     }
 
     /// Everything published so far as one JSON object, for an export:
-    /// `{"model", "stats", "probe", "neuron", "profile", "status", "epochs", "ablations",
-    /// "shrinks"}`, each the latest payload of that name or `null` when none was published,
+    /// `{"model", "stats", "probe", "neuron", "profile", "network", "status", "epochs",
+    /// "ablations", "shrinks"}`, each the latest payload of that name or `null` when none was published,
     /// and the last three arrays of the kept events, oldest first.
     ///
     /// ```
@@ -412,7 +419,7 @@ impl Hub {
     /// hub.publish_event(Event::Epoch, |w| { w.begin_object().key("epoch").uint(1).end_object(); }, true);
     /// assert_eq!(
     ///     hub.export_json(),
-    ///     r#"{"model":null,"stats":{"step":3},"probe":null,"neuron":null,"profile":null,"status":null,"epochs":[{"epoch":1}],"ablations":[],"shrinks":[]}"#
+    ///     r#"{"model":null,"stats":{"step":3},"probe":null,"neuron":null,"profile":null,"network":null,"status":null,"epochs":[{"epoch":1}],"ablations":[],"shrinks":[]}"#
     /// );
     /// ```
     pub fn export_json(&self) -> String {
@@ -461,6 +468,45 @@ impl Hub {
         self.connected.load(Ordering::Acquire)
     }
 
+    /// Waits until every connected client's writer has written everything queued for it
+    /// and is not in the middle of a write, for at most `bound`; returns whether that
+    /// happened in time. A client that leaves meanwhile no longer counts. Nothing new is
+    /// published by this call; it is meant for shutdown, so that the last events of a run
+    /// (its final `status`, say) reach the page before [`close`](Self::close) cuts the
+    /// connections.
+    ///
+    /// ```
+    /// use cavitation_inspect::sse::{Event, Hub};
+    /// use std::time::Duration;
+    /// let hub = Hub::new(8, 256, Duration::from_secs(2));
+    /// hub.publish_event(Event::Status, |w| { w.string("finished"); }, true);
+    /// // No client is connected, so there is nothing to wait for.
+    /// assert!(hub.flush(Duration::from_millis(100)));
+    /// ```
+    pub fn flush(&self, bound: Duration) -> bool {
+        let start = Instant::now();
+        let mut state = self.lock();
+        loop {
+            if state.closed
+                || state
+                    .clients
+                    .iter()
+                    .all(|c| c.queue.is_empty() && !c.writing)
+            {
+                return true;
+            }
+            let left = bound.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return false;
+            }
+            state = self
+                .changed
+                .wait_timeout(state, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
     /// Closes the hub: every writer loop ends, waiting publishers return `false`, and
     /// nothing is published again.
     ///
@@ -506,7 +552,11 @@ impl Hub {
         if let Some(status) = &state.status {
             queue.push_back((Event::Status, status.clone()));
         }
-        state.clients.push(Client { id, queue });
+        state.clients.push(Client {
+            id,
+            queue,
+            writing: false,
+        });
         self.connected.store(state.clients.len(), Ordering::Release);
         Some(id)
     }
@@ -533,9 +583,9 @@ impl Hub {
     /// client has closed its connection, so a closed tab is noticed within a fraction of a
     /// second.
     pub(crate) fn serve(&self, id: u64, stream: &mut TcpStream, write_timeout: Duration) {
-        let mut seen = [0u64; 4];
-        let mut fresh = [false; 4];
-        let mut payloads: [String; 4] = Default::default();
+        let mut seen = [0u64; 5];
+        let mut fresh = [false; 5];
+        let mut payloads: [String; 5] = Default::default();
         let mut events: VecDeque<(Event, String)> = VecDeque::new();
         let mut out: Vec<u8> = Vec::new();
         let mut last_write = Instant::now();
@@ -554,6 +604,7 @@ impl Hub {
                         .iter()
                         .any(|s| state.slots[s.slot()].version > seen[s.slot()]);
                     if !state.clients[i].queue.is_empty() || newer {
+                        state.clients[i].writing = true;
                         std::mem::swap(&mut state.clients[i].queue, &mut events);
                         for s in Snapshot::ALL {
                             let slot = &state.slots[s.slot()];
@@ -609,6 +660,14 @@ impl Hub {
                 return;
             }
             last_write = Instant::now();
+            {
+                let mut state = self.lock();
+                if let Some(i) = state.position(id) {
+                    state.clients[i].writing = false;
+                }
+            }
+            // A flush may be waiting for this write.
+            self.changed.notify_all();
         }
     }
 }

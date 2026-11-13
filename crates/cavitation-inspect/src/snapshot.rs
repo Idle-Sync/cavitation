@@ -33,6 +33,11 @@ fn far_future(now: Instant) -> Instant {
     now + Duration::from_secs(100 * 365 * 24 * 3600)
 }
 
+/// `n` followed by the singular or the plural noun: "1 level", "2 levels".
+pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
 /// An event that could not be published yet (the hub's lock was busy), kept to retry at the
 /// next step.
 #[derive(Debug)]
@@ -297,8 +302,8 @@ impl Training {
     ) -> Result<usize, String> {
         let Some((layer, lin)) = model.linears().nth(linear) else {
             return Err(format!(
-                "cannot switch a neuron of Linear layer {linear}: the model has {} Linear layers",
-                model.linears().count()
+                "cannot switch a neuron of Linear layer {linear}: the model has {}",
+                plural(model.linears().count(), "Linear layer", "Linear layers")
             ));
         };
         let width = lin.outputs();
@@ -391,7 +396,9 @@ impl Training {
                     self.capture_now = true;
                 } else {
                     self.say(format!(
-                        "there is no probe row {index}: there are {rows} probe rows"
+                        "there is no probe row {index}: there {} {}",
+                        if rows == 1 { "is" } else { "are" },
+                        plural(rows, "probe row", "probe rows")
                     ));
                 }
             }
@@ -404,8 +411,8 @@ impl Training {
                     "there is no neuron {neuron} in layer {layer}: it has width {width}"
                 )),
                 None => self.say(format!(
-                    "there is no layer {layer}: the model has {} layers",
-                    self.widths.len()
+                    "there is no layer {layer}: the model has {}",
+                    plural(self.widths.len(), "layer", "layers")
                 )),
             },
             Command::Ablate { .. } | Command::Shrink | Command::Cancel | Command::Finish => {
@@ -641,7 +648,15 @@ impl Inspector {
         t.flops = wire::flops_per_sample(model);
         t.parameters = wire::parameter_count(model, params);
         t.pending.push_back(Pending::Model);
-        t.say(format!("training started: {} epochs", fit.epochs));
+        t.say(format!(
+            "training started: {}",
+            plural(fit.epochs, "epoch", "epochs")
+        ));
+        // A new run: a page that connects later must not see an earlier explore mode's
+        // shrink result. A refused lock leaves the old one, which the page drops on `model`.
+        shared
+            .hub
+            .publish_snapshot(Snapshot::Network, |w| wire::network(w, None));
         t.flush(config, &shared.hub, model, false);
         Ok(())
     }
@@ -657,7 +672,10 @@ impl Inspector {
         } = self;
         t.paused = false;
         let message = match result {
-            Ok(history) => format!("training finished after {} epochs", history.epochs.len()),
+            Ok(history) => format!(
+                "training finished after {}",
+                plural(history.epochs.len(), "epoch", "epochs")
+            ),
             Err(e) => format!("training stopped: {e}"),
         };
         t.pending

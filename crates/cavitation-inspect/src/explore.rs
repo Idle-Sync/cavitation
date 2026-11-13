@@ -4,16 +4,15 @@
 //!
 //! Everything runs on the caller's thread, which has nothing else to do meanwhile, so
 //! events are published with the hub's blocking `publish_event`. A ranking or a shrink run
-//! can take a long time: the page's commands are read between its neurons or its levels,
-//! so `Cancel` and `Finish` reach it, and a command that cannot run beside it is answered
+//! can take a long time: while one runs, a second thread answers the page's commands at
+//! once, so `Cancel` and `Finish` are acknowledged straight away and take effect after the
+//! neuron or the level in progress, and a command that cannot run beside it is answered
 //! with a `status` message.
 
 use std::borrow::Cow;
-use std::cell::Cell;
 use std::fmt;
-use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,10 +20,10 @@ use cavitation_core::{Error, ParamStore};
 use cavitation_nn::shrink::{Ablation, ShrinkConfig, ShrinkReport, ShrinkStep};
 use cavitation_nn::{Dataset, Flow, Loss, Sequential};
 
-use crate::commands::{Command, CommandQueue};
+use crate::commands::Command;
 use crate::probe::Probe;
 use crate::server::{Inspector, InspectorConfig, Shared};
-use crate::snapshot::{Training, check_probe, trainable};
+use crate::snapshot::{Training, check_probe, plural, trainable};
 use crate::sse::{Event, Hub, Snapshot};
 use crate::wire::{self, ModelInfo, RunState};
 
@@ -37,6 +36,10 @@ const RANK_BATCH: usize = 256;
 /// How many of the cheapest neurons a ranking's `status` message names.
 const RANK_NAMED: usize = 10;
 
+/// The identifier of the next ranking or shrink run, unique in the process, so the page
+/// can tell one run's events from another's (the `sweep` and `run` fields).
+static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+
 /// What explore mode works with, beside the inspector's own configuration.
 ///
 /// The page's neuron switches and the ranking need only the network. The shrink lab needs
@@ -44,6 +47,15 @@ const RANK_NAMED: usize = 10;
 /// fresh one for each `Shrink` command, and it must name a
 /// [`validation`](ShrinkConfig::validation) set, which has no default. Without either, the
 /// page's `Shrink` is answered with a `status` message saying what is missing.
+///
+/// [`Default`] is cross-entropy with neither training rows nor a factory; set the fields
+/// you need and fill the rest with `..ExploreConfig::default()`, so a field added in a
+/// later release does not break your code. The struct is not `#[non_exhaustive]`, which
+/// would forbid that update syntax outside this crate.
+///
+/// A shrink run reads the page's `Cancel` at once but can stop only between levels, so a
+/// cancel takes effect when the level in progress, its retraining included, ends: with
+/// many training rows or retraining epochs per level that can take a while.
 ///
 /// # Examples
 ///
@@ -54,13 +66,14 @@ const RANK_NAMED: usize = 10;
 /// use cavitation_nn::{Dataset, Loss, Targets};
 /// let held_out = Dataset { x: Tensor::zeros(&[300, 4]), targets: Targets::Classes(vec![0; 300]) };
 /// let config = ExploreConfig {
-///     loss: Loss::CrossEntropy,
 ///     train: Some(Dataset { x: Tensor::zeros(&[100, 4]), targets: Targets::Classes(vec![0; 100]) }),
 ///     shrink: Some(Box::new(move || ShrinkConfig {
 ///         validation: Some(Validation::Given(held_out.clone())),
 ///         ..ShrinkConfig::default()
 ///     })),
+///     ..ExploreConfig::default()
 /// };
+/// assert_eq!(config.loss, Loss::CrossEntropy);
 /// assert!(format!("{config:?}").contains("CrossEntropy"));
 /// ```
 pub struct ExploreConfig {
@@ -77,6 +90,18 @@ pub struct ExploreConfig {
     // The boxed factory is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
     pub shrink: Option<Box<dyn FnMut() -> ShrinkConfig>>,
+}
+
+impl Default for ExploreConfig {
+    /// Cross-entropy, no training rows and no shrink factory: neuron switches and rankings
+    /// work, and the shrink lab answers that it needs `train` and `shrink`.
+    fn default() -> ExploreConfig {
+        ExploreConfig {
+            loss: Loss::CrossEntropy,
+            train: None,
+            shrink: None,
+        }
+    }
 }
 
 impl fmt::Debug for ExploreConfig {
@@ -111,22 +136,68 @@ fn say(hub: &Hub, message: &str) {
     );
 }
 
-/// What a command that arrives during a ranking or a shrink run gets: `Cancel` and
-/// `Finish` are recorded in `stop` (whether to end the run) and `finish` (whether to end
-/// explore mode too); anything else is answered with a `status` message saying what is in
-/// progress.
-fn while_running(command: Command, what: &str, hub: &Hub, stop: &Cell<bool>, finish: &Cell<bool>) {
-    match command {
-        Command::Cancel => stop.set(true),
-        Command::Finish => {
-            stop.set(true);
-            finish.set(true);
-        }
-        _ => say(
-            hub,
-            &format!("{what} is in progress: Cancel ends it, or wait for it to end"),
-        ),
+/// What the thread that answers commands during a run has been asked.
+#[derive(Debug, Default)]
+struct Watch {
+    /// The page asked to stop the run (`Cancel` or `Finish`).
+    stop: AtomicBool,
+    /// The page asked to end explore mode once the run has stopped (`Finish`).
+    finish: AtomicBool,
+    /// The run has returned, so the thread ends.
+    done: AtomicBool,
+}
+
+/// Sets its flag when dropped, so the command thread ends even if the run panics.
+struct Done<'a>(&'a AtomicBool);
+
+impl Drop for Done<'_> {
+    /// Raises the flag.
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
     }
+}
+
+/// Runs `run` on this thread while a second thread answers the page's commands every
+/// [`POLL`]: `Cancel` and `Finish` raise [`Watch::stop`] (and `Finish` [`Watch::finish`])
+/// and are acknowledged at once with `cancelling`, and anything else is answered with a
+/// `status` saying that `what` is in progress. `run` reads the flags at its own stopping
+/// points.
+fn watched<R>(
+    shared: &Shared,
+    what: &str,
+    cancelling: &str,
+    run: impl FnOnce(&Arc<Watch>) -> R,
+) -> R {
+    let watch = Arc::new(Watch::default());
+    thread::scope(|s| {
+        let flags = Arc::clone(&watch);
+        s.spawn(move || {
+            let hub = &shared.hub;
+            while !flags.done.load(Ordering::Acquire) && !hub.stopping().load(Ordering::Acquire) {
+                while let Some(command) = shared.commands.try_pop() {
+                    match command {
+                        Command::Cancel | Command::Finish => {
+                            if command == Command::Finish {
+                                flags.finish.store(true, Ordering::Release);
+                            }
+                            if !flags.stop.swap(true, Ordering::AcqRel) {
+                                say(hub, cancelling);
+                            }
+                        }
+                        _ => say(
+                            hub,
+                            &format!(
+                                "{what} is in progress: Cancel ends it, or wait for it to end"
+                            ),
+                        ),
+                    }
+                }
+                thread::sleep(POLL);
+            }
+        });
+        let _done = Done(&watch.done);
+        run(&watch)
+    })
 }
 
 /// The width of the model's input rows when its first layer is a `Linear`, which fixes it.
@@ -146,6 +217,8 @@ struct Explore<'a> {
     probe_set: Option<&'a Dataset>,
     /// The rows a ranking measures on: the first `eval_rows` probe rows.
     eval: Option<Cow<'a, Dataset>>,
+    /// Whether those rows are training rows (no probe set was configured).
+    eval_is_training: bool,
     /// Each layer's output width.
     widths: Vec<usize>,
     /// The probe; replaced after a shrink run, which can replace the parameter store.
@@ -160,6 +233,11 @@ struct Explore<'a> {
     capture_now: bool,
     /// Whether the probe's last failure has been reported, so it is said once.
     probe_failed: bool,
+    /// The level the last shrink run kept (its checkpoint dropped), for the `network`
+    /// snapshot.
+    shrunk: Option<ShrinkStep>,
+    /// Whether the `network` snapshot needs publishing.
+    network_due: bool,
 }
 
 impl Explore<'_> {
@@ -193,6 +271,13 @@ impl Explore<'_> {
         self.capture_now = !published;
     }
 
+    /// Publishes the `network` snapshot; a publish the hub's lock refused is tried again at
+    /// the next poll.
+    fn publish_network(&mut self, hub: &Hub) {
+        let shrunk = self.shrunk.as_ref();
+        self.network_due = !hub.publish_snapshot(Snapshot::Network, |w| wire::network(w, shrunk));
+    }
+
     /// Carries out one command from the page; every index is checked first, and a command
     /// that cannot be carried out is answered with a `status` message.
     fn command(
@@ -223,7 +308,11 @@ impl Explore<'_> {
                 } else {
                     say(
                         hub,
-                        &format!("there is no probe row {index}: there are {rows} probe rows"),
+                        &format!(
+                            "there is no probe row {index}: there {} {}",
+                            if rows == 1 { "is" } else { "are" },
+                            plural(rows, "probe row", "probe rows")
+                        ),
                     );
                 }
             }
@@ -239,8 +328,8 @@ impl Explore<'_> {
                 None => say(
                     hub,
                     &format!(
-                        "there is no layer {layer}: the model has {} layers",
-                        self.widths.len()
+                        "there is no layer {layer}: the model has {}",
+                        plural(self.widths.len(), "layer", "layers")
                     ),
                 ),
             },
@@ -252,7 +341,7 @@ impl Explore<'_> {
             Command::Cancel => say(hub, "nothing is running to cancel"),
             Command::Finish => return Next::Finish,
             Command::Ablate { linear } => {
-                return self.rank(linear, hub, &shared.commands, model, params);
+                return self.rank(linear, shared, model, params);
             }
             Command::Shrink => return self.shrink(hub, shared, model, params, config),
         }
@@ -260,16 +349,17 @@ impl Explore<'_> {
     }
 
     /// Ranks the neurons of the `linear`-th `Linear` (counting only `Linear`s): one
-    /// `ablation` event per neuron as it is measured, then a `status` message with the
-    /// cheapest neurons. Commands are read between neurons.
+    /// `ablation` event per neuron as it is measured, all with one new `sweep` number, then
+    /// a `status` message with the cheapest neurons. A `Cancel` stops it after the neuron in
+    /// progress.
     fn rank(
         &mut self,
         linear: usize,
-        hub: &Hub,
-        commands: &CommandQueue,
+        shared: &Shared,
         model: &Sequential,
         params: &ParamStore,
     ) -> Next {
+        let hub = &shared.hub;
         let Some(data) = self.eval.as_deref() else {
             say(
                 hub,
@@ -282,49 +372,62 @@ impl Explore<'_> {
             say(
                 hub,
                 &format!(
-                    "cannot rank the neurons of Linear layer {linear}: the model has {} Linear \
-                     layers",
-                    model.linears().count()
+                    "cannot rank the neurons of Linear layer {linear}: the model has {}",
+                    plural(model.linears().count(), "Linear layer", "Linear layers")
                 ),
             );
             return Next::Stay;
         };
-        let (stop, finish, measured) = (Cell::new(false), Cell::new(false), Cell::new(0usize));
-        let result = cavitation_nn::shrink::ablate_controlled(
-            model,
-            params,
-            data,
-            &[layer],
-            self.loss,
-            RANK_BATCH,
-            &mut |a: &Ablation| {
-                hub.publish_event(Event::Ablation, |w| wire::ablation(w, a), true);
-                measured.set(measured.get() + 1);
-                while let Some(command) = commands.try_pop() {
-                    while_running(command, "a neuron ranking", hub, &stop, &finish);
-                }
-                if stop.get() || hub.stopping().load(Ordering::Acquire) {
-                    Flow::Stop
-                } else {
-                    Flow::Continue
-                }
+        let sweep = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
+        let mut measured = 0usize;
+        let (result, stopped, finish) = watched(
+            shared,
+            "a neuron ranking",
+            "cancelling: the ranking stops after the neuron in progress",
+            |watch| {
+                let result = cavitation_nn::shrink::ablate_controlled(
+                    model,
+                    params,
+                    data,
+                    &[layer],
+                    self.loss,
+                    RANK_BATCH,
+                    &mut |a: &Ablation| {
+                        hub.publish_event(Event::Ablation, |w| wire::ablation(w, a, sweep), true);
+                        measured += 1;
+                        if watch.stop.load(Ordering::Acquire)
+                            || hub.stopping().load(Ordering::Acquire)
+                        {
+                            Flow::Stop
+                        } else {
+                            Flow::Continue
+                        }
+                    },
+                );
+                let stopped = watch.stop.load(Ordering::Acquire);
+                (result, stopped, watch.finish.load(Ordering::Acquire))
             },
         );
         match result {
             Ok(ranked) => {
-                let mut message = if stop.get() {
+                let mut message = if stopped {
                     format!(
-                        "ranking cancelled after {} neurons of Linear layer {linear} (layer \
-                         {layer})",
-                        measured.get()
+                        "ranking cancelled after {} of Linear layer {linear} (layer {layer})",
+                        plural(measured, "neuron", "neurons")
                     )
                 } else {
                     format!(
-                        "ranked the {} neurons of Linear layer {linear} (layer {layer}) by what \
+                        "ranked the {} of Linear layer {linear} (layer {layer}) by what \
                          switching each off costs",
-                        ranked.len()
+                        plural(ranked.len(), "neuron", "neurons")
                     )
                 };
+                if self.eval_is_training {
+                    message.push_str(&format!(
+                        ", measured on the first {}, which the network was trained on",
+                        plural(data.len(), "training row", "training rows")
+                    ));
+                }
                 if !ranked.is_empty() {
                     message.push_str("; cheapest first:");
                     for (k, a) in ranked.iter().rev().take(RANK_NAMED).enumerate() {
@@ -339,11 +442,7 @@ impl Explore<'_> {
                 &format!("cannot rank the neurons of Linear layer {linear}: {e}"),
             ),
         }
-        if finish.get() {
-            Next::Finish
-        } else {
-            Next::Stay
-        }
+        if finish { Next::Finish } else { Next::Stay }
     }
 
     /// Runs the shrink tool with a fresh configuration from the factory: one `shrink`
@@ -387,54 +486,63 @@ impl Explore<'_> {
             }
         };
         let mut shrink_config = factory();
-        let stop = Rc::new(Cell::new(false));
-        let finish = Rc::new(Cell::new(false));
-        let levels = Rc::new(Cell::new(0usize));
-        {
-            let (shared, stop, finish, levels) = (
-                Arc::clone(shared),
-                Rc::clone(&stop),
-                Rc::clone(&finish),
-                Rc::clone(&levels),
-            );
-            shrink_config.on_step = Some(Box::new(move |step: &ShrinkStep| {
-                let hub = &shared.hub;
-                hub.publish_event(Event::Shrink, |w| wire::shrink(w, step), true);
-                levels.set(levels.get() + 1);
-                while let Some(command) = shared.commands.try_pop() {
-                    while_running(command, "a shrink run", hub, &stop, &finish);
-                }
-                if stop.get() || hub.stopping().load(Ordering::Acquire) {
-                    Flow::Stop
-                } else {
-                    Flow::Continue
-                }
-            }));
-        }
+        let run = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
         say(
             hub,
             "shrinking: each level switches more neurons off, retrains and measures the \
-             network; Cancel keeps the best level so far",
+             network; Cancel takes effect when the level in progress ends, and keeps the best \
+             level so far",
         );
-        let result = cavitation_nn::shrink::shrink(model, params, train, shrink_config);
+        let levels = Arc::new(AtomicU64::new(0));
+        let (result, stopped, finish) = watched(
+            shared,
+            "a shrink run",
+            "cancelling: the shrink run stops when the level in progress ends, its retraining \
+             included, and keeps the best level so far",
+            |watch| {
+                let (shared, watch_step, levels) =
+                    (Arc::clone(shared), Arc::clone(watch), Arc::clone(&levels));
+                shrink_config.on_step = Some(Box::new(move |step: &ShrinkStep| {
+                    let hub = &shared.hub;
+                    hub.publish_event(Event::Shrink, |w| wire::shrink(w, step, run), true);
+                    levels.fetch_add(1, Ordering::Relaxed);
+                    if watch_step.stop.load(Ordering::Acquire)
+                        || hub.stopping().load(Ordering::Acquire)
+                    {
+                        Flow::Stop
+                    } else {
+                        Flow::Continue
+                    }
+                }));
+                let result = cavitation_nn::shrink::shrink(model, params, train, shrink_config);
+                let stopped = watch.stop.load(Ordering::Acquire);
+                (result, stopped, watch.finish.load(Ordering::Acquire))
+            },
+        );
         // The run may have replaced the parameter store, which the probe's gradients belong
         // to.
         self.probe = Probe::new();
         self.capture_now = true;
+        let levels = usize::try_from(levels.load(Ordering::Relaxed)).unwrap_or(usize::MAX);
         let message = match result {
-            Ok(report) => summary(&report, stop.get()),
-            Err(e) if levels.get() == 0 => format!("cannot shrink: {e}"),
+            Ok(mut report) => {
+                let message = summary(&report, stopped);
+                if let Some(i) = report.chosen {
+                    let mut step = report.steps.swap_remove(i);
+                    step.checkpoint = None;
+                    self.shrunk = Some(step);
+                    self.network_due = true;
+                }
+                message
+            }
+            Err(e) if levels == 0 => format!("cannot shrink: {e}"),
             Err(e) => format!(
-                "shrink stopped after {} levels: {e}; the network is as it was before the run",
-                levels.get()
+                "shrink stopped after {}: {e}; the network is as it was before the run",
+                plural(levels, "level", "levels")
             ),
         };
         say(hub, &message);
-        if finish.get() {
-            Next::Finish
-        } else {
-            Next::Stay
-        }
+        if finish { Next::Finish } else { Next::Stay }
     }
 }
 
@@ -446,7 +554,7 @@ fn summary(report: &ShrinkReport, cancelled: bool) -> String {
     } else {
         "shrink finished"
     };
-    let n = report.steps.len();
+    let n = plural(report.steps.len(), "level", "levels");
     let mut message = match report.chosen.map(|i| &report.steps[i]) {
         Some(step) => {
             // One count per shrunk layer, in order: "58" or "40 + 12".
@@ -462,16 +570,16 @@ fn summary(report: &ShrinkReport, cancelled: bool) -> String {
                 (None, None) => format!("validation loss {:.4}", step.validation.loss),
             };
             format!(
-                "{verb} after {n} levels: kept the level that removes {:.0}% of each layer, \
+                "{verb} after {n}: kept the level that removes {:.0}% of each layer, \
                  with {} neurons on and {} parameters, {measure}",
                 f64::from(step.removed_bp) / 100.0,
                 kept,
                 step.parameters
             )
         }
-        None => format!(
-            "{verb} after {n} levels: no level met the stop rule, so the network is as it was"
-        ),
+        None => {
+            format!("{verb} after {n}: no level met the stop rule, so the network is as it was")
+        }
     };
     for warning in &report.warnings {
         message.push_str("; warning: ");
@@ -498,13 +606,17 @@ impl Inspector {
     ///   and `params` at the level it keeps, which the page's view of switched-off neurons
     ///   follows; it can run again on a later click, on the network the last run left.
     ///
-    /// While a ranking or a shrink run is going, `Cancel` ends it after the neuron or the
-    /// level in progress (a cancelled shrink run keeps the best level so far), `Finish`
-    /// does that and then ends explore mode, and any other command is answered with a
-    /// `status` message. A command that cannot be carried out (an index out of range, a
-    /// shrink without training rows or factory, a network the shrink tool refuses) is
-    /// answered with a `status` message in the library's words, never a panic. Masks
-    /// switched from the page stay on `model` afterwards.
+    /// While a ranking or a shrink run is going, a second thread answers the page's
+    /// commands: `Cancel` is acknowledged at once with a `status` and ends the run after the
+    /// neuron or the level in progress (a shrink level includes its retraining, so with
+    /// large data that can take a while; a cancelled shrink run keeps the best level so
+    /// far), `Finish` does that and then ends explore mode, and any other command is
+    /// answered with a `status` message saying a run is in progress. After a shrink run
+    /// keeps a level, the `network` snapshot gives its size. A command that cannot be
+    /// carried out (an index out of range, a shrink without training rows or factory, a
+    /// network the shrink tool refuses) is answered with a `status` message in the
+    /// library's words, never a panic. Masks switched from the page stay on `model`
+    /// afterwards. A ranking measured on training rows (no probe set configured) says so.
     ///
     /// The probe rows are the configuration's [`probe`](InspectorConfig::probe) set, or
     /// else the first `eval_rows` rows of [`ExploreConfig::train`], or else those of the
@@ -525,7 +637,7 @@ impl Inspector {
     /// use std::time::Duration;
     /// use cavitation_core::{ParamStore, Rng, Tensor};
     /// use cavitation_inspect::{ExploreConfig, Inspector, InspectorConfig};
-    /// use cavitation_nn::{Dataset, Linear, Loss, Relu, Sequential, Targets};
+    /// use cavitation_nn::{Dataset, Linear, Relu, Sequential, Targets};
     /// let mut inspector = Inspector::start(InspectorConfig {
     ///     address: "127.0.0.1:0".parse().unwrap(),
     ///     idle_resume: Duration::from_millis(50),
@@ -542,7 +654,7 @@ impl Inspector {
     ///     targets: Targets::Classes(vec![0, 1, 1, 0]),
     /// };
     /// println!("open {}", inspector.url());
-    /// let config = ExploreConfig { loss: Loss::CrossEntropy, train: Some(data), shrink: None };
+    /// let config = ExploreConfig { train: Some(data), ..ExploreConfig::default() };
     /// // With no page connected it returns after `idle_resume`.
     /// inspector.explore(&mut net, &mut params, config)?;
     /// # Ok::<(), cavitation_core::Error>(())
@@ -620,6 +732,7 @@ impl Inspector {
             loss: config.loss,
             probe_set,
             eval,
+            eval_is_training: settings.probe.is_none(),
             widths,
             probe: Probe::new(),
             row: 0,
@@ -627,6 +740,8 @@ impl Inspector {
             step: training.step,
             capture_now: true,
             probe_failed: false,
+            shrunk: None,
+            network_due: true,
         };
         say(
             hub,
@@ -675,6 +790,9 @@ impl Inspector {
                 if explore.capture_now {
                     explore.capture(hub, model, params);
                 }
+            }
+            if explore.network_due {
+                explore.publish_network(hub);
             }
             thread::sleep(POLL);
         }
