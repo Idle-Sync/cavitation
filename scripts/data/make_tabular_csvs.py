@@ -33,6 +33,7 @@ import io
 import os
 import sys
 import zipfile
+from typing import NoReturn
 
 import xlrd
 
@@ -74,7 +75,7 @@ BREAST_CANCER_HEADER = (
 )
 
 
-def fail(message):
+def fail(message) -> NoReturn:
     """Prints `message` to standard error and exits with status 1."""
     print(f"error: {message}", file=sys.stderr)
     sys.exit(1)

@@ -19,8 +19,9 @@ fn csv_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/digits/digits.csv")
 }
 
-/// The shuffled order of `n` source rows, shared by every split in this crate: Fisher-Yates from the end, with
-/// `k = floor(r * (i + 1))` for each `r` from [`Mulberry32::new(42)`](Mulberry32).
+/// The shuffled order of `n` source rows, shared by every split in this crate: Fisher-Yates
+/// from the end, with `k = floor(r * (i + 1))` for each `r` from
+/// [`Mulberry32::new(42)`](Mulberry32).
 pub(crate) fn split_order(n: usize) -> Vec<usize> {
     let mut rng = Mulberry32::new(42);
     let mut order: Vec<usize> = (0..n).collect();
