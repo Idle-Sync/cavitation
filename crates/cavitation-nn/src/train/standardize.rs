@@ -44,9 +44,10 @@ impl Standardizer {
     /// Computes each column's mean and population standard deviation (divisor `n`, in `f64`)
     /// from the rows of `x`. A column whose values are all equal gets scale 1.
     ///
-    /// A NaN or infinite value in a column makes that column's mean and scale NaN (the
-    /// statistics are not checked), so [`transform`](Self::transform) then gives NaN for the
-    /// whole column and a fold refuses with `Error::InvalidData`; check the data first.
+    /// A NaN or infinite value in a column makes that column's mean or scale non-finite (NaN
+    /// or infinite; the statistics are not checked), so [`transform`](Self::transform) then
+    /// gives NaN or infinite values for the column and a fold refuses with
+    /// `Error::InvalidData`; check the data first.
     ///
     /// # Panics
     ///
@@ -75,14 +76,6 @@ impl Standardizer {
         let mut scale = Vec::with_capacity(width);
         for j in 0..width {
             let column = || data[j..].iter().step_by(width).map(|&v| f64::from(v));
-            let first = f64::from(data[j]);
-            // A column of equal values is its own mean exactly (a sum divided by `n` need not
-            // be) and has no spread: scale 1.
-            if column().all(|v| v == first) {
-                mean.push(first);
-                scale.push(1.0);
-                continue;
-            }
             let m = column().sum::<f64>() / n;
             let variance = column().map(|v| (v - m) * (v - m)).sum::<f64>() / n;
             mean.push(m);
@@ -174,7 +167,9 @@ impl Standardizer {
     ///
     /// The round trip is not exact: the standardised value is rounded to `f32` and the error
     /// that rounding leaves in the result is about `|x − mean|` times 6e-8, plus the final
-    /// rounding. For values of a size like the mean's, that is within 2 ulp of the original.
+    /// rounding. That is within 2 ulp of the original `x` when `|x − mean|` is no larger than
+    /// `|x|`; for a value much smaller than its column's mean, the error is relative to the
+    /// mean, not to the value (0.001 with mean 1000 comes back as 0.0009765625).
     ///
     /// # Panics
     ///
@@ -237,7 +232,8 @@ impl Standardizer {
     ///     targets: Targets::Values(Tensor::from_vec(vec![5.0f32, 15.0], &[2, 1]).unwrap()),
     /// };
     /// s.transform_targets(&mut data).unwrap();
-    /// assert_eq!(data.targets, Targets::Values(Tensor::from_vec(vec![-1.0f32, 1.0], &[2, 1]).unwrap()));
+    /// let standardised = Tensor::from_vec(vec![-1.0f32, 1.0], &[2, 1]).unwrap();
+    /// assert_eq!(data.targets, Targets::Values(standardised));
     ///
     /// let mut classes = Dataset { x: Tensor::zeros(&[1, 1]), targets: Targets::Classes(vec![0]) };
     /// assert!(s.transform_targets(&mut classes).is_err());
@@ -266,6 +262,15 @@ impl Standardizer {
     /// written, so the folded network agrees with standardising first to float rounding
     /// (about `(inputs + 1) · 1.2e-7` of the sum of the absolute terms), not bit for bit.
     /// Fold once: folding the same parameters again divides by the scale again.
+    ///
+    /// The change is made in `params`, so every clone of `model` used with that store and every
+    /// layer that shares these parameters (a `Linear` pushed twice) sees it, and an
+    /// [`InferenceModel`](crate::InferenceModel) or [`Evaluator`](crate::Evaluator) built
+    /// before the fold keeps the old weights until it is compiled again or refreshed. Fold
+    /// the store you will ship, after training, then compile.
+    ///
+    /// A mask on layer 0 acts after the affine map, which the fold preserves, so it does not
+    /// matter here.
     ///
     /// # Errors
     ///
@@ -324,15 +329,19 @@ impl Standardizer {
     /// (each row multiplied by its scale) and the bias `b' = σ b + μ`, because
     /// `σ (W h + b) + μ = W' h + b'`.
     ///
-    /// The rounding is as for [`fold_into_input`](Self::fold_into_input). Fold once. The last
-    /// layer must be the `Linear` itself: an activation after it (a softmax, say) cannot be
-    /// folded through.
+    /// The rounding is as for [`fold_into_input`](Self::fold_into_input), and so are the
+    /// notes on fold once and on shared parameters and compiled models. The last layer must
+    /// be the `Linear` itself: an activation after it (a softmax, say) cannot be folded
+    /// through. Nor can a mask with a neuron off: the mask sets that output to 0 after the
+    /// bias, which is `μ` in the targets' units before the fold and 0 after it, so the fold
+    /// refuses. Clear the mask, or fold before masking.
     ///
     /// # Errors
     ///
     /// `Error::InvalidData`, and `params` unchanged, as for
     /// [`fold_into_input`](Self::fold_into_input), with the last layer in place of layer 0 and
-    /// its output width in place of its input width.
+    /// its output width in place of its input width; also if the last layer has a mask with
+    /// any neuron off.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -344,7 +353,8 @@ impl Standardizer {
     /// let (w, b) = (layer.weight(), layer.bias());
     /// let net = Sequential::new().push(layer);
     /// // y = 4 (2h + 1) + 10 = 8h + 14.
-    /// Standardizer::from_parts(vec![10.0], vec![4.0]).fold_into_output(&net, &mut params).unwrap();
+    /// let s = Standardizer::from_parts(vec![10.0], vec![4.0]);
+    /// s.fold_into_output(&net, &mut params).unwrap();
     /// assert_eq!(params.value(w).data(), &[8.0]);
     /// assert_eq!(params.value(b).data(), &[14.0]);
     /// ```
@@ -360,6 +370,16 @@ impl Standardizer {
                 "Standardizer::fold_into_output: the last layer gives {outputs} outputs but the \
                  standardiser has {} columns",
                 self.width()
+            )));
+        }
+        let at = model.len() - 1;
+        if let Some(mask) = model.mask(at).filter(|m| m.count_on() < m.width()) {
+            return Err(Error::InvalidData(format!(
+                "Standardizer::fold_into_output: layer {at} has {} of {} neurons switched off; \
+                 a masked output is 0 after the fold instead of the mean, so clear the mask or \
+                 fold before masking",
+                mask.width() - mask.count_on(),
+                mask.width()
             )));
         }
         let (weight, bias) = Self::parameters(last, params, "fold_into_output")?;
@@ -732,6 +752,33 @@ mod tests {
             s.fold_into_input(&Sequential::new(), &mut params),
             Err(Error::InvalidData(_))
         ));
+    }
+
+    /// A mask with a neuron off on the output layer makes `fold_into_output` refuse and write
+    /// nothing; an all-on mask, or a mask on another layer, does not.
+    #[test]
+    fn fold_output_refuses_masked_output() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(8);
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 2, 3, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 3, 2, &mut rng));
+        let s = Standardizer::from_parts(vec![500.0, -40.0], vec![25.0, 0.5]);
+        let w = net.linear(2).unwrap().weight();
+        let before = params.value(w).clone();
+        net.set_neuron(2, 1, false);
+        let Err(Error::InvalidData(msg)) = s.fold_into_output(&net, &mut params) else {
+            panic!("expected InvalidData");
+        };
+        assert!(
+            msg.contains("layer 2") && msg.contains("clear the mask"),
+            "{msg}"
+        );
+        assert_eq!(params.value(w), &before);
+        net.set_neuron(2, 1, true);
+        net.set_mask(1, crate::NeuronMask::all_on(3));
+        assert!(s.fold_into_output(&net, &mut params).is_ok());
     }
 
     /// A width that differs from the `Linear`'s, or a fit on non-finite data, is refused

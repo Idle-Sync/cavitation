@@ -1,8 +1,8 @@
 //! Training: datasets, targets and batches (in `data`), and the training step
 //! ([`Trainer`]), [`fit`] and [`accuracy`] (in `fit`), held-out measurement
 //! ([`Evaluator`] and [`evaluate`], in `evaluate`), [`Standardizer`], which standardises
-//! inputs or targets and folds that into a network (in `standardize`), and [`Flow`], which a progress
-//! callback returns to go on or stop.
+//! inputs or targets and folds that into a network (in `standardize`), and [`Flow`], which a
+//! progress callback returns to go on or stop.
 
 mod data;
 mod evaluate;
