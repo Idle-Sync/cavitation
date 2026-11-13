@@ -68,14 +68,18 @@ pub struct GradientConfig {
     pub shuffle_seed: Option<u64>,
     /// The seed of the weights' initialisation (Xavier uniform, as [`Linear::new`]).
     pub init_seed: u64,
-    /// The health checks run on every step and at the end of every epoch.
+    /// The health checks run on every step and at the end of every epoch. The default turns
+    /// the vanishing-gradient check off (`grad_norm_low: 0.0`, since no norm is below 0):
+    /// least squares is convex, so a tiny gradient here means the fit has converged, and on
+    /// noisy data the loss stops at the residual variance instead of falling the 10,000-fold
+    /// that would otherwise silence the check. The non-finite and exploding checks stay on.
     pub health: Health,
 }
 
 impl Default for GradientConfig {
     /// 1,000 epochs, every row in one batch (`usize::MAX`), Adam at 0.5 without weight
-    /// decay, cosine annealing to 0, shuffle seed 0, initialisation seed 0, the default
-    /// health checks.
+    /// decay, cosine annealing to 0, shuffle seed 0, initialisation seed 0, and the default
+    /// health checks with the vanishing-gradient check off.
     fn default() -> GradientConfig {
         GradientConfig {
             epochs: 1000,
@@ -87,7 +91,10 @@ impl Default for GradientConfig {
             schedule: LrSchedule::Cosine { min_lr: 0.0 },
             shuffle_seed: Some(0),
             init_seed: 0,
-            health: Health::default(),
+            health: Health {
+                grad_norm_low: 0.0,
+                ..Health::default()
+            },
         }
     }
 }
