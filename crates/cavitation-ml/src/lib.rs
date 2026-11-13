@@ -12,6 +12,16 @@
 //!   independent, naming the column, instead of returning one answer out of many.
 //!   [`linalg::Qr`] gives the factorisation itself, and [`linalg::qr_reference`] is the same
 //!   solver written as plainly as possible, which the fast one is tested against.
+//! - [`LinearRegression`]: ordinary least squares and ridge regression, matching
+//!   scikit-learn's `LinearRegression` and `Ridge`. [`LinearRegression::fit`] solves exactly
+//!   by QR; [`LinearRegression::fit_gradient`] trains a `Linear` layer to the same answer by
+//!   gradient descent, as [`GradientConfig`] sets out; standardise the inputs and the value
+//!   targets with `cavitation_nn::Standardizer` before the gradient path and fold the scaling
+//!   back in with `fold_into_input` and `fold_into_output` afterwards, because its defaults
+//!   cannot reach coefficients much larger than about learning rate × epochs, and then
+//!   return `Ok` with a model far from the exact one. Both return a [`LinearModel`], which
+//!   predicts, scores R² and converts to and from a one-layer `Sequential` that saves as a
+//!   PyTorch `nn.Linear`.
 //!
 //! Everything here works in `f64`, on [`Tensor`](cavitation_core::Tensor)s and
 //! [`TensorView`](cavitation_core::TensorView)s from `cavitation-core`, and returns
@@ -36,4 +46,9 @@
 //! assert!((c.data()[1] - 2.0).abs() < 0.1);
 //! ```
 
+mod gradient;
 pub mod linalg;
+mod linear;
+
+pub use gradient::GradientConfig;
+pub use linear::{LinearModel, LinearRegression};
