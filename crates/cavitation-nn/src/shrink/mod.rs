@@ -6,8 +6,9 @@
 //! them off by `Linear` with [`Sequential::set_neuron_mask`](crate::Sequential::set_neuron_mask),
 //! and measure the result with an [`Evaluator`](crate::Evaluator). [`compact()`] then
 //! removes the off neurons for good: it rebuilds the network as a smaller dense one that
-//! gives the masked network's outputs bit for bit through
-//! [`InferenceModel::infer`](crate::InferenceModel::infer).
+//! gives the masked network's outputs through
+//! [`InferenceModel::infer`](crate::InferenceModel::infer), bit for bit on the `reference`
+//! and `sse4.2` kernel levels and within the documented rounding bound on the others.
 //!
 //! The items here are reached through this module, `cavitation_nn::shrink`, and are not in
 //! the crate root or the `cavitation` prelude.

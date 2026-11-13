@@ -1,6 +1,8 @@
 //! Compaction: [`compact`] rebuilds a masked network without its off neurons, as a smaller
 //! dense network with its own parameter store.
 
+use std::collections::BTreeMap;
+
 use cavitation_core::{Error, Graph, ParamStore, Real, Tensor};
 
 use crate::{Layer, Linear, Prelu, Sequential};
@@ -23,13 +25,22 @@ use crate::{Layer, Linear, Prelu, Sequential};
 /// ([`Sequential::parameter_names`]) keep their layer indices, so the result saves and
 /// loads like any network.
 ///
-/// Through [`InferenceModel::infer`](crate::InferenceModel::infer) the compacted network
-/// gives the masked one's outputs bit for bit: each output of the matvec is a sum in input
-/// order from +0, and a masked input adds an exact 0 to it, which leaves the sum as it is.
-/// On the batched paths ([`InferenceModel::infer_batch`](crate::InferenceModel::infer_batch)
-/// and the tape) the two agree within the GEMM tolerance for the masked layer's length,
-/// and bit for bit while every sum fits in one block of the GEMM (256 terms on every
-/// level). This holds for finite weights: a masked neuron whose outgoing weight is infinite
+/// On the kernel levels whose matvec computes every output with the same steps, a sum in
+/// input order from +0 with a separate multiply and add (`reference` and `sse4.2`), the
+/// compacted network gives the masked one's outputs bit for bit through
+/// [`InferenceModel::infer`](crate::InferenceModel::infer): a masked input adds an exact 0
+/// to the sum, which leaves it as it is. Those levels' GEMM also sums each block of 256
+/// terms in order, so the batched paths
+/// ([`InferenceModel::infer_batch`](crate::InferenceModel::infer_batch) and the tape) are
+/// bit for bit there too while every summed length is at most 256. On the other levels
+/// (`avx2`, `neon`, `accelerate`) an output's rounding depends on its position (the vector
+/// part of the matvec fuses the multiply and add, its last few columns do not, and
+/// Accelerate's GEMM keeps its own order), and removing neurons moves outputs between those
+/// parts. There each network is within the documented matvec and GEMM tolerance of the
+/// exact in-order result for the masked network's summed lengths, so the two differ by at
+/// most the sum of their tolerances.
+///
+/// All of this holds for finite weights: a masked neuron whose outgoing weight is infinite
 /// or NaN gives `0 · ∞ = NaN` in the masked network, while the compacted network drops that
 /// weight and gives a number.
 ///
@@ -46,11 +57,20 @@ use crate::{Layer, Linear, Prelu, Sequential};
 ///   (a mask before a `Softmax`, or on a layer that does not follow a `Linear`);
 /// - a layer with parameters other than a `Linear` or a `Prelu`, whose parameters cannot be
 ///   moved to the new store;
+/// - between a `Linear` that loses neurons and the next `Linear`, a layer that is neither an
+///   [`activation`](Layer::activation) (a built-in or an
+///   [`ActivationLayer`](crate::ActivationLayer)) nor a `Prelu`: compaction moves neurons to
+///   lower positions, and only for those layers is it known that every position is treated
+///   alike;
 /// - a `Linear` whose every neuron is off.
 ///
+/// A mask with no neuron off removes nothing and is dropped wherever it is. For each
+/// removed neuron, the layers after the last mask in its run that switches it off must map
+/// 0 to 0; `f(0)` is found by running each of them on a row of zeros with the model's own
+/// values, so a `Prelu` with an infinite slope there fails too.
+///
 /// [`Error::InvalidData`], naming the layer, when a mask's width or a parameter's shape does
-/// not fit its layer. `f(0)` is found by running each element-wise layer after a mask on a
-/// row of zeros, so any layer, built-in or your own, is judged by what it computes.
+/// not fit its layer.
 ///
 /// # Panics
 ///
@@ -75,7 +95,10 @@ use crate::{Layer, Linear, Prelu, Sequential};
 /// let x = [0.5, -1.0, 0.25, 2.0];
 /// let mut masked = InferenceModel::compile(&net, &params).unwrap();
 /// let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
-/// assert_eq!(masked.infer(&x), compacted.infer(&x));
+/// let want = masked.infer(&x).to_vec();
+/// for (got, want) in compacted.infer(&x).iter().zip(&want) {
+///     assert!((got - want).abs() <= 1e-5); // bit for bit on reference and sse4.2
+/// }
 /// ```
 pub fn compact<T: Real>(
     model: &Sequential<T>,
@@ -83,7 +106,11 @@ pub fn compact<T: Real>(
 ) -> Result<(Sequential<T>, ParamStore<T>), Error> {
     check_parameters(model)?;
     let owners = run_owners(model);
-    let keep = kept_neurons(model, params, &owners)?;
+    let masks = placed_masks(model, &owners)?;
+    for (&linear, masked) in &masks {
+        check_narrowed_run(model, params, linear, masked)?;
+    }
+    let keep = kept_neurons(model, params, &masks)?;
     let mut store = ParamStore::<T>::new_generic();
     let mut out = Sequential::<T>::new_generic();
     for i in 0..model.len() {
@@ -99,7 +126,7 @@ pub fn compact<T: Real>(
             out = out.push(rebuilt);
         } else if let Some(prelu) = layer.as_prelu() {
             let kept = owners[i].and_then(|owner| keep[owner].as_deref());
-            out = out.push(rebuild_prelu(i, prelu, params, &mut store, kept)?);
+            out = out.push(rebuild_prelu(prelu, params, &mut store, kept));
         } else {
             out = out.push_shared(model.shared_layer(i));
         }
@@ -139,23 +166,25 @@ fn run_owners<T: Real>(model: &Sequential<T>) -> Vec<Option<usize>> {
     owners
 }
 
-/// For each layer index, the on neurons of the `Linear` there if any mask switches some of
-/// them off (`None` for an unmasked `Linear` and every other layer), after checking that
-/// every masked neuron reaches the next `Linear` as 0.
-fn kept_neurons<T: Real>(
+/// The layers whose masks switch some neuron off, grouped by the `Linear` whose neurons
+/// they mask, in layer order, after checking that each one sits in the run of element-wise
+/// layers of a hidden `Linear` that leads to the next `Linear` and fits its width. Masks
+/// with every neuron on are left out: they remove nothing.
+fn placed_masks<T: Real>(
     model: &Sequential<T>,
-    params: &ParamStore<T>,
     owners: &[Option<usize>],
-) -> Result<Vec<Option<Vec<usize>>>, Error> {
+) -> Result<BTreeMap<usize, Vec<usize>>, Error> {
     let n = model.len();
-    let mut on: Vec<Option<Vec<bool>>> = vec![None; n];
+    let mut placed: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
     for (m, &owner) in owners.iter().enumerate() {
         let Some(mask) = model.mask(m) else {
             continue;
         };
+        if mask.off().next().is_none() {
+            continue;
+        }
         let name = model.layer(m).name();
-        let no_linear_after = (m + 1..n).all(|l| model.linear(l).is_none());
-        if no_linear_after {
+        if (m + 1..n).all(|l| model.linear(l).is_none()) {
             return Err(Error::Unsupported(format!(
                 "compact: layer {m} ({name}) carries a mask, but no Linear layer follows it, \
                  so its neurons are the model's outputs and cannot be removed; clear the mask \
@@ -177,18 +206,14 @@ fn kept_neurons<T: Real>(
                     .to_string(),
             ));
         };
-        let end = model.neuron_layer(linear);
-        if model.linear(end + 1).is_none() {
-            let next = end + 1;
+        let next = model.neuron_layer(linear) + 1;
+        if model.linear(next).is_none() {
             return Err(not_reaching(format!(
                 "reach layer {next} ({}), which is not a Linear",
                 model.layer(next).name()
             )));
         }
-        let width = model
-            .linear(linear)
-            .expect("the owner of a run is a Linear")
-            .outputs();
+        let width = linear_width(model, linear);
         if mask.width() != width {
             return Err(Error::InvalidData(format!(
                 "compact: the mask on layer {m} ({name}) has width {}, but the linear layer \
@@ -196,49 +221,123 @@ fn kept_neurons<T: Real>(
                 mask.width()
             )));
         }
-        let off: Vec<usize> = mask.off().collect();
-        for l in m + 1..=end {
-            let zeros = zeros_through(model.layer(l), params, width);
-            if zeros.len() != width {
+        placed.entry(linear).or_default().push(m);
+    }
+    Ok(placed)
+}
+
+/// The output width of the `Linear` at layer `linear`, which must be one.
+fn linear_width<T: Real>(model: &Sequential<T>, linear: usize) -> usize {
+    model
+        .linear(linear)
+        .expect("the owner of a run is a Linear")
+        .outputs()
+}
+
+/// Checks the run of the `Linear` at layer `linear`, which loses neurons (its masks are on
+/// the layers `masked`): every layer after it up to the next `Linear` must be an activation
+/// or a `Prelu` with one slope or one per neuron, and the next `Linear` must take as many
+/// inputs as the `Linear` has neurons.
+fn check_narrowed_run<T: Real>(
+    model: &Sequential<T>,
+    params: &ParamStore<T>,
+    linear: usize,
+    masked: &[usize],
+) -> Result<(), Error> {
+    let (width, end) = (linear_width(model, linear), model.neuron_layer(linear));
+    for l in linear + 1..=end {
+        let layer = model.layer(l);
+        if let Some(prelu) = layer.as_prelu() {
+            let slopes = params.value(prelu.weight()).data().len();
+            if slopes != 1 && slopes != width {
                 return Err(Error::InvalidData(format!(
-                    "compact: layer {l} ({}) turns a row of width {width} into width {}",
-                    model.layer(l).name(),
-                    zeros.len()
+                    "compact: the prelu layer {l} has {slopes} slopes, but the linear layer \
+                     {linear} before it outputs width {width}"
                 )));
             }
-            if off.iter().any(|&j| zeros[j] != T::ZERO) {
-                return Err(Error::Unsupported(format!(
-                    "compact: the mask on layer {m} ({name}) switches neurons off before layer \
-                     {l} ({}), which does not map 0 to 0, so an off neuron does not send 0 to \
-                     the next Linear and cannot be removed; mask the neurons of the linear \
-                     layer {linear} with set_neuron_mask({linear}, mask) instead, which puts \
-                     the mask on layer {end}, after every activation",
-                    model.layer(l).name()
-                )));
-            }
-        }
-        let entry = on[linear].get_or_insert_with(|| vec![true; width]);
-        for j in off {
-            entry[j] = false;
+        } else if layer.activation().is_none() {
+            return Err(Error::Unsupported(format!(
+                "compact: layer {l} ({}) is element-wise but compact cannot tell whether it \
+                 treats every position alike, so it cannot follow the linear layer {linear} \
+                 once neurons are removed from it; use an activation (a built-in or an \
+                 ActivationLayer) or a Prelu there, or clear the masks on layers {masked:?}",
+                layer.name()
+            )));
         }
     }
-    on.into_iter()
-        .enumerate()
-        .map(|(linear, on)| {
-            let Some(on) = on else {
-                return Ok(None);
+    let next = model
+        .linear(end + 1)
+        .expect("placed_masks checked that a Linear follows the run");
+    if next.inputs() != width {
+        return Err(Error::InvalidData(format!(
+            "compact: the linear layer {} takes {} inputs, but the linear layer {linear} before \
+             it outputs width {width}",
+            end + 1,
+            next.inputs()
+        )));
+    }
+    Ok(())
+}
+
+/// For each layer index, the on neurons of the `Linear` there if a mask switches some of
+/// them off (`None` for an unmasked `Linear` and every other layer), after checking that
+/// every removed neuron reaches the next `Linear` as 0: each layer after the last mask in
+/// its run that switches it off must map 0 to 0 at its position.
+fn kept_neurons<T: Real>(
+    model: &Sequential<T>,
+    params: &ParamStore<T>,
+    masks: &BTreeMap<usize, Vec<usize>>,
+) -> Result<Vec<Option<Vec<usize>>>, Error> {
+    let mut keep = vec![None; model.len()];
+    for (&linear, masked) in masks {
+        let (width, end) = (linear_width(model, linear), model.neuron_layer(linear));
+        let mut zeros: Vec<Option<Vec<T>>> = vec![None; end + 1];
+        let mut kept = Vec::with_capacity(width);
+        for j in 0..width {
+            let last = masked.iter().rev().find(|&&m| {
+                !model
+                    .mask(m)
+                    .expect("placed_masks lists masked layers")
+                    .is_on(j)
+            });
+            let Some(&last) = last else {
+                kept.push(j);
+                continue;
             };
-            let kept: Vec<usize> = (0..on.len()).filter(|&j| on[j]).collect();
-            if kept.is_empty() {
-                return Err(Error::Unsupported(format!(
-                    "compact: every neuron of the linear layer {linear} is off, which would \
-                     leave it with no neuron; switch at least one on with \
-                     set_neuron({linear}, neuron, true)"
-                )));
+            for (l, cached) in zeros.iter_mut().enumerate().skip(last + 1) {
+                let out =
+                    cached.get_or_insert_with(|| zeros_through(model.layer(l), params, width));
+                if out.len() != width {
+                    return Err(Error::InvalidData(format!(
+                        "compact: layer {l} ({}) turns a row of width {width} into width {}",
+                        model.layer(l).name(),
+                        out.len()
+                    )));
+                }
+                if out[j] != T::ZERO {
+                    return Err(Error::Unsupported(format!(
+                        "compact: the mask on layer {last} ({}) switches neuron {j} off before \
+                         layer {l} ({}), which does not map 0 to 0, so the neuron does not send \
+                         0 to the next Linear and cannot be removed; clear_mask({last}) and \
+                         mask the neurons of the linear layer {linear} with \
+                         set_neuron_mask({linear}, mask) instead, which puts the mask on layer \
+                         {end}, after every activation",
+                        model.layer(last).name(),
+                        model.layer(l).name()
+                    )));
+                }
             }
-            Ok(Some(kept))
-        })
-        .collect()
+        }
+        if kept.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "compact: every neuron of the linear layer {linear} is off, which would leave \
+                 it with no neuron; switch at least one on with \
+                 set_neuron({linear}, neuron, true)"
+            )));
+        }
+        keep[linear] = Some(kept);
+    }
+    Ok(keep)
 }
 
 /// The output of `layer` for one row of `width` zeros, run on a tape with `params`.
@@ -272,14 +371,6 @@ fn rebuild_linear<T: Real>(
             b.shape().dims()
         )));
     }
-    if let Some(cols) = cols
-        && cols.last().is_some_and(|&c| c >= inputs)
-    {
-        return Err(Error::InvalidData(format!(
-            "compact: the linear layer {index} takes {inputs} inputs, fewer than the neurons \
-             of the layer before it"
-        )));
-    }
     let all_rows: Vec<usize>;
     let rows = match rows {
         Some(rows) => rows,
@@ -307,28 +398,18 @@ fn rebuild_linear<T: Real>(
     Linear::from_values(store, weight, bias)
 }
 
-/// The `Prelu` at layer `index` rebuilt in `store` with its slopes from `params`: only the
-/// slopes of the neurons in `kept` when it has one slope per neuron and `kept` is given,
-/// every slope otherwise.
+/// The `Prelu` rebuilt in `store` with its slopes from `params`: only the slopes of the
+/// neurons in `kept` when it has one slope per neuron and `kept` is given (the run was
+/// checked to have one slope per neuron then), every slope otherwise.
 fn rebuild_prelu<T: Real>(
-    index: usize,
     prelu: &Prelu,
     params: &ParamStore<T>,
     store: &mut ParamStore<T>,
     kept: Option<&[usize]>,
-) -> Result<Prelu, Error> {
+) -> Prelu {
     let slopes = params.value(prelu.weight()).data();
     let slopes: Vec<T> = match kept {
-        Some(kept) if slopes.len() > 1 => {
-            if kept.last().is_some_and(|&j| j >= slopes.len()) {
-                return Err(Error::InvalidData(format!(
-                    "compact: the prelu layer {index} has {} slopes, fewer than the neurons it \
-                     receives",
-                    slopes.len()
-                )));
-            }
-            kept.iter().map(|&j| slopes[j]).collect()
-        }
+        Some(kept) if slopes.len() > 1 => kept.iter().map(|&j| slopes[j]).collect(),
         _ => slopes.to_vec(),
     };
     let rebuilt = Prelu::new(store, slopes.len());
@@ -336,5 +417,5 @@ fn rebuild_prelu<T: Real>(
         .value_mut(rebuilt.weight())
         .data_mut()
         .copy_from_slice(&slopes);
-    Ok(rebuilt)
+    rebuilt
 }

@@ -1,8 +1,12 @@
 //! Tests of `shrink::compact`: a masked network rebuilt without its off neurons gives the
-//! masked network's outputs (bit for bit through `infer`, within the GEMM bound on the
-//! batched paths), and the masks it cannot compact are refused with a message that says
-//! what to do. The kernel level is the one `CAVITATION_KERNEL` sets for the test process.
+//! masked network's outputs (bit for bit on the kernel levels whose sums do not depend on an
+//! output's position, within the documented rounding bound on the others), and the masks
+//! and layers it cannot compact are refused with a message that says what to do. The kernel
+//! level is the one `CAVITATION_KERNEL` sets for the test process, except in
+//! `matvec_drops_zero_terms_at_every_level`, which names each level it runs.
 
+use cavitation_core::kernels::matvec::matvec_f32_with;
+use cavitation_core::kernels::{Level, MatRef, supported};
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
 use cavitation_nn::shrink::compact;
 use cavitation_nn::{
@@ -148,6 +152,31 @@ fn assert_within(got: &[f32], want: &[f32], bound: &[f64], what: &str) {
     }
 }
 
+/// Whether compaction is exact at `level`: whether its matvec and GEMM compute every output
+/// with the same steps whatever the output's position and the matrix's width, a sum in
+/// input order from +0 with the multiply and the add rounded separately. The kernel docs
+/// describe this for the reference loops and SSE4.2. AVX2 and NEON fuse the multiply and
+/// add in the vector part of the matvec but not in its last few columns, and Accelerate's
+/// GEMM keeps its own order, so removing neurons can change an output's rounding there.
+fn compaction_is_exact(level: Level) -> bool {
+    matches!(level, Level::Reference | Level::Sse42)
+}
+
+/// Asserts that `got`, from the compacted network, matches `want`, from the masked one, at
+/// the current kernel level: bit for bit where [`compaction_is_exact`], and elsewhere within
+/// twice `bound`, the masked network's rounding bound (each network is within it of the
+/// exact in-order result, which is the same for both). Names `what` and the level.
+fn assert_compacted(got: &[f32], want: &[f32], bound: &[f64], what: &str) {
+    let level = cavitation_core::kernels::level();
+    let what = format!("{what}, level {level}");
+    if compaction_is_exact(level) {
+        assert_bits(got, want, &what);
+    } else {
+        let twice: Vec<f64> = bound.iter().map(|b| 2.0 * b).collect();
+        assert_within(got, want, &twice, &what);
+    }
+}
+
 /// The error message of a refused `compact`, which must be `Error::Unsupported`.
 fn refusal(net: &Sequential, params: &ParamStore) -> String {
     match compact(net, params) {
@@ -157,27 +186,46 @@ fn refusal(net: &Sequential, params: &ParamStore) -> String {
     }
 }
 
-/// Through `infer`, the compacted network gives the masked network's outputs bit for bit
-/// on 360 seeded inputs, at the kernel level of this run.
+/// Runs each row of `x` through `infer` on the masked and the compacted network and checks
+/// them with [`assert_compacted`] against the masked network's bound, naming `what`.
+fn check_infer(
+    (net, params): (&Sequential, &ParamStore),
+    (small, small_params): (&Sequential, &ParamStore),
+    x: &[f32],
+    what: &str,
+) {
+    let width = net
+        .linear(0)
+        .expect("the networks start with a Linear")
+        .inputs();
+    let rows = x.len() / width;
+    let bound = gemm_bound(net, params, x, rows);
+    let mut masked = InferenceModel::compile(net, params).unwrap();
+    let mut compacted = InferenceModel::compile(small, small_params).unwrap();
+    let outputs = masked.output_width();
+    for (r, row) in x.chunks_exact(width).enumerate() {
+        let want = masked.infer(row).to_vec();
+        let got = compacted.infer(row);
+        let b = &bound[r * outputs..(r + 1) * outputs];
+        assert_compacted(got, &want, b, &format!("{what}, infer, input {r}"));
+    }
+}
+
+/// Through `infer`, the compacted network gives the masked network's outputs on 360 seeded
+/// inputs: bit for bit at the levels where compaction is exact, within the matvec bound
+/// elsewhere.
 #[test]
 fn compact_matches_masked_bit_for_bit_through_infer() {
     let mut params = ParamStore::new();
     let net = masked_network(&mut params);
     let (small, small_params) = compact(&net, &params).unwrap();
-    let mut masked = InferenceModel::compile(&net, &params).unwrap();
-    let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
     let x = inputs(ROWS, 64, 5);
-    let level = cavitation_core::kernels::level();
-    for (r, row) in x.as_chunks::<64>().0.iter().enumerate() {
-        let want = masked.infer(row).to_vec();
-        let got = compacted.infer(row);
-        assert_bits(got, &want, &format!("infer, input {r}, level {level}"));
-    }
+    check_infer((&net, &params), (&small, &small_params), &x, "80% off");
 }
 
 /// Through `infer_batch` at batch 360 and through the tape, the compacted network is within
-/// the GEMM bound of the masked one, and bit for bit here, where every summed length is at
-/// most 256 (one block of the GEMM).
+/// the GEMM bound of the masked one at every level, and bit for bit where compaction is
+/// exact, since every summed length here is at most 256 (one block of the GEMM).
 #[test]
 fn compact_matches_within_gemm_bound_batched() {
     let mut params = ParamStore::new();
@@ -185,20 +233,17 @@ fn compact_matches_within_gemm_bound_batched() {
     let (small, small_params) = compact(&net, &params).unwrap();
     let x = inputs(ROWS, 64, 6);
     let bound = gemm_bound(&net, &params, &x, ROWS);
-    let level = cavitation_core::kernels::level();
 
     let mut masked = InferenceModel::compile(&net, &params).unwrap();
     let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
     let batch = Tensor::from_vec(x.clone(), &[ROWS, 64]).unwrap();
     let want = masked.infer_batch(batch.view()).data().to_vec();
     let got = compacted.infer_batch(batch.view()).data().to_vec();
-    assert_within(&got, &want, &bound, &format!("infer_batch, level {level}"));
-    assert_bits(&got, &want, &format!("infer_batch, level {level}"));
+    assert_compacted(&got, &want, &bound, "infer_batch");
 
     let want = tape_output(&net, &params, &x, ROWS);
     let got = tape_output(&small, &small_params, &x, ROWS);
-    assert_within(&got, &want, &bound, &format!("tape, level {level}"));
-    assert_bits(&got, &want, &format!("tape, level {level}"));
+    assert_compacted(&got, &want, &bound, "tape");
 }
 
 /// The compacted weights are the on rows of each masked `Linear` and the matching columns
@@ -261,7 +306,8 @@ fn compact_drops_rows_and_columns() {
 }
 
 /// A per-channel `Prelu` after a masked `Linear` keeps the slopes of the on neurons; a
-/// shared `Prelu` keeps its one slope; the outputs match through `infer`.
+/// shared `Prelu` keeps its one slope; the outputs match through `infer`, as
+/// [`assert_compacted`] checks.
 #[test]
 fn compact_prelu_per_channel() {
     let mut params = ParamStore::new();
@@ -294,12 +340,8 @@ fn compact_prelu_per_channel() {
     assert_eq!(small.linear(2).unwrap().inputs(), 3);
     assert_eq!(small.linear(4).unwrap().inputs(), 4);
 
-    let mut masked = InferenceModel::compile(&net, &params).unwrap();
-    let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
-    for (r, row) in inputs(50, 4, 9).as_chunks::<4>().0.iter().enumerate() {
-        let want = masked.infer(row).to_vec();
-        assert_bits(compacted.infer(row), &want, &format!("input {r}"));
-    }
+    let x = inputs(50, 4, 9);
+    check_infer((&net, &params), (&small, &small_params), &x, "prelu");
 }
 
 /// A mask on the output layer is refused, naming the layer.
@@ -328,7 +370,9 @@ fn mask_on_linear_before_sigmoid_refused() {
     net.set_mask(0, NeuronMask::from_off(4, &[2]));
     let msg = refusal(&net, &params);
     assert!(
-        msg.contains("layer 0") && msg.contains("set_neuron_mask(0, mask)"),
+        msg.contains("layer 0")
+            && msg.contains("clear_mask(0) and")
+            && msg.contains("set_neuron_mask(0, mask)"),
         "{msg}"
     );
     assert!(msg.contains("layer 1 (sigmoid)"), "{msg}");
@@ -361,7 +405,7 @@ fn mask_on_tanh_then_sigmoid_refused() {
 }
 
 /// A mask on a `Linear` itself compacts when the layers after it map 0 to 0 (a ReLU), and
-/// matches the masked network through `infer`.
+/// matches the masked network through `infer`, as [`assert_compacted`] checks.
 #[test]
 fn mask_on_linear_before_relu_compacts() {
     let mut params = ParamStore::new();
@@ -374,12 +418,13 @@ fn mask_on_linear_before_relu_compacts() {
         (0..256).filter(|&j| a.is_on(j) && b.is_on(j)).count()
     };
     assert_eq!(small.linear(0).unwrap().outputs(), union);
-    let mut masked = InferenceModel::compile(&net, &params).unwrap();
-    let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
-    for (r, row) in inputs(40, 64, 10).as_chunks::<64>().0.iter().enumerate() {
-        let want = masked.infer(row).to_vec();
-        assert_bits(compacted.infer(row), &want, &format!("input {r}"));
-    }
+    let x = inputs(40, 64, 10);
+    check_infer(
+        (&net, &params),
+        (&small, &small_params),
+        &x,
+        "mask on the linear",
+    );
 }
 
 /// A mask whose neurons reach a `Softmax` before the next `Linear` is refused, and so is a
@@ -421,17 +466,21 @@ struct ScaledTanh {
 }
 
 impl<T: Real> Layer<T> for ScaledTanh {
+    /// Returns `"scaled_tanh"`.
     fn name(&self) -> &str {
         "scaled_tanh"
     }
+    /// The width is unchanged.
     fn output_width(&self, input_width: usize) -> usize {
         input_width
     }
+    /// Records `tanh(x) · alpha`.
     fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
         let t = tape.tanh(x);
         let alpha = tape.param(self.alpha);
         tape.mul(t, alpha)
     }
+    /// Returns `alpha`.
     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
         vec![("alpha", self.alpha)]
     }
@@ -562,4 +611,270 @@ fn infinite_weight_on_a_masked_neuron_differs() {
     let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
     assert!(masked.infer(&[2.0])[0].is_nan());
     assert_eq!(compacted.infer(&[2.0]), &[6.5]);
+}
+
+/// An element-wise layer without parameters that scales position `j` by `j + 1`: it keeps
+/// the `is_elementwise` promise, maps 0 to 0, and treats each position differently.
+struct PositionScale;
+
+impl<T: Real> Layer<T> for PositionScale {
+    /// Returns `"position_scale"`.
+    fn name(&self) -> &str {
+        "position_scale"
+    }
+    /// The width is unchanged.
+    fn output_width(&self, input_width: usize) -> usize {
+        input_width
+    }
+    /// Records `x · [1, 2, …, width]`.
+    fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+        let width = *tape.shape(x).dims().last().expect("a matrix input");
+        let scale: Vec<T> = (1..=width).map(|j| T::from_f64(j as f64)).collect();
+        let scale = Tensor::from_vec(scale, &[1, width]).unwrap();
+        let s = tape.input(scale.view());
+        tape.mul(x, s)
+    }
+    /// None.
+    fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+        Vec::new()
+    }
+    /// `true`: each output depends only on the input at the same position.
+    fn is_elementwise(&self) -> bool {
+        true
+    }
+}
+
+/// A layer that is element-wise but neither an activation nor a `Prelu` is refused, naming
+/// it, when the `Linear` before it loses neurons, since moving a neuron to a lower position
+/// could change what the layer does to it; with nothing removed it is shared as it is.
+#[test]
+fn position_dependent_layer_refused() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(8);
+    let mut net = Sequential::new()
+        .push(linear(&mut params, 3, 4, &mut rng))
+        .push(PositionScale)
+        .push(linear(&mut params, 4, 2, &mut rng));
+    let (copy, _) = compact(&net, &params).unwrap();
+    assert_eq!(copy.layer(1).name(), "position_scale");
+    net.set_neuron_mask(0, NeuronMask::from_off(4, &[0]));
+    let msg = refusal(&net, &params);
+    assert!(
+        msg.contains("layer 1 (position_scale)") && msg.contains("every position alike"),
+        "{msg}"
+    );
+}
+
+/// The matvec of each level this CPU supports, named explicitly, on a masked layer (inputs
+/// switched off as exact zeros, every output computed) and on its compacted form (those
+/// inputs and four outputs removed, so outputs move between the vector part and the last
+/// columns): bit for bit where [`compaction_is_exact`], within twice the matvec bound
+/// `2·(k + 2)·1.19e-7·(Σᵢ |xᵢ|·|wᵢⱼ| + |bⱼ|)` (k = 20, the masked length) elsewhere.
+#[test]
+fn matvec_drops_zero_terms_at_every_level() {
+    let (k, n) = (20, 13);
+    let (off_inputs, off_outputs) = ([1, 5, 9, 10, 17], [0, 3, 6, 11]);
+    let mut rng = Rng::seed(12);
+    let w_t: Vec<f32> = (0..k * n).map(|_| rng.range(-1.0, 1.0) as f32).collect();
+    let bias: Vec<f32> = (0..n).map(|_| rng.range(-0.1, 0.1) as f32).collect();
+    let mut x: Vec<f32> = (0..k).map(|_| rng.range(-1.0, 1.0) as f32).collect();
+    for &i in &off_inputs {
+        x[i] = 0.0;
+    }
+    let rows: Vec<usize> = (0..k).filter(|i| !off_inputs.contains(i)).collect();
+    let cols: Vec<usize> = (0..n).filter(|j| !off_outputs.contains(j)).collect();
+    let small_w: Vec<f32> = rows
+        .iter()
+        .flat_map(|&i| cols.iter().map(move |&j| (i, j)))
+        .map(|(i, j)| w_t[i * n + j])
+        .collect();
+    let small_x: Vec<f32> = rows.iter().map(|&i| x[i]).collect();
+    let small_bias: Vec<f32> = cols.iter().map(|&j| bias[j]).collect();
+    let bound: Vec<f64> = cols
+        .iter()
+        .map(|&j| {
+            let s: f64 = (0..k)
+                .map(|i| f64::from(x[i]).abs() * f64::from(w_t[i * n + j]).abs())
+                .sum();
+            2.0 * 2.0 * (k as f64 + 2.0) * 1.19e-7 * (s + f64::from(bias[j]).abs())
+        })
+        .collect();
+    let levels = [
+        Level::Reference,
+        Level::Sse42,
+        Level::Avx2Fma,
+        Level::Neon,
+        Level::Accelerate,
+    ];
+    for level in levels.into_iter().filter(|&l| supported(l)) {
+        let mut full = vec![0.0f32; n];
+        let w = MatRef::new(&w_t, k, n, n, 1).unwrap();
+        matvec_f32_with(level, w, &x, Some(&bias), false, &mut full);
+        let want: Vec<f32> = cols.iter().map(|&j| full[j]).collect();
+        let mut got = vec![0.0f32; cols.len()];
+        let w = MatRef::new(&small_w, rows.len(), cols.len(), cols.len(), 1).unwrap();
+        matvec_f32_with(level, w, &small_x, Some(&small_bias), false, &mut got);
+        let what = format!("matvec, level {level}");
+        if compaction_is_exact(level) {
+            assert_bits(&got, &want, &what);
+        } else {
+            assert_within(&got, &want, &bound, &what);
+        }
+    }
+}
+
+/// A layer of your own that wraps a `Prelu` and doubles its output. It cannot claim to be
+/// a `Prelu` (only the crate's own `Prelu` answers `as_prelu`), so `compact` refuses it as a
+/// layer with parameters instead of putting a bare `Prelu` in its place.
+struct PreluTimesTwo {
+    /// The wrapped `Prelu`.
+    inner: Prelu,
+}
+
+impl<T: Real> Layer<T> for PreluTimesTwo {
+    /// Returns `"prelu_times_two"`.
+    fn name(&self) -> &str {
+        "prelu_times_two"
+    }
+    /// The width is unchanged.
+    fn output_width(&self, input_width: usize) -> usize {
+        input_width
+    }
+    /// Records `2 · prelu(x)`.
+    fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+        let y = self.inner.forward(tape, x);
+        tape.scale(y, T::from_f64(2.0))
+    }
+    /// The wrapped `Prelu`'s slopes.
+    fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+        vec![("weight", self.inner.weight())]
+    }
+    /// `true`: each output depends only on the input at the same position.
+    fn is_elementwise(&self) -> bool {
+        true
+    }
+}
+
+/// A wrapper around a `Prelu` is not taken for one: it is refused, naming it.
+#[test]
+fn prelu_wrapper_is_not_taken_for_a_prelu() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(9);
+    let first = linear(&mut params, 3, 4, &mut rng);
+    let inner = Prelu::new(&mut params, 4);
+    let wrapper = PreluTimesTwo { inner };
+    assert!((&wrapper as &dyn Layer<f32>).as_prelu().is_none());
+    let mut net =
+        Sequential::new()
+            .push(first)
+            .push(wrapper)
+            .push(linear(&mut params, 4, 2, &mut rng));
+    net.set_neuron_mask(0, NeuronMask::from_off(4, &[1]));
+    let msg = refusal(&net, &params);
+    assert!(msg.contains("layer 1 (prelu_times_two)"), "{msg}");
+}
+
+/// A mask with every neuron on removes nothing and is dropped, even on the output layer or
+/// on a `Softmax`.
+#[test]
+fn all_on_masks_are_dropped() {
+    let mut params = ParamStore::new();
+    let mut net = network(&mut params);
+    net.set_neuron_mask(4, NeuronMask::all_on(10));
+    net.set_mask(1, NeuronMask::all_on(256));
+    let (copy, copy_params) = compact(&net, &params).unwrap();
+    assert_eq!(copy_params.len(), params.len());
+    for i in 0..copy.len() {
+        assert!(copy.mask(i).is_none(), "layer {i} keeps a mask");
+    }
+
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(10);
+    let mut net = Sequential::new()
+        .push(linear(&mut params, 3, 4, &mut rng))
+        .push(Softmax)
+        .push(linear(&mut params, 4, 2, &mut rng));
+    net.set_mask(1, NeuronMask::all_on(4));
+    assert!(compact(&net, &params).is_ok());
+}
+
+/// A neuron masked on a `Linear` that a `Sigmoid` follows is removed when a later mask in
+/// the run (on the `Sigmoid`) switches it off too, since it then sends 0; a neuron only the
+/// first mask switches off is still refused, naming it.
+#[test]
+fn a_later_mask_covers_an_earlier_one() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(11);
+    let mut net = Sequential::new()
+        .push(linear(&mut params, 3, 4, &mut rng))
+        .push(Sigmoid)
+        .push(linear(&mut params, 4, 2, &mut rng));
+    net.set_mask(0, NeuronMask::from_off(4, &[2]));
+    net.set_mask(1, NeuronMask::from_off(4, &[2]));
+    let (small, small_params) = compact(&net, &params).unwrap();
+    assert_eq!(small.linear(2).unwrap().inputs(), 3);
+    let x = inputs(20, 3, 13);
+    check_infer((&net, &params), (&small, &small_params), &x, "covered");
+
+    net.set_mask(1, NeuronMask::from_off(4, &[1]));
+    let msg = refusal(&net, &params);
+    assert!(
+        msg.contains("neuron 2") && msg.contains("clear_mask(0)"),
+        "{msg}"
+    );
+}
+
+/// The error of a `compact` that must fail with `Error::InvalidData`.
+fn invalid(net: &Sequential, params: &ParamStore) -> String {
+    match compact(net, params) {
+        Err(Error::InvalidData(msg)) => msg,
+        Err(other) => panic!("expected Error::InvalidData, got {other}"),
+        Ok(_) => panic!("expected compact to fail"),
+    }
+}
+
+/// A mask of the wrong width, a weight of the wrong shape in the store, a `Prelu` with the
+/// wrong number of slopes and a next `Linear` with the wrong number of inputs are each
+/// `Error::InvalidData`, naming the layer.
+#[test]
+fn misfitting_masks_and_values_are_invalid_data() {
+    let mut params = ParamStore::new();
+    let mut net = network(&mut params);
+    net.set_mask(1, NeuronMask::from_off(5, &[0]));
+    let msg = invalid(&net, &params);
+    assert!(msg.contains("layer 1") && msg.contains("width 5"), "{msg}");
+
+    let mut params = ParamStore::new();
+    let mut net = network(&mut params);
+    net.set_neuron_mask(0, NeuronMask::from_off(256, &[0]));
+    let weight = net.linear(2).unwrap().weight();
+    *params.value_mut(weight) = Tensor::zeros(&[3, 3]);
+    let msg = invalid(&net, &params);
+    assert!(
+        msg.contains("linear layer 2") && msg.contains("[3, 3]"),
+        "{msg}"
+    );
+
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(14);
+    let first = linear(&mut params, 3, 4, &mut rng);
+    let prelu = Prelu::new(&mut params, 5);
+    let mut net =
+        Sequential::new()
+            .push(first)
+            .push(prelu)
+            .push(linear(&mut params, 4, 2, &mut rng));
+    net.set_mask(0, NeuronMask::from_off(4, &[0]));
+    let msg = invalid(&net, &params);
+    assert!(msg.contains("prelu layer 1 has 5 slopes"), "{msg}");
+
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(15);
+    let mut net = Sequential::new()
+        .push(linear(&mut params, 3, 4, &mut rng))
+        .push(Relu)
+        .push(linear(&mut params, 5, 2, &mut rng));
+    net.set_neuron_mask(0, NeuronMask::from_off(4, &[0]));
+    let msg = invalid(&net, &params);
+    assert!(msg.contains("linear layer 2 takes 5 inputs"), "{msg}");
 }

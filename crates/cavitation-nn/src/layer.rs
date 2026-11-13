@@ -4,6 +4,14 @@ use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
 use crate::{Activation, InferenceLayer, Linear, Prelu};
 
+/// Keeps the layer downcasts closed: only this crate can name `Token`, so only this crate's
+/// `Linear` and `Prelu` can override [`Layer::linear_form`] and [`Layer::prelu_form`].
+pub(crate) mod private {
+    /// The argument of the sealed [`Layer`](super::Layer) hooks; only this crate can make one.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Token(pub(crate) ());
+}
+
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
 /// The trait is object safe, so a network can hold its layers as `Box<dyn Layer<T>>` or an `Arc<dyn
@@ -151,30 +159,21 @@ pub trait Layer<T: Real>: Send + Sync {
         self.activation().is_some()
     }
 
-    /// This layer as a [`Linear`], if it is one. The default is `None`.
-    ///
-    /// ```
-    /// use cavitation_core::{ParamStore, Rng};
-    /// use cavitation_nn::{Layer, Linear, Relu};
-    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
-    /// assert!(Layer::<f32>::as_linear(&layer).is_some());
-    /// assert!(Layer::<f32>::as_linear(&Relu).is_none());
-    /// ```
-    fn as_linear(&self) -> Option<&Linear> {
+    /// This layer as a [`Linear`], if it is one: the sealed hook behind `as_linear` on
+    /// `dyn Layer`. Only this crate can name
+    /// [`private::Token`], so only its own `Linear` can answer `Some`, and code that relies on
+    /// the answer (compiling for inference, compaction) is never handed a layer that only
+    /// claims to be a `Linear`.
+    #[doc(hidden)]
+    fn linear_form(&self, _: private::Token) -> Option<&Linear> {
         None
     }
 
-    /// This layer as a [`Prelu`], if it is one. The default is `None`.
-    /// [`shrink::compact`](crate::shrink::compact) uses it to find the slopes it rebuilds.
-    ///
-    /// ```
-    /// use cavitation_core::ParamStore;
-    /// use cavitation_nn::{Layer, Prelu, Relu};
-    /// let layer = Prelu::new(&mut ParamStore::new(), 3);
-    /// assert!(Layer::<f32>::as_prelu(&layer).is_some());
-    /// assert!(Layer::<f32>::as_prelu(&Relu).is_none());
-    /// ```
-    fn as_prelu(&self) -> Option<&Prelu> {
+    /// This layer as a [`Prelu`], if it is one: the sealed hook behind `as_prelu` on
+    /// `dyn Layer`, closed to other crates as
+    /// [`linear_form`](Self::linear_form) is.
+    #[doc(hidden)]
+    fn prelu_form(&self, _: private::Token) -> Option<&Prelu> {
         None
     }
 
@@ -266,5 +265,52 @@ pub trait Layer<T: Real>: Send + Sync {
     fn inference(&self, params: &ParamValues<f32>) -> Option<InferenceLayer> {
         let _ = params;
         None
+    }
+}
+
+impl<'a, T: Real> dyn Layer<T> + 'a {
+    /// This layer as a [`Linear`], if it is one. Only the crate's own `Linear` answers
+    /// `Some`: a layer of your own cannot claim to be one.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear, Relu};
+    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
+    /// let layers: [&dyn Layer<f32>; 2] = [&layer, &Relu];
+    /// assert_eq!(layers[0].as_linear().unwrap().outputs(), 3);
+    /// assert!(layers[1].as_linear().is_none());
+    /// ```
+    pub fn as_linear(&self) -> Option<&Linear> {
+        self.linear_form(private::Token(()))
+    }
+
+    /// This layer as a [`Prelu`], if it is one. Only the crate's own `Prelu` answers `Some`;
+    /// [`shrink::compact`](crate::shrink::compact) uses it to find the slopes it rebuilds.
+    ///
+    /// ```
+    /// use cavitation_core::ParamStore;
+    /// use cavitation_nn::{Layer, Prelu, Relu};
+    /// let layer = Prelu::new(&mut ParamStore::new(), 3);
+    /// let layers: [&dyn Layer<f32>; 2] = [&layer, &Relu];
+    /// assert!(layers[0].as_prelu().is_some());
+    /// assert!(layers[1].as_prelu().is_none());
+    /// ```
+    ///
+    /// A layer of your own cannot answer it, so it cannot pass for a `Prelu`:
+    ///
+    /// ```compile_fail,E0407
+    /// use cavitation_core::{ParamId, Real, Tape, Var};
+    /// use cavitation_nn::{Layer, Prelu};
+    /// struct Fake(Prelu);
+    /// impl<T: Real> Layer<T> for Fake {
+    ///     fn name(&self) -> &str { "fake" }
+    ///     fn output_width(&self, width: usize) -> usize { width }
+    ///     fn forward(&self, _tape: &mut Tape<'_, T>, x: Var) -> Var { x }
+    ///     fn parameters(&self) -> Vec<(&'static str, ParamId)> { Vec::new() }
+    ///     fn as_prelu(&self) -> Option<&Prelu> { Some(&self.0) }
+    /// }
+    /// ```
+    pub fn as_prelu(&self) -> Option<&Prelu> {
+        self.prelu_form(private::Token(()))
     }
 }
