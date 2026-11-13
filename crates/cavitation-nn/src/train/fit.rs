@@ -758,7 +758,7 @@ impl fmt::Debug for FitConfig {
 
 /// Checks that `data` can be trained on: `x` a matrix with at least one row, and one target
 /// per row.
-pub(super) fn check_dataset(data: &Dataset) -> Result<(), Error> {
+pub(crate) fn check_dataset(data: &Dataset) -> Result<(), Error> {
     let &[rows, _] = data.x.shape().dims() else {
         return Err(Error::InvalidData(format!(
             "the inputs must have shape [rows, features], found {:?}",

@@ -234,7 +234,7 @@ impl<T: Real> Layer<T> for Linear {
     }
 
     /// The layer itself.
-    fn as_linear(&self) -> Option<&Linear> {
+    fn linear_form(&self, _: crate::layer::private::Token) -> Option<&Linear> {
         Some(self)
     }
 

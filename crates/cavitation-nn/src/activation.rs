@@ -723,7 +723,9 @@ macro_rules! builtin_layer {
 
 builtin_layer!(
     /// ReLU: `max(x, 0)`.
-    Relu, Relu, |_s| ActivationKind::Relu
+    Relu,
+    Relu,
+    |_s| ActivationKind::Relu
 );
 builtin_layer!(
     /// Leaky ReLU: `x` above 0, `slope · x` elsewhere.
@@ -748,11 +750,15 @@ impl Default for LeakyRelu {
 }
 builtin_layer!(
     /// The hyperbolic tangent.
-    Tanh, Tanh, |_s| ActivationKind::Tanh
+    Tanh,
+    Tanh,
+    |_s| ActivationKind::Tanh
 );
 builtin_layer!(
     /// The logistic sigmoid.
-    Sigmoid, Sigmoid, |_s| ActivationKind::Sigmoid
+    Sigmoid,
+    Sigmoid,
+    |_s| ActivationKind::Sigmoid
 );
 builtin_layer!(
     /// GELU in the given form.
@@ -760,7 +766,9 @@ builtin_layer!(
         /// Exact (erf) or tanh form.
         approx: GeluApprox
     },
-    Gelu { approx: cavitation_core::GeluApprox::Exact },
+    Gelu {
+        approx: cavitation_core::GeluApprox::Exact
+    },
     |s| ActivationKind::Gelu(s.approx)
 );
 
@@ -800,7 +808,9 @@ impl Default for Elu {
 }
 builtin_layer!(
     /// SELU, the scaled ELU of self-normalising networks.
-    Selu, Selu, |_s| ActivationKind::Selu
+    Selu,
+    Selu,
+    |_s| ActivationKind::Selu
 );
 builtin_layer!(
     /// CELU: `x` above 0, `alpha · (e^(x/alpha) - 1)` elsewhere.
@@ -825,11 +835,15 @@ impl Default for Celu {
 }
 builtin_layer!(
     /// SiLU (swish): `x · σ(x)`.
-    Silu, Silu, |_s| ActivationKind::Silu
+    Silu,
+    Silu,
+    |_s| ActivationKind::Silu
 );
 builtin_layer!(
     /// Mish: `x · tanh(softplus(x))`.
-    Mish, Mish, |_s| ActivationKind::Mish
+    Mish,
+    Mish,
+    |_s| ActivationKind::Mish
 );
 builtin_layer!(
     /// Softplus: `ln(1 + e^(beta·x)) / beta`, and `x` once `beta · x` passes `threshold`.
@@ -839,8 +853,14 @@ builtin_layer!(
         /// The value of `beta · x` above which the output is `x`.
         threshold: f64
     },
-    Softplus { beta: 1.0, threshold: 20.0 },
-    |s| ActivationKind::Softplus { beta: s.beta, threshold: s.threshold }
+    Softplus {
+        beta: 1.0,
+        threshold: 20.0
+    },
+    |s| ActivationKind::Softplus {
+        beta: s.beta,
+        threshold: s.threshold
+    }
 );
 
 impl Default for Softplus {
@@ -860,7 +880,9 @@ impl Default for Softplus {
 }
 builtin_layer!(
     /// Softsign: `x / (1 + |x|)`.
-    Softsign, Softsign, |_s| ActivationKind::Softsign
+    Softsign,
+    Softsign,
+    |_s| ActivationKind::Softsign
 );
 builtin_layer!(
     /// Hardtanh: `x` clamped to `[min, max]`.
@@ -870,8 +892,14 @@ builtin_layer!(
         /// The upper bound.
         max: f64
     },
-    Hardtanh { min: -1.0, max: 1.0 },
-    |s| ActivationKind::Hardtanh { min: s.min, max: s.max }
+    Hardtanh {
+        min: -1.0,
+        max: 1.0
+    },
+    |s| ActivationKind::Hardtanh {
+        min: s.min,
+        max: s.max
+    }
 );
 
 impl Default for Hardtanh {
@@ -891,19 +919,27 @@ impl Default for Hardtanh {
 }
 builtin_layer!(
     /// ReLU6: `min(max(x, 0), 6)`.
-    Relu6, Relu6, |_s| ActivationKind::Relu6
+    Relu6,
+    Relu6,
+    |_s| ActivationKind::Relu6
 );
 builtin_layer!(
     /// Hard sigmoid: 0 up to -3, 1 from 3, `x/6 + 1/2` between.
-    Hardsigmoid, Hardsigmoid, |_s| ActivationKind::Hardsigmoid
+    Hardsigmoid,
+    Hardsigmoid,
+    |_s| ActivationKind::Hardsigmoid
 );
 builtin_layer!(
     /// Hard swish: `x · hardsigmoid(x)`.
-    Hardswish, Hardswish, |_s| ActivationKind::Hardswish
+    Hardswish,
+    Hardswish,
+    |_s| ActivationKind::Hardswish
 );
 builtin_layer!(
     /// Log-sigmoid: `ln σ(x)`.
-    LogSigmoid, LogSigmoid, |_s| ActivationKind::LogSigmoid
+    LogSigmoid,
+    LogSigmoid,
+    |_s| ActivationKind::LogSigmoid
 );
 
 /// The last dimension of a shape, or 1 for a scalar.
@@ -1158,6 +1194,11 @@ impl<T: Real> Layer<T> for Prelu {
     /// `true`: each output depends only on the input at the same position.
     fn is_elementwise(&self) -> bool {
         true
+    }
+
+    /// The layer itself.
+    fn prelu_form(&self, _: crate::layer::private::Token) -> Option<&Prelu> {
+        Some(self)
     }
 
     /// `weight`, without allocating.

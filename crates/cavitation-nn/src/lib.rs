@@ -19,7 +19,9 @@
 //!   on request, and masks changed per instance), and [`save`] and [`load`] for safetensors
 //!   files named like a PyTorch `state_dict`.
 //! - [`shrink`]: shrinking a trained network, with [`shrink::activity`], each neuron's mean,
-//!   mean absolute value, firing share and maximum over a data set.
+//!   mean absolute value, firing share and maximum over a data set, and [`shrink::compact`],
+//!   which removes switched-off neurons into smaller dense layers, and [`shrink::ablate`],
+//!   which ranks neurons by what switching each one off costs.
 //!
 //! # Examples
 //!
@@ -90,7 +92,7 @@ pub use mask::NeuronMask;
 pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
-    Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, History,
-    Loss, LrSchedule, OptimizerConfig, Targets, TargetsView, Trainer, accuracy, evaluate, fit,
-    fit_with_hooks,
+    Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,
+    History, Loss, LrSchedule, OptimizerConfig, Targets, TargetsView, Trainer, accuracy, evaluate,
+    fit, fit_with_hooks,
 };
