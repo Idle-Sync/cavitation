@@ -432,7 +432,7 @@ fn ols_fixtures_match() {
     }
 }
 
-/// A constant column gets the coefficient 0 exactly (scikit-learn's is within 1e-12 of 0),
+/// A constant column gets the coefficient 0 exactly (scikit-learn's is exactly 0.0 too),
 /// and the other coefficients match.
 #[test]
 fn ols_constant_column_matches() {

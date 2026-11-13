@@ -15,7 +15,11 @@
 //! - [`LinearRegression`]: ordinary least squares and ridge regression, matching
 //!   scikit-learn's `LinearRegression` and `Ridge`. [`LinearRegression::fit`] solves exactly
 //!   by QR; [`LinearRegression::fit_gradient`] trains a `Linear` layer to the same answer by
-//!   gradient descent, as [`GradientConfig`] sets out. Both return a [`LinearModel`], which
+//!   gradient descent, as [`GradientConfig`] sets out; standardise the inputs and the value
+//!   targets with `cavitation_nn::Standardizer` before the gradient path and fold the scaling
+//!   back in with `fold_into_input` and `fold_into_output` afterwards, because its defaults
+//!   cannot reach coefficients much larger than about learning rate × epochs, and then
+//!   return `Ok` with a model far from the exact one. Both return a [`LinearModel`], which
 //!   predicts, scores R² and converts to and from a one-layer `Sequential` that saves as a
 //!   PyTorch `nn.Linear`.
 //!

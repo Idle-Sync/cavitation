@@ -27,11 +27,19 @@ use crate::linear::{LinearModel, LinearRegression, Shape, check_alpha, check_val
 /// it happened to draw; near the minimum that noise is as large as the gradient itself, and
 /// the last iterate wanders with it. On the same Concrete rows, minibatches of 32 rows with
 /// Adam stayed about 2e-3 away from the exact solution even after 3,000 to 5,000 epochs
-/// (several seeds), where full batches reach 1e-5 in 1,000. The learning rate is high for
-/// Adam because Adam moves each parameter at most about one learning rate per step, and the
-/// coefficients of a regression on standardised inputs are often of order 10; scale the
-/// inputs to unit variance first ([`Standardizer`](cavitation_nn::Standardizer)), or both
-/// the steps and the conditioning will be off.
+/// (several seeds), where full batches reach 1e-5 in 1,000.
+///
+/// These defaults assume standardised inputs **and** value targets: standardise both with
+/// [`Standardizer`](cavitation_nn::Standardizer) before training and fold the scaling back
+/// in afterwards with `fold_into_input` and `fold_into_output` (the example on
+/// [`LinearRegression::fit_gradient`] shows how). Adam moves each weight by about one
+/// learning rate per step, so over 1,000 cosine-annealed epochs from 0.5 a weight travels
+/// at most about 250 from where it starts: coefficients much larger than about
+/// learning rate × epochs cannot be reached, and the result can be far from the exact
+/// answer with no error returned. On the Concrete rows with standardised inputs but targets
+/// multiplied by 100 (coefficients near 1,260) the defaults end about 2.3 away from the exact
+/// solution, relative to `max(1, |exact|)`; unscaled inputs end as far off and make the
+/// conditioning worse as well.
 ///
 /// # Examples
 ///
@@ -55,7 +63,8 @@ pub struct GradientConfig {
     pub optimizer: OptimizerConfig,
     /// How the learning rate changes from epoch to epoch, starting from the optimiser's.
     pub schedule: LrSchedule,
-    /// The seed that shuffles the rows each epoch; `None` keeps the data's order.
+    /// The seed that shuffles the rows each epoch; `None` keeps the data's order. With a
+    /// full batch, shuffling changes only the order of the sums.
     pub shuffle_seed: Option<u64>,
     /// The seed of the weights' initialisation (Xavier uniform, as [`Linear::new`]).
     pub init_seed: u64,
@@ -96,16 +105,29 @@ impl LinearRegression {
     ///
     /// the mean squared error over the batch's `b·k` values (`k` outputs, `n` rows in all)
     /// plus the ridge penalty on the weight only, both recorded on the tape. Its minimiser is
-    /// the exact path's. An epoch splits the rows into `B` batches, and a row lands in batch
-    /// `j` (of `b_j` rows) with probability `b_j / n`, where its squared error is weighted
-    /// `1/(b_j·k)`; so each row's expected weight in an epoch's summed gradient is
+    /// the exact path's. An epoch splits the shuffled rows into `B` batches, and a row lands
+    /// in batch `j` (of `b_j` rows) with probability `b_j / n`, where its squared error is
+    /// weighted `1/(b_j·k)`; so each row's expected weight in an epoch's summed gradient is
     /// `Σ_j (b_j/n) · 1/(b_j·k) = B/(n·k)`, the same for every row even when the last batch
     /// is short. The penalty enters once per step, `B` times per epoch, with weight
     /// `B·alpha/(n·k)`. The expected gradient of an epoch is therefore
     /// `B/(n·k) · ∇(‖y − X·Wᵀ − c‖² + alpha·‖W‖²)`: a positive multiple of the gradient of
     /// scikit-learn's ridge objective, with the same minimiser. With a full batch (`B = 1`,
-    /// `b = n`) each step's objective is exactly `1/(n·k)` times scikit-learn's. Without the
-    /// `1/(n·k)` the penalty would be `n·k` times too strong next to a mean.
+    /// `b = n`) shuffling has no effect: the argument holds for every epoch, not only in
+    /// expectation, and each step's objective is exactly `1/(n·k)` times scikit-learn's.
+    /// Without the `1/(n·k)` the penalty would be `n·k` times too strong next to a mean. With
+    /// minibatches and `shuffle_seed: None`, a short last batch holds the same rows every
+    /// epoch and weights them more, so the iterates are not centred on that minimiser.
+    ///
+    /// **Standardise first.** The defaults of [`GradientConfig`] assume standardised inputs
+    /// and value targets. Standardise both with [`Standardizer`](cavitation_nn::Standardizer),
+    /// train, then fold the scaling back into the layer with `fold_into_input` and
+    /// `fold_into_output`, as the second example does. Adam moves each weight by about one
+    /// learning rate per step, so with the defaults a coefficient much larger than about
+    /// learning rate × epochs (about 250) cannot be reached: the call returns `Ok` with a
+    /// model that can be far from the exact one. On the Concrete rows with standardised
+    /// inputs but targets multiplied by 100, the defaults end about 2.3 away (relative to
+    /// `max(1, |exact|)`). [`fit`](Self::fit) is the reference to compare with.
     ///
     /// Without `fit_intercept` the bias is held at 0: set to 0 at the start and after every
     /// step. Every step runs the [`HealthMonitor`] checks of `config.health`, as
@@ -142,6 +164,42 @@ impl LinearRegression {
     /// assert!((model.coef.data()[0] - 3.0).abs() < 1e-3);
     /// assert!((model.intercept[0] + 1.0).abs() < 1e-3);
     /// assert_eq!(history.epochs.len(), 1000);
+    /// ```
+    ///
+    /// Inputs in the hundreds and targets in the tens of thousands: standardise both, train,
+    /// fold the scaling back in, and compare with the exact path.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_ml::{GradientConfig, LinearModel, LinearRegression};
+    /// use cavitation_nn::{Dataset, Standardizer, Targets};
+    /// let mut rng = Rng::seed(1);
+    /// let x: Vec<f32> = (0..200).map(|_| 500.0 + 100.0 * rng.normal() as f32).collect();
+    /// let y: Vec<f32> = x.chunks(2).map(|r| 40.0 * r[0] - 7.0 * r[1] + 2000.0).collect();
+    /// let raw = Dataset {
+    ///     x: Tensor::from_vec(x, &[100, 2]).unwrap(),
+    ///     targets: Targets::Values(Tensor::from_vec(y, &[100, 1]).unwrap()),
+    /// };
+    /// let exact = LinearRegression::default().fit(&raw).unwrap();
+    ///
+    /// let Targets::Values(t) = &raw.targets else { unreachable!() };
+    /// let (inputs, outputs) = (Standardizer::fit(raw.x.view()), Standardizer::fit(t.view()));
+    /// let mut data = raw.clone();
+    /// inputs.transform_inputs(&mut data);
+    /// outputs.transform_targets(&mut data).unwrap();
+    /// let regression = LinearRegression::default();
+    /// let (scaled, _) = regression.fit_gradient(&data, GradientConfig::default()).unwrap();
+    ///
+    /// let mut params = ParamStore::new();
+    /// let net = scaled.to_sequential(&mut params);
+    /// inputs.fold_into_input(&net, &mut params).unwrap();
+    /// outputs.fold_into_output(&net, &mut params).unwrap();
+    /// let model = LinearModel::from_sequential(&net, &params).unwrap();
+    /// let ours = model.coef.data().iter().chain(&model.intercept);
+    /// let theirs = exact.coef.data().iter().chain(&exact.intercept);
+    /// for (g, e) in ours.zip(theirs) {
+    ///     assert!((g - e).abs() <= 1e-3 * e.abs().max(1.0), "{g} against {e}");
+    /// }
     /// ```
     pub fn fit_gradient(
         &self,
@@ -344,6 +402,44 @@ mod tests {
         let exact = ridge.fit(&d).unwrap();
         for (g, e) in q.coef.data().iter().zip(exact.coef.data()) {
             assert!((g - e).abs() <= 1e-3 * e.abs().max(1.0), "{g} against {e}");
+        }
+    }
+
+    /// Ridge with three outputs reaches the exact path within `1e-3 · max(1, |exact|)`: the
+    /// penalty's `1/(n·k)` scaling holds for `k > 1` (with `1/n` alone it would be three
+    /// times too strong).
+    #[test]
+    fn several_outputs_ridge_matches_exact() {
+        let (rows, features, outputs) = (200, 4, 3);
+        let mut rng = Rng::seed(9);
+        let x: Vec<f32> = (0..rows * features).map(|_| rng.normal() as f32).collect();
+        let w: Vec<f32> = (0..features * outputs)
+            .map(|_| 2.0 * rng.normal() as f32)
+            .collect();
+        let mut y = Vec::with_capacity(rows * outputs);
+        for row in x.chunks(features) {
+            for q in 0..outputs {
+                let s: f32 = (0..features).map(|j| row[j] * w[j * outputs + q]).sum();
+                y.push(s + q as f32 + 0.5 * rng.normal() as f32);
+            }
+        }
+        let d = Dataset {
+            x: Tensor::from_vec(x, &[rows, features]).unwrap(),
+            targets: Targets::Values(Tensor::from_vec(y, &[rows, outputs]).unwrap()),
+        };
+        let ridge = LinearRegression {
+            alpha: 10.0,
+            ..LinearRegression::default()
+        };
+        let (g, _) = ridge.fit_gradient(&d, quiet()).unwrap();
+        let exact = ridge.fit(&d).unwrap();
+        let ours = g.coef.data().iter().chain(&g.intercept);
+        let theirs = exact.coef.data().iter().chain(&exact.intercept);
+        for (i, (a, e)) in ours.zip(theirs).enumerate() {
+            assert!(
+                (a - e).abs() <= 1e-3 * e.abs().max(1.0),
+                "value {i}: {a} against {e}"
+            );
         }
     }
 

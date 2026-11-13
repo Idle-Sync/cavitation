@@ -93,9 +93,10 @@ impl LinearRegression {
     /// use cavitation_nn::{Dataset, Targets};
     /// // Column 1 is twice column 0: no unique answer without a penalty.
     /// let x = vec![1.0f32, 2.0, 2.0, 4.0, 3.0, 6.0, 5.0, 10.0];
+    /// let y = vec![1.0f32, 2.0, 3.0, 5.0];
     /// let data = Dataset {
     ///     x: Tensor::from_vec(x, &[4, 2]).unwrap(),
-    ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 5.0], &[4, 1]).unwrap()),
+    ///     targets: Targets::Values(Tensor::from_vec(y, &[4, 1]).unwrap()),
     /// };
     /// let err = LinearRegression::default().fit(&data).unwrap_err();
     /// assert!(err.to_string().contains("column 1"));
@@ -212,7 +213,7 @@ impl LinearRegression {
                 column[rows + c] = root;
             }
         }
-        let qr = Qr::from_columns(a, total, m)?;
+        let qr = Qr::from_columns(a, total, m).map_err(in_context)?;
         if let Some(c) = qr.dependent_column() {
             let j = used[c];
             let hint = if ridge {
@@ -234,10 +235,26 @@ impl LinearRegression {
         for (i, row) in b.chunks_exact_mut(outputs).take(rows).enumerate() {
             for (q, value) in row.iter_mut().enumerate() {
                 *value = y[i * outputs + q] - y_mean[q];
+                if value.is_nan() || value.abs() > limit {
+                    return Err(Error::InvalidData(format!(
+                        "linear regression: target column {q} holds values too close to the \
+                         largest f64 to solve with; rescale the targets"
+                    )));
+                }
             }
         }
         let b = Tensor::from_vec(b, &[total, outputs])?;
-        Ok(qr.solve(b.view())?.data().to_vec())
+        Ok(qr.solve(b.view()).map_err(in_context)?.data().to_vec())
+    }
+}
+
+/// Prefixes an [`Error::InvalidData`] from the least-squares solver with "linear
+/// regression: ", so that an overflow found inside QR says which call met it. Other errors
+/// pass through unchanged.
+fn in_context(error: Error) -> Error {
+    match error {
+        Error::InvalidData(message) => Error::InvalidData(format!("linear regression: {message}")),
+        other => other,
     }
 }
 
@@ -445,7 +462,10 @@ impl LinearModel {
     /// use cavitation_core::Tensor;
     /// use cavitation_ml::LinearModel;
     /// use cavitation_nn::{Dataset, Targets};
-    /// let model = LinearModel { coef: Tensor::from_vec(vec![1.0], &[1, 1]).unwrap(), intercept: vec![0.0] };
+    /// let model = LinearModel {
+    ///     coef: Tensor::from_vec(vec![1.0], &[1, 1]).unwrap(),
+    ///     intercept: vec![0.0],
+    /// };
     /// let data = Dataset {
     ///     x: Tensor::from_vec(vec![1.0f32, 2.0, 3.0], &[3, 1]).unwrap(),
     ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 2.0, 4.0], &[3, 1]).unwrap()),
@@ -512,10 +532,16 @@ impl LinearModel {
     /// [`save`](cavitation_nn::save), it is a PyTorch `nn.Linear(features, outputs)`'s
     /// `state_dict` (keys `0.weight` and `0.bias`, inside an `nn.Sequential`).
     ///
+    /// A coefficient or intercept beyond the `f32` range (about ±3.4e38, possible for a model
+    /// fitted on `f64` data) becomes ±infinity in the layer, and a saved file carries the
+    /// infinity; debug builds panic instead, naming the value. Rescale the data so the
+    /// coefficients fit before converting.
+    ///
     /// # Panics
     ///
     /// Panics if the model has no features or no outputs (a `Linear` needs both), and as
-    /// described on the model's fields if `coef` and `intercept` do not agree.
+    /// described on the model's fields if `coef` and `intercept` do not agree. In debug
+    /// builds, also panics if a finite coefficient or intercept rounds to an infinite `f32`.
     ///
     /// # Examples
     ///
@@ -541,6 +567,20 @@ impl LinearModel {
         );
         let weight: Vec<f32> = self.coef.data().iter().map(|&w| w as f32).collect();
         let bias: Vec<f32> = self.intercept.iter().map(|&b| b as f32).collect();
+        debug_assert!(
+            {
+                let wide = self.coef.data().iter().zip(&weight);
+                let narrow = self.intercept.iter().zip(&bias);
+                wide.chain(narrow)
+                    .all(|(&v, r)| !v.is_finite() || r.is_finite())
+            },
+            "LinearModel::to_sequential: a coefficient or intercept is beyond the f32 range: {:?}",
+            self.coef
+                .data()
+                .iter()
+                .chain(&self.intercept)
+                .find(|v| v.is_finite() && !(**v as f32).is_finite())
+        );
         let weight = Tensor::from_vec(weight, &[outputs, features]).expect("coef's shape");
         let bias = Tensor::from_vec(bias, &[outputs]).expect("one bias per output");
         let linear = Linear::from_values(params, weight, bias).expect("checked shapes");
@@ -572,7 +612,9 @@ impl LinearModel {
     /// let model = LinearModel::from_sequential(&net, &params).unwrap();
     /// assert_eq!(model.coef.shape().dims(), &[2, 3]);
     ///
-    /// let deeper = Sequential::new().push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0))).push(Relu);
+    /// let deeper = Sequential::new()
+    ///     .push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0)))
+    ///     .push(Relu);
     /// assert!(LinearModel::from_sequential(&deeper, &params).is_err());
     /// ```
     pub fn from_sequential(model: &Sequential, params: &ParamStore) -> Result<LinearModel, Error> {
@@ -844,6 +886,49 @@ mod tests {
         };
         let err = LinearRegression::default().fit(&d).unwrap_err().to_string();
         assert!(err.contains("column 1 holds values too close"), "{err}");
+    }
+
+    /// Targets whose centred values would overflow f64 are refused, naming the target
+    /// column, and a solution that overflows inside QR is reported with the regression's
+    /// context.
+    #[test]
+    fn overflow_errors_have_context() {
+        let x = vec![1.0, 2.0, 3.0];
+        let y = vec![1.5e308, -1.6e308, 1.7e308];
+        let d = Dataset {
+            x: Tensor::from_vec(x, &[3, 1]).unwrap(),
+            targets: Targets::Values(Tensor::from_vec(y, &[3, 1]).unwrap()),
+        };
+        let err = LinearRegression::default().fit(&d).unwrap_err().to_string();
+        assert!(
+            err.contains("target column 0 holds values too close"),
+            "{err}"
+        );
+        // Inputs near 1e-300 and targets near 1e10: the slope is near 1e310.
+        let x = vec![1e-300, 2e-300, 4e-300];
+        let y = vec![1e10, 2e10, 5e10];
+        let d = Dataset {
+            x: Tensor::from_vec(x, &[3, 1]).unwrap(),
+            targets: Targets::Values(Tensor::from_vec(y, &[3, 1]).unwrap()),
+        };
+        let err = LinearRegression::default().fit(&d).unwrap_err().to_string();
+        assert!(
+            err.contains("linear regression: the least-squares solution"),
+            "{err}"
+        );
+        assert!(err.contains("overflows"), "{err}");
+    }
+
+    /// In debug builds `to_sequential` refuses a coefficient beyond the `f32` range.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "beyond the f32 range")]
+    fn to_sequential_refuses_out_of_range() {
+        let model = LinearModel {
+            coef: Tensor::from_vec(vec![1e39], &[1, 1]).unwrap(),
+            intercept: vec![0.0],
+        };
+        model.to_sequential(&mut ParamStore::new());
     }
 
     /// Several outputs are fitted at once, each as its own regression.
