@@ -2,7 +2,7 @@
 
 use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
-use crate::{Activation, InferenceLayer, Linear};
+use crate::{Activation, InferenceLayer, Linear, Prelu};
 
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
@@ -161,6 +161,20 @@ pub trait Layer<T: Real>: Send + Sync {
     /// assert!(Layer::<f32>::as_linear(&Relu).is_none());
     /// ```
     fn as_linear(&self) -> Option<&Linear> {
+        None
+    }
+
+    /// This layer as a [`Prelu`], if it is one. The default is `None`.
+    /// [`shrink::compact`](crate::shrink::compact) uses it to find the slopes it rebuilds.
+    ///
+    /// ```
+    /// use cavitation_core::ParamStore;
+    /// use cavitation_nn::{Layer, Prelu, Relu};
+    /// let layer = Prelu::new(&mut ParamStore::new(), 3);
+    /// assert!(Layer::<f32>::as_prelu(&layer).is_some());
+    /// assert!(Layer::<f32>::as_prelu(&Relu).is_none());
+    /// ```
+    fn as_prelu(&self) -> Option<&Prelu> {
         None
     }
 

@@ -253,6 +253,23 @@ impl<T: Real> Sequential<T> {
         self
     }
 
+    /// Adds a layer already shared with another network at the end, so that both hold the
+    /// same layer: for a copy that rebuilds some layers and keeps the rest.
+    pub(crate) fn push_shared(mut self, layer: Arc<dyn Layer<T>>) -> Sequential<T> {
+        self.layers.push(layer);
+        self.masks.push(None);
+        self
+    }
+
+    /// Layer `i`, shared.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i >= len()`.
+    pub(crate) fn shared_layer(&self, i: usize) -> Arc<dyn Layer<T>> {
+        Arc::clone(&self.layers[i])
+    }
+
     /// The number of layers.
     ///
     /// ```

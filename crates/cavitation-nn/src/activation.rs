@@ -1160,6 +1160,11 @@ impl<T: Real> Layer<T> for Prelu {
         true
     }
 
+    /// The layer itself.
+    fn as_prelu(&self) -> Option<&Prelu> {
+        Some(self)
+    }
+
     /// `weight`, without allocating.
     fn parameter(&self, local: &str) -> Option<ParamId> {
         (local == "weight").then_some(self.weight)
