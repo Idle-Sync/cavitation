@@ -69,7 +69,8 @@ pub struct LogisticRegression {
     /// The most Newton steps [`fit`](Self::fit) takes.
     pub max_iter: usize,
     /// [`fit`](Self::fit) stops once a step changes every coefficient by at most
-    /// `tol · (1 + |coefficient|)`.
+    /// `tol · (1 + |coefficient|)`. Values below about 1e-14 can be finer than `f64`
+    /// resolves the answer, and then end in an error saying Newton's method stalled.
     pub tol: f64,
 }
 
@@ -148,7 +149,9 @@ impl LogisticRegression {
     ///   suggests setting `c`;
     /// - if `max_iter` steps do not converge otherwise, or if no point along a Newton step
     ///   lowers the objective (beyond rounding) while the step is still larger than `tol`
-    ///   allows.
+    ///   allows: the message suggests raising `tol`, and, when the fit has no penalty and
+    ///   the coefficients are moving outward or some rows' probabilities are within 1e-10
+    ///   of 0 or 1, says the classes may be separable.
     ///
     /// A model is returned only when a step passed the `tol` test.
     ///
@@ -288,9 +291,11 @@ impl LogisticRegression {
             let mut a = vec![0.0; total * cols];
             let mut b = vec![0.0; total];
             let mut gradient = vec![0.0; cols];
+            let mut clamped = false;
             for (i, (row, &pos)) in x.chunks_exact(features).zip(&positive).enumerate() {
                 let eta = score(&beta, row, offset);
                 let (p, q) = (sigmoid(eta), sigmoid(-eta));
+                clamped |= p < MIN_PROBABILITY || q < MIN_PROBABILITY;
                 let w = p.max(MIN_PROBABILITY) * q.max(MIN_PROBABILITY);
                 let residual = if pos { q } else { -p };
                 let s = (weight * w).sqrt();
@@ -368,13 +373,11 @@ impl LogisticRegression {
                 step.iter_mut().for_each(|d| *d *= 0.5);
                 halvings += 1;
             };
-            let Some((trial, value)) = accepted else {
-                return Err(Error::InvalidData(format!(
-                    "logistic regression: Newton's method stalled at step {step_number}: no \
-                     point along the Newton step lowers the objective, but the step is larger \
-                     than tol allows; rescale the inputs, or set c to add a penalty"
-                )));
+            let Some(accepted) = accepted else {
+                let outward = norm(&full) > norm(&beta) || norm(&beta) > previous_norm;
+                return Err(self.stalled(step_number, !penalised && (outward || clamped)));
             };
+            let (trial, value) = accepted;
             let converged = small(&step, &trial);
             previous_norm = norm(&beta);
             previous = current;
@@ -402,6 +405,38 @@ impl LogisticRegression {
              raise max_iter or tol",
             self.max_iter
         )))
+    }
+
+    /// The error for a Newton step, numbered `step_number`, that no halving made acceptable
+    /// while it was still larger than `tol` allows. When `separating` (no penalty, and the
+    /// stalled step or the last accepted one pushes the coefficients outward, or some
+    /// row's probability is within 1e-10 of 0 or 1) the classes may be separable, which the
+    /// message says first, suggesting `c`; in either case `tol` may be below what `f64`
+    /// resolves for these inputs. Setting `c` is suggested only when it is not set. This
+    /// choice only words an error that is returned either way.
+    fn stalled(&self, step_number: usize, separating: bool) -> Error {
+        let start = format!(
+            "logistic regression: Newton's method stalled at step {step_number}: no point along \
+             the Newton step lowers the objective, but the step is larger than tol = {:e} allows",
+            self.tol
+        );
+        if separating {
+            return Error::InvalidData(format!(
+                "{start}, with the coefficients moving outward or some rows' probabilities \
+                 within 1e-10 of 0 or 1. The classes may be separable, or nearly so, with no \
+                 finite answer; set c to add a penalty. If they are not, tol may be below what \
+                 f64 resolves for these inputs; raise tol"
+            ));
+        }
+        let penalty = if self.c.is_none() {
+            ", or set c to add a penalty"
+        } else {
+            ""
+        };
+        Error::InvalidData(format!(
+            "{start}, which can mean tol is below what f64 resolves for these inputs; raise tol, \
+             or rescale the inputs{penalty}"
+        ))
     }
 
     /// The error for column `col` of the coefficients (the intercept first, when there is
@@ -1123,8 +1158,68 @@ mod tests {
         let err = long.fit(&d).unwrap_err();
         assert!(err.to_string().contains("max_iter = 2000"), "{err}");
         assert_separable(&err);
+        // By 5,000 steps the separated rows' losses no longer change the objective in
+        // `f64`, so it has stopped falling; rule 2 still fires, because it asks only that
+        // the objective not rise beyond rounding while the coefficients grow.
+        let longer = LogisticRegression {
+            max_iter: 5000,
+            ..unpenalised()
+        };
+        let err = longer.fit(&d).unwrap_err();
+        assert!(err.to_string().contains("max_iter = 5000"), "{err}");
+        assert_separable(&err);
         // With a penalty the same rows fit.
         assert!(LogisticRegression::default().fit(&d).is_ok());
+    }
+
+    /// Overlapping classes in column 0 (both at -1, 0 and 1), and a column 1 equal to it
+    /// except on one extra class-1 row, where it is larger by `offset`: moving along column
+    /// 1 minus column 0 separates that row alone.
+    fn one_row_apart(offset: f64) -> Dataset<f64> {
+        let x0 = [-2.0, -1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 2.0, 0.5];
+        let mut x = Vec::new();
+        for (i, &v) in x0.iter().enumerate() {
+            x.extend([v, if i == 8 { v + offset } else { v }]);
+        }
+        wide(x, vec![0, 0, 1, 0, 1, 0, 1, 1, 1], 2)
+    }
+
+    /// A `tol` finer than `f64` resolves the answer stalls Newton at a converged point: an
+    /// error (never a model whose step did not pass the `tol` test) that suggests raising
+    /// `tol`, and does not suggest setting `c` when it is set.
+    #[test]
+    fn tolerance_below_resolution_stalls() {
+        let d = correlated(4);
+        let tight = LogisticRegression {
+            tol: 0.0,
+            ..LogisticRegression::default()
+        };
+        let err = tight.fit(&d).unwrap_err().to_string();
+        assert!(
+            err.contains("stalled") && err.contains("raise tol"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("set c") && !err.contains("separable"),
+            "{err}"
+        );
+        let unpenalised_tight = LogisticRegression { c: None, ..tight };
+        let err = unpenalised_tight.fit(&d).unwrap_err().to_string();
+        assert!(
+            err.contains("stalled") && err.contains("raise tol"),
+            "{err}"
+        );
+    }
+
+    /// Quasi-separable data whose separating direction cancels in `f64` (the extra row 1e-6
+    /// apart) stalls with coefficients near ±2.7e7 and the separated row's probability past
+    /// the clamp: the error says the classes may be separable and suggests `c`.
+    #[test]
+    fn stall_while_growing_suggests_separable() {
+        let err = unpenalised().fit(&one_row_apart(1e-6)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("stalled"), "{text}");
+        assert_separable(&err);
     }
 
     /// The weighted problem losing rank after the first step while the objective falls is
@@ -1135,12 +1230,7 @@ mod tests {
     /// was not at the first step.
     #[test]
     fn rank_lost_while_falling_is_separable() {
-        let x0 = [-2.0, -1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 2.0, 0.5];
-        let mut x = Vec::new();
-        for (i, &v) in x0.iter().enumerate() {
-            x.extend([v, if i == 8 { v + 1e-11 } else { v }]);
-        }
-        let d = wide(x, vec![0, 0, 1, 0, 1, 0, 1, 1, 1], 2);
+        let d = one_row_apart(1e-11);
         let err = unpenalised().fit(&d).unwrap_err();
         assert!(err.to_string().contains("lost rank"), "{err}");
         assert_separable(&err);
@@ -1269,6 +1359,26 @@ mod tests {
         }
     }
 
+    /// The correlated set of [`correlated_rows_with_far_points_fit`] for generator `seed`.
+    fn correlated(seed: u64) -> Dataset<f64> {
+        let mut rng = XorShift(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for i in 0..3000 {
+            let base = rng.normal();
+            let mut row: Vec<f64> = (0..4)
+                .map(|j| base + 0.01 * (f64::from(j) + 1.0) * rng.normal())
+                .collect();
+            let mut label = usize::from(rng.next() < sigmoid(row[0] + 0.3 * row[1]));
+            if i < 3 {
+                row.iter_mut().for_each(|v| *v *= 40.0);
+                label = usize::from(row[0] > 0.0);
+            }
+            x.extend(row);
+            y.push(label);
+        }
+        wide(x, y, 4)
+    }
+
     /// 3,000 rows of four correlated columns (`base + 0.01·k·N(0, 1)`), Bernoulli labels
     /// from `σ(x0 + 0.3·x1)`, and three rows scaled ×40 with the correct label, for the
     /// generator seeds that once stalled Newton (3, 4, 7, 17). Not separable: without a
@@ -1278,22 +1388,7 @@ mod tests {
     #[test]
     fn correlated_rows_with_far_points_fit() {
         for seed in [3u64, 4, 7, 17] {
-            let mut rng = XorShift(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
-            let (mut x, mut y) = (Vec::new(), Vec::new());
-            for i in 0..3000 {
-                let base = rng.normal();
-                let mut row: Vec<f64> = (0..4)
-                    .map(|j| base + 0.01 * (f64::from(j) + 1.0) * rng.normal())
-                    .collect();
-                let mut label = usize::from(rng.next() < sigmoid(row[0] + 0.3 * row[1]));
-                if i < 3 {
-                    row.iter_mut().for_each(|v| *v *= 40.0);
-                    label = usize::from(row[0] > 0.0);
-                }
-                x.extend(row);
-                y.push(label);
-            }
-            let d = wide(x, y, 4);
+            let d = correlated(seed);
             for r in [unpenalised(), LogisticRegression::default()] {
                 let model = r
                     .fit(&d)
