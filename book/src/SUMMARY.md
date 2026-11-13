@@ -5,3 +5,4 @@
 [Introduction](introduction.md)
 
 - [Backprop by hand](backprop-by-hand.md)
+- [Shrinking a network](shrinking.md)

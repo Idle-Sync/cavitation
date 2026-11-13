@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -32,6 +32,15 @@
 //!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
 //!   only; its ticks are taken as 1/100 s (`USER_HZ` = 100, as on x86 and Arm Linux).
 //!   `small --child` is the child's side: one run at the current thread count.
+//! - `shrink` trains the digits network (64 → 256 → 128 → 10, the digits known result's
+//!   recipe) on the first 1,149 training digits and shrinks it twice with the last 288 as
+//!   the validation set: once ranking by outgoing-weight norm with `dead_first` off and
+//!   every level run, once with the defaults. It prints both curves (validation and test
+//!   accuracy at every level), checks that the compacted networks give the masked ones'
+//!   outputs on the 360 test digits through `infer` and `infer_batch`, then times `infer`
+//!   on one test digit for the full network, the full network with the first run's masks,
+//!   and the first run's network compacted: 20,000 warm-up calls each, then 301 interleaved
+//!   rounds of 1,000 calls of each, and prints the medians and the speed-ups.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
@@ -48,7 +57,7 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH]\n\
     \x20 digits  [--python PATH]\n\
@@ -57,6 +66,7 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
+    \x20 shrink\n\
     \x20 info";
 
 /// Entry point of the benchmark runner.
@@ -75,6 +85,13 @@ fn main() -> ExitCode {
         "gemm" => gemm(rest),
         "subnormal" => subnormal(rest),
         "small" => small(rest),
+        "shrink" => {
+            if rest.is_empty() {
+                shrink()
+            } else {
+                Err("shrink takes no arguments".to_string())
+            }
+        }
         "mnist" | "cifar" | "digits" | "latency" | "all" => Options::parse(rest).and_then(|o| {
             let mut rows = Vec::new();
             if command == "all" {
@@ -553,6 +570,243 @@ fn parse_small_line(line: &str) -> Option<runs::SmallRun> {
         }),
         _ => None,
     }
+}
+
+/// The hidden neurons of the digits network: 256 + 128.
+const HIDDEN: usize = 384;
+
+/// Prints one `shrink` run's curve: a line per level with the neurons kept, the parameters
+/// after compaction, validation and test accuracy, validation loss and whether the step met
+/// the criterion; then the chosen step.
+fn print_curve(name: &str, run: &runs::ShrinkRun, start: &runs::ShrinkStart) {
+    let (val_rows, test_rows) = (start.validation.len(), start.test.len());
+    let base = run.baseline.accuracy.unwrap_or(f64::NAN);
+    println!(
+        "{name}: unpruned validation {}/{val_rows} ({:.2}%), loss {:.4}",
+        runs::rows_right(base, &start.validation),
+        base * 100.0,
+        run.baseline.loss
+    );
+    println!(
+        "  {:>7} {:>8} {:>7} {:>16} {:>9} {:>16}  met",
+        "removed", "kept", "params", "validation", "val loss", "test"
+    );
+    for point in &run.curve {
+        let step = &point.step;
+        let val = step.validation.accuracy.unwrap_or(f64::NAN);
+        println!(
+            "  {:>6.1}% {:>8} {:>7} {:>7} {:>7.2}% {:>9.4} {:>7} {:>7.2}%  {}",
+            f64::from(step.removed_bp) / 100.0,
+            step.kept
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join("+"),
+            step.parameters,
+            format!("{}/{val_rows}", runs::rows_right(val, &start.validation)),
+            val * 100.0,
+            step.validation.loss,
+            format!("{}/{test_rows}", point.test_right),
+            point.test_right as f64 * 100.0 / test_rows as f64,
+            if step.met { "yes" } else { "no" }
+        );
+    }
+}
+
+/// What a `shrink` run chose, in one line: the level, the share of hidden neurons removed and
+/// the test accuracy against the unpruned network's. Returns the share removed and the test
+/// accuracy points lost.
+fn print_choice(
+    name: &str,
+    run: &runs::ShrinkRun,
+    unpruned_right: usize,
+    test_rows: usize,
+) -> (f64, f64) {
+    let Some(i) = run.chosen else {
+        println!("{name}: no step met the criterion; the unpruned network is kept");
+        return (0.0, 0.0);
+    };
+    let point = &run.curve[i];
+    let kept: usize = point.step.kept.iter().sum();
+    let removed = (HIDDEN - kept) as f64 / HIDDEN as f64 * 100.0;
+    let lost = (unpruned_right as f64 - point.test_right as f64) * 100.0 / test_rows as f64;
+    println!(
+        "{name}: chose the {:.1}% level, {} of {HIDDEN} hidden neurons removed ({removed:.2}%), \
+         test {}/{test_rows} against {unpruned_right}/{test_rows} unpruned ({:+.2} points)",
+        f64::from(point.step.removed_bp) / 100.0,
+        HIDDEN - kept,
+        point.test_right,
+        -lost
+    );
+    (removed, lost)
+}
+
+/// Compacts `masked` and compares the compacted network's outputs with the masked one's on
+/// the test digits through `infer` (one row at a time) and `infer_batch` (all rows at once),
+/// and prints the count of values whose bits differ. Returns the compacted network.
+///
+/// # Errors
+///
+/// Returns a message if compaction or compilation fails.
+fn check_compaction(
+    what: &str,
+    masked: (&cavitation_nn::Sequential, &cavitation_core::ParamStore),
+    test: &cavitation_nn::Dataset,
+) -> Result<(cavitation_nn::Sequential, cavitation_core::ParamStore), String> {
+    let (small, small_params) =
+        cavitation_nn::shrink::compact(masked.0, masked.1).map_err(|e| e.to_string())?;
+    let compile = |net, params| {
+        cavitation_nn::InferenceModel::compile(net, params).map_err(|e| e.to_string())
+    };
+    let (mut a, mut b) = (
+        compile(masked.0, masked.1)?,
+        compile(&small, &small_params)?,
+    );
+    let one = runs::bit_diff(
+        &runs::infer_rows(&mut b, test),
+        &runs::infer_rows(&mut a, test),
+    );
+    let all = runs::bit_diff(
+        &runs::infer_all(&mut b, test),
+        &runs::infer_all(&mut a, test),
+    );
+    let values = test.len() * 10;
+    println!(
+        "compaction, {what}: infer {} of {values} values differ in their bits (largest \
+         difference {:e}); infer_batch {} of {values} (largest {:e})",
+        one.0, one.1, all.0, all.1
+    );
+    Ok((small, small_params))
+}
+
+/// Runs the `shrink` subcommand: trains, shrinks twice, checks compaction and times the
+/// full and the compacted network.
+///
+/// # Errors
+///
+/// Returns a message if a step fails.
+fn shrink() -> Result<(), String> {
+    use cavitation_nn::shrink::{Ranking, ShrinkConfig};
+    let machine = machine::detect();
+    println!(
+        "shrink: {} ({} logical cores), kernel {}, {} threads, {}",
+        machine.cpu_model,
+        machine.logical_cores,
+        level(),
+        threads(),
+        machine::rustc_version()
+    );
+    println!("load average at the start {}", machine::load_average());
+    println!(
+        "network 64 → 256 → 128 → 10 (ReLU), trained as the digits known result on the first \
+         {} training digits; validation: the last {}",
+        runs::SHRINK_FIT_ROWS,
+        1437 - runs::SHRINK_FIT_ROWS
+    );
+    let start = runs::shrink_start()?;
+    let test_rows = start.test.len();
+    let unpruned = cavitation_nn::accuracy(&start.net, &start.params, &start.test, 128);
+    let unpruned_right = runs::rows_right(unpruned, &start.test);
+    println!(
+        "unpruned test accuracy: {unpruned_right}/{test_rows} ({:.2}%)",
+        unpruned * 100.0
+    );
+
+    let first_name = "run 1 (Ranking::OutNorm, dead_first off, every level)";
+    let first = runs::shrink_run(
+        &start,
+        ShrinkConfig {
+            ranking: Ranking::OutNorm,
+            dead_first: false,
+            patience: None,
+            ..ShrinkConfig::default()
+        },
+    )?;
+    print_curve(first_name, &first, &start);
+    let second_name = "run 2 (ShrinkConfig::default())";
+    let second = runs::shrink_run(&start, ShrinkConfig::default())?;
+    print_curve(second_name, &second, &start);
+    let (removed1, lost1) = print_choice("run 1", &first, unpruned_right, test_rows);
+    let (removed2, lost2) = print_choice("run 2", &second, unpruned_right, test_rows);
+    let verdict = |ok: bool| if ok { "met" } else { "not met" };
+    println!(
+        "run 1: at least 75% removed and at most 1 point lost: {}",
+        verdict(removed1 >= 75.0 && lost1 <= 1.0)
+    );
+    println!(
+        "run 2: at least 70% removed and at most 1 point lost: {}",
+        verdict(removed2 >= 70.0 && lost2 <= 1.0)
+    );
+
+    if let Some(point) = first.curve.iter().find(|p| p.step.removed_bp == 8000) {
+        let (masks, store) = point
+            .step
+            .checkpoint
+            .as_ref()
+            .expect("checkpoints are kept");
+        let mut at = start.net.clone();
+        for (linear, mask) in masks {
+            at.set_neuron_mask(*linear, mask.clone());
+        }
+        let kept = point
+            .step
+            .kept
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>();
+        check_compaction(
+            &format!("run 1's 80% step ({})", kept.join("+")),
+            (&at, store),
+            &start.test,
+        )?;
+    }
+    let (small, small_params) =
+        check_compaction("run 1's choice", (&first.net, &first.params), &start.test)?;
+
+    let compile = |net, params| {
+        cavitation_nn::InferenceModel::compile(net, params).map_err(|e| e.to_string())
+    };
+    let mut models = vec![
+        compile(&start.net, &start.params)?,
+        compile(&first.net, &first.params)?,
+        compile(&small, &small_params)?,
+    ];
+    let names = ["full", "full, run 1's masks on", "run 1's choice compacted"];
+    let sizes = [
+        runs::elements(&start.net, &start.params),
+        runs::elements(&first.net, &first.params),
+        runs::elements(&small, &small_params),
+    ];
+    let input = &start.test.x.data()[..start.test.features()];
+    println!(
+        "latency: one test digit through InferenceModel::infer, {} warm-up calls each, {} \
+         interleaved rounds of {} calls each",
+        runs::SHRINK_WARMUP,
+        runs::SHRINK_ROUNDS,
+        runs::SHRINK_CALLS
+    );
+    let times = runs::time_infer(&mut models, input);
+    println!(
+        "  {:<26} {:>10} {:>11} {:>19} {:>9}",
+        "network", "parameters", "median us", "p10-p90 us", "speed-up"
+    );
+    let full = runs::median(&times.per_call[0]);
+    for ((name, size), t) in names.iter().zip(sizes).zip(&times.per_call) {
+        let m = runs::median(t);
+        println!(
+            "  {name:<26} {size:>10} {:>11.3} {:>9.3}-{:<9.3} {:>8.2}x",
+            m * 1e6,
+            runs::quantile(t, 0.1) * 1e6,
+            runs::quantile(t, 0.9) * 1e6,
+            full / m
+        );
+    }
+    println!(
+        "speed-up of run 1's choice compacted over the full network: {:.2}x",
+        full / runs::median(&times.per_call[2])
+    );
+    println!("load average at the end {}", machine::load_average());
+    Ok(())
 }
 
 /// Tests for the command-line side of the runner.

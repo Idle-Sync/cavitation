@@ -502,10 +502,10 @@ pub struct ShrinkReport {
 /// were given. Call [`compact`](super::compact()) on the result for the smaller dense
 /// network that runs faster.
 ///
-/// What pruning mostly buys is the size. On a 64 → 256 → 128 → 10 network on the digits
-/// data, networks pruned and retrained this way were about as accurate as networks of the
-/// same size trained from scratch at 75–90% removed, and worse at 95%. Treat the size the
-/// run finds as the answer, and compare with a network of that size trained from scratch.
+/// Much of what pruning gives you can be the size itself: a network of the size the run
+/// finds, trained from scratch, may come close to the pruned one or fall short of it,
+/// depending on the problem and the training. Train one and compare before you settle on
+/// the pruned network; the guide's chapter on shrinking does this for the digits network.
 ///
 /// Neurons the model already has off in a neuron mask stay off. The masks the run sets
 /// are neuron masks, by `Linear` ([`Sequential::set_neuron_mask`]); masks on other layers

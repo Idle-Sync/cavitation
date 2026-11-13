@@ -127,6 +127,7 @@ assert_eq!(net.layer(1).name(), "cube");
 ```sh
 cargo run --release --example xor -p cavitation      # the manual loop, then every layer's values through hooks
 cargo run --release --example digits -p cavitation   # fit on the 8x8 digits, then one inference
+cargo run --release --example shrink_digits -p cavitation  # shrink the digits network, compact it and save it
 scripts/data/get-mnist.sh                            # downloads MNIST into data/mnist/ (once)
 cargo run --release --example mnist -p cavitation    # fit on MNIST with Adam and cosine decay
 ```
@@ -163,6 +164,7 @@ cargo run --release -p cavitation-bench -- cifar --batch 128 --steps 100  # step
 cargo run --release -p cavitation-bench -- digits
 cargo run --release -p cavitation-bench -- latency
 cargo run --release -p cavitation-bench -- gemm --shapes mnist128    # the matrix products of one step
+cargo run --release -p cavitation-bench -- shrink                    # shrink the digits network twice, time it compacted
 ```
 
 `all` leaves out `cifar`: an epoch of its network on 50,000 images takes minutes on a small machine, so it is its own command. It is sized so that matrix products, not per-step overheads, take most of the time, which the MNIST run is too short for on a fast machine.
@@ -184,7 +186,7 @@ This runs the gradient checks, the PyTorch fixture comparisons on every kernel l
 
 ## Guide
 
-The guide is in `book/`. Its first chapter, "Backprop by hand", works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks. Build it with [mdBook](https://rust-lang.github.io/mdBook/):
+The guide is in `book/`. Its first chapter, "Backprop by hand", works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks. The second, "Shrinking a network", finds how many neurons the digits network can do without and removes them. Build it with [mdBook](https://rust-lang.github.io/mdBook/):
 
 ```sh
 mdbook serve book   # then open http://localhost:3000

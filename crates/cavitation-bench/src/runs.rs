@@ -1,5 +1,6 @@
-//! Timed runs: the matrix products of one training step, each timed on its own, and the
-//! training and inference runs that are compared with the numpy baseline.
+//! Timed runs: the matrix products of one training step, each timed on its own, the
+//! training and inference runs that are compared with the numpy baseline, and the parts of
+//! the `shrink` run.
 
 use std::cell::{Cell, RefCell};
 use std::hint::black_box;
@@ -11,9 +12,11 @@ use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
 use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_datasets::{cifar10, digits, mnist};
+use cavitation_nn::shrink::{ShrinkConfig, ShrinkStep, Validation, shrink};
 use cavitation_nn::{
-    Adam, Batch, Batcher, Dataset, Health, InferenceModel, Init, Linear, Loss, Optimizer,
-    OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer, Warning, WarningKind,
+    Adam, Batch, Batcher, Dataset, Evaluation, FitConfig, Health, InferenceModel, Init, Linear,
+    Loss, LrSchedule, Optimizer, OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer,
+    Warning, WarningKind, accuracy, fit,
 };
 
 use crate::numpy;
@@ -807,4 +810,220 @@ pub fn small_once() -> Result<SmallRun, String> {
         cpu: cpu()? - cpu0,
         loss_bits: black_box(loss).to_bits(),
     })
+}
+
+/// The training rows the `shrink` run trains on: the first 1,149 of the 1,437 training
+/// digits. The other 288 are its validation set.
+pub const SHRINK_FIT_ROWS: usize = 1149;
+
+/// Timed rounds of the `shrink` run's latency comparison.
+pub const SHRINK_ROUNDS: usize = 301;
+
+/// Calls per model in each timed round of the `shrink` run.
+pub const SHRINK_CALLS: usize = 1_000;
+
+/// Untimed calls per model before the `shrink` run's timed rounds.
+pub const SHRINK_WARMUP: usize = 20_000;
+
+/// The digits network trained for the `shrink` run, with the rows it was not trained on.
+pub struct ShrinkStart {
+    /// The trained network, with no masks.
+    pub net: Sequential,
+    /// Its trained parameters.
+    pub params: ParamStore,
+    /// The rows it was trained on, which shrinking retrains on.
+    pub fit_rows: Dataset,
+    /// The held-out training rows: the validation set.
+    pub validation: Dataset,
+    /// The 360 test digits, used only to check the results.
+    pub test: Dataset,
+}
+
+/// Trains the 64 → 256 → 128 → 10 ReLU network as the digits known result does (He uniform
+/// weights, zero biases, `Rng::seed(1)`, Adam lr 0.002, batch 32, 20 epochs, shuffle seed
+/// 7), on the first [`SHRINK_FIT_ROWS`] training rows, with quiet health checks.
+///
+/// # Errors
+///
+/// Returns a message if the data cannot be loaded or training stops.
+pub fn shrink_start() -> Result<ShrinkStart, String> {
+    let (train, test) = digits::load().map_err(|e| e.to_string())?;
+    let (fit_rows, validation) = train.split_at(SHRINK_FIT_ROWS);
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(1);
+    let mut net = Sequential::new();
+    for (i, pair) in DIGITS_NET.windows(2).enumerate() {
+        net = net.push(Linear::with_init(
+            &mut params,
+            pair[0],
+            pair[1],
+            Init::HeUniform,
+            Init::Zeros,
+            &mut rng,
+        ));
+        if i + 2 < DIGITS_NET.len() {
+            net = net.push(Relu);
+        }
+    }
+    let config = FitConfig {
+        epochs: 20,
+        batch: 32,
+        optimizer: OptimizerConfig::Adam {
+            lr: 0.002,
+            weight_decay: 0.0,
+        },
+        loss: Loss::CrossEntropy,
+        shuffle_seed: Some(7),
+        schedule: LrSchedule::Constant,
+        health: Health::quiet(),
+        on_epoch: None,
+    };
+    fit(&net, &mut params, &fit_rows, config).map_err(|e| e.to_string())?;
+    Ok(ShrinkStart {
+        net,
+        params,
+        fit_rows,
+        validation,
+        test,
+    })
+}
+
+/// The rows of `data` a network classifies correctly, from its accuracy.
+pub fn rows_right(acc: f64, data: &Dataset) -> usize {
+    (acc * data.len() as f64).round() as usize
+}
+
+/// One step of a `shrink` run, with the test accuracy of its network.
+pub struct CurvePoint {
+    /// The step as the run recorded it, with its checkpoint.
+    pub step: ShrinkStep,
+    /// The test digits its network classifies correctly.
+    pub test_right: usize,
+}
+
+/// What one `shrink` run found.
+pub struct ShrinkRun {
+    /// The unpruned network's measures on the validation set.
+    pub baseline: Evaluation,
+    /// Every step, in order.
+    pub curve: Vec<CurvePoint>,
+    /// The index of the chosen step in `curve`, if a step met the criterion.
+    pub chosen: Option<usize>,
+    /// The chosen network (the unpruned one if no step met the criterion), with its masks.
+    pub net: Sequential,
+    /// The chosen network's parameters.
+    pub params: ParamStore,
+}
+
+/// Runs `shrink` from `start` with `config`, the validation set and checkpoints filled in,
+/// and measures each step's network on the test digits. `start` is not changed.
+///
+/// # Errors
+///
+/// Returns a message if the run fails.
+pub fn shrink_run(start: &ShrinkStart, config: ShrinkConfig) -> Result<ShrinkRun, String> {
+    let mut net = start.net.clone();
+    let mut params = start.params.clone();
+    let config = ShrinkConfig {
+        validation: Some(Validation::Given(start.validation.clone())),
+        keep_checkpoints: true,
+        ..config
+    };
+    let report =
+        shrink(&mut net, &mut params, &start.fit_rows, config).map_err(|e| e.to_string())?;
+    let curve = report
+        .steps
+        .into_iter()
+        .map(|step| {
+            let (masks, store) = step.checkpoint.as_ref().expect("checkpoints are kept");
+            let mut at = start.net.clone();
+            for (linear, mask) in masks {
+                at.set_neuron_mask(*linear, mask.clone());
+            }
+            let test_right = rows_right(accuracy(&at, store, &start.test, 128), &start.test);
+            CurvePoint { step, test_right }
+        })
+        .collect();
+    Ok(ShrinkRun {
+        baseline: report.baseline,
+        curve,
+        chosen: report.chosen,
+        net,
+        params,
+    })
+}
+
+/// How `a` and `b` compare value by value: the count of values whose bits differ, and the
+/// largest absolute difference.
+pub fn bit_diff(a: &[f32], b: &[f32]) -> (usize, f32) {
+    assert_eq!(a.len(), b.len(), "bit_diff: lengths differ");
+    a.iter().zip(b).fold((0, 0.0f32), |(n, worst), (x, y)| {
+        (
+            n + usize::from(x.to_bits() != y.to_bits()),
+            worst.max((x - y).abs()),
+        )
+    })
+}
+
+/// The outputs of `model` on every row of `data`, one `infer` call per row.
+pub fn infer_rows(model: &mut InferenceModel, data: &Dataset) -> Vec<f32> {
+    let width = data.features();
+    data.x
+        .data()
+        .chunks(width)
+        .flat_map(|row| model.infer(row).to_vec())
+        .collect()
+}
+
+/// The outputs of `model` on all rows of `data` in one `infer_batch` call.
+pub fn infer_all(model: &mut InferenceModel, data: &Dataset) -> Vec<f32> {
+    model.infer_batch(data.x.view()).data().to_vec()
+}
+
+/// The per-call times of the `shrink` run's latency comparison, one list per model.
+pub struct Latencies {
+    /// For each model, the mean seconds per call of each timed round.
+    pub per_call: Vec<Vec<f64>>,
+}
+
+/// Times one input through each of `models` with `InferenceModel::infer`: each model is
+/// warmed up with [`SHRINK_WARMUP`] calls, then timed in [`SHRINK_ROUNDS`] rounds; each round
+/// runs [`SHRINK_CALLS`] back-to-back calls of every model, starting from a different model
+/// each round, so that every model sees the same machine state.
+pub fn time_infer(models: &mut [InferenceModel], input: &[f32]) -> Latencies {
+    for model in models.iter_mut() {
+        for _ in 0..SHRINK_WARMUP {
+            black_box(model.infer(black_box(input)));
+        }
+    }
+    let n = models.len();
+    let mut per_call = vec![Vec::with_capacity(SHRINK_ROUNDS); n];
+    for round in 0..SHRINK_ROUNDS {
+        for k in 0..n {
+            let m = (round + k) % n;
+            let model = &mut models[m];
+            let start = Instant::now();
+            for _ in 0..SHRINK_CALLS {
+                black_box(model.infer(black_box(input)));
+            }
+            per_call[m].push(start.elapsed().as_secs_f64() / SHRINK_CALLS as f64);
+        }
+    }
+    Latencies { per_call }
+}
+
+/// The `p`-th share (0 to 1) of `values` by rank, nearest rank below.
+pub fn quantile(values: &[f64], p: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    sorted[((sorted.len() - 1) as f64 * p).floor() as usize]
+}
+
+/// The parameter values `net` holds in `params`, every element of every parameter counted
+/// (masked neurons' included).
+pub fn elements(net: &Sequential, params: &ParamStore) -> usize {
+    net.parameter_names()
+        .iter()
+        .map(|(_, id)| params.value(*id).data().len())
+        .sum()
 }

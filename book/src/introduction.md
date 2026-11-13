@@ -22,3 +22,4 @@ cargo run --release --example xor -p cavitation
 ## Chapters
 
 1. [Backprop by hand](backprop-by-hand.md): a small network learns XOR. The forward pass, the local derivatives, the gradients of backpropagation, and all of them read through hooks.
+2. [Shrinking a network](shrinking.md): how many neurons the digits network can do without. Switching neurons off by hand and in a sweep, `shrink` and its stop rule on a held-out validation set, compaction into a smaller and faster network, and the lottery-ticket question.
