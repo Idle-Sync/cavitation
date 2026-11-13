@@ -2,7 +2,7 @@
 
 use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
-use crate::{Activation, InferenceLayer};
+use crate::{Activation, InferenceLayer, Linear};
 
 /// One stage of a network: it records its forward pass on a tape and names its parameters.
 ///
@@ -111,6 +111,58 @@ pub trait Layer<T: Real>: Send + Sync {
     /// assert_eq!(names, ["weight", "bias"]);
     /// ```
     fn parameters(&self) -> Vec<(&'static str, ParamId)>;
+
+    /// The parameter with local name `local` (for example `"weight"`), if the layer has one.
+    /// The default searches [`parameters`](Self::parameters), which allocates; `Linear` and
+    /// `Prelu` answer without allocating.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear};
+    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
+    /// assert_eq!(Layer::<f32>::parameter(&layer, "bias"), Some(layer.bias()));
+    /// assert_eq!(Layer::<f32>::parameter(&layer, "scale"), None);
+    /// ```
+    fn parameter(&self, local: &str) -> Option<ParamId> {
+        self.parameters()
+            .into_iter()
+            .find(|(name, _)| *name == local)
+            .map(|(_, id)| id)
+    }
+
+    /// Whether each output value depends only on the input value at the same position, so
+    /// that a neuron mask on this layer's output switches off exactly the neuron that feeds
+    /// it. [`Sequential::neuron_layer`](crate::Sequential::neuron_layer) puts a `Linear`'s
+    /// neuron mask on the last layer of the run of element-wise layers after it. The
+    /// default is whether the layer has an [`activation`](Self::activation); `Prelu`
+    /// overrides it to `true`. A layer of your own that is element-wise but has no
+    /// `activation()` should override this, so that neuron masks land after it.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear, Prelu, Relu};
+    /// let mut params = ParamStore::new();
+    /// assert!(Layer::<f32>::is_elementwise(&Relu));
+    /// assert!(Layer::<f32>::is_elementwise(&Prelu::new(&mut params, 1)));
+    /// let linear = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
+    /// assert!(!Layer::<f32>::is_elementwise(&linear));
+    /// ```
+    fn is_elementwise(&self) -> bool {
+        self.activation().is_some()
+    }
+
+    /// This layer as a [`Linear`], if it is one. The default is `None`.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Layer, Linear, Relu};
+    /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
+    /// assert!(Layer::<f32>::as_linear(&layer).is_some());
+    /// assert!(Layer::<f32>::as_linear(&Relu).is_none());
+    /// ```
+    fn as_linear(&self) -> Option<&Linear> {
+        None
+    }
 
     /// The width of input the layer requires, if it requires one. [`Sequential`](crate::Sequential)
     /// checks it against the width of the previous layer's output. The default is `None`

@@ -9,9 +9,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 use cavitation_nn::{
-    Adam, AdamW, Batch, Batcher, Dataset, GradStats, Health, Hooks, InferenceModel, Init, Linear,
-    Loss, NeuronMask, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace, Trainer,
-    Warning,
+    Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats,
+    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential,
+    Sgd, Targets, TargetsView, Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -406,6 +406,94 @@ fn masked_training_step() -> usize {
     made
 }
 
+/// Looks up parameters of the 50k network by name 1,000 times (each of its six names, one
+/// after another) and returns the allocations made.
+fn param_lookup() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let names = [
+        "0.weight", "0.bias", "2.weight", "2.bias", "4.weight", "4.bias",
+    ];
+    let mut found = 0;
+    let before = allocations();
+    for i in 0..1000 {
+        if net.param(names[i % names.len()]).is_some() {
+            found += 1;
+        }
+        if net.param("9.weight").is_some() || net.param("x").is_some() {
+            found += 1;
+        }
+    }
+    let made = allocations() - before;
+    assert_eq!(found, 1000);
+    made
+}
+
+/// Switches neurons of a masked 50k network 1,000 times, on the first and the last `Linear`,
+/// and returns the allocations made (the masks exist before counting starts).
+fn set_neuron_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let mut net = network_50k(&mut params);
+    net.set_neuron_mask(0, NeuronMask::all_on(256));
+    net.set_neuron_mask(4, NeuronMask::all_on(10));
+    let before = allocations();
+    for i in 0..1000 {
+        let (linear, width) = if i % 2 == 0 { (0, 256) } else { (4, 10) };
+        net.set_neuron(linear, i % width, i % 3 == 0);
+    }
+    let made = allocations() - before;
+    assert!(net.neuron_mask(0).unwrap().count_on() < 256);
+    made
+}
+
+/// Trains the 50k network with neuron masks on both ReLU layers, set with `set_neuron`, with
+/// one forward and one backward hook on the first ReLU layer, SGD and Adam, batch 128: one
+/// whole warm-up epoch, then counts the allocations of a second whole epoch.
+fn masked_hooks_steady_state() -> usize {
+    let data = synthetic_1437();
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let mut net = network_50k(&mut params);
+        for (linear, width, every) in [(0, 256, 3), (2, 128, 5)] {
+            net.set_neuron_mask(linear, NeuronMask::all_on(width));
+            for neuron in (0..width).step_by(every) {
+                net.set_neuron(linear, neuron, false);
+            }
+        }
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let mut batcher = Batcher::new(data.len(), 128, Some(3));
+        let mut batch = Batch::new(&data, 128);
+        let mut sink = 0.0f32;
+        let mut seen = 0.0f32;
+        let mut grads = 0.0f32;
+        {
+            let mut hooks = Hooks::new();
+            hooks.on_forward(1, |e| seen += e.output.data()[1]);
+            hooks.on_backward(1, |e| grads += e.grad_output.unwrap().data()[1]);
+            let mut before = 0;
+            for epoch in 0..2 {
+                if epoch == 1 {
+                    before = allocations();
+                }
+                sink += hooked_epoch(
+                    &mut trainer,
+                    &net,
+                    &mut params,
+                    &data,
+                    &mut batcher,
+                    &mut batch,
+                    &mut hooks,
+                );
+            }
+            made += allocations() - before;
+        }
+        assert!(sink.is_finite() && sink > 0.0);
+        assert!(seen.is_finite() && grads.is_finite());
+    }
+    made
+}
+
 /// Trains the 50k network with `Trainer::step` on the centred 1,437-row set at batch 128,
 /// with SGD and with Adam, with every health check on (non-finite values, gradient norms, dead ReLU
 /// neurons) and a sink that counts warnings, calling `Trainer::end_epoch` after each epoch:
@@ -496,6 +584,73 @@ fn infer_batch_steady_state() -> usize {
     made
 }
 
+/// Compiles the 50k network with a mask on its second ReLU and runs one batch of 128 rows
+/// through `infer_batch_observed` as a warm-up, then 2,000 more batches, alternating 128 and
+/// 29 rows, summing every observed output. Returns the allocations made after the warm-up.
+fn observed_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let mut net = network_50k(&mut params);
+    net.set_neuron_mask(2, NeuronMask::from_off(128, &[3, 70]));
+    let mut model = InferenceModel::compile(&net, &params).unwrap();
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    let batch = |start: usize, n: usize| {
+        TensorView::from_slice(&rows[start * 64..(start + n) * 64], &[n, 64]).unwrap()
+    };
+    let mut sink = 0.0f64;
+    let mut layers = 0usize;
+    let mut observe = |layer: usize, out: TensorView<'_, f32>| {
+        layers += layer;
+        sink += f64::from(out.data()[0]);
+    };
+    model.infer_batch_observed(batch(0, 128), &mut observe);
+    let before = allocations();
+    for i in 0..2_000 {
+        let n = if i % 2 == 0 { 128 } else { 29 };
+        let start = (i * 37) % (1437 - 128);
+        model.infer_batch_observed(batch(start, n), &mut observe);
+    }
+    let made = allocations() - before;
+    // Layers 1, 3 and 4 are reported on each of the 2,001 calls.
+    assert_eq!(layers, 2_001 * 8);
+    assert!(sink.is_finite());
+    made
+}
+
+/// Compiles the 50k network with mask steps on both ReLU layers, then alternates
+/// `set_mask` (three prepared masks per layer) with `infer` 1,000 times after one warm-up
+/// round. Returns the allocations made after the warm-up.
+fn set_mask_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut model = InferenceModel::compile_with_masks(&net, &params, &[1, 3]).unwrap();
+    let first = [
+        NeuronMask::all_on(256),
+        NeuronMask::from_off(256, &[0, 9, 255]),
+        NeuronMask::from_on(256, &[4]),
+    ];
+    let second = [
+        NeuronMask::from_off(128, &[1]),
+        NeuronMask::all_off(128),
+        NeuronMask::all_on(128),
+    ];
+    let data = synthetic_1437();
+    let rows = data.x.data();
+    model.set_mask(1, &first[0]).unwrap();
+    model.set_mask(3, &second[0]).unwrap();
+    let mut sink = model.infer(&rows[..64])[0];
+    let before = allocations();
+    for i in 0..1_000 {
+        model.set_mask(1, &first[i % 3]).unwrap();
+        model.set_mask(3, &second[(i / 3) % 3]).unwrap();
+        let at = (i % 1437) * 64;
+        sink += model.infer(&rows[at..at + 64])[0];
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// Traces the 5-layer 50k network (three `Linear` and two `Relu`) into a trace made with
 /// `Trace::with_capacity(5)`: one warm-up pass (which starts the tape's buffers), then 100
 /// more passes through `forward_traced` with the same trace and graph. Returns the allocations
@@ -523,9 +678,180 @@ fn trace_with_capacity_allocates_nothing() -> usize {
     made
 }
 
+/// ReLU written as an activation of your own, so a network using it has no inference form
+/// and evaluates on the tape.
+struct MyRelu;
+
+impl Activation<f32> for MyRelu {
+    /// Returns `"my_relu"`.
+    fn name(&self) -> &str {
+        "my_relu"
+    }
+    /// `max(x, 0)`.
+    fn f(&self, x: f32) -> f32 {
+        x.max(0.0)
+    }
+    /// 1 above 0, else 0.
+    fn df(&self, x: f32, _y: f32) -> f32 {
+        if x > 0.0 { 1.0 } else { 0.0 }
+    }
+}
+
+/// For each row of `data`, whether the two largest outputs of `net` (a chain of `Linear`
+/// and `Relu` layers) lie within twice the inference bound of each other, so that two
+/// calculation paths may rank them differently. The outputs are computed in `f64`, and the
+/// bound is the one the inference tests use: each `Linear` adds
+/// `2·(k + 2)·1.19e-7·(Σᵢ |hᵢ|·|wᵢⱼ| + |bⱼ|)` and carries the bound of its input through
+/// `Σᵢ boundᵢ·|wᵢⱼ|`; a ReLU carries it unchanged.
+fn near_ties(net: &Sequential, params: &ParamStore, data: &Dataset) -> Vec<bool> {
+    let features = data.features();
+    data.x
+        .data()
+        .chunks(features)
+        .map(|row| {
+            let mut h: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+            let mut bound = vec![0.0f64; h.len()];
+            for i in 0..net.len() {
+                let Some(linear) = net.linear(i) else {
+                    h.iter_mut().for_each(|v| *v = v.max(0.0));
+                    continue;
+                };
+                let w = params.value(linear.weight()).data();
+                let b = params.value(linear.bias()).data();
+                let k = h.len();
+                let (mut next, mut carried) = (Vec::new(), Vec::new());
+                for j in 0..linear.outputs() {
+                    let (mut v, mut s, mut c) = (f64::from(b[j]), 0.0f64, 0.0f64);
+                    for p in 0..k {
+                        let wv = f64::from(w[j * k + p]);
+                        v += h[p] * wv;
+                        s += h[p].abs() * wv.abs();
+                        c += bound[p] * wv.abs();
+                    }
+                    next.push(v);
+                    let own = 2.0 * (k as f64 + 2.0) * 1.19e-7 * (s + f64::from(b[j]).abs());
+                    carried.push(own + c);
+                }
+                h = next;
+                bound = carried;
+            }
+            let mut order: Vec<usize> = (0..h.len()).collect();
+            order.sort_by(|&i, &j| h[j].total_cmp(&h[i]));
+            let (top, second) = (order[0], order[1]);
+            h[top] - h[second] <= 2.0 * (bound[top] + bound[second])
+        })
+        .collect()
+}
+
+/// Evaluates the 50k network on the 1,437-row set at batch 128 (a last batch of 29): with
+/// cross-entropy on class labels (`evaluate` and `misclassified`) and with mean squared error
+/// on value targets (`evaluate`, with R²), compiled; and the same network with its ReLUs
+/// written as an activation of your own, on the tape (`evaluate` and `misclassified` on
+/// class labels). One warm-up call of each, then 100 more calls of each. Returns the
+/// allocations made after the warm-up.
+///
+/// The two paths' misclassified rows are compared after the count, leaving out the rows
+/// whose two largest outputs are within the calculation bound of each other
+/// ([`near_ties`]), where the compiled GEMM and the tape may rank them differently.
+fn evaluator_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let classes = synthetic_1437();
+    let mut rng = Rng::seed(3);
+    let y: Vec<f32> = (0..1437 * 10)
+        .map(|_| rng.range(-1.0, 1.0) as f32)
+        .collect();
+    let values = Dataset {
+        x: classes.x.clone(),
+        targets: Targets::Values(Tensor::from_vec(y, &[1437, 10]).unwrap()),
+    };
+    let mut ce = Evaluator::new(&net, &params, Loss::CrossEntropy, 128).unwrap();
+    let mut mse = Evaluator::new(&net, &params, Loss::Mse, 128).unwrap();
+    let mut own = Sequential::new();
+    for i in 0..net.len() {
+        own = match net.linear(i) {
+            Some(linear) => own.push(linear.clone()),
+            None => own.push(ActivationLayer::new(MyRelu)),
+        };
+    }
+    let mut tape = Evaluator::new(&own, &params, Loss::CrossEntropy, 128).unwrap();
+    assert!(format!("{tape:?}").contains("compiled: false"), "{tape:?}");
+    let mut wrong = Vec::new();
+    let mut tape_wrong = Vec::new();
+    let mut sink = 0.0;
+    let mut before = 0;
+    for call in 0..101 {
+        if call == 1 {
+            before = allocations();
+        }
+        let e = ce.evaluate(&classes).unwrap();
+        sink += e.loss + e.accuracy.unwrap();
+        ce.misclassified(&classes, &mut wrong).unwrap();
+        sink += wrong.len() as f64;
+        let e = mse.evaluate(&values).unwrap();
+        sink += e.loss + e.r2.unwrap();
+        let e = tape.evaluate(&classes).unwrap();
+        sink += e.loss + e.accuracy.unwrap();
+        tape.misclassified(&classes, &mut tape_wrong).unwrap();
+        sink += tape_wrong.len() as f64;
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite() && !wrong.is_empty());
+    let ties = near_ties(&net, &params, &classes);
+    wrong.retain(|&r| !ties[r]);
+    tape_wrong.retain(|&r| !ties[r]);
+    assert_eq!(wrong, tape_wrong);
+    made
+}
+
+/// The 50k network as `Evaluator::with_neuron_masks` on both hidden `Linear`s, compiled,
+/// and the same network with its ReLUs written as an activation of your own, on the tape:
+/// each switches one neuron of each hidden layer off with `set_neuron_mask` (masks prepared
+/// beforehand) and evaluates the 1,437-row set at batch 128 with cross-entropy, 100 times
+/// after one warm-up round. Returns the allocations made after the warm-up.
+fn evaluator_neuron_mask_steady_state() -> usize {
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut own = Sequential::new();
+    for i in 0..net.len() {
+        own = match net.linear(i) {
+            Some(linear) => own.push(linear.clone()),
+            None => own.push(ActivationLayer::new(MyRelu)),
+        };
+    }
+    let data = synthetic_1437();
+    let first: Vec<NeuronMask> = (0..7)
+        .map(|n| NeuronMask::from_off(256, &[n * 31]))
+        .collect();
+    let second: Vec<NeuronMask> = (0..5)
+        .map(|n| NeuronMask::from_off(128, &[n * 17]))
+        .collect();
+    let mut compiled =
+        Evaluator::with_neuron_masks(&net, &params, Loss::CrossEntropy, 128, &[0, 2]).unwrap();
+    let mut tape =
+        Evaluator::with_neuron_masks(&own, &params, Loss::CrossEntropy, 128, &[0, 2]).unwrap();
+    assert!(format!("{tape:?}").contains("compiled: false"), "{tape:?}");
+    let mut sink = 0.0;
+    let mut before = 0;
+    for call in 0..101 {
+        if call == 1 {
+            before = allocations();
+        }
+        for evaluator in [&mut compiled, &mut tape] {
+            evaluator.set_neuron_mask(0, &first[call % 7]).unwrap();
+            evaluator.set_neuron_mask(2, &second[call % 5]).unwrap();
+            let e = evaluator.evaluate(&data).unwrap();
+            sink += e.loss + e.accuracy.unwrap();
+        }
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite());
+    made
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 11] = [
+    let scenarios: [Scenario; 18] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -533,9 +859,19 @@ fn main() -> ExitCode {
         ("manual_loop", manual_loop),
         ("no_hooks_no_cost", no_hooks_no_cost),
         ("masked_training_step", masked_training_step),
+        ("param_lookup", param_lookup),
+        ("set_neuron_steady_state", set_neuron_steady_state),
+        ("masked_hooks_steady_state", masked_hooks_steady_state),
         ("health_steady_state", health_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),
+        ("observed_steady_state", observed_steady_state),
+        ("set_mask_steady_state", set_mask_steady_state),
+        ("evaluator_steady_state", evaluator_steady_state),
+        (
+            "evaluator_neuron_mask_steady_state",
+            evaluator_neuron_mask_steady_state,
+        ),
         (
             "trace_with_capacity_allocates_nothing",
             trace_with_capacity_allocates_nothing,

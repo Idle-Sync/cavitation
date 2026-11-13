@@ -10,11 +10,16 @@
 //!   [`Activation`] and [`ActivationLayer`] for your own, and [`Sequential`] to chain them.
 //! - Optimisers: [`Sgd`], [`Adam`] and [`AdamW`] behind the [`Optimizer`] trait.
 //! - Training: [`Dataset`] and [`Batcher`], [`Trainer`] for one step at a time, and [`fit`]
-//!   for whole runs, with the [`Health`] checks on every step.
+//!   for whole runs, with the [`Health`] checks on every step; [`Evaluator`] and [`evaluate`]
+//!   for the loss and accuracy or R² on held-out data, and [`Dataset::split_at`] to hold it
+//!   out.
 //! - Looking inside: [`Hooks`] (each layer's values and gradients), [`NeuronMask`] (turn
 //!   neurons off) and [`Trace`].
-//! - [`InferenceModel`], for answers without the training graph, and [`save`] and [`load`]
-//!   for safetensors files named like a PyTorch `state_dict`.
+//! - [`InferenceModel`], for answers without the training graph (with each layer's output
+//!   on request, and masks changed per instance), and [`save`] and [`load`] for safetensors
+//!   files named like a PyTorch `state_dict`.
+//! - [`shrink`]: shrinking a trained network, with [`shrink::activity`], each neuron's mean,
+//!   mean absolute value, firing share and maximum over a data set.
 //!
 //! # Examples
 //!
@@ -64,6 +69,7 @@ mod linear;
 mod mask;
 mod optim;
 mod sequential;
+pub mod shrink;
 #[cfg(test)]
 mod test_child;
 mod train;
@@ -84,6 +90,7 @@ pub use mask::NeuronMask;
 pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
-    Batch, BatchView, Batcher, Dataset, EpochReport, FitConfig, History, Loss, LrSchedule,
-    OptimizerConfig, Targets, TargetsView, Trainer, accuracy, fit, fit_with_hooks,
+    Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, History,
+    Loss, LrSchedule, OptimizerConfig, Targets, TargetsView, Trainer, accuracy, evaluate, fit,
+    fit_with_hooks,
 };

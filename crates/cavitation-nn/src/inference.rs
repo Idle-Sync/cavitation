@@ -5,6 +5,11 @@
 //! read (a `Linear` weight transposed to `[inputs, outputs]`), turns each neuron mask into a
 //! step of its own, and fuses a `Linear` followed by a ReLU into one kernel call. One input
 //! runs through the matvec kernel on the calling thread; a batch runs through the GEMM.
+//!
+//! The weights are shared by every clone of a compiled model; the masks' keep values are
+//! each instance's own, so [`InferenceModel::set_neuron_mask`] (by `Linear`) and
+//! [`InferenceModel::set_mask`] (by layer) change one instance in place.
+//! [`InferenceModel::infer_batch_observed`] reports each layer's output as it is computed.
 
 use std::fmt;
 use std::sync::Arc;
@@ -14,7 +19,7 @@ use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
 use cavitation_core::{Error, Gate, ParamStore, TensorView, log_softmax_row, softmax_row};
 
-use crate::{Activation, ActivationKind, Sequential};
+use crate::{Activation, ActivationKind, NeuronMask, Sequential};
 
 /// What one layer computes at inference time, with its parameters copied out of the store:
 /// the form a [`Layer`](crate::Layer) reports through
@@ -55,17 +60,41 @@ pub enum InferenceLayer {
     Mask(Vec<f32>),
 }
 
-/// One step of a compiled model: a layer's form, with the widths it reads and writes.
+/// The closure [`InferenceModel::infer_batch_observed`] calls with each layer's index and
+/// output.
+type Observer<'o> = &'o mut dyn FnMut(usize, TensorView<'_, f32>);
+
+/// What one compiled step computes.
+#[derive(Debug)]
+enum Op {
+    /// A layer's inference form, with its values in the shared compiled model.
+    Layer(InferenceLayer),
+    /// A neuron mask whose keep values are the instance's own mask number `slot` (see
+    /// [`InferenceModel::masks`]), so that each instance can change them.
+    Mask {
+        /// The index of the keep values in [`InferenceModel::masks`].
+        slot: usize,
+    },
+}
+
+/// One step of a compiled model: what it computes, with the widths it reads and writes and
+/// the layer of the [`Sequential`] whose output it completes.
 #[derive(Debug)]
 struct Step {
     /// What the step computes.
-    form: InferenceLayer,
+    op: Op,
     /// For a `Linear` step, whether a ReLU that followed it is fused into it.
     relu: bool,
     /// The width of each row the step reads.
     inputs: usize,
     /// The width of each row the step writes.
     outputs: usize,
+    /// The index of the [`Sequential`] layer whose output, as the next layer receives it,
+    /// this step's output is: the layer's own step when it has no mask, its mask step when
+    /// it has one, and for a `Linear` with a fused ReLU the ReLU's layer (the `Linear`'s own
+    /// output never exists on its own). `None` for a step whose layer a later step
+    /// completes.
+    completes: Option<usize>,
 }
 
 /// The read-only part of a compiled model, shared by every clone.
@@ -79,6 +108,15 @@ struct Compiled {
     output_width: usize,
     /// The widest row any step reads or writes.
     max_width: usize,
+    /// For each mask slot, the [`Sequential`] layer whose output the mask applies to, in
+    /// increasing order.
+    mask_layers: Vec<usize>,
+    /// The layers given a mask step whether or not the model has a mask there: the `layers`
+    /// of [`InferenceModel::compile_with_masks`].
+    extra: Vec<usize>,
+    /// Every `Linear` of the model, in order, with the layer that holds its neurons
+    /// ([`Sequential::neuron_layer`]): `(linear, layer)`.
+    neurons: Vec<(usize, usize)>,
 }
 
 /// A [`Sequential`] compiled for inference: it answers one input or a batch without
@@ -92,7 +130,10 @@ struct Compiled {
 ///
 /// The compiled weights are copied out of the store, so training the network further does
 /// not change them; compile again to pick up new weights. A clone shares the weights (they
-/// sit behind an [`Arc`]) and has buffers of its own, so give each thread its own clone.
+/// sit behind an [`Arc`]) and has buffers and neuron masks of its own, so give each thread
+/// its own clone, and change one clone's masks with
+/// [`set_neuron_mask`](Self::set_neuron_mask) (by `Linear`) or [`set_mask`](Self::set_mask)
+/// (by layer index) without touching the others'.
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng};
@@ -111,6 +152,9 @@ struct Compiled {
 pub struct InferenceModel {
     /// The compiled steps and widths, shared by clones.
     shared: Arc<Compiled>,
+    /// This instance's neuron masks, one per mask step (in the order of
+    /// [`Compiled::mask_layers`]): 0 for each neuron set to exactly 0, 1 for each kept.
+    masks: Vec<Vec<f32>>,
     /// Two buffers the steps write to in turn, each at least `max_width` values per row of
     /// the largest batch seen so far.
     bufs: [Vec<f32>; 2],
@@ -166,118 +210,289 @@ impl InferenceModel {
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
     ) -> Result<InferenceModel, Error> {
-        if model.is_empty() {
-            return Err(Error::Unsupported(
-                "inference of a model with no layers".to_string(),
-            ));
+        InferenceModel::compile_with_masks(model, params, &[])
+    }
+
+    /// Like [`compile`](Self::compile), and gives each layer listed in `layers` that has no
+    /// neuron mask a mask step with every neuron on, so that [`set_mask`](Self::set_mask)
+    /// can turn its neurons off later. A layer that already has a mask keeps it.
+    ///
+    /// `layers` are layer indices, not `Linear`s. To switch the neurons of a `Linear`, use
+    /// [`compile_with_neuron_masks`](Self::compile_with_neuron_masks) and
+    /// [`set_neuron_mask`](Self::set_neuron_mask), which put the mask step after the
+    /// activations that follow it ([`Sequential::neuron_layer`]). Listing the `Linear`'s own
+    /// index here masks its pre-activation instead: on a sigmoid an off neuron then sends
+    /// `sigmoid(0) = 0.5` to the next layer, not 0. A mask step on a `Linear` itself also
+    /// stops it from running fused with a ReLU that follows, so the ReLU then runs as a step
+    /// of its own and is observed on its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if a listed layer is not below the model's length
+    /// (the message names the index and the length), and the errors
+    /// [`compile`](Self::compile) returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`compile`](Self::compile) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let layer = Linear::new(&mut params, 1, 2, &mut Rng::seed(0));
+    /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[1.0, 2.0]);
+    /// let net = Sequential::new().push(layer).push(Relu);
+    /// let mut model = InferenceModel::compile_with_masks(&net, &params, &[1]).unwrap();
+    /// assert_eq!(model.infer(&[1.0]), &[1.0, 2.0]);
+    /// model.set_mask(1, &NeuronMask::from_off(2, &[0])).unwrap();
+    /// assert_eq!(model.infer(&[1.0]), &[0.0, 2.0]);
+    /// ```
+    pub fn compile_with_masks(
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+        layers: &[usize],
+    ) -> Result<InferenceModel, Error> {
+        if let Some(&layer) = layers.iter().find(|&&l| l >= model.len()) {
+            return Err(Error::InvalidData(format!(
+                "inference: layer {layer} is out of range for a model of {} layers",
+                model.len()
+            )));
         }
-        let mut forms = Vec::with_capacity(model.len());
-        for i in 0..model.len() {
-            let layer = model.layer(i);
-            let form = layer.inference(&params.values).ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "inference: layer {i} ({}) has no inference form",
-                    layer.name()
-                ))
-            })?;
-            forms.push(form);
-        }
-        let input_width = input_width(&forms, model)?;
-        let mut steps: Vec<Step> = Vec::with_capacity(2 * forms.len());
-        let (mut width, mut max_width) = (input_width, input_width);
-        for (i, form) in forms.into_iter().enumerate() {
-            let layer = model.layer(i);
-            let name = layer.name();
-            if let Some(expected) = layer.input_width().or(declared_width(&form)) {
-                assert!(
-                    expected == width,
-                    "InferenceModel::compile: layer {i} ({name}) expects input width \
-                     {expected}, but its input has width {width}"
-                );
-            }
-            let produced = match &form {
-                InferenceLayer::Linear {
-                    w_t,
-                    bias,
-                    inputs,
-                    outputs,
-                } => {
-                    assert!(
-                        w_t.len() == inputs * outputs && bias.len() == *outputs,
-                        "InferenceModel::compile: layer {i} ({name}) is {inputs} -> {outputs} \
-                         but has {} weights and {} biases",
-                        w_t.len(),
-                        bias.len()
-                    );
-                    *outputs
-                }
-                InferenceLayer::Prelu(slopes) => {
-                    assert!(
-                        slopes.len() == 1 || slopes.len() == width,
-                        "InferenceModel::compile: layer {i} ({name}) has {} slopes for width \
-                         {width}",
-                        slopes.len()
-                    );
-                    width
-                }
-                InferenceLayer::Glu(_) => {
-                    assert!(
-                        width % 2 == 0,
-                        "InferenceModel::compile: layer {i} ({name}) needs an even width, got \
-                         {width}"
-                    );
-                    width / 2
-                }
-                _ => width,
-            };
-            let reported = layer.output_width(width);
-            assert!(
-                produced == reported,
-                "InferenceModel::compile: layer {i} ({name}) produces output width {produced}, \
-                 but reports {reported} for input width {width}"
-            );
-            let fuses = form == InferenceLayer::Activation(ActivationKind::Relu)
-                && steps
-                    .last()
-                    .is_some_and(|s| matches!(s.form, InferenceLayer::Linear { .. }) && !s.relu);
-            match steps.last_mut() {
-                Some(last) if fuses => last.relu = true,
-                _ => steps.push(Step {
-                    form,
-                    relu: false,
-                    inputs: width,
-                    outputs: produced,
-                }),
-            }
-            if let Some(mask) = model.mask(i) {
-                assert!(
-                    mask.width() == produced,
-                    "InferenceModel::compile: the mask on layer {i} ({name}) has width {}, but \
-                     the layer outputs width {produced}",
-                    mask.width()
-                );
-                let keep = (0..produced)
-                    .map(|j| if mask.is_on(j) { 1.0 } else { 0.0 })
-                    .collect();
-                steps.push(Step {
-                    form: InferenceLayer::Mask(keep),
-                    relu: false,
-                    inputs: produced,
-                    outputs: produced,
-                });
-            }
-            width = produced;
-            max_width = max_width.max(width);
-        }
+        let (compiled, masks) = Compiled::build(model, params, layers)?;
+        let max_width = compiled.max_width;
         Ok(InferenceModel {
-            shared: Arc::new(Compiled {
-                steps,
-                input_width,
-                output_width: width,
-                max_width,
-            }),
+            shared: Arc::new(compiled),
+            masks,
             bufs: [vec![0.0; max_width], vec![0.0; max_width]],
         })
+    }
+
+    /// Like [`compile`](Self::compile), and gives the neurons of each `Linear` listed in
+    /// `linears` (by layer index) a mask step with every neuron on, at
+    /// [`Sequential::neuron_layer`] of it, so that [`set_neuron_mask`](Self::set_neuron_mask)
+    /// can turn them off later. A `Linear` whose neurons already have a mask keeps it. This
+    /// is [`compile_with_masks`](Self::compile_with_masks) with each `Linear` mapped to the
+    /// layer that holds its neurons.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if an entry of `linears` is not the index of a
+    /// `Linear` layer (the message names it), and the errors [`compile`](Self::compile)
+    /// returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`compile`](Self::compile) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, NeuronMask, Sequential, Sigmoid};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
+    ///     .push(Sigmoid);
+    /// let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+    /// model.set_neuron_mask(0, &NeuronMask::from_off(3, &[1])).unwrap();
+    /// // The mask sits after the sigmoid, so the off neuron gives exactly 0.
+    /// assert_eq!(model.infer(&[1.0, -1.0])[1], 0.0);
+    /// ```
+    pub fn compile_with_neuron_masks(
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+        linears: &[usize],
+    ) -> Result<InferenceModel, Error> {
+        let mut layers = Vec::with_capacity(linears.len());
+        for &linear in linears {
+            if model.linear(linear).is_none() {
+                return Err(Error::InvalidData(format!(
+                    "inference: layer {linear} is not a Linear layer"
+                )));
+            }
+            layers.push(model.neuron_layer(linear));
+        }
+        InferenceModel::compile_with_masks(model, params, &layers)
+    }
+
+    /// Picks up new weights and masks from `model` and `params`, as
+    /// [`compile_with_masks`](Self::compile_with_masks) would with the layers this model was
+    /// compiled with (those still below `model.len()`), so a mask step added there is kept.
+    ///
+    /// The weights: when no clone shares this model's compiled steps and the new steps have
+    /// the same layout (the same steps with the same widths, fused ReLUs, parameter counts
+    /// and mask positions), the new values replace the old ones in place and the buffers are
+    /// kept; returns `true`. Otherwise this model alone gets a freshly compiled copy,
+    /// leaving any clone with the old weights; returns `false`.
+    ///
+    /// The masks are this instance's own, and a clone's never change. When the new mask
+    /// steps sit on the same layers with the same widths, each one on a layer where `model`
+    /// has a mask takes that mask's values, copied in place whether or not the weights were;
+    /// each one `model` has no mask for (a step added by `compile_with_masks` or
+    /// `compile_with_neuron_masks`) keeps the values [`set_mask`](Self::set_mask) or
+    /// [`set_neuron_mask`](Self::set_neuron_mask) gave it. Otherwise the masks are compiled
+    /// afresh, the added steps with every neuron on.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`compile`](Self::compile) returns; the model is then unchanged.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`compile`](Self::compile) does.
+    pub(crate) fn refresh(
+        &mut self,
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+    ) -> Result<bool, Error> {
+        let extra: Vec<usize> = (self.shared.extra.iter())
+            .copied()
+            .filter(|&l| l < model.len())
+            .collect();
+        let (fresh, masks) = Compiled::build(model, params, &extra)?;
+        let same_masks = self.shared.mask_layers == fresh.mask_layers
+            && self
+                .masks
+                .iter()
+                .zip(&masks)
+                .all(|(a, b)| a.len() == b.len());
+        if same_masks {
+            for ((old, new), &layer) in self.masks.iter_mut().zip(&masks).zip(&fresh.mask_layers) {
+                if model.mask(layer).is_some() {
+                    old.copy_from_slice(new);
+                }
+            }
+        } else {
+            self.masks = masks;
+        }
+        if let Some(current) = Arc::get_mut(&mut self.shared)
+            && current.same_layout(&fresh)
+        {
+            for (old, new) in current.steps.iter_mut().zip(fresh.steps) {
+                old.op = new.op;
+            }
+            return Ok(true);
+        }
+        for buf in &mut self.bufs {
+            if buf.len() < fresh.max_width {
+                buf.resize(fresh.max_width, 0.0);
+            }
+        }
+        self.shared = Arc::new(fresh);
+        Ok(false)
+    }
+
+    /// Whether this model and `other` share their compiled steps, the weights (one is a
+    /// clone of the other and neither has been recompiled since). Their masks are never
+    /// shared.
+    #[cfg(test)]
+    pub(crate) fn shares_steps(&self, other: &InferenceModel) -> bool {
+        Arc::ptr_eq(&self.shared, &other.shared)
+    }
+
+    /// Replaces the neuron mask on the output of layer `layer` with `mask`: each neuron
+    /// `mask` turns off is set to exactly 0 from the next call on. Only this instance
+    /// changes; its clones keep their own masks. Allocates nothing.
+    ///
+    /// `layer` is a layer index, not a `Linear`. To switch the neurons of a `Linear`, use
+    /// [`set_neuron_mask`](Self::set_neuron_mask), which finds the layer that holds them
+    /// ([`Sequential::neuron_layer`]).
+    ///
+    /// The layer must have a mask step: a mask on it when the model was compiled, or a
+    /// place in the `layers` given to [`compile_with_masks`](Self::compile_with_masks).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if layer `layer` has no mask step, and
+    /// [`Error::InvalidData`] if `mask`'s width differs from the layer's output width (each
+    /// message names the layer); the model is then unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{Error, ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, NeuronMask, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// let mut model = InferenceModel::compile_with_masks(&net, &params, &[0]).unwrap();
+    /// model.set_mask(0, &NeuronMask::all_off(3)).unwrap();
+    /// assert_eq!(model.infer(&[1.0, -1.0]), &[0.0, 0.0, 0.0]);
+    /// assert!(matches!(model.set_mask(0, &NeuronMask::all_on(2)), Err(Error::InvalidData(_))));
+    /// let mut plain = InferenceModel::compile(&net, &params).unwrap();
+    /// assert!(matches!(plain.set_mask(0, &NeuronMask::all_on(3)), Err(Error::Unsupported(_))));
+    /// ```
+    pub fn set_mask(&mut self, layer: usize, mask: &NeuronMask) -> Result<(), Error> {
+        let Some(slot) = self.shared.mask_layers.iter().position(|&l| l == layer) else {
+            return Err(Error::Unsupported(format!(
+                "inference: layer {layer} has no mask step; compile with a mask on it, or \
+                 list it in compile_with_masks"
+            )));
+        };
+        self.copy_mask(slot, mask, &format_args!("layer {layer}"))
+    }
+
+    /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
+    /// neuron `mask` turns off outputs exactly 0 from the next call on, after the
+    /// activations that follow the `Linear` (at [`Sequential::neuron_layer`]), so an off
+    /// neuron sends 0 to the next layer whatever the activations give at 0. Only this
+    /// instance changes; its clones keep their own masks. Allocates nothing.
+    ///
+    /// The neurons must have a mask step: a mask on them when the model was compiled (set
+    /// with [`Sequential::set_neuron_mask`], say), or a place in the `linears` given to
+    /// [`compile_with_neuron_masks`](Self::compile_with_neuron_masks).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidData`] if layer `linear` is not a `Linear` or `mask`'s width
+    /// differs from its output width, and [`Error::Unsupported`] if its neurons have no mask
+    /// step (each message names the `Linear`); the model is then unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{Error, ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let layer = Linear::new(&mut params, 1, 2, &mut Rng::seed(0));
+    /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[1.0, 2.0]);
+    /// let net = Sequential::new().push(layer).push(Relu);
+    /// let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+    /// model.set_neuron_mask(0, &NeuronMask::from_off(2, &[1])).unwrap();
+    /// assert_eq!(model.infer(&[1.0]), &[1.0, 0.0]);
+    /// assert!(matches!(model.set_neuron_mask(1, &NeuronMask::all_on(2)), Err(Error::InvalidData(_))));
+    /// ```
+    pub fn set_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> Result<(), Error> {
+        let Some(&(_, layer)) = self.shared.neurons.iter().find(|(l, _)| *l == linear) else {
+            return Err(Error::InvalidData(format!(
+                "inference: layer {linear} is not a Linear layer"
+            )));
+        };
+        let Some(slot) = self.shared.mask_layers.iter().position(|&l| l == layer) else {
+            return Err(Error::Unsupported(format!(
+                "inference: the neurons of the linear layer {linear} (at layer {layer}) have \
+                 no mask step; compile with a neuron mask on it, or list it in \
+                 compile_with_neuron_masks"
+            )));
+        };
+        self.copy_mask(slot, mask, &format_args!("the linear layer {linear}"))
+    }
+
+    /// Copies `mask` into the keep values of mask step `slot`, or returns
+    /// [`Error::InvalidData`] naming `what` if the widths differ. Allocates nothing unless
+    /// it fails.
+    fn copy_mask(
+        &mut self,
+        slot: usize,
+        mask: &NeuronMask,
+        what: &dyn fmt::Display,
+    ) -> Result<(), Error> {
+        let keep = &mut self.masks[slot];
+        if mask.width() != keep.len() {
+            return Err(Error::InvalidData(format!(
+                "inference: a mask of width {} for {what}, which outputs width {}",
+                mask.width(),
+                keep.len()
+            )));
+        }
+        for (j, k) in keep.iter_mut().enumerate() {
+            *k = if mask.is_on(j) { 1.0 } else { 0.0 };
+        }
+        Ok(())
     }
 
     /// The width of one input.
@@ -340,7 +555,7 @@ impl InferenceModel {
             rows: 1,
             batched: false,
         };
-        let at = run.forward(shared, input, &mut self.bufs);
+        let at = run.forward(shared, &self.masks, input, &mut self.bufs, None);
         &self.bufs[at][..shared.output_width]
     }
 
@@ -369,11 +584,61 @@ impl InferenceModel {
     /// assert!(y.data().iter().all(|&v| v >= 0.0));
     /// ```
     pub fn infer_batch(&mut self, inputs: TensorView<f32>) -> TensorView<'_, f32> {
+        self.batch("infer_batch", inputs, None)
+    }
+
+    /// Like [`infer_batch`](Self::infer_batch), and calls `observe(layer, output)` with the
+    /// output of each layer of the [`Sequential`] as the next layer receives it (masked, if
+    /// the layer has a mask), shape `[batch, width]`, as soon as it is computed: once per
+    /// layer, in increasing layer order. A `Linear` followed by a ReLU runs as one step, so
+    /// its own output is never computed and only the ReLU's layer is reported. Allocates
+    /// only when the batch is larger than any before it.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`infer_batch`](Self::infer_batch) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{InferenceModel, Linear, Relu, Sequential, Tanh};
+    /// let mut params = ParamStore::new();
+    /// let mut rng = Rng::seed(0);
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 3, 4, &mut rng))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 4, 2, &mut rng))
+    ///     .push(Tanh);
+    /// let mut model = InferenceModel::compile(&net, &params).unwrap();
+    /// let mut seen = Vec::new();
+    /// let x = Tensor::full(&[5, 3], 0.5f32);
+    /// model.infer_batch_observed(x.view(), &mut |layer, out| {
+    ///     seen.push((layer, out.shape().dims().to_vec()));
+    /// });
+    /// // Layer 0 runs fused with the ReLU at layer 1, so only layer 1 is reported.
+    /// assert_eq!(seen, [(1, vec![5, 4]), (2, vec![5, 2]), (3, vec![5, 2])]);
+    /// ```
+    pub fn infer_batch_observed(
+        &mut self,
+        inputs: TensorView<f32>,
+        observe: &mut dyn FnMut(usize, TensorView<'_, f32>),
+    ) -> TensorView<'_, f32> {
+        self.batch("infer_batch_observed", inputs, Some(observe))
+    }
+
+    /// The work of [`infer_batch`](Self::infer_batch) and
+    /// [`infer_batch_observed`](Self::infer_batch_observed); `what` names the caller in the
+    /// panic message.
+    fn batch(
+        &mut self,
+        what: &str,
+        inputs: TensorView<f32>,
+        observe: Option<Observer<'_>>,
+    ) -> TensorView<'_, f32> {
         let shared = &*self.shared;
         let dims = inputs.shape().dims();
         assert!(
             dims.len() == 2 && dims[1] == shared.input_width,
-            "infer_batch: expected inputs of shape [batch, {}], got {dims:?}",
+            "{what}: expected inputs of shape [batch, {}], got {dims:?}",
             shared.input_width
         );
         let rows = dims[0];
@@ -389,10 +654,195 @@ impl InferenceModel {
             rows,
             batched: true,
         };
-        let at = run.forward(shared, inputs.data(), &mut self.bufs);
+        let at = run.forward(shared, &self.masks, inputs.data(), &mut self.bufs, observe);
         let out = &self.bufs[at][..rows * shared.output_width];
         TensorView::from_slice(out, &[rows, shared.output_width])
             .expect("the output buffer holds batch × output_width values")
+    }
+}
+
+impl Compiled {
+    /// Compiles `model` with the values in `params`, with a mask step on each layer that
+    /// has a mask or is listed in `extra` (every listed index below `model.len()`): the
+    /// work of [`InferenceModel::compile_with_masks`], without the buffers. Returns the
+    /// shared part and the keep values of each mask step, in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`InferenceModel::compile`] returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`InferenceModel::compile`] does.
+    fn build(
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+        extra: &[usize],
+    ) -> Result<(Compiled, Vec<Vec<f32>>), Error> {
+        if model.is_empty() {
+            return Err(Error::Unsupported(
+                "inference of a model with no layers".to_string(),
+            ));
+        }
+        let mut forms = Vec::with_capacity(model.len());
+        for i in 0..model.len() {
+            let layer = model.layer(i);
+            let form = layer.inference(&params.values).ok_or_else(|| {
+                Error::Unsupported(format!(
+                    "inference: layer {i} ({}) has no inference form",
+                    layer.name()
+                ))
+            })?;
+            forms.push(form);
+        }
+        let input_width = input_width(&forms, model)?;
+        let mut steps: Vec<Step> = Vec::with_capacity(2 * forms.len());
+        let (mut masks, mut mask_layers) = (Vec::new(), Vec::new());
+        let (mut width, mut max_width) = (input_width, input_width);
+        for (i, form) in forms.into_iter().enumerate() {
+            let layer = model.layer(i);
+            let name = layer.name();
+            if let Some(expected) = layer.input_width().or(declared_width(&form)) {
+                assert!(
+                    expected == width,
+                    "InferenceModel::compile: layer {i} ({name}) expects input width \
+                     {expected}, but its input has width {width}"
+                );
+            }
+            let produced = match &form {
+                InferenceLayer::Linear {
+                    w_t,
+                    bias,
+                    inputs,
+                    outputs,
+                } => {
+                    assert!(
+                        w_t.len() == inputs * outputs && bias.len() == *outputs,
+                        "InferenceModel::compile: layer {i} ({name}) is {inputs} -> {outputs} \
+                         but has {} weights and {} biases",
+                        w_t.len(),
+                        bias.len()
+                    );
+                    *outputs
+                }
+                InferenceLayer::Prelu(slopes) => {
+                    assert!(
+                        slopes.len() == 1 || slopes.len() == width,
+                        "InferenceModel::compile: layer {i} ({name}) has {} slopes for width \
+                         {width}",
+                        slopes.len()
+                    );
+                    width
+                }
+                InferenceLayer::Glu(_) => {
+                    assert!(
+                        width % 2 == 0,
+                        "InferenceModel::compile: layer {i} ({name}) needs an even width, got \
+                         {width}"
+                    );
+                    width / 2
+                }
+                _ => width,
+            };
+            let reported = layer.output_width(width);
+            assert!(
+                produced == reported,
+                "InferenceModel::compile: layer {i} ({name}) produces output width {produced}, \
+                 but reports {reported} for input width {width}"
+            );
+            let mask = model.mask(i);
+            let masked = mask.is_some() || extra.contains(&i);
+            // The layer's own step completes it unless a mask step follows.
+            let completes = if masked { None } else { Some(i) };
+            let fuses = form == InferenceLayer::Activation(ActivationKind::Relu)
+                && steps.last().is_some_and(|s| {
+                    matches!(s.op, Op::Layer(InferenceLayer::Linear { .. })) && !s.relu
+                });
+            match steps.last_mut() {
+                Some(last) if fuses => {
+                    last.relu = true;
+                    last.completes = completes;
+                }
+                _ => steps.push(Step {
+                    op: Op::Layer(form),
+                    relu: false,
+                    inputs: width,
+                    outputs: produced,
+                    completes,
+                }),
+            }
+            if masked {
+                let keep = match mask {
+                    Some(mask) => {
+                        assert!(
+                            mask.width() == produced,
+                            "InferenceModel::compile: the mask on layer {i} ({name}) has width \
+                             {}, but the layer outputs width {produced}",
+                            mask.width()
+                        );
+                        (0..produced)
+                            .map(|j| if mask.is_on(j) { 1.0 } else { 0.0 })
+                            .collect()
+                    }
+                    None => vec![1.0; produced],
+                };
+                steps.push(Step {
+                    op: Op::Mask { slot: masks.len() },
+                    relu: false,
+                    inputs: produced,
+                    outputs: produced,
+                    completes: Some(i),
+                });
+                masks.push(keep);
+                mask_layers.push(i);
+            }
+            width = produced;
+            max_width = max_width.max(width);
+        }
+        let neurons = model
+            .linears()
+            .map(|(linear, _)| (linear, model.neuron_layer(linear)))
+            .collect();
+        let compiled = Compiled {
+            steps,
+            input_width,
+            output_width: width,
+            max_width,
+            mask_layers,
+            extra: extra.to_vec(),
+            neurons,
+        };
+        Ok((compiled, masks))
+    }
+
+    /// Whether `other` has the same steps as `self`, in the same order, with the same
+    /// widths, fused ReLUs, parameter counts, completed layers and mask positions, so that
+    /// its values can replace these in place.
+    fn same_layout(&self, other: &Compiled) -> bool {
+        let params = |op: &Op| match op {
+            Op::Layer(InferenceLayer::Linear { w_t, bias, .. }) => (w_t.len(), bias.len()),
+            Op::Layer(InferenceLayer::Prelu(v) | InferenceLayer::Mask(v)) => (v.len(), 0),
+            Op::Mask { slot } => (*slot, 0),
+            Op::Layer(_) => (0, 0),
+        };
+        let kind = |op: &Op| match op {
+            Op::Layer(form) => Some(std::mem::discriminant(form)),
+            Op::Mask { .. } => None,
+        };
+        self.input_width == other.input_width
+            && self.output_width == other.output_width
+            && self.max_width == other.max_width
+            && self.mask_layers == other.mask_layers
+            && self.neurons == other.neurons
+            && self.steps.len() == other.steps.len()
+            && self.steps.iter().zip(&other.steps).all(|(a, b)| {
+                kind(&a.op) == kind(&b.op)
+                    && a.relu == b.relu
+                    && a.inputs == b.inputs
+                    && a.outputs == b.outputs
+                    && a.completes == b.completes
+                    && params(&a.op) == params(&b.op)
+            })
     }
 }
 
@@ -443,17 +893,39 @@ struct Run {
 }
 
 impl Run {
-    /// Runs every step of `model` on `input` (`rows` rows of the input width), writing into
-    /// `bufs` in turn, and returns the index of the buffer that holds the output.
+    /// Runs every step of `model` on `input` (`rows` rows of the input width), with the
+    /// keep values of each mask step in `masks`, writing into `bufs` in turn, and returns
+    /// the index of the buffer that holds the output. After each step that completes a
+    /// layer, calls `observe` (if given) with the layer's index and its output.
     ///
     /// Each buffer must hold at least `rows · max_width` values.
-    fn forward(&self, model: &Compiled, input: &[f32], bufs: &mut [Vec<f32>; 2]) -> usize {
+    fn forward(
+        &self,
+        model: &Compiled,
+        masks: &[Vec<f32>],
+        input: &[f32],
+        bufs: &mut [Vec<f32>; 2],
+        mut observe: Option<Observer<'_>>,
+    ) -> usize {
         let rows = self.rows;
         // The buffer holding the current rows, or `None` while they are still `input`.
         let mut cur: Option<usize> = None;
         for step in &model.steps {
             let (n_in, n_out) = (rows * step.inputs, rows * step.outputs);
-            match &step.form {
+            let form = match &step.op {
+                Op::Layer(form) => form,
+                Op::Mask { slot } => {
+                    let c = cur.unwrap_or(0);
+                    if cur.is_none() {
+                        bufs[c][..n_in].copy_from_slice(&input[..n_in]);
+                    }
+                    apply_mask(&masks[*slot], &mut bufs[c][..n_in], step.inputs);
+                    cur = Some(c);
+                    observe_step(step, &mut observe, &bufs[c][..n_out], rows);
+                    continue;
+                }
+            };
+            match form {
                 InferenceLayer::Linear {
                     w_t,
                     bias,
@@ -482,7 +954,7 @@ impl Run {
                         Some(0) => (b0, b1),
                         Some(_) => (b1, b0),
                     };
-                    let row = if matches!(step.form, InferenceLayer::Softmax) {
+                    let row = if matches!(form, InferenceLayer::Softmax) {
                         softmax_row::<f32>
                     } else {
                         log_softmax_row::<f32>
@@ -525,6 +997,8 @@ impl Run {
                     cur = Some(c);
                 }
             }
+            let c = cur.expect("every step writes into a buffer");
+            observe_step(step, &mut observe, &bufs[c][..n_out], rows);
         }
         cur.expect("a compiled model has at least one step")
     }
@@ -560,6 +1034,31 @@ impl Run {
                 for (o, &b) in row.iter_mut().zip(bias) {
                     *o += b;
                 }
+            }
+        }
+    }
+}
+
+/// Calls `observe`, if given, with the layer `step` completes and its output `out` (`rows`
+/// rows of the step's output width); does nothing for a step that completes no layer.
+fn observe_step(step: &Step, observe: &mut Option<Observer<'_>>, out: &[f32], rows: usize) {
+    if let (Some(layer), Some(f)) = (step.completes, observe.as_mut()) {
+        let view = TensorView::from_slice(out, &[rows, step.outputs])
+            .expect("the step's output holds rows × outputs values");
+        f(layer, view);
+    }
+}
+
+/// Sets each value of `data` (rows of `width`) whose column's `keep` value is 0 to exactly
+/// 0, whatever it was, NaN and infinity included.
+fn apply_mask(keep: &[f32], data: &mut [f32], width: usize) {
+    if width == 0 {
+        return;
+    }
+    for row in data.chunks_exact_mut(width) {
+        for (v, &k) in row.iter_mut().zip(keep) {
+            if k == 0.0 {
+                *v = 0.0;
             }
         }
     }
@@ -602,15 +1101,7 @@ fn element_wise(form: &InferenceLayer, data: &mut [f32], width: usize) {
                 }
             }
         }
-        InferenceLayer::Mask(keep) => {
-            for row in data.chunks_exact_mut(width) {
-                for (v, &k) in row.iter_mut().zip(keep) {
-                    if k == 0.0 {
-                        *v = 0.0;
-                    }
-                }
-            }
-        }
+        InferenceLayer::Mask(keep) => apply_mask(keep, data, width),
         InferenceLayer::Linear { .. }
         | InferenceLayer::Glu(_)
         | InferenceLayer::Softmax
@@ -621,10 +1112,10 @@ fn element_wise(form: &InferenceLayer, data: &mut [f32], width: usize) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! Tests for inference mode: agreement with the tape's forward pass for one input and for
-    //! batches, masks, every built-in layer, width checks, sharing between threads and
-    //! layers without an inference form.
+    //! batches, masks, every built-in layer, width checks, sharing between threads, layers
+    //! without an inference form, observed layer outputs and masks changed per instance.
 
     use std::sync::Arc;
 
@@ -670,26 +1161,29 @@ mod tests {
             .collect()
     }
 
-    /// The tape's forward pass over `rows` rows of `x` at once, and for each output value the
-    /// bound inference must stay within: the matvec tolerance of each `Linear` layer,
+    /// The tape's forward pass over `rows` rows of `x` at once: for each layer, its output
+    /// (as the next layer receives it, masked) and for each value of it the bound inference
+    /// must stay within: the matvec tolerance of each `Linear` layer,
     /// `2·(k + 2)·1.19e-7·(Σᵢ |hᵢ|·|wᵢⱼ| + |bⱼ|)` with `h` the layer's input on the tape,
     /// plus the bound carried in from the layer before, `Σᵢ boundᵢ·|wᵢⱼ|`. Every other layer
     /// must be element-wise with slope at most 1 (ReLU), so it carries the bound through
-    /// unchanged; a mask sets it to 0 for the neurons it turns off.
-    fn tape_with_bounds(
+    /// unchanged; a mask sets it to 0 for the neurons it turns off. The GEMM keeps to the
+    /// same bound.
+    pub(crate) fn layer_bounds(
         net: &Sequential,
         params: &ParamStore,
         x: &[f32],
         rows: usize,
-    ) -> (Vec<f32>, Vec<f64>) {
+    ) -> Vec<(Vec<f32>, Vec<f64>)> {
         let width = x.len() / rows;
         let mut graph = Graph::new();
         let mut tape = graph.tape(&params.values);
         let input = Tensor::from_vec(x.to_vec(), &[rows, width]).unwrap();
         let xv = tape.input(input.view());
         let mut trace = Trace::new();
-        let y = net.forward_traced(&mut tape, xv, &mut trace);
+        net.forward_traced(&mut tape, xv, &mut trace);
         let mut bound = vec![0.0f64; x.len()];
+        let mut layers = Vec::with_capacity(net.len());
         for i in 0..net.len() {
             let layer = net.layer(i);
             if layer.name() == "linear" {
@@ -722,8 +1216,23 @@ mod tests {
                     }
                 }
             }
+            let out = tape.value(trace.output(i)).data().to_vec();
+            layers.push((out, bound.clone()));
         }
-        (tape.value(y).data().to_vec(), bound)
+        layers
+    }
+
+    /// The tape's output over `rows` rows of `x` at once and the bound inference must stay
+    /// within, from [`layer_bounds`]'s last layer.
+    fn tape_with_bounds(
+        net: &Sequential,
+        params: &ParamStore,
+        x: &[f32],
+        rows: usize,
+    ) -> (Vec<f32>, Vec<f64>) {
+        layer_bounds(net, params, x, rows)
+            .pop()
+            .expect("the network has layers")
     }
 
     /// Asserts `got` is within `bound` of `want` element by element (NaN only where `want` is
@@ -1154,5 +1663,373 @@ mod tests {
             Some(InferenceLayer::Activation(ActivationKind::Relu))
         ));
         assert!(Layer::<f32>::inference(&ActivationLayer::new(Cube), &params.values).is_none());
+    }
+
+    /// The digits-shaped network, 64 → 32 → ReLU → 10, with He uniform weights and biases
+    /// uniform in `[-0.1, 0.1)`, all from `Rng::seed(seed)`.
+    pub(crate) fn digits(params: &mut ParamStore, seed: u64) -> Sequential {
+        let mut rng = Rng::seed(seed);
+        let mut layer = |inputs, outputs| {
+            let l = Linear::with_init(
+                params,
+                inputs,
+                outputs,
+                Init::HeUniform,
+                Init::Zeros,
+                &mut rng,
+            );
+            for b in params.value_mut(l.bias()).data_mut() {
+                *b = rng.range(-0.1, 0.1) as f32;
+            }
+            l
+        };
+        Sequential::new()
+            .push(layer(64, 32))
+            .push(Relu)
+            .push(layer(32, 10))
+    }
+
+    /// One observed layer: its index, the shape of its output and a copy of the output.
+    type Observed = (usize, Vec<usize>, Vec<f32>);
+
+    /// Runs `x` (`rows` rows) through `model.infer_batch_observed` and returns each observed
+    /// layer with a copy of its output, in the order reported, and the returned output.
+    fn observe_all(
+        model: &mut InferenceModel,
+        x: &[f32],
+        rows: usize,
+    ) -> (Vec<Observed>, Vec<f32>) {
+        let view = TensorView::from_slice(x, &[rows, x.len() / rows]).unwrap();
+        let mut seen = Vec::new();
+        let out = model
+            .infer_batch_observed(view, &mut |layer, out| {
+                seen.push((layer, out.shape().dims().to_vec(), out.data().to_vec()));
+            })
+            .data()
+            .to_vec();
+        (seen, out)
+    }
+
+    /// The digits-shaped network, with a mask on its last layer, over 37 rows: every
+    /// observed output equals the tape's output of that layer (from the trace) within the
+    /// GEMM bound, the layers come in increasing order (the first `Linear`, fused with its
+    /// ReLU, not on its own), and the last one observed is the returned output, bit for bit.
+    #[test]
+    fn observed_outputs_match_trace() {
+        let mut params = ParamStore::new();
+        let mut net = digits(&mut params, 11);
+        net.set_mask(2, NeuronMask::from_off(10, &[4]));
+        let x = inputs(37, 64, 12);
+        let want = layer_bounds(&net, &params, &x, 37);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        let (seen, out) = observe_all(&mut model, &x, 37);
+        let layers: Vec<usize> = seen.iter().map(|(l, _, _)| *l).collect();
+        assert_eq!(layers, [1, 2]);
+        for (layer, dims, got) in &seen {
+            let (tape, bound) = &want[*layer];
+            assert_eq!(dims, &[37, got.len() / 37]);
+            assert_within(got, tape, bound, &format!("layer {layer}"));
+        }
+        assert_same(&seen[1].2, &out, "the last observed output");
+        assert!(seen[1].2.chunks(10).all(|row| row[4].to_bits() == 0));
+    }
+
+    /// A `Linear` fused with the ReLU after it reports the ReLU's layer only, with the
+    /// ReLU's output (and its mask, when the ReLU has one); a `Linear` with a mask of its
+    /// own is not fused, so both layers are reported.
+    #[test]
+    fn fused_linear_reports_activation_layer() {
+        let mut params = ParamStore::new();
+        let x = inputs(5, 4, 13);
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 4, 6, &mut Rng::seed(14)))
+            .push(Relu);
+        let want = layer_bounds(&net, &params, &x, 5);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        let (seen, _) = observe_all(&mut model, &x, 5);
+        assert_eq!(seen.len(), 1);
+        assert_eq!((seen[0].0, seen[0].1.as_slice()), (1, &[5, 6][..]));
+        assert_within(&seen[0].2, &want[1].0, &want[1].1, "fused");
+        assert!(seen[0].2.iter().all(|&v| v >= 0.0));
+
+        net.set_mask(1, NeuronMask::from_off(6, &[0]));
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        let (seen, _) = observe_all(&mut model, &x, 5);
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [1]);
+        assert!(seen[0].2.chunks(6).all(|row| row[0].to_bits() == 0));
+
+        net.clear_mask(1);
+        net.set_mask(0, NeuronMask::from_off(6, &[2]));
+        let want = layer_bounds(&net, &params, &x, 5);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        let (seen, _) = observe_all(&mut model, &x, 5);
+        assert_eq!(seen.iter().map(|s| s.0).collect::<Vec<_>>(), [0, 1]);
+        for (layer, _, got) in &seen {
+            assert_within(
+                got,
+                &want[*layer].0,
+                &want[*layer].1,
+                &format!("layer {layer}"),
+            );
+        }
+        assert!(
+            seen[0].2.iter().any(|&v| v < 0.0),
+            "the Linear's own output"
+        );
+    }
+
+    /// Asserts two models give the same bits for every one of `x`'s rows through `infer`
+    /// and for all of them through `infer_batch`, naming `what`.
+    fn assert_models_agree(a: &mut InferenceModel, b: &mut InferenceModel, x: &[f32], what: &str) {
+        let width = a.input_width();
+        let rows = x.len() / width;
+        for (r, row) in x.chunks(width).enumerate() {
+            let got = a.infer(row).to_vec();
+            assert_same(&got, b.infer(row), &format!("{what}, input {r}"));
+        }
+        let view = TensorView::from_slice(x, &[rows, width]).unwrap();
+        let got = a.infer_batch(view).data().to_vec();
+        assert_same(&got, b.infer_batch(view).data(), &format!("{what}, batch"));
+    }
+
+    /// Masks set with `set_mask` on a model compiled with all-on mask steps give the bits of
+    /// compiling the masked model, through `infer` and `infer_batch`, and changing them
+    /// again (back to all on, to other neurons) keeps agreeing.
+    #[test]
+    fn set_mask_matches_masked_compile() {
+        let mut params = ParamStore::new();
+        let net = digits(&mut params, 15);
+        let x = inputs(23, 64, 16);
+        let mut model = InferenceModel::compile_with_masks(&net, &params, &[1, 2]).unwrap();
+        let mut plain = InferenceModel::compile(&net, &params).unwrap();
+        assert_models_agree(&mut model, &mut plain, &x, "all on");
+        let cases = [
+            (
+                NeuronMask::from_off(32, &[0, 7, 31]),
+                NeuronMask::from_off(10, &[3]),
+            ),
+            (NeuronMask::all_on(32), NeuronMask::from_on(10, &[1, 2])),
+            (NeuronMask::all_off(32), NeuronMask::all_on(10)),
+        ];
+        for (i, (hidden, last)) in cases.into_iter().enumerate() {
+            model.set_mask(1, &hidden).unwrap();
+            model.set_mask(2, &last).unwrap();
+            let mut masked = net.clone();
+            masked.set_mask(1, hidden);
+            masked.set_mask(2, last);
+            let mut want = InferenceModel::compile(&masked, &params).unwrap();
+            assert_models_agree(&mut model, &mut want, &x, &format!("case {i}"));
+        }
+    }
+
+    /// `set_mask` on a clone changes the clone alone: the original's outputs stay the same
+    /// bit for bit, and the two still share their weights.
+    #[test]
+    fn set_mask_on_clone_leaves_original() {
+        let mut params = ParamStore::new();
+        let net = digits(&mut params, 17);
+        let x = inputs(9, 64, 18);
+        let view = TensorView::from_slice(&x, &[9, 64]).unwrap();
+        let mut original = InferenceModel::compile_with_masks(&net, &params, &[1]).unwrap();
+        let before = original.infer_batch(view).data().to_vec();
+        let rows_before: Vec<Vec<f32>> = x
+            .chunks(64)
+            .map(|row| original.infer(row).to_vec())
+            .collect();
+        let mut copy = original.clone();
+        copy.set_mask(1, &NeuronMask::all_off(32)).unwrap();
+        assert!(copy.shares_steps(&original));
+        let changed = copy.infer_batch(view).data().to_vec();
+        assert_ne!(changed, before);
+        assert_same(original.infer_batch(view).data(), &before, "original batch");
+        for (r, (row, want)) in x.chunks(64).zip(&rows_before).enumerate() {
+            let got = original.infer(row).to_vec();
+            assert_same(&got, want, &format!("original input {r}"));
+        }
+    }
+
+    /// `refresh` keeps the mask steps `compile_with_masks` added, with the values
+    /// `set_mask` gave them, whether the weights go in place or are recompiled (a clone
+    /// shares them); masks the model has take the model's values in this instance only, and
+    /// the clone's outputs stay the same bit for bit.
+    #[test]
+    fn refresh_keeps_added_mask_steps() {
+        let mut params = ParamStore::new();
+        let mut net = digits(&mut params, 27);
+        net.set_mask(2, NeuronMask::all_on(10));
+        let x = inputs(6, 64, 28);
+        let view = TensorView::from_slice(&x, &[6, 64]).unwrap();
+        let mut model = InferenceModel::compile_with_masks(&net, &params, &[1]).unwrap();
+        let hidden = NeuronMask::from_off(32, &[2, 3, 30]);
+        model.set_mask(1, &hidden).unwrap();
+        let w = net.param("0.weight").unwrap();
+        let want = |net: &Sequential, params: &ParamStore| {
+            let mut masked = net.clone();
+            masked.set_mask(1, hidden.clone());
+            let mut m = InferenceModel::compile(&masked, params).unwrap();
+            m.infer_batch(view).data().to_vec()
+        };
+
+        params.value_mut(w).data_mut()[0] += 0.5;
+        assert!(model.refresh(&net, &params).unwrap());
+        assert_same(
+            model.infer_batch(view).data(),
+            &want(&net, &params),
+            "in place",
+        );
+
+        let mut copy = model.clone();
+        let copy_before = copy.infer_batch(view).data().to_vec();
+        params.value_mut(w).data_mut()[1] -= 0.5;
+        net.set_mask(2, NeuronMask::from_off(10, &[7]));
+        assert!(!model.refresh(&net, &params).unwrap());
+        assert!(!model.shares_steps(&copy));
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &want(&net, &params), "recompiled");
+        assert!(got.chunks(10).all(|row| row[7].to_bits() == 0));
+        assert_same(copy.infer_batch(view).data(), &copy_before, "the clone");
+        model.set_mask(1, &NeuronMask::all_on(32)).unwrap();
+    }
+
+    /// Linear(3 → 4) → Sigmoid → Linear(4 → 2), with weights from `Rng::seed(seed)`.
+    fn sigmoid_net(params: &mut ParamStore, seed: u64) -> Sequential {
+        let mut rng = Rng::seed(seed);
+        Sequential::new()
+            .push(Linear::new(params, 3, 4, &mut rng))
+            .push(Sigmoid)
+            .push(Linear::new(params, 4, 2, &mut rng))
+    }
+
+    /// On Linear → Sigmoid → Linear, `set_neuron_mask` on a model compiled with
+    /// `compile_with_neuron_masks` puts the mask after the sigmoid: the off neuron reads
+    /// exactly 0 at layer 1, the output is bit for bit that of compiling the network masked
+    /// with `Sequential::set_neuron_mask`, and both differ from masking the `Linear`'s own
+    /// output by layer (where the neuron reads `sigmoid(0) = 0.5`). Changing it back gives
+    /// the plain model's bits.
+    #[test]
+    fn set_neuron_mask_after_sigmoid_is_zero() {
+        let mut params = ParamStore::new();
+        let net = sigmoid_net(&mut params, 31);
+        let x = inputs(5, 3, 32);
+        let off = NeuronMask::from_off(4, &[1]);
+        let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+        model.set_neuron_mask(0, &off).unwrap();
+        let (seen, out) = observe_all(&mut model, &x, 5);
+        let hidden = &seen.iter().find(|s| s.0 == 1).expect("layer 1 observed").2;
+        for row in hidden.chunks(4) {
+            assert_eq!(row[1].to_bits(), 0.0f32.to_bits(), "{row:?}");
+            assert!(row[0] > 0.0 && row[2] > 0.0);
+        }
+        let mut masked = net.clone();
+        masked.set_neuron_mask(0, off.clone());
+        let mut want = InferenceModel::compile(&masked, &params).unwrap();
+        assert_models_agree(&mut model, &mut want, &x, "by Linear");
+
+        let mut by_layer = InferenceModel::compile_with_masks(&net, &params, &[0]).unwrap();
+        by_layer.set_mask(0, &off).unwrap();
+        let (seen, wrong) = observe_all(&mut by_layer, &x, 5);
+        let hidden = &seen.iter().find(|s| s.0 == 1).expect("layer 1 observed").2;
+        assert!(hidden.chunks(4).all(|row| row[1] == 0.5), "{hidden:?}");
+        assert_ne!(wrong, out);
+
+        model.set_neuron_mask(0, &NeuronMask::all_on(4)).unwrap();
+        let mut plain = InferenceModel::compile(&net, &params).unwrap();
+        assert_models_agree(&mut model, &mut plain, &x, "all on again");
+    }
+
+    /// On Linear → Tanh → Sigmoid → Linear the mask step of the first `Linear`'s neurons
+    /// sits after the `Sigmoid`, so an off neuron reads exactly 0 at layer 2.
+    #[test]
+    fn neuron_mask_step_after_chained_activations() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(33);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 4, &mut rng))
+            .push(Tanh)
+            .push(Sigmoid)
+            .push(Linear::new(&mut params, 4, 2, &mut rng));
+        let x = inputs(4, 3, 34);
+        let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+        model
+            .set_neuron_mask(0, &NeuronMask::from_off(4, &[2]))
+            .unwrap();
+        let (seen, _) = observe_all(&mut model, &x, 4);
+        let layers: Vec<usize> = seen.iter().map(|s| s.0).collect();
+        assert_eq!(layers, [0, 1, 2, 3]);
+        for row in seen[2].2.chunks(4) {
+            assert_eq!(row[2].to_bits(), 0.0f32.to_bits(), "{row:?}");
+            assert!(row[1] > 0.0);
+        }
+        assert!(seen[1].2.chunks(4).all(|row| row[2] != 0.0));
+    }
+
+    /// `compile_with_neuron_masks` with an index that is not a `Linear` is `InvalidData`;
+    /// `set_neuron_mask` on a layer that is not a `Linear` or with the wrong width is
+    /// `InvalidData`, and on a `Linear` without a mask step `Unsupported`, each naming the
+    /// `Linear` and leaving the model unchanged. A neuron mask set on the network before
+    /// compiling has a mask step without being listed.
+    #[test]
+    fn set_neuron_mask_errors() {
+        let mut params = ParamStore::new();
+        let mut net = sigmoid_net(&mut params, 35);
+        match InferenceModel::compile_with_neuron_masks(&net, &params, &[0, 1]) {
+            Err(Error::InvalidData(msg)) => assert!(msg.contains("layer 1"), "{msg}"),
+            other => panic!("expected InvalidData, got {:?}", other.map(|_| ())),
+        }
+        let x = inputs(1, 3, 36);
+        let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
+        let before = model.infer(&x).to_vec();
+        let cases: [(usize, NeuronMask, &str); 3] = [
+            (1, NeuronMask::all_off(4), "layer 1 is not a Linear"),
+            (0, NeuronMask::all_off(3), "the linear layer 0"),
+            (2, NeuronMask::all_off(2), "the linear layer 2"),
+        ];
+        for (linear, mask, want) in cases {
+            let got = model.set_neuron_mask(linear, &mask);
+            let msg = match (&got, linear) {
+                (Err(Error::Unsupported(msg)), 2) | (Err(Error::InvalidData(msg)), 0 | 1) => msg,
+                _ => panic!("linear {linear}: {got:?}"),
+            };
+            assert!(msg.contains(want), "{msg}");
+        }
+        assert_same(model.infer(&x), &before, "after the failed calls");
+        net.set_neuron_mask(2, NeuronMask::all_on(2));
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        model.set_neuron_mask(2, &NeuronMask::all_off(2)).unwrap();
+        assert_eq!(model.infer(&x), &[0.0, 0.0]);
+    }
+
+    /// `set_mask` on a layer with no mask step is `Unsupported`, and a mask of the wrong
+    /// width `InvalidData`, both naming the layer and leaving the model unchanged;
+    /// `compile_with_masks` with a layer out of range is `InvalidData`.
+    #[test]
+    fn set_mask_without_mask_step_is_unsupported() {
+        let mut params = ParamStore::new();
+        let net = digits(&mut params, 19);
+        let x = inputs(1, 64, 20);
+        let mut model = InferenceModel::compile_with_masks(&net, &params, &[1]).unwrap();
+        let before = model.infer(&x).to_vec();
+        for layer in [0, 2, 3] {
+            match model.set_mask(layer, &NeuronMask::all_off(10)) {
+                Err(Error::Unsupported(msg)) => {
+                    assert!(msg.contains(&format!("layer {layer}")), "{msg}");
+                }
+                other => panic!("layer {layer}: expected Unsupported, got {other:?}"),
+            }
+        }
+        match model.set_mask(1, &NeuronMask::all_off(31)) {
+            Err(Error::InvalidData(msg)) => assert!(msg.contains("layer 1"), "{msg}"),
+            other => panic!("expected InvalidData, got {other:?}"),
+        }
+        assert_same(model.infer(&x), &before, "after the failed calls");
+        let mut plain = InferenceModel::compile(&net, &params).unwrap();
+        assert!(matches!(
+            plain.set_mask(1, &NeuronMask::all_on(32)),
+            Err(Error::Unsupported(_))
+        ));
+        match InferenceModel::compile_with_masks(&net, &params, &[1, 3]) {
+            Err(Error::InvalidData(msg)) => assert!(msg.contains("layer 3"), "{msg}"),
+            other => panic!("expected InvalidData, got {:?}", other.map(|_| ())),
+        }
     }
 }

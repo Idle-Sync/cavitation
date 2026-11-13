@@ -1,6 +1,6 @@
 //! `Linear`: a fully connected layer.
 
-use cavitation_core::{ParamId, ParamStore, ParamValues, Real, Rng, Tape, Tensor, Var};
+use cavitation_core::{Error, ParamId, ParamStore, ParamValues, Real, Rng, Tape, Tensor, Var};
 
 use crate::{InferenceLayer, Init, Layer};
 
@@ -103,6 +103,45 @@ impl Linear {
         }
     }
 
+    /// Creates a layer from a weight of shape `[outputs, inputs]` and a bias of shape
+    /// `[outputs]`, adding both to `params`: for weights trained elsewhere.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidData`], naming both shapes, if the weight is not a matrix with
+    /// positive sides or the bias is not `[outputs]`. Nothing is added to `params` then.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::Linear;
+    /// let mut params = ParamStore::new();
+    /// let weight = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]).unwrap();
+    /// let bias = Tensor::from_vec(vec![0.5f32, 0.0, -0.5], &[3]).unwrap();
+    /// let layer = Linear::from_values(&mut params, weight, bias).unwrap();
+    /// assert_eq!((layer.inputs(), layer.outputs()), (2, 3));
+    /// assert_eq!(params.value(layer.bias()).data(), &[0.5, 0.0, -0.5]);
+    /// ```
+    pub fn from_values<T: Real>(
+        params: &mut ParamStore<T>,
+        weight: Tensor<T>,
+        bias: Tensor<T>,
+    ) -> Result<Linear, Error> {
+        let (w, b) = (weight.shape().dims(), bias.shape().dims());
+        let fits = matches!(w, [o, i] if *o > 0 && *i > 0 && b == [*o]);
+        if !fits {
+            return Err(Error::InvalidData(format!(
+                "linear: expected weight [outputs, inputs] and bias [outputs], got weight {w:?} and bias {b:?}"
+            )));
+        }
+        let (outputs, inputs) = (w[0], w[1]);
+        Ok(Linear {
+            weight: params.add(weight),
+            bias: params.add(bias),
+            inputs,
+            outputs,
+        })
+    }
+
     /// The weight's id in the store.
     ///
     /// ```
@@ -183,6 +222,20 @@ impl<T: Real> Layer<T> for Linear {
         let b = tape.param(self.bias);
         let y = tape.matmul_nt(x, w);
         tape.add(y, b)
+    }
+
+    /// `weight` or `bias`, without allocating.
+    fn parameter(&self, local: &str) -> Option<ParamId> {
+        match local {
+            "weight" => Some(self.weight),
+            "bias" => Some(self.bias),
+            _ => None,
+        }
+    }
+
+    /// The layer itself.
+    fn as_linear(&self) -> Option<&Linear> {
+        Some(self)
     }
 
     /// Returns the number of inputs.
@@ -284,6 +337,25 @@ mod tests {
         let mut tape = graph.tape(&params.values);
         let xv = tape.input(x.view());
         layer.forward(&mut tape, xv);
+    }
+
+    /// `from_values` takes `[outputs, inputs]` and `[outputs]`, and names both shapes
+    /// otherwise.
+    #[test]
+    fn from_values_checks_shapes() {
+        let mut params = ParamStore::new();
+        let w = Tensor::from_vec(vec![1.0f32; 6], &[3, 2]).unwrap();
+        let b = Tensor::from_vec(vec![0.0f32; 3], &[3]).unwrap();
+        let layer = Linear::from_values(&mut params, w.clone(), b.clone()).unwrap();
+        assert_eq!((layer.inputs(), layer.outputs()), (2, 3));
+        assert_eq!(params.value(layer.weight()).data(), w.data());
+        let short = Tensor::from_vec(vec![0.0f32; 2], &[2]).unwrap();
+        let err = Linear::from_values(&mut params, w.clone(), short).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("[3, 2]") && msg.contains("[2]"), "{msg}");
+        let flat = Tensor::from_vec(vec![1.0f32; 6], &[6]).unwrap();
+        assert!(Linear::from_values(&mut params, flat, b).is_err());
+        assert_eq!(params.len(), 2);
     }
 
     /// The layer can sit behind a trait object.

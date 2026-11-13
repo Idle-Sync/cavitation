@@ -1001,10 +1001,17 @@ impl HealthMonitor {
                     }
                 }
             }
-            // A neuron masked on the layer's own output, or on the layer before it (the
-            // `Linear` that feeds the ReLU), is off on purpose, not dead.
-            let before = i.checked_sub(1).and_then(|p| model.mask(p));
-            for mask in [model.mask(i), before].into_iter().flatten() {
+            // A neuron masked on the layer's own output, on the layer before it (the
+            // `Linear` that feeds the ReLU), or on an element-wise layer in the run right
+            // after it (where `Sequential::neuron_layer` puts the mask) is off on purpose,
+            // not dead.
+            let first = i.saturating_sub(1);
+            let mut last = i;
+            while last + 1 < model.len() && model.layer(last + 1).is_elementwise() {
+                last += 1;
+            }
+            for p in first..=last {
+                let Some(mask) = model.mask(p) else { continue };
                 if mask.width() == width {
                     for (j, a) in alive.iter_mut().enumerate() {
                         *a |= !mask.is_on(j);
@@ -1188,7 +1195,7 @@ mod tests {
     use super::*;
     use crate::{
         Batch, Batcher, Dataset, FitConfig, Linear, Loss, NeuronMask, Optimizer, OptimizerConfig,
-        Relu, Sequential, Sgd, Tanh, Targets, Trainer, fit,
+        Relu, Sequential, Sgd, Sigmoid, Tanh, Targets, Trainer, fit,
     };
     use cavitation_core::{Error, Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 
@@ -1487,6 +1494,53 @@ mod tests {
                 "masked {masked:?}"
             );
         }
+    }
+
+    /// On 2 → 4 → ReLU → Sigmoid → 1 with the first bias at −100 (every ReLU neuron dead),
+    /// neurons 1 and 2 masked through `set_neuron_mask` sit on the `Sigmoid`, at the end of
+    /// the run after the ReLU: they are off on purpose and not reported, while the unmasked
+    /// dead neurons 0 and 3 still are.
+    #[test]
+    fn mask_after_the_relu_run_is_not_dead() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(3);
+        let first = Linear::new(&mut params, 2, 4, &mut rng);
+        params.value_mut(first.bias()).data_mut().fill(-100.0);
+        let mut net = Sequential::new()
+            .push(first)
+            .push(Relu)
+            .push(Sigmoid)
+            .push(Linear::new(&mut params, 4, 1, &mut rng));
+        net.set_neuron_mask(0, NeuronMask::from_off(4, &[1, 2]));
+        assert!(net.mask(2).is_some() && net.mask(1).is_none());
+        let x: Vec<f32> = (0..16).map(|_| rng.range(-1.0, 1.0) as f32).collect();
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[8, 2]).unwrap(),
+            targets: Targets::Values(Tensor::full(&[8, 1], 0.5f32)),
+        };
+        let (seen, sink) = collecting_sink();
+        let config = FitConfig {
+            epochs: 1,
+            batch: 4,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.1,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            health: health(OnNonFinite::Stop, sink),
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(
+            dead_reports(&seen),
+            [Warning::DeadNeurons {
+                epoch: 1,
+                layer: 1,
+                width: 4,
+                neurons: vec![0, 3]
+            }]
+        );
     }
 
     /// `epochs` epochs of `fit` on [`dead_network`] with `health`, using SGD and mean squared
