@@ -11,7 +11,7 @@ Cavitation trains and runs small and medium neural networks on the CPU, inside a
 - **Fast on ordinary CPUs.** The kernel level (SSE4.2, AVX2 with FMA, NEON, or Apple's Accelerate framework for matrix products on Apple Silicon) is chosen at run time, matrix products are split across threads (on Apple Silicon each one is a single call into Accelerate), and a training step allocates nothing after a warm-up epoch.
 - **Compatible with PyTorch.** Operations follow PyTorch's definitions. `Linear` stores its weight as `[outputs, inputs]`, and weights save and load as safetensors named like a PyTorch `state_dict` (`0.weight`, `2.bias`).
 
-What v0.1 contains:
+What it contains:
 
 - An f32 tensor and reverse-mode autograd over a recorded tape.
 - Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, 17 activations plus the learnable PReLU layer (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
@@ -20,6 +20,10 @@ What v0.1 contains:
 - Hooks, neuron masks, and health checks that warn about NaN or infinity, exploding and vanishing gradients and dead ReLU neurons.
 - An inference mode that runs a trained network without the training tape, for one input or a batch.
 - User-defined activations, layers and tape operations, each covered by the gradient check.
+- Held-out evaluation (loss, accuracy, R²), dataset splits, and a `Standardizer` whose scaling folds into the first or last `Linear`.
+- Shrinking: an ablation sweep that ranks neurons by what switching each off costs, a `shrink` tool that removes neurons step by step with retraining and stops on a validation set, and compaction, which rebuilds a masked network as a smaller dense one.
+- Linear and logistic regression in `f64`, fitted exactly (QR, Newton) or by gradient descent on one `Linear` (the `ml` feature, on by default).
+- The inspector: a live view of a training run in the browser, from a server inside your program (the `inspect` feature, off by default).
 
 ## Using it
 
@@ -31,6 +35,21 @@ cavitation = { git = "https://github.com/Idle-Sync/cavitation" }
 ```
 
 It needs Rust 1.99 or newer.
+
+Two features choose the optional parts:
+
+- `ml` (on by default) adds `cavitation::cavitation_ml`: least squares, `LinearRegression` and `LogisticRegression`.
+- `inspect` (off by default) adds `cavitation::cavitation_inspect`: the inspector.
+
+```toml
+[dependencies]
+# With the inspector:
+cavitation = { git = "https://github.com/Idle-Sync/cavitation", features = ["inspect"] }
+# Or only the neural network parts, without the classic models:
+# cavitation = { git = "https://github.com/Idle-Sync/cavitation", default-features = false }
+```
+
+With either feature on, `cavitation::prelude` also has its main types: `LinearRegression`, `LogisticRegression`, `LinearModel` and `LogisticModel` with `ml`, and `Inspector` and `InspectorConfig` with `inspect`.
 
 ## Three levels of use
 
@@ -122,17 +141,78 @@ let net = Sequential::new()
 assert_eq!(net.layer(1).name(), "cube");
 ```
 
+## The inspector
+
+The inspector shows a training run in the browser while it trains. Turn on the `inspect` feature, start an `Inspector`, open the address it gives, and train with `cavitation_inspect::fit` in place of `fit`:
+
+```rust,ignore
+use cavitation::prelude::*;
+use cavitation::cavitation_inspect;
+
+let mut inspector = Inspector::start(InspectorConfig::default())?;
+println!("open {}", inspector.url()); // http://127.0.0.1:7878/?token=...
+let history = cavitation_inspect::fit(&mut net, &mut params, &data, config, &mut inspector)?;
+inspector.export_html("run.html")?; // the page with the run in it, to open without a server
+```
+
+The page shows:
+
+- samples per second, GFLOPS, loss, accuracy or R², the epoch and the step, with pause and resume and a learning-rate override;
+- one input row through every layer as heat maps of a, z, f′(z) and ∂L/∂z, with switched-off neurons crossed out;
+- one neuron in detail: its values and gradients, the chain rule with its numbers, its activation curve with the tangent at z, its incoming weights (as an image for image inputs) and its largest input contributions, and a switch to turn it off;
+- where a training step's time goes, layer by layer.
+
+After training, `Inspector::explore` serves the trained network to the page: switch neurons, rank a hidden layer's neurons by what each one's absence costs, and shrink the network level by level while you watch its validation accuracy.
+
+The server binds `127.0.0.1:7878` by default, so only this machine can reach it. Every request for the run's data or a command needs the per-run token in the address, requests from other sites are refused, and the page loads nothing from outside the server. With no page open, nothing is captured, and a run with no commands from the page trains to the same parameters as `fit`, bit for bit.
+
+## Shrinking and compaction
+
+`cavitation_nn::shrink` finds how many neurons a trained network can do without. `ablate` switches each neuron of a hidden layer off in turn and ranks them by what their absence costs. `shrink` removes neurons a step at a time with neuron masks, retrains after each step, and keeps the smallest network whose accuracy on a validation set has not dropped by more than the limit (1 point by default). `compact` then rebuilds the masked network as a smaller dense one in a new parameter store, whose outputs through `infer` match the masked network's bit for bit.
+
+```sh
+cargo run --release --example shrink_digits -p cavitation
+```
+
+The example trains the 64 → 256 → 128 → 10 digits network on 1,149 training rows, shrinks it with the other 288 as the validation set, compacts it and saves it.
+
+Measured on an Intel Celeron N5105 (4 cores, kernel level `sse4.2`, rustc 1.99.1), pinned to one core, with `cargo run --release -p cavitation-bench -- shrink`: shrinking with the defaults removed 75% of the hidden neurons, leaving 64 + 32, with 351 of 360 test digits right (the unpruned network had 352). One input through the compacted network in inference mode took 1.006 µs, against 6.808 µs for the full network: 6.77× faster (median of 301 rounds of 1,000 calls). The guide's chapter "Shrinking a network" walks through it.
+
+## Linear and logistic regression
+
+`cavitation_ml` (the `ml` feature, on by default) fits linear regression, ridge and logistic regression in `f64`, exactly or by gradient descent. The exact paths solve least squares by Householder QR, and logistic regression by Newton's method. The gradient paths train one `Linear` through the same tape as a neural network. Both give a model that converts to a one-layer `Sequential`, which saves in PyTorch's `nn.Linear` layout.
+
+```rust
+use cavitation::prelude::*;
+
+let x = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap();
+let y = Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap();
+let data = Dataset { x, targets: Targets::Values(y) };
+let model = LinearRegression::default().fit(&data).unwrap();
+assert!((model.coef.data()[0] - 2.0).abs() < 1e-12); // y = 2x + 1
+assert!((model.intercept[0] - 1.0).abs() < 1e-12);
+assert!((model.score(&data).unwrap() - 1.0).abs() < 1e-12); // R²
+```
+
+Both paths are tested against scikit-learn 1.9.1. Measured on an Intel Celeron N5105 (4 cores) with `cargo test --release -p cavitation-ml --test sklearn --test gradient_path -- --nocapture`, the largest gaps, relative to max(1, |value|), are:
+
+- `LinearRegression` and ridge against scikit-learn's `LinearRegression` and `Ridge`: 2.6e-14 (the tests allow 1e-9);
+- `LogisticRegression`'s Newton path against `newton-cholesky`: 1.6e-12 (allowed 1e-8), and against `lbfgs`: 5.3e-7 (allowed 1e-5);
+- the gradient path against the exact one: 3.2e-6 on the standardised Concrete data and 4.8e-7 on the standardised Breast Cancer data (allowed 1e-3).
+
 ## Examples
 
 ```sh
 cargo run --release --example xor -p cavitation      # the manual loop, then every layer's values through hooks
 cargo run --release --example digits -p cavitation   # fit on the 8x8 digits, then one inference
 cargo run --release --example shrink_digits -p cavitation  # shrink the digits network, compact it and save it
+cargo run --release --example linear_regression -p cavitation    # Concrete: exact and gradient OLS and ridge
+cargo run --release --example logistic_regression -p cavitation  # Breast Cancer: Newton and gradient paths
 scripts/data/get-mnist.sh                            # downloads MNIST into data/mnist/ (once)
 cargo run --release --example mnist -p cavitation    # fit on MNIST with Adam and cosine decay
 ```
 
-The digits data ships in the repository. MNIST is downloaded by its script, and CIFAR-10 (binary version, 50,000 training and 10,000 test images of 32 by 32 pixels in three colours) by `scripts/data/get-cifar10.sh` into `data/cifar10/`; `cavitation_datasets::cifar10::load` reads it, for the benchmark below.
+The digits, Concrete and Breast Cancer data ship in the repository. MNIST is downloaded by its script, and CIFAR-10 (binary version, 50,000 training and 10,000 test images of 32 by 32 pixels in three colours) by `scripts/data/get-cifar10.sh` into `data/cifar10/`; `cavitation_datasets::cifar10::load` reads it, for the benchmark below.
 
 ## Results
 
@@ -186,13 +266,13 @@ This runs the gradient checks, the PyTorch fixture comparisons on every kernel l
 
 ## Guide
 
-The guide is in `book/`. Its first chapter, "Backprop by hand", works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks. The second, "Shrinking a network", finds how many neurons the digits network can do without and removes them. Build it with [mdBook](https://rust-lang.github.io/mdBook/):
+The guide is in `book/`. Its first chapter, "Backprop by hand", works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks. The second, "Shrinking a network", finds how many neurons the digits network can do without and removes them. The third, "Regression, exactly and by gradient", fits linear and logistic regression both ways and shows why the two meet. Build it with [mdBook](https://rust-lang.github.io/mdBook/):
 
 ```sh
 mdbook serve book   # then open http://localhost:3000
 ```
 
-Status: in development. No release yet.
+Status: in development. v0.1.0 is tagged in the repository; nothing is published on crates.io yet.
 
 ## Licence
 

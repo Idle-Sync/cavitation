@@ -62,7 +62,8 @@ fn allocations() -> usize {
 }
 
 /// Builds the same small graphs 12 times, with backward passes (`keep_where` among them), a
-/// forward-only tape of larger tensors and `zero_grad` each step. Returns the allocations made during steps 3 to 12.
+/// forward-only tape of larger tensors and `zero_grad` each step. Returns the allocations made
+/// during steps 3 to 12.
 fn tape_steady_state() -> usize {
     let mut store = ParamStore::new();
     let p1 = store.add(Tensor::from_vec(vec![0.5f32], &[1]).unwrap());

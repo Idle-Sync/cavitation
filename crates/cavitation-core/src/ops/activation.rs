@@ -344,7 +344,10 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::Gelu(x, approx), x, |v| gelu_value(v, approx))
     }
 
-    /// Records ELU: `x` where `x > 0`, `alpha · (eˣ - 1)` elsewhere. PyTorch's default `alpha` is 1. The derivative is 1 for `x > 0` and `alpha · eˣ` elsewhere (so `alpha` at exactly 0). The backward pass recomputes `eˣ` from the input: reading it off the output as `y + alpha` would cancel most digits for large negative `x`.
+    /// Records ELU: `x` where `x > 0`, `alpha · (eˣ - 1)` elsewhere. PyTorch's default `alpha`
+    /// is 1. The derivative is 1 for `x > 0` and `alpha · eˣ` elsewhere (so `alpha` at exactly 0).
+    /// The backward pass recomputes `eˣ` from the input: reading it off the output as `y + alpha`
+    /// would cancel most digits for large negative `x`.
     ///
     /// # Panics
     ///
@@ -364,7 +367,9 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::Elu(x, alpha.to_f64()), x, |v| elu_value(v, alpha))
     }
 
-    /// Records SELU: `scale · elu(x, alpha)` with `scale = 1.0507009873554805` and `alpha = 1.6732632423543772`, the constants PyTorch uses. The derivative is `scale` for `x > 0` and `scale · alpha · eˣ` elsewhere, computed from the input.
+    /// Records SELU: `scale · elu(x, alpha)` with `scale = 1.0507009873554805` and
+    /// `alpha = 1.6732632423543772`, the constants PyTorch uses. The derivative is `scale` for
+    /// `x > 0` and `scale · alpha · eˣ` elsewhere, computed from the input.
     ///
     /// # Panics
     ///
@@ -386,7 +391,8 @@ impl<T: Real> Tape<'_, T> {
         })
     }
 
-    /// Records CELU: `max(0, x) + min(0, alpha · (e^(x/alpha) - 1))`. PyTorch's default `alpha` is 1. The derivative is 1 for `x > 0` and `e^(x/alpha)` elsewhere.
+    /// Records CELU: `max(0, x) + min(0, alpha · (e^(x/alpha) - 1))`. PyTorch's default `alpha`
+    /// is 1. The derivative is 1 for `x > 0` and `e^(x/alpha)` elsewhere.
     ///
     /// # Panics
     ///
@@ -427,7 +433,8 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::Silu(x), x, silu_value)
     }
 
-    /// Records Mish: `x · tanh(softplus(x))`, with softplus at PyTorch's defaults (`beta` 1, threshold 20). The derivative is `tanh(sp) + x · σ(x) · (1 - tanh²(sp))`.
+    /// Records Mish: `x · tanh(softplus(x))`, with softplus at PyTorch's defaults (`beta` 1,
+    /// threshold 20). The derivative is `tanh(sp) + x · σ(x) · (1 - tanh²(sp))`.
     ///
     /// # Panics
     ///
@@ -447,7 +454,9 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::Mish(x), x, mish_value)
     }
 
-    /// Records softplus: `ln(1 + e^(beta·x)) / beta` where `beta · x <= threshold`, and `x` itself above, which is exact and avoids overflow. PyTorch's defaults are `beta = 1` and `threshold = 20`. The derivative is `σ(beta · x)`, and 1 above the threshold.
+    /// Records softplus: `ln(1 + e^(beta·x)) / beta` where `beta · x <= threshold`, and `x` itself
+    /// above, which is exact and avoids overflow. PyTorch's defaults are `beta = 1` and
+    /// `threshold = 20`. The derivative is `σ(beta · x)`, and 1 above the threshold.
     ///
     /// # Panics
     ///
@@ -488,7 +497,9 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::Softsign(x), x, |v| v / (T::ONE + v.abs()))
     }
 
-    /// Records hardtanh: `x` clamped to `[min, max]` (PyTorch's defaults are -1 and 1). The derivative is 1 strictly inside `(min, max)` and 0 at the bounds and beyond. NaN passes through, in the value and in the gradient.
+    /// Records hardtanh: `x` clamped to `[min, max]` (PyTorch's defaults are -1 and 1). The
+    /// derivative is 1 strictly inside `(min, max)` and 0 at the bounds and beyond. NaN passes
+    /// through, in the value and in the gradient.
     ///
     /// # Panics
     ///
@@ -511,7 +522,8 @@ impl<T: Real> Tape<'_, T> {
         })
     }
 
-    /// Records ReLU6: `x` clamped to `[0, 6]`, the same as `hardtanh(x, 0, 6)`. The derivative is 0 at exactly 0 and 6. NaN passes through.
+    /// Records ReLU6: `x` clamped to `[0, 6]`, the same as `hardtanh(x, 0, 6)`. The derivative is 0
+    /// at exactly 0 and 6. NaN passes through.
     ///
     /// # Panics
     ///
@@ -531,7 +543,8 @@ impl<T: Real> Tape<'_, T> {
         self.hardtanh(x, T::ZERO, T::from_f64(6.0))
     }
 
-    /// Records the hard sigmoid: 0 for `x <= -3`, 1 for `x >= 3`, `x/6 + 1/2` between. The derivative is 1/6 strictly inside `(-3, 3)` and 0 elsewhere. NaN passes through.
+    /// Records the hard sigmoid: 0 for `x <= -3`, 1 for `x >= 3`, `x/6 + 1/2` between. The
+    /// derivative is 1/6 strictly inside `(-3, 3)` and 0 elsewhere. NaN passes through.
     ///
     /// # Panics
     ///
@@ -551,7 +564,9 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::HardSigmoid(x), x, hardsigmoid_value)
     }
 
-    /// Records the hard swish: 0 for `x <= -3`, `x` for `x >= 3`, `x · (x + 3) / 6` between. The derivative follows PyTorch's boundaries: 0 for `x < -3`, `x/3 + 1/2` for `-3 <= x <= 3`, 1 for `x > 3`. NaN passes through.
+    /// Records the hard swish: 0 for `x <= -3`, `x` for `x >= 3`, `x · (x + 3) / 6` between. The
+    /// derivative follows PyTorch's boundaries: 0 for `x < -3`, `x/3 + 1/2` for `-3 <= x <= 3`, 1
+    /// for `x > 3`. NaN passes through.
     ///
     /// # Panics
     ///
@@ -571,7 +586,8 @@ impl<T: Real> Tape<'_, T> {
         self.map(Op::HardSwish(x), x, hardswish_value)
     }
 
-    /// Records log-sigmoid: `log σ(x)`, computed as `min(x, 0) - ln(1 + e^-|x|)` so it never overflows: `log_sigmoid(-1000)` is exactly -1000. The derivative is `σ(-x)`.
+    /// Records log-sigmoid: `log σ(x)`, computed as `min(x, 0) - ln(1 + e^-|x|)` so it never
+    /// overflows: `log_sigmoid(-1000)` is exactly -1000. The derivative is `σ(-x)`.
     ///
     /// # Panics
     ///

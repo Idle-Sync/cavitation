@@ -29,7 +29,8 @@ use crate::Real;
 /// `A` is `m` by `k`, `B` is `k` by `n`, `C` is `m` by `n`. Each element is computed as
 ///
 /// ```text
-/// acc = 0; for p in 0..k { acc = acc + a[i][p] * b[p][j] }   // in order, in T, separate multiply and add
+/// // in order, in T, separate multiply and add
+/// acc = 0; for p in 0..k { acc = acc + a[i][p] * b[p][j] }
 /// c[i][j] = alpha * acc                      if beta == 0
 /// c[i][j] = beta * c[i][j] + alpha * acc     otherwise
 /// ```
@@ -101,7 +102,8 @@ pub(super) fn check_gemm_shapes<T: Real>(a: &MatRef<T>, b: &MatRef<T>, c: &MatMu
     );
 }
 
-/// One input vector times a weight matrix stored transposed: `out[j] = bias[j] + sum_i x[i] * w_t[i][j]`.
+/// One input vector times a weight matrix stored transposed:
+/// `out[j] = bias[j] + sum_i x[i] * w_t[i][j]`.
 ///
 /// `w_t` is `x.len()` by `out.len()`. The sum runs over `i` in order, accumulated in `T`
 /// from zero; the bias, if present, is added to the finished sum.

@@ -137,7 +137,10 @@ impl<T: Real> Dataset<T> {
     /// };
     /// let middle = data.subset(1..2);
     /// assert_eq!(middle.x.data(), &[2.0, 3.0]);
-    /// assert_eq!(middle.targets, Targets::Values(Tensor::from_vec(vec![20.0f32], &[1, 1]).unwrap()));
+    /// assert_eq!(
+    ///     middle.targets,
+    ///     Targets::Values(Tensor::from_vec(vec![20.0f32], &[1, 1]).unwrap())
+    /// );
     /// ```
     pub fn subset(&self, rows: Range<usize>) -> Dataset<T> {
         let (n, features) = self.matrix_dims();

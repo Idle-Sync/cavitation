@@ -120,7 +120,12 @@ struct Entry<'h, T: Real> {
 ///     let d = e.local_derivative.unwrap().data();
 ///     live.push(d.iter().filter(|&&v| v > 0.0).count() as f32 / d.len() as f32);
 /// });
-/// let config = FitConfig { epochs: 3, batch: 2, loss: Loss::CrossEntropy, ..FitConfig::default() };
+/// let config = FitConfig {
+///     epochs: 3,
+///     batch: 2,
+///     loss: Loss::CrossEntropy,
+///     ..FitConfig::default()
+/// };
 /// fit_with_hooks(&net, &mut params, &data, config, &mut hooks).unwrap();
 /// drop(hooks);
 /// assert_eq!(live.len(), 3);
