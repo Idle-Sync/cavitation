@@ -22,8 +22,16 @@ use crate::linear::LinearModel;
 const MIN_PROBABILITY: f64 = 1e-10;
 
 /// The most times a Newton step is halved looking for a lower objective; past it the fit
-/// stops where it is, as no step along the Newton direction improves on it in `f64`.
+/// reports that it stalled.
 const MAX_HALVINGS: usize = 64;
+
+/// How far, in multiples of `f64::EPSILON · (terms + 2) · |objective|`, an objective may
+/// rise and still count as unchanged. The objective is a sum of non-negative terms (one
+/// log-loss per row and one square per weight), each computed to within a few ulp, and a
+/// running sum of `terms` non-negative values carries an error of at most
+/// `(terms − 1) · ε` times the sum; two evaluations of it can therefore differ by about
+/// twice that with no real change. A rise inside this band is rounding, not a worse point.
+const ROUNDING: f64 = 2.0;
 
 /// Logistic regression: the coefficients `w` and intercept `b` that minimise
 /// `c · Σ log(1 + exp(−s·(x·w + b))) + ½‖w‖²` over every row, with `s = 1` for class 1 and
@@ -104,7 +112,12 @@ impl LogisticRegression {
     /// without a penalty `c` is 1 in these rows and there are no extra rows. Its normal
     /// equations, `(c·XᵀWX + I)·β' = c·XᵀWz`, are the Newton step for the objective, and its
     /// solution is the next `β`, halved towards the current one until the objective
-    /// decreases. The fit stops when a step changes every coefficient by at most
+    /// decreases. A step along which the objective falls at first (its directional
+    /// derivative is negative) and whose new objective is above the current one by no more
+    /// than the rounding of the sum, `2 · ε · (terms + 2) · |objective|`, is taken as it is:
+    /// near the optimum, and with rows whose probabilities are far into the tails, the
+    /// decrease is smaller than `f64` resolves, and requiring it would stop Newton short.
+    /// The fit stops when a step changes every coefficient by at most
     /// `tol · (1 + |coefficient|)`. In the weight, `p` and `1 − p` are each taken as at
     /// least 1e-10, so that `w` never reaches 0; the residual `y − p` is exact, so this does
     /// not move the answer.
@@ -129,13 +142,15 @@ impl LogisticRegression {
     /// - without a penalty, if the classes are separable, so that the log-loss falls
     ///   towards its infimum while the coefficients grow without bound. This is detected
     ///   when the objective falls below `1e-8 · rows` while the coefficients' norm still
-    ///   grows, when `max_iter` is reached while it grows and the objective falls, or when
-    ///   the weighted problem becomes rank deficient after the first step while the
-    ///   objective is still falling; also when no step lowers the objective in `f64` any
-    ///   more while the coefficients were growing and some rows' probabilities are within
-    ///   1e-10 of 0 or 1 (separated rows whose losses no longer register). The message says
-    ///   the classes are separable and suggests setting `c`;
-    /// - if `max_iter` steps do not converge otherwise.
+    ///   grows, when `max_iter` is reached while it grows and the objective has not risen,
+    ///   or when the weighted problem becomes rank deficient after the first step while the
+    ///   objective is still falling. The message says the classes are separable and
+    ///   suggests setting `c`;
+    /// - if `max_iter` steps do not converge otherwise, or if no point along a Newton step
+    ///   lowers the objective (beyond rounding) while the step is still larger than `tol`
+    ///   allows.
+    ///
+    /// A model is returned only when a step passed the `tol` test.
     ///
     /// # Examples
     ///
@@ -263,6 +278,8 @@ impl LogisticRegression {
             }
         };
         let norm = |beta: &[f64]| beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let terms = rows + if penalised { features } else { 0 };
+        let noise = |value: f64| ROUNDING * f64::EPSILON * (terms + 2) as f64 * value.abs();
         let mut beta = vec![0.0; cols];
         let mut current = objective(&beta);
         let mut previous = f64::INFINITY;
@@ -270,11 +287,10 @@ impl LogisticRegression {
         for step_number in 1..=self.max_iter {
             let mut a = vec![0.0; total * cols];
             let mut b = vec![0.0; total];
-            let mut clamped = false;
+            let mut gradient = vec![0.0; cols];
             for (i, (row, &pos)) in x.chunks_exact(features).zip(&positive).enumerate() {
                 let eta = score(&beta, row, offset);
                 let (p, q) = (sigmoid(eta), sigmoid(-eta));
-                clamped |= p < MIN_PROBABILITY || q < MIN_PROBABILITY;
                 let w = p.max(MIN_PROBABILITY) * q.max(MIN_PROBABILITY);
                 let residual = if pos { q } else { -p };
                 let s = (weight * w).sqrt();
@@ -285,6 +301,17 @@ impl LogisticRegression {
                     a[(offset + j) * total + i] = s * v;
                 }
                 b[i] = s * (eta + residual / w);
+                if self.fit_intercept {
+                    gradient[0] -= weight * residual;
+                }
+                for (g, &v) in gradient[offset..].iter_mut().zip(row) {
+                    *g -= weight * residual * v;
+                }
+            }
+            if penalised {
+                for (g, &w) in gradient[offset..].iter_mut().zip(&beta[offset..]) {
+                    *g += w;
+                }
             }
             if penalised {
                 for j in 0..features {
@@ -316,43 +343,37 @@ impl LogisticRegression {
                     .zip(at)
                     .all(|(d, v)| d.abs() <= self.tol * (1.0 + v.abs()))
             };
-            // A full step already within `tol` is the converged answer: the objective
-            // changes by about the square of the gradient there, below what `f64` resolves,
-            // so it is taken without asking for a decrease. Otherwise the step is halved
-            // until the objective decreases; if halving shrinks it within `tol` first, no
-            // step along this direction improves on `beta` in `f64`, and the fit stops
-            // there, unless, without a penalty, the coefficients were still growing towards
-            // rows whose probabilities are already past the clamp: then the log-loss has
-            // stopped changing in `f64` because those rows are separated, not because the
-            // fit converged.
+            // A full step already within `tol` is the converged answer, taken without asking
+            // for a decrease. Otherwise the step is halved until the objective decreases, or,
+            // along a descent direction, rises by no more than the rounding of the sum (see
+            // `ROUNDING`): a change that small is not resolved in `f64`, and refusing it
+            // would stall Newton short of the optimum. If no halving is accepted, the fit
+            // stops with an error rather than returning a point the `tol` test did not pass.
             let full: Vec<f64> = beta.iter().zip(&step).map(|(v, d)| v + d).collect();
             if small(&step, &full) {
                 return Ok((full, step_number));
             }
+            let descent = gradient.iter().zip(&step).map(|(g, d)| g * d).sum::<f64>() < 0.0;
+            let slack = noise(current);
             let mut halvings = 0;
             let accepted = loop {
                 let trial: Vec<f64> = beta.iter().zip(&step).map(|(v, d)| v + d).collect();
                 let value = objective(&trial);
-                if value < current {
+                if value < current || (descent && value <= current + slack) {
                     break Some((trial, value));
                 }
-                if halvings == MAX_HALVINGS {
+                if halvings == MAX_HALVINGS || small(&step, &beta) {
                     break None;
                 }
                 step.iter_mut().for_each(|d| *d *= 0.5);
                 halvings += 1;
-                if small(&step, &beta) {
-                    break None;
-                }
             };
             let Some((trial, value)) = accepted else {
-                if !penalised && clamped && norm(&beta) > previous_norm && current < previous {
-                    return Err(separable(
-                        "the log-loss stopped falling in f64 while the coefficients were \
-                         growing and some rows' probabilities were within 1e-10 of 0 or 1",
-                    ));
-                }
-                return Ok((beta, step_number));
+                return Err(Error::InvalidData(format!(
+                    "logistic regression: Newton's method stalled at step {step_number}: no \
+                     point along the Newton step lowers the objective, but the step is larger \
+                     than tol allows; rescale the inputs, or set c to add a penalty"
+                )));
             };
             let converged = small(&step, &trial);
             previous_norm = norm(&beta);
@@ -369,10 +390,10 @@ impl LogisticRegression {
                 )));
             }
         }
-        if !penalised && norm(&beta) > previous_norm && current < previous {
+        if !penalised && norm(&beta) > previous_norm && current <= previous + noise(previous) {
             return Err(separable(&format!(
                 "after max_iter = {} Newton steps the coefficients were still growing and the \
-                 log-loss still falling; if they are not separable, raise max_iter",
+                 log-loss was not rising; if they are not separable, raise max_iter",
                 self.max_iter
             )));
         }
@@ -1099,8 +1120,30 @@ mod tests {
             max_iter: 2000,
             ..unpenalised()
         };
-        assert_separable(&long.fit(&d).unwrap_err());
+        let err = long.fit(&d).unwrap_err();
+        assert!(err.to_string().contains("max_iter = 2000"), "{err}");
+        assert_separable(&err);
         // With a penalty the same rows fit.
+        assert!(LogisticRegression::default().fit(&d).is_ok());
+    }
+
+    /// The weighted problem losing rank after the first step while the objective falls is
+    /// reported as separation. Column 0 overlaps (both classes at -1, 0 and 1); column 1
+    /// equals it except on one extra class-1 row, where it is larger by 1e-11. Moving along
+    /// column 1 minus column 0 separates that row alone, so its weight collapses; once it
+    /// does, column 1 is a linear combination of the others to working precision, though it
+    /// was not at the first step.
+    #[test]
+    fn rank_lost_while_falling_is_separable() {
+        let x0 = [-2.0, -1.0, -1.0, 0.0, 0.0, 1.0, 1.0, 2.0, 0.5];
+        let mut x = Vec::new();
+        for (i, &v) in x0.iter().enumerate() {
+            x.extend([v, if i == 8 { v + 1e-11 } else { v }]);
+        }
+        let d = wide(x, vec![0, 0, 1, 0, 1, 0, 1, 1, 1], 2);
+        let err = unpenalised().fit(&d).unwrap_err();
+        assert!(err.to_string().contains("lost rank"), "{err}");
+        assert_separable(&err);
         assert!(LogisticRegression::default().fit(&d).is_ok());
     }
 
@@ -1122,6 +1165,143 @@ mod tests {
         );
         assert_eq!(model.predict(d.x.view()), [0, 0, 1, 1]);
         assert_eq!(model.score(&d).unwrap(), 1.0);
+        // Asymmetric classes put the optimal intercept away from 0, so the unpenalised
+        // intercept shows: its gradient `Σ(p − y)` has no `+ b` term and is 0 at the answer.
+        let x = [-2.0, -1.0, 3.0, 4.0];
+        let d = classes(x.iter().map(|&v| v as f32).collect(), vec![0, 0, 1, 1]);
+        let model = LogisticRegression::default().fit(&d).unwrap();
+        let (w, b) = (model.coef.data()[0], model.intercept[0]);
+        let p = |v: f64| 1.0 / (1.0 + (-(w * v + b)).exp());
+        let grad_w: f64 = x.iter().zip(y).map(|(&v, t)| (p(v) - t) * v).sum::<f64>() + w;
+        let grad_b: f64 = x.iter().zip(y).map(|(&v, t)| p(v) - t).sum();
+        assert!(b.abs() > 0.1, "intercept {b}");
+        assert!(
+            grad_w.abs() < 1e-12 && grad_b.abs() < 1e-12,
+            "{grad_w} {grad_b}"
+        );
+    }
+
+    /// The reviewer-style generator: xorshift64 uniforms in [0, 1) and Box-Muller normals,
+    /// so the data sets below are fixed bit for bit.
+    struct XorShift(u64);
+
+    impl XorShift {
+        /// The next uniform in [0, 1).
+        fn next(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+
+        /// The next standard normal.
+        fn normal(&mut self) -> f64 {
+            let (u, v) = (self.next().max(1e-300), self.next());
+            (-2.0 * u.ln()).sqrt() * (2.0 * std::f64::consts::PI * v).cos()
+        }
+    }
+
+    /// An `f64` data set of `features` columns from row-major inputs and labels.
+    fn wide(x: Vec<f64>, labels: Vec<usize>, features: usize) -> Dataset<f64> {
+        let rows = labels.len();
+        Dataset {
+            x: Tensor::from_vec(x, &[rows, features]).unwrap(),
+            targets: Targets::Classes(labels),
+        }
+    }
+
+    /// The largest component of the objective's gradient at `model`:
+    /// `c·Xᵀ(p − y) + w` (with `c = 1` and no `w` term without a penalty), the intercept's
+    /// component included.
+    fn largest_gradient(model: &LogisticModel, d: &Dataset<f64>) -> f64 {
+        let features = d.features();
+        let Targets::Classes(y) = &d.targets else {
+            unreachable!()
+        };
+        let (w, b) = (model.coef.data(), model.intercept[0]);
+        let c = model.c.unwrap_or(1.0);
+        let mut g = vec![0.0; features + 1];
+        for (row, &l) in d.x.data().chunks(features).zip(y) {
+            let z: f64 = row.iter().zip(w).map(|(a, b)| a * b).sum::<f64>() + b;
+            let r = sigmoid(z) - l as f64;
+            g[features] += c * r;
+            for (gj, v) in g.iter_mut().zip(row) {
+                *gj += c * r * v;
+            }
+        }
+        if model.c.is_some() {
+            for (gj, wj) in g.iter_mut().zip(w) {
+                *gj += wj;
+            }
+        }
+        g.iter().fold(0.0f64, |m, v| m.max(v.abs()))
+    }
+
+    /// Not separable, though nearly: 2,000 rows with `x0` evenly spaced on [-1, 1], labels
+    /// random inside `|x0| < 0.01` and `x0 > 0` outside, and a standard-normal noise column,
+    /// for two generator seeds that were once called separable. The unpenalised optimum is
+    /// finite (a slope near 210) with rows far past the 1e-10 probability clamp, where a
+    /// Newton step's decrease is below what the objective resolves in `f64`; Newton must
+    /// fit it, with the objective's gradient below 1e-9 in every component (about 4e-15
+    /// is reached).
+    #[test]
+    fn narrow_band_overlap_fits() {
+        for seed in [1u64, 2] {
+            let mut rng = XorShift(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            for i in 0..2000 {
+                let v = -1.0 + 2.0 * (f64::from(i) + 0.5) / 2000.0;
+                let label = if v.abs() < 0.01 {
+                    usize::from(rng.next() < 0.5)
+                } else {
+                    usize::from(v > 0.0)
+                };
+                x.extend([v, rng.normal()]);
+                y.push(label);
+            }
+            let d = wide(x, y, 2);
+            let model = unpenalised()
+                .fit(&d)
+                .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
+            let g = largest_gradient(&model, &d);
+            assert!(g < 1e-9, "seed {seed}: gradient {g:e}, model {model:?}");
+            assert!(model.coef.data()[0] > 50.0, "seed {seed}: {model:?}");
+        }
+    }
+
+    /// 3,000 rows of four correlated columns (`base + 0.01·k·N(0, 1)`), Bernoulli labels
+    /// from `σ(x0 + 0.3·x1)`, and three rows scaled ×40 with the correct label, for the
+    /// generator seeds that once stalled Newton (3, 4, 7, 17). Not separable: without a
+    /// penalty and with `c = 1` each fit converges, with the objective's gradient below
+    /// `1e-8 · max(1, c)` in every component at the returned answer (converged fits reach
+    /// about 1e-12; a stalled fit at `c = 1` stopped at 2.9e-6).
+    #[test]
+    fn correlated_rows_with_far_points_fit() {
+        for seed in [3u64, 4, 7, 17] {
+            let mut rng = XorShift(seed.wrapping_mul(0x2545_F491_4F6C_DD1D) | 1);
+            let (mut x, mut y) = (Vec::new(), Vec::new());
+            for i in 0..3000 {
+                let base = rng.normal();
+                let mut row: Vec<f64> = (0..4)
+                    .map(|j| base + 0.01 * (f64::from(j) + 1.0) * rng.normal())
+                    .collect();
+                let mut label = usize::from(rng.next() < sigmoid(row[0] + 0.3 * row[1]));
+                if i < 3 {
+                    row.iter_mut().for_each(|v| *v *= 40.0);
+                    label = usize::from(row[0] > 0.0);
+                }
+                x.extend(row);
+                y.push(label);
+            }
+            let d = wide(x, y, 4);
+            for r in [unpenalised(), LogisticRegression::default()] {
+                let model = r
+                    .fit(&d)
+                    .unwrap_or_else(|e| panic!("seed {seed}, c {:?}: {e}", r.c));
+                let g = largest_gradient(&model, &d);
+                assert!(g < 1e-8, "seed {seed}, c {:?}: gradient {g:e}", r.c);
+            }
+        }
     }
 
     /// A single class is refused, naming it, by both paths.
@@ -1345,8 +1525,9 @@ mod tests {
         assert!((model.objective(&d).unwrap() - expected).abs() < 1e-12);
     }
 
-    /// The penalised objective falls at every Newton step, and the fit stops on the step
-    /// tolerance.
+    /// A penalised fit on overlapping classes converges on the step tolerance in 2 to 14
+    /// Newton steps, and one step is not enough: `max_iter = 1` is an error naming
+    /// `max_iter`.
     #[test]
     fn newton_iterations_reported() {
         let x: Vec<f32> = (0..40).map(|i| (i as f32 - 20.0) / 7.0).collect();
