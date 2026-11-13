@@ -71,8 +71,9 @@
 //! - `seconds` (number): the epoch's wall-clock time, pauses included.
 //! - `evaluation` (object or `null`): the held-out evaluation on the first `eval_rows` probe
 //!   rows, or `null` when it was skipped (no client was connected, or the time since the
-//!   last evaluation was under 100 times that evaluation's own cost; the last epoch always
-//!   has one while a client is connected):
+//!   last evaluation was under [`EVALUATION_FACTOR`](crate::EVALUATION_FACTOR), 200, times
+//!   that evaluation's own cost; the last epoch always has one while a client is
+//!   connected):
 //!   - `rows` (integer): the rows measured.
 //!   - `loss` (number): their mean loss, as training defines it.
 //!   - `accuracy` (number or `null`): the share classified right, for class targets.

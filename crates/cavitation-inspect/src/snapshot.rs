@@ -24,6 +24,20 @@ use crate::server::{Inspector, InspectorConfig};
 use crate::sse::{Event, Hub, Snapshot};
 use crate::wire::{self, EpochEvaluation, ModelInfo, RunState, Stats};
 
+/// How far apart the held-out evaluations are: after an evaluation that took `c`, an
+/// epoch end evaluates again only once at least `EVALUATION_FACTOR · c` has passed since it
+/// ended, so evaluation takes at most about 1/200 = 0.5% of a run's time, besides the
+/// evaluation the last epoch always gets.
+///
+/// ```
+/// assert_eq!(cavitation_inspect::EVALUATION_FACTOR, 200);
+/// ```
+pub const EVALUATION_FACTOR: u32 = 200;
+
+/// How many times the end of a run tries to publish its last snapshot, [`PAUSE_POLL`]
+/// apart, when the hub's lock is busy: up to about a second.
+const FINAL_CAPTURE_TRIES: usize = 200;
+
 /// How often a paused run looks for commands and for its clients leaving.
 const PAUSE_POLL: Duration = Duration::from_millis(5);
 
@@ -101,6 +115,8 @@ pub(crate) struct Training {
     epoch: usize,
     /// The last step's batch loss.
     last_loss: f32,
+    /// The learning rate after the last step, for the final snapshot.
+    learning_rate: f64,
     /// The held-out evaluator, made at the first evaluation.
     evaluator: Option<Evaluator>,
     /// The rows the last evaluation classified wrong.
@@ -142,6 +158,7 @@ impl Training {
             step: 0,
             epoch: 0,
             last_loss: f32::NAN,
+            learning_rate: f64::NAN,
             evaluator: None,
             misclassified: Vec::new(),
             last_eval: None,
@@ -661,9 +678,11 @@ impl Inspector {
         Ok(())
     }
 
-    /// Ends a run: says how it ended and publishes every waiting event, waiting for the
-    /// hub's lock now that training is over.
-    fn end(&mut self, model: &Sequential, result: &Result<History, Error>) {
+    /// Ends a run: while a client is connected, captures one last snapshot, so the page
+    /// shows the final step and epoch rather than the last sampled one; then says how the
+    /// run ended and publishes every waiting event, waiting for the hub's lock now that
+    /// training is over.
+    fn end(&mut self, model: &Sequential, params: &ParamStore, result: &Result<History, Error>) {
         let Inspector {
             config,
             shared,
@@ -671,6 +690,19 @@ impl Inspector {
             ..
         } = self;
         t.paused = false;
+        if t.step > 0 {
+            // Training is over, so a capture the hub's lock refuses can wait a little and try
+            // again; a client that leaves, or a hub that closes, ends the attempts.
+            for _ in 0..FINAL_CAPTURE_TRIES {
+                if shared.hub.clients() == 0
+                    || shared.hub.stopping().load(Ordering::Acquire)
+                    || t.capture(config, &shared.hub, model, params, t.learning_rate)
+                {
+                    break;
+                }
+                thread::sleep(PAUSE_POLL);
+            }
+        }
         let message = match result {
             Ok(history) => format!(
                 "training finished after {}",
@@ -736,6 +768,7 @@ impl StepControl for Inspector {
         t.step = info.step;
         t.epoch = info.epoch;
         t.last_loss = info.loss;
+        t.learning_rate = trainer.learning_rate();
         t.rows_since += info.rows;
         t.seconds_since += info.seconds;
         if hub.clients() > 0
@@ -770,8 +803,9 @@ impl StepControl for Inspector {
     /// is due, and publishes the `epoch` event.
     ///
     /// The evaluation runs only while a client is connected, and only when the time since
-    /// the last one ended is at least 100 times that one's own cost, so it takes at most
-    /// about 1% of the run; the last epoch always has one while a client is connected.
+    /// the last one ended is at least [`EVALUATION_FACTOR`] (200) times that one's own cost,
+    /// so it takes at most about 0.5% of the run; the last epoch always has one while a
+    /// client is connected.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -814,7 +848,7 @@ impl StepControl for Inspector {
         let last = report.epoch >= t.epochs;
         let due = t
             .last_eval
-            .is_none_or(|(end, cost)| end.elapsed() >= cost.saturating_mul(100));
+            .is_none_or(|(end, cost)| end.elapsed() >= cost.saturating_mul(EVALUATION_FACTOR));
         let evaluation = if hub.clients() > 0 && (last || due) {
             t.evaluate(config, model.model(), params)
         } else {
@@ -878,6 +912,6 @@ pub fn fit(
 ) -> Result<History, Error> {
     inspector.begin(model, params, train, &config)?;
     let result = fit_controlled(model, params, train, config, &mut Hooks::new(), inspector);
-    inspector.end(model, &result);
+    inspector.end(model, params, &result);
     result
 }

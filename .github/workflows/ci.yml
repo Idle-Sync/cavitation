@@ -36,6 +36,8 @@ jobs:
         run: |
           cargo run --release --example linear_regression -p cavitation
           cargo run --release --example logistic_regression -p cavitation
+      - name: Build the inspector example
+        run: cargo build --release --example inspect_digits -p cavitation --features inspect
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
