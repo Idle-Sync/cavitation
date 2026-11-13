@@ -22,7 +22,7 @@ mod activity;
 mod compact;
 mod prune;
 
-pub use ablate::{Ablation, ablate, ablate_with};
+pub use ablate::{Ablation, ablate, ablate_controlled, ablate_with};
 pub use activity::{LayerActivity, activity};
 pub use compact::compact;
 pub use prune::{

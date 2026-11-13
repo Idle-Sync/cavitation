@@ -15,7 +15,7 @@ use cavitation_core::kernels::{Level, MatRef, supported};
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
 use cavitation_nn::shrink::{
     Ablation, Criterion, Ranking, RetrainConfig, ShrinkConfig, ShrinkStep, ShrinkWarning,
-    Validation, ablate, ablate_with, activity, compact, shrink,
+    Validation, ablate, ablate_controlled, ablate_with, activity, compact, shrink,
 };
 use cavitation_nn::{
     Activation, ActivationLayer, Dataset, Evaluator, Flow, InferenceModel, Layer, Linear, Loss,
@@ -1183,6 +1183,43 @@ fn ablate_with_reports_each_neuron() {
             .is_empty()
     );
     assert!(ablate(&net, &params, &data, &[0], Loss::Mse, 0).is_err());
+}
+
+/// `ablate_controlled` ends the sweep at the first `Flow::Stop`, after that neuron, and ranks
+/// the neurons measured so far exactly as the full sweep measured them.
+#[test]
+fn ablate_controlled_stops_where_asked() {
+    let mut params = ParamStore::new();
+    let net = small_network(&mut params);
+    let data = value_data();
+    let full = ablate(&net, &params, &data, &[0, 2], Loss::Mse, 32).unwrap();
+    let mut calls = 0;
+    let part = ablate_controlled(&net, &params, &data, &[0, 2], Loss::Mse, 32, &mut |_| {
+        calls += 1;
+        if calls == 4 {
+            Flow::Stop
+        } else {
+            Flow::Continue
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 4);
+    assert_eq!(part.len(), 4);
+    assert!(part.windows(2).all(|w| w[0].drop >= w[1].drop));
+    for a in &part {
+        assert_eq!((a.linear, a.neuron < 4), (0, true));
+        let same = full
+            .iter()
+            .find(|f| (f.linear, f.neuron) == (a.linear, a.neuron))
+            .unwrap();
+        assert_eq!(a.drop.to_bits(), same.drop.to_bits());
+    }
+    // `Flow::Continue` throughout is the whole sweep.
+    let all = ablate_controlled(&net, &params, &data, &[0, 2], Loss::Mse, 32, &mut |_| {
+        Flow::Continue
+    })
+    .unwrap();
+    assert_eq!(all, full);
 }
 
 /// Neurons off in a mask on the `Linear` itself (not at the neuron layer) are already off:

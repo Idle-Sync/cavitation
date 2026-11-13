@@ -63,11 +63,11 @@ pub(crate) struct Training {
     /// The width of an input row.
     input_width: usize,
     /// Each layer's output width.
-    widths: Vec<usize>,
+    pub(crate) widths: Vec<usize>,
     /// The layer index of every `Linear`, whose neurons the evaluator can switch.
     linears: Vec<usize>,
     /// The first training rows, the probe rows when the configuration names none.
-    own_probe: Option<Dataset>,
+    pub(crate) own_probe: Option<Dataset>,
     /// The first `eval_rows` probe rows, made when there are more probe rows than that.
     eval_set: Option<Dataset>,
     /// The time between captures.
@@ -91,7 +91,7 @@ pub(crate) struct Training {
     /// The last throughput measured, kept for snapshots taken while paused.
     samples_per_second: f64,
     /// The last step's number.
-    step: u64,
+    pub(crate) step: u64,
     /// The epoch in progress.
     epoch: usize,
     /// The last step's batch loss.
@@ -290,7 +290,11 @@ impl Training {
     /// Checks a page's request to switch neuron `neuron` of the `linear`-th `Linear`
     /// (counting only `Linear`s), and returns the `Linear`'s layer index, or why it cannot
     /// be switched.
-    fn mask_target(model: &Sequential, linear: usize, neuron: usize) -> Result<usize, String> {
+    pub(crate) fn mask_target(
+        model: &Sequential,
+        linear: usize,
+        neuron: usize,
+    ) -> Result<usize, String> {
         let Some((layer, lin)) = model.linears().nth(linear) else {
             return Err(format!(
                 "cannot switch a neuron of Linear layer {linear}: the model has {} Linear layers",
@@ -528,7 +532,11 @@ impl Training {
 }
 
 /// Checks the configuration's probe set against the training data and the loss.
-fn check_probe(probe: &Dataset, train: Option<&Dataset>, loss: Loss) -> Result<(), Error> {
+pub(crate) fn check_probe(
+    probe: &Dataset,
+    train: Option<&Dataset>,
+    loss: Loss,
+) -> Result<(), Error> {
     let bad = |why: String| Err(Error::InvalidData(format!("inspector probe set: {why}")));
     let dims = probe.x.shape().dims();
     if dims.len() != 2 || dims[0] == 0 {
@@ -572,7 +580,7 @@ fn check_probe(probe: &Dataset, train: Option<&Dataset>, loss: Loss) -> Result<(
 
 /// Whether `data` has the shape training needs (a matrix with rows, one target per row), so
 /// its first rows can be copied; `fit` reports the problem when it does not.
-fn trainable(data: &Dataset) -> bool {
+pub(crate) fn trainable(data: &Dataset) -> bool {
     let dims = data.x.shape().dims();
     let targets = match &data.targets {
         Targets::Classes(labels) => labels.len(),

@@ -1,11 +1,11 @@
-//! The ablation sweep: [`ablate`] and [`ablate_with`] switch each neuron of chosen hidden
-//! `Linear` layers off, one at a time, measure the network, and rank the neurons by how much
-//! each one's absence costs.
+//! The ablation sweep: [`ablate`], [`ablate_with`] and [`ablate_controlled`] switch each
+//! neuron of chosen hidden `Linear` layers off, one at a time, measure the network, and rank
+//! the neurons by how much each one's absence costs.
 
 use cavitation_core::{Error, ParamStore};
 
 use super::neurons_on;
-use crate::{Dataset, Evaluation, Evaluator, Loss, NeuronMask, Sequential, Targets};
+use crate::{Dataset, Evaluation, Evaluator, Flow, Loss, NeuronMask, Sequential, Targets};
 
 /// What switching one neuron off costs, from [`ablate`]: the neuron, the network's
 /// [`Evaluation`] without it (every other neuron as the model had it), and the drop.
@@ -142,6 +142,52 @@ pub fn ablate_with(
     batch: usize,
     on_neuron: &mut dyn FnMut(&Ablation),
 ) -> Result<Vec<Ablation>, Error> {
+    ablate_controlled(model, params, data, linears, loss, batch, &mut |a| {
+        on_neuron(a);
+        Flow::Continue
+    })
+}
+
+/// Like [`ablate_with`], and `on_neuron`'s answer decides whether the sweep goes on:
+/// [`Flow::Stop`] ends it after that neuron, and the neurons measured so far are ranked
+/// and returned, each measured as the whole sweep would measure it. For a sweep that a
+/// person watching it can cancel.
+///
+/// # Errors
+///
+/// As [`ablate_with`].
+///
+/// # Panics
+///
+/// Panics as [`ablate_with`] does.
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::shrink::ablate_controlled;
+/// use cavitation_nn::{Dataset, Flow, Linear, Loss, Relu, Sequential, Targets};
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 2, 3, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 3, 2, &mut rng));
+/// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0; 4]) };
+/// // Stop after the first neuron.
+/// let some = ablate_controlled(&net, &params, &data, &[0], Loss::CrossEntropy, 4, &mut |_| {
+///     Flow::Stop
+/// })
+/// .unwrap();
+/// assert_eq!(some.len(), 1);
+/// ```
+pub fn ablate_controlled(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    linears: &[usize],
+    loss: Loss,
+    batch: usize,
+    on_neuron: &mut dyn FnMut(&Ablation) -> Flow,
+) -> Result<Vec<Ablation>, Error> {
     let mut chosen: Vec<usize> = Vec::with_capacity(linears.len());
     for &linear in linears {
         check_hidden(model, linear, "ablate")?;
@@ -153,7 +199,7 @@ pub fn ablate_with(
     let base = evaluator.evaluate(data)?;
     let rows = data.len();
     let mut all = Vec::new();
-    for &linear in &chosen {
+    'sweep: for &linear in &chosen {
         let width = model.linear(linear).expect("checked above").outputs();
         // The neurons that are off in any mask of the `Linear`'s run (the `Linear` and the
         // element-wise layers up to `neuron_layer`) are off already: no entry, and they
@@ -175,8 +221,10 @@ pub fn ablate_with(
                 evaluation,
                 drop: drop_of(&base, &evaluation, &data.targets, rows),
             };
-            on_neuron(&ablation);
             all.push(ablation);
+            if on_neuron(&ablation) == Flow::Stop {
+                break 'sweep;
+            }
         }
         evaluator.set_neuron_mask(linear, &start)?;
     }

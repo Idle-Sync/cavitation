@@ -197,6 +197,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
   const S = {
     model: null, stats: null, probe: null, neuron: null, profile: null, status: null,
     epochs: [], ablations: new Map(), shrinks: new Map(),
+    abLast: new Map(), shrinkLast: null,
     mode: 'a', views: [], live: false, exported: false, connected: false,
     pending: null, modelSeen: false,
   };
@@ -889,7 +890,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       // run: what the last run left is cleared. The same model replayed on reconnect keeps it.
       const same = S.model !== null && JSON.stringify(S.model) === JSON.stringify(d);
       if (S.modelSeen || !same) {
-        S.epochs = []; S.ablations.clear(); S.shrinks.clear();
+        S.epochs = []; S.ablations.clear(); S.shrinks.clear(); S.abLast.clear(); S.shrinkLast = null;
         S.stats = null; S.probe = null; S.neuron = null; S.profile = null; S.pending = null;
       }
       S.modelSeen = true;
@@ -908,8 +909,22 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       S.epochs.push(d);
       if (S.epochs.length > 1000) S.epochs.shift();
     },
-    ablation: (d) => { S.ablations.set(keyOf(d), d); },
-    shrink: (d) => { S.shrinks.set(d.removed_bp, d); },
+    ablation: (d) => {
+      // A sweep measures a layer's neurons in rising order, so a neuron at or below the
+      // last one measured there starts a new sweep: the old sweep's entries go.
+      const last = S.abLast.get(d.linear);
+      if (last !== undefined && d.neuron <= last) {
+        S.ablations.forEach((a, k) => { if (a.linear === d.linear) S.ablations.delete(k); });
+      }
+      S.abLast.set(d.linear, d.neuron);
+      S.ablations.set(keyOf(d), d);
+    },
+    shrink: (d) => {
+      // Levels rise within a run, so a level at or below the last one starts a new run.
+      if (S.shrinkLast !== null && d.removed_bp <= S.shrinkLast) S.shrinks.clear();
+      S.shrinkLast = d.removed_bp;
+      S.shrinks.set(d.removed_bp, d);
+    },
   };
   function take(name, d) {
     if (!d || typeof d !== 'object') return;
