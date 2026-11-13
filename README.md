@@ -176,7 +176,7 @@ cargo run --release --example shrink_digits -p cavitation
 
 The example trains the 64 → 256 → 128 → 10 digits network on 1,149 training rows, shrinks it with the other 288 as the validation set, compacts it and saves it.
 
-Measured on an Intel Celeron N5105 (4 cores, kernel level `sse4.2`, rustc 1.99.1), pinned to one core, with `cargo run --release -p cavitation-bench -- shrink`: shrinking with the defaults removed 75% of the hidden neurons, leaving 64 + 32, with 351 of 360 test digits right (the unpruned network had 352). One input through the compacted network in inference mode took 1.006 µs, against 6.808 µs for the full network: 6.77× faster (median of 301 rounds of 1,000 calls). The guide's chapter "Shrinking a network" walks through it.
+Measured on an Intel Celeron N5105 (4 cores, kernel level `sse4.2`, rustc 1.99.1), pinned to one core with `taskset`, with `cargo run --release -p cavitation-bench -- shrink` on a machine that was otherwise mostly idle (other processes used under 30% of one core): shrinking with the defaults removed 75% of the hidden neurons, leaving 64 + 32, with 351 of 360 test digits right (the unpruned network had 352). One input through the compacted network in inference mode took 1.006 µs, against 6.808 µs for the full network: 6.77× faster (median of 301 rounds of 1,000 calls). The guide's chapter "Shrinking a network" walks through it.
 
 ## Linear and logistic regression
 

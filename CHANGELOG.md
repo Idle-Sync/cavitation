@@ -7,7 +7,6 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
-- `Error` has a new variant, `Error::Net`, for an address the inspector cannot listen on. `Error` is `#[non_exhaustive]`, so a `match` with a wildcard arm still compiles.
 
 ### Workspace
 
@@ -16,6 +15,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Tensors and autograd (`cavitation-core`)
 
+- New error variant, `Error::Net`, for an address the inspector cannot listen on. `Error` is `#[non_exhaustive]`, so this is not a breaking change.
 - `Tape::backward_timed`: `backward` with bit-identical gradients that also adds the time between marks (each layer's output, say) to the caller's `times`, reading the clock only at the marks.
 - `ParamGrads::like` makes a second gradient set for a store, allocated on first use, so a second backward pass leaves `ParamStore::grads` untouched; `ParamGrads::zero_grad` clears it.
 
