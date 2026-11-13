@@ -6,10 +6,12 @@
 //! Each fit is 1,000 full-batch steps over 824 or 455 rows, a fraction of a second in a
 //! debug build, so the tests run in every build.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Instant;
 
 use cavitation_ml::{GradientConfig, LinearRegression};
-use cavitation_nn::Standardizer;
+use cavitation_nn::{Standardizer, Targets, Warning};
 
 /// On the Concrete training rows with standardised inputs, OLS and ridge (α = 1) trained by
 /// the gradient path with `GradientConfig::default()` agree with the exact solution within
@@ -81,4 +83,41 @@ fn breast_cancer_gradient_matches_exact() {
         gradient.objective(&train).unwrap(),
         exact.objective(&train).unwrap()
     );
+}
+
+/// The workflow the docs recommend raises no health warning: Concrete with standardised
+/// inputs and targets, OLS and ridge (α = 1) by `fit_gradient` with the default
+/// `GradientConfig`, whose only change is a sink that records every warning. The bias
+/// starts at its optimum here, so a vanishing-gradient check would fire from step 1.
+#[test]
+fn recommended_path_raises_no_warning() {
+    let (mut train, _) = cavitation_datasets::concrete::load().unwrap();
+    Standardizer::fit(train.x.view()).transform_inputs(&mut train);
+    let Targets::Values(y) = &train.targets else {
+        panic!("Concrete has value targets");
+    };
+    Standardizer::fit(y.view())
+        .transform_targets(&mut train)
+        .unwrap();
+    for alpha in [0.0, 1.0] {
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&seen);
+        let mut config = GradientConfig::default();
+        config.health.sink = Some(Box::new(move |w: &Warning| {
+            record.borrow_mut().push(format!("{w:?}"));
+        }));
+        LinearRegression {
+            alpha,
+            ..LinearRegression::default()
+        }
+        .fit_gradient(&train, config)
+        .unwrap();
+        let seen = seen.borrow();
+        assert!(
+            seen.is_empty(),
+            "alpha {alpha}: {} warnings, first {:?}",
+            seen.len(),
+            seen.first()
+        );
+    }
 }
