@@ -10,6 +10,10 @@
 //!   something that happened once, so each client has a bounded queue of them and none is
 //!   skipped.
 //!
+//! The hub also keeps what an export needs: the latest `model` and `status`, and the most
+//! recent `epoch`, `ablation` and `shrink` events (up to [`EPOCH_HISTORY`],
+//! [`ABLATION_HISTORY`] and [`SHRINK_HISTORY`] of them).
+//!
 //! Everything is behind one `Mutex` with one `Condvar`. The training side publishes
 //! snapshots with `try_lock` and never waits; each client's writer thread waits on the
 //! condition variable, copies what is new under the lock and writes outside it.
@@ -29,6 +33,27 @@ use crate::json::JsonWriter;
 /// assert_eq!(cavitation_inspect::sse::KEEPALIVE.as_secs(), 15);
 /// ```
 pub const KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// How many of the latest `epoch` events the hub keeps for an export.
+///
+/// ```
+/// assert_eq!(cavitation_inspect::sse::EPOCH_HISTORY, 1000);
+/// ```
+pub const EPOCH_HISTORY: usize = 1000;
+
+/// How many of the latest `ablation` events the hub keeps for an export.
+///
+/// ```
+/// assert_eq!(cavitation_inspect::sse::ABLATION_HISTORY, 4096);
+/// ```
+pub const ABLATION_HISTORY: usize = 4096;
+
+/// How many of the latest `shrink` events the hub keeps for an export.
+///
+/// ```
+/// assert_eq!(cavitation_inspect::sse::SHRINK_HISTORY, 256);
+/// ```
+pub const SHRINK_HISTORY: usize = 256;
 
 /// How often a waiting writer checks whether its client has closed the connection.
 const CHECK: Duration = Duration::from_millis(100);
@@ -154,6 +179,10 @@ struct State {
     scratch: JsonWriter,
     /// The latest `model` event's payload, queued first for every new client.
     model: Option<String>,
+    /// The latest `status` event's payload, for an export.
+    status: Option<String>,
+    /// The latest `epoch`, `ablation` and `shrink` payloads, oldest first, for an export.
+    history: [VecDeque<String>; 3],
     /// The connected clients.
     clients: Vec<Client>,
     /// The identifier the next client gets.
@@ -220,6 +249,8 @@ impl Hub {
                 slots: Default::default(),
                 scratch: JsonWriter::new(),
                 model: None,
+                status: None,
+                history: Default::default(),
                 clients: Vec::new(),
                 next_id: 0,
             }),
@@ -340,6 +371,8 @@ impl Hub {
             scratch,
             clients,
             model,
+            status,
+            history,
             ..
         } = &mut *state;
         scratch.clear();
@@ -349,12 +382,71 @@ impl Hub {
                 .queue
                 .push_back((which, scratch.as_str().to_string()));
         }
-        if which == Event::Model {
-            *model = Some(scratch.as_str().to_string());
+        match which {
+            Event::Model => *model = Some(scratch.as_str().to_string()),
+            Event::Status => {
+                let kept = status.get_or_insert_with(String::new);
+                kept.clear();
+                kept.push_str(scratch.as_str());
+            }
+            Event::Epoch => remember(&mut history[0], EPOCH_HISTORY, scratch.as_str()),
+            Event::Ablation => remember(&mut history[1], ABLATION_HISTORY, scratch.as_str()),
+            Event::Shrink => remember(&mut history[2], SHRINK_HISTORY, scratch.as_str()),
         }
         drop(state);
         self.changed.notify_all();
         true
+    }
+
+    /// Everything published so far as one JSON object, for an export:
+    /// `{"model", "stats", "probe", "neuron", "profile", "status", "epochs", "ablations",
+    /// "shrinks"}`, each the latest payload of that name or `null` when none was published,
+    /// and the last three arrays of the kept events, oldest first.
+    ///
+    /// ```
+    /// use cavitation_inspect::sse::{Event, Hub, Snapshot};
+    /// use std::time::Duration;
+    /// let hub = Hub::new(8, 256, Duration::from_secs(2));
+    /// hub.publish_snapshot(Snapshot::Stats, |w| { w.begin_object().key("step").uint(3).end_object(); });
+    /// hub.publish_event(Event::Epoch, |w| { w.begin_object().key("epoch").uint(1).end_object(); }, true);
+    /// assert_eq!(
+    ///     hub.export_json(),
+    ///     r#"{"model":null,"stats":{"step":3},"probe":null,"neuron":null,"profile":null,"status":null,"epochs":[{"epoch":1}],"ablations":[],"shrinks":[]}"#
+    /// );
+    /// ```
+    pub fn export_json(&self) -> String {
+        let state = self.lock();
+        let mut out = String::new();
+        out.push('{');
+        member(&mut out, "model", state.model.as_deref());
+        for s in Snapshot::ALL {
+            let slot = &state.slots[s.slot()];
+            out.push(',');
+            member(
+                &mut out,
+                s.name(),
+                (slot.version > 0).then(|| slot.json.as_str()),
+            );
+        }
+        out.push(',');
+        member(&mut out, "status", state.status.as_deref());
+        for (name, kept) in ["epochs", "ablations", "shrinks"]
+            .iter()
+            .zip(&state.history)
+        {
+            out.push_str(",\"");
+            out.push_str(name);
+            out.push_str("\":[");
+            for (k, payload) in kept.iter().enumerate() {
+                if k > 0 {
+                    out.push(',');
+                }
+                out.push_str(payload);
+            }
+            out.push(']');
+        }
+        out.push('}');
+        out
     }
 
     /// The number of connected clients, read without the lock, so the training side can
@@ -509,6 +601,31 @@ impl Hub {
             }
             last_write = Instant::now();
         }
+    }
+}
+
+/// Appends `payload` to `kept`, dropping the oldest when it already holds `cap`; the dropped
+/// payload's buffer is reused, so a full history allocates nothing.
+fn remember(kept: &mut VecDeque<String>, cap: usize, payload: &str) {
+    let mut buf = if kept.len() >= cap {
+        kept.pop_front().unwrap_or_default()
+    } else {
+        String::new()
+    };
+    buf.clear();
+    buf.push_str(payload);
+    kept.push_back(buf);
+}
+
+/// Appends `"name":payload` to `out`, or `"name":null` when there is no payload or it is
+/// empty.
+fn member(out: &mut String, name: &str, payload: Option<&str>) {
+    out.push('"');
+    out.push_str(name);
+    out.push_str("\":");
+    match payload {
+        Some(p) if !p.is_empty() => out.push_str(p),
+        _ => out.push_str("null"),
     }
 }
 
