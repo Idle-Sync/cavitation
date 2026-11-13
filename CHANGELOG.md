@@ -30,6 +30,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- `cavitation-bench` names the processor on Windows from the registry (`reg query … ProcessorNameString`) and reports the load there as the CPU busy percentage, since Windows has no load average; both used to print `unknown`.
 - `cavitation_datasets::concrete` and `cavitation_datasets::breast_cancer`: `load` reads the UCI Concrete Compressive Strength (1,030 rows, eight inputs, the strength in MPa as a value target) and Breast Cancer Wisconsin (Diagnostic) (569 rows, 30 features, 0 malignant and 1 benign) data sets, included in `data/` under CC BY 4.0 and rebuilt from UCI's archives by `scripts/data/make_tabular_csvs.py`, shuffled as the digits split into 824 and 455 training rows; `scripts/fixtures/make_sklearn_fixtures.py` writes the scikit-learn 1.9.1 fixtures (`LinearRegression`, `Ridge`, `LogisticRegression` from `newton-cholesky` and `lbfgs`, multinomial, `StandardScaler`, `r2_score`) that `cavitation-ml` is tested against.
 
 ## v0.1.0 (2026-11-13)
