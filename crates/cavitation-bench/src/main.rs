@@ -41,17 +41,18 @@
 //!   on one test digit for the full network, the full network with the first run's masks,
 //!   and the first run's network compacted: 20,000 warm-up calls each, then 301 interleaved
 //!   rounds of 1,000 calls of each, and prints the medians and the speed-ups.
-//! - `inspect [--rounds N]` (default 9) measures what the inspector costs on the `digits`
-//!   training (the 50k network, SGD lr 0.01, batch 128, 100 epochs per run, timed around the
-//!   `fit` call) with the 360 test digits as the probe set and the default `eval_rows` and
-//!   `snapshot_hz`. It first trains, untimed, for at least 30 s in every mode in turn, past
-//!   the package power-limit window, so every round runs at the same power limit. Each round
-//!   runs four modes, starting one mode later every round: off (`cavitation_nn::fit`), off
-//!   again (the A/A pair), on with one client reading `/events` on its own thread, and on with
-//!   one client connected and not reading (both `cavitation_inspect::fit`). It prints every
-//!   round's times and ratios (off's time over the mode's: 1 is no cost, 0.98 is 2% slower),
-//!   the median ratios, the off/off spread (`|1 − median(off / off again)|`) and whether each
-//!   passes.
+//! - `inspect [--rounds N]` (default 8, a multiple of 4) measures what the inspector costs
+//!   on the `digits` training (the 50k network, SGD lr 0.01, batch 128, 100 epochs per run,
+//!   timed around the `fit` call) with the 360 test digits as the probe set and the default
+//!   `eval_rows` and `snapshot_hz`. It first trains, untimed, for at least 30 s in every mode
+//!   in turn, past the package power-limit window, so every round runs at the same power
+//!   limit. Each round runs four modes, starting one mode later every round: off
+//!   (`cavitation_nn::fit`), off again (the A/A pair), on with one client reading `/events`
+//!   on its own thread, and on with one client connected and not reading (both
+//!   `cavitation_inspect::fit`). It prints every round's times and ratios (off's time over
+//!   the mode's: 1 is no cost, 0.98 is 2% slower), the median ratios, the off/off spread (the
+//!   median over rounds of `|1 − off / off again|`: how far a typical round strays from 1,
+//!   the machine's noise) and whether each passes.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
@@ -590,8 +591,8 @@ fn parse_small_line(line: &str) -> Option<runs::SmallRun> {
 ///
 /// # Errors
 ///
-/// Returns a message for an unknown argument, a `--rounds` that is not a positive number, a
-/// run that fails, or runs that ended on different losses.
+/// Returns a message for an unknown argument, a `--rounds` that is not a positive multiple
+/// of 4, a run that fails, or runs that ended on different losses.
 fn inspect(args: &[String]) -> Result<(), String> {
     use runs::InspectMode;
     let mut rounds = runs::INSPECT_ROUNDS;
@@ -603,8 +604,13 @@ fn inspect(args: &[String]) -> Result<(), String> {
                 rounds = v
                     .parse()
                     .ok()
-                    .filter(|&n| n > 0)
-                    .ok_or_else(|| format!("--rounds must be a positive number, got `{v}`"))?;
+                    .filter(|&n: &usize| n > 0 && n % 4 == 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "--rounds must be a positive multiple of 4, so every mode runs in \
+                             every position equally often; got `{v}`"
+                        )
+                    })?;
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
@@ -716,14 +722,15 @@ fn inspect(args: &[String]) -> Result<(), String> {
         );
     }
     let aa = ratio(InspectMode::OffAgain);
-    let spread = (1.0 - runs::median(&aa)).abs();
+    let spread = runs::aa_spread(&aa);
     let (lo, hi) = aa
         .iter()
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &r| {
             (lo.min(r), hi.max(r))
         });
     println!(
-        "off / off again: median ratio {:.4}, spread {:.2}% (rounds {lo:.4} to {hi:.4})",
+        "off / off again: median ratio {:.4}; spread (median over rounds of |1 - ratio|) \
+         {:.2}%; rounds {lo:.4} to {hi:.4}",
         runs::median(&aa),
         spread * 100.0
     );

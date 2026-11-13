@@ -34,9 +34,17 @@ use crate::wire::{self, EpochEvaluation, ModelInfo, RunState, Stats};
 /// ```
 pub const EVALUATION_FACTOR: u32 = 200;
 
-/// How many times the end of a run tries to publish its last snapshot, [`PAUSE_POLL`]
-/// apart, when the hub's lock is busy: up to about a second.
-const FINAL_CAPTURE_TRIES: usize = 200;
+/// Whether a held-out evaluation is due at an epoch end, `since` after the last one ended,
+/// when that one took `cost`: at least [`EVALUATION_FACTOR`] times `cost` must have passed.
+/// A cost so large that the product does not fit a `Duration` is never due again.
+fn evaluation_due(since: Duration, cost: Duration) -> bool {
+    cost.checked_mul(EVALUATION_FACTOR)
+        .is_some_and(|budget| since >= budget)
+}
+
+/// How long the end of a run keeps trying to publish its last snapshot, [`PAUSE_POLL`]
+/// apart, while the hub's lock is busy.
+const FINAL_CAPTURE_WINDOW: Duration = Duration::from_secs(1);
 
 /// How often a paused run looks for commands and for its clients leaving.
 const PAUSE_POLL: Duration = Duration::from_millis(5);
@@ -692,16 +700,18 @@ impl Inspector {
         t.paused = false;
         if t.step > 0 {
             // Training is over, so a capture the hub's lock refuses can wait a little and try
-            // again; a client that leaves, or a hub that closes, ends the attempts.
-            for _ in 0..FINAL_CAPTURE_TRIES {
-                if shared.hub.clients() == 0
-                    || shared.hub.stopping().load(Ordering::Acquire)
-                    || t.capture(config, &shared.hub, model, params, t.learning_rate)
-                {
-                    break;
-                }
+            // again, for at most `FINAL_CAPTURE_WINDOW` after the first attempt; a client that
+            // leaves, or a hub that closes, ends the attempts. However many attempts it
+            // takes, it counts as one snapshot.
+            let (deadline, captures) = (Instant::now() + FINAL_CAPTURE_WINDOW, t.captures);
+            while shared.hub.clients() > 0
+                && !shared.hub.stopping().load(Ordering::Acquire)
+                && !t.capture(config, &shared.hub, model, params, t.learning_rate)
+                && Instant::now() < deadline
+            {
                 thread::sleep(PAUSE_POLL);
             }
+            t.captures = t.captures.min(captures + 1);
         }
         let message = match result {
             Ok(history) => format!(
@@ -848,7 +858,7 @@ impl StepControl for Inspector {
         let last = report.epoch >= t.epochs;
         let due = t
             .last_eval
-            .is_none_or(|(end, cost)| end.elapsed() >= cost.saturating_mul(EVALUATION_FACTOR));
+            .is_none_or(|(end, cost)| evaluation_due(end.elapsed(), cost));
         let evaluation = if hub.clients() > 0 && (last || due) {
             t.evaluate(config, model.model(), params)
         } else {
@@ -914,4 +924,24 @@ pub fn fit(
     let result = fit_controlled(model, params, train, config, &mut Hooks::new(), inspector);
     inspector.end(model, params, &result);
     result
+}
+
+/// Tests of the training side's pure rules.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An evaluation is due from exactly `EVALUATION_FACTOR` times its cost on: not at 199
+    /// times, yes at 200 and after, and never when the budget does not fit a `Duration`.
+    #[test]
+    fn evaluation_due_at_the_budget_edge() {
+        let cost = Duration::from_millis(3);
+        assert_eq!(EVALUATION_FACTOR, 200);
+        assert!(!evaluation_due(cost * 199, cost));
+        assert!(!evaluation_due(cost * 200 - Duration::from_nanos(1), cost));
+        assert!(evaluation_due(cost * 200, cost));
+        assert!(evaluation_due(cost * 201, cost));
+        assert!(evaluation_due(Duration::ZERO, Duration::ZERO));
+        assert!(!evaluation_due(Duration::MAX, Duration::MAX / 2));
+    }
 }

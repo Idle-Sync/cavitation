@@ -628,10 +628,10 @@ fn probe_leaves_training_untouched() {
     }
 }
 
-/// The held-out evaluation follows its budget: after an evaluation costing `c` seconds, an
-/// epoch end evaluates again only once at least `EVALUATION_FACTOR · c` seconds of training
-/// have passed, and the last epoch always carries one. A 40,000-row evaluation costs more
-/// than the epochs that follow it, so every epoch but the first and the last is skipped.
+/// An evaluation that costs more than the epochs after it is skipped at their ends, and the
+/// first and the last epoch always carry one. (A 40,000-row evaluation costs more than the
+/// four epochs between them, so their ends are under any budget. The budget's edge, 199
+/// against 200 times the cost, is checked by the unit test of `evaluation_due`.)
 #[test]
 fn evaluation_skipped_when_budget_spent() {
     let data = digits(256, 13);
@@ -683,34 +683,20 @@ fn evaluation_skipped_when_budget_spent() {
         epochs_seen.iter().any(|e| e.0.is_none()),
         "no evaluation was skipped"
     );
-    // Between the last evaluation and each later epoch end before the last, the training
-    // time decides: under the budget, skipped; at or over it (with 5% for the time between
-    // epochs that no epoch's `seconds` counts), evaluated.
-    let factor = f64::from(cavitation_inspect::EVALUATION_FACTOR);
-    let mut last_cost = epochs_seen[0].0.unwrap();
-    let mut since = 0.0;
-    for (i, &(cost, seconds)) in epochs_seen.iter().enumerate().skip(1) {
-        since += seconds;
-        if i == epochs - 1 {
-            break;
-        }
-        match cost {
-            Some(c) => {
-                assert!(
-                    since >= 0.95 * factor * last_cost,
-                    "epoch {}: evaluated {since:.4} s after one costing {last_cost:.4} s",
-                    i + 1
-                );
-                last_cost = c;
-                since = 0.0;
-            }
-            None => assert!(
-                since <= 1.05 * factor * last_cost,
-                "epoch {}: skipped {since:.4} s after one costing {last_cost:.4} s",
-                i + 1
-            ),
-        }
-    }
+    let (first_cost, middle): (f64, f64) = (
+        epochs_seen[0].0.unwrap(),
+        epochs_seen[1..epochs - 1].iter().map(|e| e.1).sum(),
+    );
+    assert!(
+        middle < first_cost * f64::from(cavitation_inspect::EVALUATION_FACTOR),
+        "the middle epochs ({middle:.4} s) are not under the budget of an evaluation costing \
+         {first_cost:.4} s"
+    );
+    // Every epoch between the first and the last is skipped: each is far under the budget.
+    assert!(
+        epochs_seen[1..epochs - 1].iter().all(|e| e.0.is_none()),
+        "an epoch under the budget was evaluated: {epochs_seen:?}"
+    );
     client.close();
 }
 

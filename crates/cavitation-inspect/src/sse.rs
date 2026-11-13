@@ -287,8 +287,12 @@ impl Hub {
     /// waiting: returns `false`, and calls nothing, when another thread holds the lock at
     /// this moment. The training side skips that snapshot; a newer one follows.
     ///
-    /// `fill` runs under the lock and gets the slot's own writer, emptied, so a payload of
-    /// the same size allocates nothing.
+    /// `fill` runs under the lock and gets the slot's own writer, emptied. After each fill
+    /// the slot's buffer is made large enough for any payload of the same shape (the same
+    /// keys, strings and array lengths, every number as long as a number can be written),
+    /// so publishing the same kind of snapshot again never grows it, however the widths of
+    /// its numbers change; only a payload of a new shape (a neuron with more inputs, say)
+    /// can.
     ///
     /// ```
     /// use cavitation_inspect::sse::{Hub, Snapshot};
@@ -306,6 +310,10 @@ impl Hub {
         let slot = &mut state.slots[which.slot()];
         slot.json.clear();
         fill(&mut slot.json);
+        // Room for the longest payload of this shape: the training thread publishes the same
+        // shapes step after step, with numbers whose printed widths vary, and must not
+        // allocate. Once the capacity reaches the bound this does nothing.
+        slot.json.reserve_for_shape();
         slot.version += 1;
         drop(state);
         self.changed.notify_all();
@@ -719,5 +727,42 @@ fn peer_closed(stream: &mut TcpStream) -> bool {
             e.kind(),
             std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
         ),
+    }
+}
+
+/// Tests of the hub's internals.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A snapshot slot filled first with the shortest numbers and then with the longest
+    /// keeps its first capacity: publishing the same shape never grows the buffer.
+    #[test]
+    fn snapshot_slot_does_not_grow_for_the_same_shape() {
+        let hub = Hub::new(8, 16, Duration::from_secs(1));
+        let short = vec![0.0f32; 300];
+        let long = vec![-1.175_494_4e-38_f32; 300];
+        let publish = |values: &[f32], step: u64, loss: f64| {
+            assert!(hub.publish_snapshot(Snapshot::Probe, |w| {
+                w.begin_object()
+                    .key("step")
+                    .uint(step)
+                    .key("loss")
+                    .number(loss)
+                    .key("a")
+                    .f32s(values)
+                    .end_object();
+            }));
+        };
+        publish(&short, 1, 0.5);
+        let capacity = hub.lock().slots[Snapshot::Probe.slot()].json.capacity();
+        publish(&long, u64::MAX, -1.347_509_013_280_615_4e-197);
+        let state = hub.lock();
+        let slot = &state.slots[Snapshot::Probe.slot()];
+        assert!(
+            slot.json.as_str().len() > 2 * 300 * 4,
+            "the long payload is long"
+        );
+        assert_eq!(slot.json.capacity(), capacity);
     }
 }

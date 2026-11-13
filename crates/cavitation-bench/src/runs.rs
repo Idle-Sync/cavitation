@@ -634,6 +634,21 @@ mod tests {
         );
     }
 
+    /// The off/off spread is the typical distance of a round from 1, so a noisy run whose
+    /// ratios straddle 1 is not met, as a median of the ratios would make it.
+    #[test]
+    fn aa_spread_measures_noise() {
+        // The nine off/off ratios of a run on a busy machine.
+        let busy = [
+            1.2324, 1.6936, 0.6832, 0.9811, 0.9599, 0.8331, 1.0346, 1.0018, 1.0437,
+        ];
+        assert!((median(&busy) - 1.0).abs() < 0.01);
+        assert!((aa_spread(&busy) - 0.0437).abs() < 1e-9);
+        assert!(aa_spread(&busy) > 0.01);
+        let quiet = [1.003, 0.998, 1.001, 0.996, 1.004, 0.999, 1.002, 0.997];
+        assert!(aa_spread(&quiet) <= 0.01);
+    }
+
     /// The 1M network's eight products do 4,799,488 FLOPs per sample (6 × weights minus the
     /// first layer's input gradient), and the digits network's 269,824.
     #[test]
@@ -1072,8 +1087,19 @@ impl InspectMode {
 /// Timed epochs in each run of the `inspect` benchmark: the `digits` benchmark's 100.
 pub const INSPECT_EPOCHS: usize = 100;
 
-/// Rounds of the `inspect` benchmark: each runs the four modes once.
-pub const INSPECT_ROUNDS: usize = 9;
+/// Rounds of the `inspect` benchmark: each runs the four modes once. A multiple of 4, so
+/// that every mode runs first, second, third and last equally often.
+pub const INSPECT_ROUNDS: usize = 8;
+
+/// The off/off spread of the `inspect` benchmark: the median, over the rounds, of
+/// `|1 − ratio|`, where each ratio is one round's off time over its off-again time. Two
+/// identical runs give 1 on a quiet machine, so this is how far a typical round strays from
+/// 1: the noise a mode's ratio carries too. It is not `|1 − median(ratio)|`, which stays near
+/// 0 whenever the noise is symmetric, however large it is.
+pub fn aa_spread(ratios: &[f64]) -> f64 {
+    let deviations: Vec<f64> = ratios.iter().map(|r| (1.0 - r).abs()).collect();
+    median(&deviations)
+}
 
 /// The least time the `inspect` benchmark trains, untimed, before its rounds: past the
 /// package power-limit window of a low-power CPU (the N5105 runs at 15 W for 27.98 s, then

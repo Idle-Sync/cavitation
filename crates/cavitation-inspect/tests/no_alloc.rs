@@ -10,7 +10,7 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -230,6 +230,18 @@ struct Shared {
     stop: AtomicBool,
     /// Exports fetched so far.
     exports: AtomicUsize,
+    /// Set by the training thread around each epoch end: no export may start meanwhile.
+    quiet: AtomicBool,
+    /// Exports under way now.
+    in_flight: AtomicUsize,
+    /// `epoch` events the reader has received.
+    epochs_read: AtomicUsize,
+    /// Set once counting starts; the reader then counts the snapshots below.
+    counting_started: AtomicBool,
+    /// `probe` snapshots the reader received after counting started.
+    probes_counted: AtomicUsize,
+    /// `neuron` snapshots the reader received after counting started.
+    neurons_counted: AtomicUsize,
 }
 
 /// Sends `POST /api/<command>?token=…&<query>` and returns the status code (0 when the
@@ -275,35 +287,63 @@ fn driver(addr: SocketAddr, token: &str, shared: &Shared) {
 /// hub's lock while it gathers the run so far, so the training thread's `try_lock` is
 /// sometimes refused and takes the path that retries at the next step. The pause keeps the
 /// number of connections, each of which leaves a closed socket behind for a while, modest.
+///
+/// No export starts while `quiet` is set, and `in_flight` counts those under way, so the
+/// training thread can keep epoch ends free of them (see [`Counted::after_epoch`]).
 fn exporter(addr: SocketAddr, token: &str, shared: &Shared) {
     let raw = format!("GET /export?token={token} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
     let mut sink = Vec::new();
     while !shared.stop.load(Ordering::SeqCst) {
-        let Ok(mut stream) = TcpStream::connect(addr) else {
-            continue;
-        };
-        let _ = stream.set_read_timeout(Some(DEADLINE));
-        if stream.write_all(raw.as_bytes()).is_ok() {
-            sink.clear();
-            let _ = stream.read_to_end(&mut sink);
-            shared.exports.fetch_add(1, Ordering::SeqCst);
-        }
         thread::sleep(Duration::from_millis(1));
+        if shared.quiet.load(Ordering::SeqCst) {
+            continue;
+        }
+        shared.in_flight.fetch_add(1, Ordering::SeqCst);
+        // Checked again after counting itself in, so that once the training thread has set
+        // `quiet` and seen `in_flight` at 0, no export can start.
+        if !shared.quiet.load(Ordering::SeqCst)
+            && let Ok(mut stream) = TcpStream::connect(addr)
+        {
+            let _ = stream.set_read_timeout(Some(DEADLINE));
+            if stream.write_all(raw.as_bytes()).is_ok() {
+                sink.clear();
+                let _ = stream.read_to_end(&mut sink);
+                shared.exports.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        shared.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-/// Opens the event stream and reads it until the server closes it, discarding the bytes.
-/// Returns the connection, to close it, and the reading thread.
-fn reader(addr: SocketAddr, token: &str) -> (TcpStream, thread::JoinHandle<()>) {
+/// Opens the event stream. Returns the connection; [`read_events`] reads it.
+fn open_events(addr: SocketAddr, token: &str) -> TcpStream {
     let mut stream = TcpStream::connect(addr).unwrap();
     let raw = format!("GET /events?token={token} HTTP/1.1\r\nHost: {addr}\r\n\r\n");
     stream.write_all(raw.as_bytes()).unwrap();
-    let mut read_side = stream.try_clone().unwrap();
-    let thread = thread::spawn(move || {
-        let mut buffer = vec![0u8; 1 << 16];
-        while matches!(read_side.read(&mut buffer), Ok(n) if n > 0) {}
-    });
-    (stream, thread)
+    stream
+}
+
+/// Reads the event stream until it closes, counting the `epoch` events, and the `probe` and
+/// `neuron` snapshots that arrive after counting started.
+fn read_events(stream: TcpStream, shared: &Shared) {
+    let mut lines = BufReader::new(stream);
+    let mut line = String::new();
+    while matches!(lines.read_line(&mut line), Ok(n) if n > 0) {
+        let counting = shared.counting_started.load(Ordering::SeqCst);
+        match line.trim_end() {
+            "event: epoch" => {
+                shared.epochs_read.fetch_add(1, Ordering::SeqCst);
+            }
+            "event: probe" if counting => {
+                shared.probes_counted.fetch_add(1, Ordering::SeqCst);
+            }
+            "event: neuron" if counting => {
+                shared.neurons_counted.fetch_add(1, Ordering::SeqCst);
+            }
+            _ => {}
+        }
+        line.clear();
+    }
 }
 
 /// Where the run is.
@@ -322,6 +362,9 @@ struct Tally {
     warm_up_epochs: usize,
     /// Steps counted.
     steps: usize,
+    /// Steps of the counted epochs left uncounted: epochs' last steps, and steps while an
+    /// `epoch` event might still be waiting to be published.
+    skipped: usize,
     /// Counted steps on which the inspector captured a snapshot.
     sampled: usize,
     /// Commands sent during the counted epochs.
@@ -347,6 +390,18 @@ struct Counted<'a> {
     captured: bool,
     /// Commands asked for so far.
     asked: usize,
+    /// `epoch` events published or waiting to be: one per epoch ended so far, the first
+    /// `fit`'s included.
+    epochs_ended: usize,
+    /// For each step of an epoch that sends a command in the counted epochs: whether a
+    /// warm-up epoch has published that step's snapshot, so the hub's slots have held every
+    /// shape the counted steps publish (which neuron is shown, which neurons are off).
+    confirmed: [bool; STEPS_PER_EPOCH as usize + 1],
+    /// The step of the epoch whose capture, in a warm-up epoch after a command, is waiting
+    /// to be confirmed by the next step's profile.
+    to_confirm: Option<u64>,
+    /// Whether allocations are being counted now, as last set.
+    counting: bool,
     /// What the run saw.
     tally: Tally,
 }
@@ -364,12 +419,27 @@ impl Counted<'_> {
             thread::sleep(Duration::from_micros(100));
         }
     }
+
+    /// Starts or stops counting, and remembers which.
+    fn count(&mut self, on: bool) {
+        self.counting = on;
+        set_counting(on);
+    }
+
+    /// Whether the reader has received every `epoch` event so far. Until it has, an event
+    /// the hub's lock refused at the epoch's end may still be waiting, and the inspector
+    /// publishes it (copying it for each client, as it must) in a later `after_step`; such a
+    /// step is not counted.
+    fn settled(&self) -> bool {
+        self.shared.epochs_read.load(Ordering::SeqCst) >= self.epochs_ended
+    }
 }
 
 impl StepControl for Counted<'_> {
     /// Stops counting, notes whether the previous capture was refused, sends this step's
-    /// command, then runs the inspector's `after_step` (counted in the counted epochs) and
-    /// leaves counting on for the next step unless this one ends its epoch.
+    /// command, then runs the inspector's `after_step`, counted when the step before it was,
+    /// and leaves counting on for the next step unless this one ends its epoch or an `epoch`
+    /// event may still be waiting to be published.
     fn after_step(
         &mut self,
         info: &StepInfo,
@@ -377,7 +447,8 @@ impl StepControl for Counted<'_> {
         params: &ParamStore,
         trainer: &mut TrainerHandle<'_>,
     ) -> Flow {
-        set_counting(false);
+        let counted = self.counting;
+        self.count(false);
         // A capture that went through asks for the next step's profile, so a capture with
         // no profile after it was refused by a busy hub.
         if self.captured && trainer.last_profile().is_none() {
@@ -386,14 +457,26 @@ impl StepControl for Counted<'_> {
                 Phase::Counted => self.tally.refused_counted += 1,
             }
         }
+        if let Some(at) = self.to_confirm.take()
+            && trainer.last_profile().is_some()
+        {
+            self.confirmed[at as usize] = true;
+        }
         let k = (info.step - 1) % STEPS_PER_EPOCH + 1;
+        let mut rehearsed = false;
         match self.phase {
             Phase::WarmUp if self.tally.warm_up_epochs == 0 => {
                 for &which in warm_up_commands(k) {
                     self.send(which);
                 }
             }
-            Phase::WarmUp => {}
+            // Later warm-up epochs rehearse the counted epochs' commands, step for step.
+            Phase::WarmUp => {
+                if let Some(which) = counted_command(k) {
+                    self.send(which);
+                    rehearsed = true;
+                }
+            }
             Phase::Counted => {
                 if let Some(which) = counted_command(k) {
                     self.send(which);
@@ -402,23 +485,31 @@ impl StepControl for Counted<'_> {
             }
         }
         let before = self.inspector.snapshots_taken();
-        set_counting(self.phase == Phase::Counted);
+        self.count(counted);
         let flow = self.inspector.after_step(info, model, params, trainer);
-        set_counting(false);
+        self.count(false);
         self.captured = self.inspector.snapshots_taken() > before;
-        if self.phase == Phase::Counted {
+        if rehearsed && self.captured {
+            self.to_confirm = Some(k);
+        }
+        if counted {
             self.tally.steps += 1;
             self.tally.sampled += usize::from(self.captured);
+        } else if self.phase == Phase::Counted {
+            self.tally.skipped += 1;
         }
         // The epoch's end (its health checks and report) is not a step, so it is not
-        // counted; the next epoch's first step is, from the end of `after_epoch`.
-        set_counting(self.phase == Phase::Counted && k != STEPS_PER_EPOCH);
+        // counted.
+        let next = self.phase == Phase::Counted && k != STEPS_PER_EPOCH && self.settled();
+        self.count(next);
         flow
     }
 
-    /// Runs the inspector's `after_step`, uncounted (it publishes the `epoch` event, which
-    /// copies a string per client), then moves the run on: counting starts once the warm-up
-    /// has taken every path, and the run stops after [`MEASURED_EPOCHS`] counted epochs.
+    /// Runs the inspector's `after_epoch`, uncounted (it publishes the `epoch` event, which
+    /// copies a string per client) and with no export under way, so that the event is
+    /// seldom refused and left for a later step; then moves the run on: counting starts once
+    /// the warm-up has taken every path, and the run stops after [`MEASURED_EPOCHS`] counted
+    /// epochs.
     fn after_epoch(
         &mut self,
         report: &EpochReport,
@@ -426,13 +517,25 @@ impl StepControl for Counted<'_> {
         params: &ParamStore,
         trainer: &mut TrainerHandle<'_>,
     ) -> Flow {
-        set_counting(false);
+        self.count(false);
+        self.shared.quiet.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        while self.shared.in_flight.load(Ordering::SeqCst) > 0 {
+            assert!(start.elapsed() < DEADLINE, "an export did not end");
+            thread::sleep(Duration::from_micros(100));
+        }
         let flow = self.inspector.after_epoch(report, model, params, trainer);
+        self.shared.quiet.store(false, Ordering::SeqCst);
+        self.epochs_ended += 1;
         match self.phase {
             Phase::WarmUp => {
                 self.tally.warm_up_epochs += 1;
-                if self.tally.refused_warm_up > 0 {
+                let rehearsed = (1..=STEPS_PER_EPOCH)
+                    .filter(|&k| counted_command(k).is_some())
+                    .all(|k| self.confirmed[k as usize]);
+                if self.tally.refused_warm_up > 0 && rehearsed {
                     self.phase = Phase::Counted;
+                    self.shared.counting_started.store(true, Ordering::SeqCst);
                 } else if self.tally.warm_up_epochs >= MAX_WARMUP_EPOCHS {
                     return Flow::Stop;
                 }
@@ -444,7 +547,8 @@ impl StepControl for Counted<'_> {
                 }
             }
         }
-        set_counting(self.phase == Phase::Counted);
+        let next = self.phase == Phase::Counted && self.settled();
+        self.count(next);
         flow
     }
 }
@@ -458,8 +562,17 @@ impl StepControl for Counted<'_> {
 /// until every path has been taken: a snapshot published, a publish refused by a busy hub, a
 /// `status` event, commands drained, the writers woken with `notify_all`, and neuron
 /// switches through `set_neuron` on both hidden `Linear`s (the first creates each mask).
+/// The warm-up epochs after the first send the counted epochs' commands at the same steps,
+/// and counting starts only once each of those steps' snapshots has been published: what a
+/// snapshot holds (which neuron, which neurons are off) sets its shape, and a hub slot grows
+/// only for a shape it has not held.
 /// Then [`MEASURED_EPOCHS`] epochs are counted, every step and its `after_step`, with
-/// commands at chosen steps; epoch ends are not counted. Returns the allocations counted.
+/// commands at chosen steps; epoch ends are not counted, nor a step that may publish an
+/// `epoch` event the hub's lock refused at the epoch's end. Returns the allocations counted.
+///
+/// The wrapped run relies on the inspector keeping the first `fit`'s run state (probe rows,
+/// widths, evaluator) into `fit_controlled`; the reader's count of `probe` and `neuron`
+/// snapshots received while counting checks that the counted steps still captured them.
 fn inspector_training_thread() -> usize {
     let train = digits_like(ROWS, 2);
     let probe = digits_like(360, 3);
@@ -482,16 +595,24 @@ fn inspector_training_thread() -> usize {
         failed: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         exports: AtomicUsize::new(0),
+        quiet: AtomicBool::new(false),
+        in_flight: AtomicUsize::new(0),
+        epochs_read: AtomicUsize::new(0),
+        counting_started: AtomicBool::new(false),
+        probes_counted: AtomicUsize::new(0),
+        neurons_counted: AtomicUsize::new(0),
     };
     let mut params = ParamStore::new();
     let mut net = network(&mut params);
-    let (stream, reading) = reader(addr, &token);
-    let start = Instant::now();
-    while inspector.clients() == 0 {
-        assert!(start.elapsed() < DEADLINE, "the client did not connect");
-        thread::sleep(Duration::from_millis(1));
-    }
+    let stream = open_events(addr, &token);
+    let read_side = stream.try_clone().unwrap();
     let tally = thread::scope(|s| {
+        s.spawn(|| read_events(read_side, &shared));
+        let start = Instant::now();
+        while inspector.clients() == 0 {
+            assert!(start.elapsed() < DEADLINE, "the client did not connect");
+            thread::sleep(Duration::from_millis(1));
+        }
         s.spawn(|| driver(addr, &token, &shared));
         for _ in 0..2 {
             s.spawn(|| exporter(addr, &token, &shared));
@@ -505,6 +626,10 @@ fn inspector_training_thread() -> usize {
             left: MEASURED_EPOCHS,
             captured: false,
             asked: 0,
+            epochs_ended: 1,
+            confirmed: [false; STEPS_PER_EPOCH as usize + 1],
+            to_confirm: None,
+            counting: false,
             tally: Tally::default(),
         };
         let config = fit_config(MAX_WARMUP_EPOCHS + MEASURED_EPOCHS);
@@ -519,7 +644,11 @@ fn inspector_training_thread() -> usize {
         set_counting(false);
         shared.stop.store(true, Ordering::SeqCst);
         result.unwrap();
-        control.tally
+        let tally = control.tally;
+        assert_eq!(inspector.clients(), 1, "the reading client was dropped");
+        // The reader ends when its connection does.
+        let _ = stream.shutdown(Shutdown::Both);
+        tally
     });
     assert!(
         !shared.failed.load(Ordering::SeqCst),
@@ -529,24 +658,36 @@ fn inspector_training_thread() -> usize {
         tally.refused_warm_up > 0,
         "no publish was refused in {MAX_WARMUP_EPOCHS} warm-up epochs"
     );
-    assert_eq!(inspector.clients(), 1, "the reading client was dropped");
     assert!(tally.sampled > 0, "no counted step captured a snapshot");
+    assert!(
+        tally.steps >= MEASURED_EPOCHS * (STEPS_PER_EPOCH as usize) / 2,
+        "only {} steps were counted",
+        tally.steps
+    );
+    let (probes, neurons) = (
+        shared.probes_counted.load(Ordering::SeqCst),
+        shared.neurons_counted.load(Ordering::SeqCst),
+    );
+    assert!(
+        probes > 0 && neurons > 0,
+        "the counted steps captured {probes} probes and {neurons} neurons"
+    );
     assert_eq!(net.neuron_mask(0).map(|m| m.off().count()), Some(0));
     println!(
         "inspector_training_thread: {} warm-up epochs, then {} steps counted ({} sampled, {} \
-         not), {} commands, {} exports fetched, refused publishes: {} in the warm-up, {} counted",
+         not; {} left out), {probes} probes and {neurons} neurons received, {} commands, {} \
+         exports fetched, refused publishes: {} in the warm-up, {} counted",
         tally.warm_up_epochs,
         tally.steps,
         tally.sampled,
         tally.steps - tally.sampled,
+        tally.skipped,
         tally.commands,
         shared.exports.load(Ordering::SeqCst),
         tally.refused_warm_up,
         tally.refused_counted
     );
     drop(inspector);
-    let _ = stream.shutdown(Shutdown::Both);
-    reading.join().unwrap();
     COUNTED.load(Ordering::Relaxed)
 }
 

@@ -104,7 +104,7 @@ Read it from the top:
 
 - **The forward pass.** The digit is an 8 the network calls a 5. Neuron 50 adds up its weighted inputs to z = 0.09567. The ReLU passes a positive z through unchanged, so a = z, and its slope there is 1.
 - **The gradient from above.** ∂L/∂a, how much the loss changes as the neuron's output changes, is the sum over the 128 neurons of the next `Linear` that read this output. Each term is the weight from neuron 50 to neuron j times the gradient at neuron j. The example adds those 128 terms itself and gets the probe's 1.489. No single term is large (the largest is 0.099); many small ones in the same direction add up.
-- **One step down.** ∂L/∂z = ∂L/∂a × f′(z) = 1.489 × 1. For a ReLU that fires, the gradient passes straight through. For one that does not fire, f′(z) is 0 and nothing passes: that is what a dead neuron is.
+- **One step down.** ∂L/∂z = ∂L/∂a × f′(z) = 1.489 × 1. For a ReLU that fires, the gradient passes straight through. For one that does not fire on this row, f′(z) is 0 and nothing passes. A neuron for which that is true on every row never learns again: that is a dead neuron.
 - **To a weight.** The same rule goes on to the weights. z = Σ w·x + b, so ∂L/∂w for each input is ∂L/∂z × x. Pixel (1, 5) is fully lit (x = 1), so that weight's gradient is 1.489 too. Gradient descent lowers each weight by the learning rate times its gradient, which here lowers z, and with it this neuron's push towards the wrong answer.
 
 On the page, step the probe to row 8 and click neuron 50 of layer 1 to see the same numbers.
@@ -158,9 +158,9 @@ It never allows another site to read its answers, and a `GET` never changes anyt
 
 - reads the client count from an atomic;
 - checks for commands with a lock it never waits for;
-- reads the clock once, the step's own timer, which `fit_controlled` reads for every step.
+- reads the clock once, only while a page is connected, to decide whether a snapshot is due.
 
-With a page connected it also captures a snapshot at most `snapshot_hz` times a second: the probe row forward and backward, the neuron, one profiled step. It publishes the snapshot with a lock it never waits for: if a page's connection holds the lock, the snapshot is taken again at the next step. After the first steps, none of this allocates memory on the training thread, sampled steps and neuron switches included. The `no_alloc` test of `cavitation-inspect` checks that.
+With a page connected it also captures a snapshot at most `snapshot_hz` times a second: the probe row forward and backward, the neuron, one profiled step. It publishes the snapshot with a lock it never waits for: if a page's connection holds the lock, the snapshot is taken again at the next step. After the first steps, none of this allocates memory on the training thread, sampled steps and neuron switches included: each snapshot's buffer is made large enough, the first time, for any values of the same shape. The `no_alloc` test of `cavitation-inspect` checks that. Only the epoch-end events copy their text, once for each connected page, at the epoch's end, or at the next step if a page's connection held the lock then.
 
 Most of the inspector's time on the training thread goes to the held-out evaluation at epoch ends: at most about 0.5% of the run by its budget, plus the one at the last epoch. The rest is small and bounded: a few snapshots a second, each one probe row forward and backward plus the page's JSON, and the `epoch` event at each epoch's end. Fewer `eval_rows` makes the evaluation cheaper. With no page connected, nothing is evaluated or captured.
 
@@ -171,14 +171,14 @@ cargo build --release -p cavitation-bench
 target/release/cavitation-bench inspect
 ```
 
-It trains the digits benchmark (the 50k network, SGD at 0.01, batch 128, 100 epochs per run), with the 360 test digits as the probe set and the default `eval_rows` and `snapshot_hz`. First it trains for at least 30 s, past the power limit after which a low-power CPU slows down. Then it runs 9 rounds of four modes, in an order rotated every round:
+It trains the digits benchmark (the 50k network, SGD at 0.01, batch 128, 100 epochs per run), with the 360 test digits as the probe set and the default `eval_rows` and `snapshot_hz`. First it trains for at least 30 s, past the power limit after which a low-power CPU slows down. Then it runs 8 rounds of four modes, in an order rotated every round, so each mode runs first, second, third and last equally often:
 
 - off (plain `fit`);
 - off again, to show how much two identical runs differ;
 - on, with one client reading the event stream;
 - on, with one client connected and not reading.
 
-It prints every round's times and each mode's ratio to off (off's time over the mode's: 1 means no cost, 0.98 means 2% slower), the median of each, and the spread between the two off modes. A spread above 1% means the machine was too busy for the medians to resolve 2%: close other programs and run it again.
+It prints every round's times and each mode's ratio to off (off's time over the mode's: 1 means no cost, 0.98 means 2% slower), and the median of each. It also prints the spread of the two identical off modes: the median, over the rounds, of how far their ratio is from 1. That is the noise every round's ratio carries. A spread above 1% means the machine was too busy for the medians to resolve 2%: close other programs and run it again.
 
 ## Try it
 

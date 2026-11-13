@@ -111,6 +111,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy on the inspector example
+        run: cargo clippy -p cavitation --features inspect --examples -- -D warnings
       - name: Rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
