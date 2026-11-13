@@ -4,6 +4,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.1.0 (2026-11-13)
+
 The first release: a CPU neural network library for multilayer perceptrons whose every value and gradient can be read during training.
 
 ### Workspace
