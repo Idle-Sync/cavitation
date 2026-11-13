@@ -31,6 +31,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Data, examples, guide and benchmark
 
 - `cavitation_datasets::concrete` and `cavitation_datasets::breast_cancer`: `load` reads the UCI Concrete Compressive Strength (1,030 rows, eight inputs, the strength in MPa as a value target) and Breast Cancer Wisconsin (Diagnostic) (569 rows, 30 features, 0 malignant and 1 benign) data sets, included in `data/` under CC BY 4.0 and rebuilt from UCI's archives by `scripts/data/make_tabular_csvs.py`, shuffled as the digits split into 824 and 455 training rows; `scripts/fixtures/make_sklearn_fixtures.py` writes the scikit-learn 1.9.1 fixtures (`LinearRegression`, `Ridge`, `LogisticRegression` from `newton-cholesky` and `lbfgs`, multinomial, `StandardScaler`, `r2_score`) that `cavitation-ml` is tested against.
+- A guide chapter, "Coming from PyTorch", with the `from_pytorch` example (CI runs it): the digits split and the Python snippet that rebuilds it, why a PyTorch loop's mean loss differs from `EpochReport::mean_loss` when the last batch is short (3 decimals of the first epoch on the digits: 2.320 against 2.330, measured with `cargo run --release --example from_pytorch -p cavitation` on an Intel Celeron N5105), the activation defaults that match PyTorch's, where Cavitation differs on purpose (masks, health checks, error kinds), and saving and loading `.safetensors` files.
 
 ## v0.1.0 (2026-11-13)
 
