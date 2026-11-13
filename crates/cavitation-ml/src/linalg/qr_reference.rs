@@ -61,7 +61,8 @@ impl Qr {
     ///
     /// The same as the shipped [`super::Qr::new`]: [`Error::InvalidData`] if `a` is not
     /// two-dimensional, has more columns than rows or holds a NaN or infinite value, or if a
-    /// column's norm or an entry of `R` does not fit in f64.
+    /// column's norm is within a small factor (up to about 4) of `f64::MAX`, so that its
+    /// norm, an entry of `R`, or an intermediate of a reflection does not fit in f64.
     ///
     /// # Examples
     ///
@@ -81,8 +82,8 @@ impl Qr {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidData`] if `data` does not hold `rows · cols` values, and for the same
-    /// problems as [`Qr::new`].
+    /// [`Error::ShapeMismatch`] if `data` does not hold `rows · cols` values, and
+    /// [`Error::InvalidData`] for the same problems as [`Qr::new`].
     ///
     /// # Examples
     ///
@@ -116,7 +117,8 @@ impl Qr {
                 continue;
             }
             // Scale the column exactly by the power of two at or below its norm, as the
-            // shipped version does: n is in [1, 2) and β = 2 / vᵀv = 1 / (n·(n + |x0|)).
+            // shipped version does: n is in [1, 2) and β = 2 / vᵀv = 1 / (n·(n + |x0|)) is
+            // between 1/8 and 1 (n < 1 and β larger for a subnormal ‖x‖).
             let unit = 1.0 / power_of_two_below(size);
             for i in j..rows {
                 f[i * cols + j] *= unit;
@@ -164,7 +166,7 @@ impl Qr {
     ///
     /// The same as the shipped [`super::Qr::solve`]: [`Error::InvalidData`] for a dependent
     /// column (naming it), for a `b` not of shape `[rows, k]` or holding a NaN or infinite
-    /// value, and for a solution that does not fit in f64.
+    /// value, and for a solution, or a step on the way to it, that overflows f64.
     ///
     /// # Examples
     ///
@@ -211,8 +213,8 @@ impl Qr {
         for value in &x {
             if !value.is_finite() {
                 return Err(Error::InvalidData(
-                    "the least-squares solution does not fit in f64; rescale the matrix or \
-                     the right-hand side"
+                    "the least-squares solution overflows f64 while solving; rescale the \
+                     matrix or the right-hand side"
                         .to_string(),
                 ));
             }

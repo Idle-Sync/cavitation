@@ -433,12 +433,89 @@ fn from_columns_matches_new() {
     let reference_rows = qr_reference::Qr::new(a.view()).unwrap();
     let reference_columns = qr_reference::Qr::from_columns(columns, rows, cols).unwrap();
     assert_eq!(reference_rows.r_diagonal(), reference_columns.r_diagonal());
-    assert!(matches!(
-        Qr::from_columns(vec![1.0; 5], 3, 2),
-        Err(Error::InvalidData(_))
-    ));
+    // A wrong buffer length is reported as `Tensor::from_vec` reports it.
+    for result in [
+        Qr::from_columns(vec![1.0; 5], 3, 2).map(|_| ()),
+        qr_reference::Qr::from_columns(vec![1.0; 5], 3, 2).map(|_| ()),
+    ] {
+        match result {
+            Err(Error::ShapeMismatch { expected, found }) => {
+                assert_eq!((expected, found), (vec![3, 2], vec![5]))
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
     assert!(matches!(
         Qr::from_columns(vec![1.0; 6], 2, 3),
         Err(Error::InvalidData(_))
     ));
+}
+
+/// Values within a small factor of `f64::MAX` are refused, naming the column, in both
+/// twins: a column whose norm does not fit in f64, and a column whose norm fits (0.45 of
+/// `f64::MAX`) but whose reflection overflows on the way.
+#[test]
+fn values_near_the_largest_f64_are_refused() {
+    let norm_overflows = Tensor::from_vec(vec![1.0, f64::MAX, 1.0, f64::MAX], &[2, 2]).unwrap();
+    let big = 0.45 * f64::MAX;
+    let reflection_overflows =
+        Tensor::from_vec(vec![1.0, big, 1.0, 0.0, 0.0, 1.0], &[3, 2]).unwrap();
+    for a in [&norm_overflows, &reflection_overflows] {
+        for result in [
+            Qr::new(a.view()).map(|_| ()),
+            qr_reference::Qr::new(a.view()).map(|_| ()),
+        ] {
+            match result {
+                Err(Error::InvalidData(msg)) => {
+                    assert!(msg.contains("column 1 holds values too close"), "{msg}")
+                }
+                other => panic!("expected InvalidData naming column 1, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// A solution, or a step on the way to it, that overflows f64 is an error from `solve` in
+/// both twins: `1e-300·x = 1e300` needs `x = 1e600`, and the mean of three `f64::MAX`
+/// values overflows while `Qᵀb` is formed although the answer itself fits.
+#[test]
+fn solution_overflow_is_an_error() {
+    let tiny = Tensor::from_vec(vec![1e-300, 0.0], &[2, 1]).unwrap();
+    let huge = Tensor::from_vec(vec![1e300, 0.0], &[2, 1]).unwrap();
+    let ones = Tensor::from_vec(vec![1.0, 1.0, 1.0], &[3, 1]).unwrap();
+    let maxes = Tensor::from_vec(vec![f64::MAX; 3], &[3, 1]).unwrap();
+    for (a, b) in [(&tiny, &huge), (&ones, &maxes)] {
+        for result in [
+            Qr::new(a.view()).unwrap().solve(b.view()),
+            qr_reference::Qr::new(a.view()).unwrap().solve(b.view()),
+        ] {
+            match result {
+                Err(Error::InvalidData(msg)) => assert!(msg.contains("overflows f64"), "{msg}"),
+                other => panic!("expected InvalidData, got {other:?}"),
+            }
+        }
+    }
+}
+
+/// A column of subnormal values (about 1e-310) beside a normal one factors and solves:
+/// with `b = 7·c1`, the solution is `[0, 7]`. Subnormals carry fewer digits, hence 1e-12.
+#[test]
+fn subnormal_column_solves() {
+    let u = [1.0, -2.0, 0.5, 3.0, -1.0];
+    let mut a = Vec::new();
+    let mut b = Vec::new();
+    for (i, &ui) in u.iter().enumerate() {
+        let c1 = 1e-310 * ui;
+        a.extend([1.0 + i as f64, c1]);
+        b.push(7.0 * c1);
+    }
+    let a = Tensor::from_vec(a, &[u.len(), 2]).unwrap();
+    let b = Tensor::from_vec(b, &[u.len(), 1]).unwrap();
+    for x in [
+        lstsq(a.view(), b.view()).unwrap(),
+        qr_reference::lstsq(a.view(), b.view()).unwrap(),
+    ] {
+        assert!(x.data()[0].abs() <= 1e-300, "{:?}", x.data());
+        assert!((x.data()[1] - 7.0).abs() <= 7e-12, "{:?}", x.data());
+    }
 }

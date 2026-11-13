@@ -49,13 +49,14 @@ fn matrix_dims(a: &TensorView<'_, f64>) -> Result<(usize, usize), Error> {
 }
 
 /// Checks that `data` holds a `[rows, cols]` matrix stored column-major that can be
-/// factored: `rows · cols` values, at least as many rows as columns, every value finite.
+/// factored: `rows · cols` values (else [`Error::ShapeMismatch`], as `Tensor::from_vec`
+/// reports a wrong length), at least as many rows as columns, every value finite.
 fn check_columns(data: &[f64], rows: usize, cols: usize) -> Result<(), Error> {
     if Some(data.len()) != rows.checked_mul(cols) {
-        return Err(Error::InvalidData(format!(
-            "a [{rows}, {cols}] matrix needs {rows} × {cols} values, found {}",
-            data.len()
-        )));
+        return Err(Error::ShapeMismatch {
+            expected: vec![rows, cols],
+            found: vec![data.len()],
+        });
     }
     check_tall(rows, cols)?;
     if let Some(at) = data.iter().position(|v| !v.is_finite()) {
@@ -106,9 +107,10 @@ fn rhs_columns(b: &TensorView<'_, f64>, rows: usize) -> Result<usize, Error> {
     Ok(k)
 }
 
-/// The error for column `j` when its factorisation does not fit in f64. The norms and the
-/// reflectors are scaled, so this happens only for values within a small factor of
-/// `f64::MAX`, where a column's norm or an entry of `R` is itself larger than `f64::MAX`.
+/// The error for column `j` when its factorisation overflows f64. The norms and the
+/// reflectors are scaled, so this happens only for a column whose norm is within a small
+/// factor (up to about 4) of `f64::MAX`: its norm, an entry of `R`, or an intermediate of a
+/// reflection applied to it does not fit in f64.
 fn too_large_error(j: usize) -> Error {
     Error::InvalidData(format!(
         "column {j} holds values too close to the largest f64 to factor; rescale the column"

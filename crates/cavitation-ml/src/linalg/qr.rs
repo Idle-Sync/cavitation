@@ -39,8 +39,9 @@ pub struct Qr {
     /// The factors, column-major, `rows` values per column. Column `j` holds `R[0..j, j]` in
     /// rows `0..j` and reflector `j`'s vector `v` in rows `j..rows`.
     factors: Vec<f64>,
-    /// Each reflector's `β`, so that it is `I − β·v·vᵀ`; between 1/8 and 1, or 0 for a column
-    /// that was already zero from row `j` down, whose reflector is the identity.
+    /// Each reflector's `β`, so that it is `I − β·v·vᵀ`: between 1/8 and 1 when the
+    /// column's norm from row `j` down is a normal f64, larger when it is subnormal, and 0
+    /// for a column already zero from row `j` down, whose reflector is the identity.
     betas: Vec<f64>,
     /// The diagonal of `R`.
     r_diagonal: Vec<f64>,
@@ -57,8 +58,9 @@ impl Qr {
     /// # Errors
     ///
     /// Returns [`Error::InvalidData`] if `a` is not two-dimensional, has more columns than
-    /// rows or holds a NaN or infinite value, and, naming the column, if a column's values
-    /// are so close to `f64::MAX` that its norm or an entry of `R` does not fit in f64.
+    /// rows or holds a NaN or infinite value, and, naming the column, if a column's norm is
+    /// within a small factor (up to about 4) of `f64::MAX`, so that its norm, an entry of
+    /// `R`, or an intermediate of a reflection applied to it does not fit in f64.
     ///
     /// # Examples
     ///
@@ -87,8 +89,9 @@ impl Qr {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidData`] if `data` does not hold `rows · cols` values, and for
-    /// the same problems as [`Qr::new`].
+    /// Returns [`Error::ShapeMismatch`] (`expected` `[rows, cols]`, `found` the length) if
+    /// `data` does not hold `rows · cols` values, as [`Tensor::from_vec`] does, and
+    /// [`Error::InvalidData`] for the same problems as [`Qr::new`].
     ///
     /// # Examples
     ///
@@ -121,8 +124,9 @@ impl Qr {
                 continue;
             }
             // Work on x·2^−e, with 2^e the power of two at or below ‖x‖: an exact scaling
-            // that brings the norm into [1, 2). Then v = x·2^−e − α·e0 with α = −sign·n, and
-            // β = 2 / vᵀv = 1 / (n·(n + |x0|)) lies between 1/8 and 1, whatever x's size.
+            // that brings the norm n into [1, 2). Then v = x·2^−e − α·e0 with α = −sign·n,
+            // and β = 2 / vᵀv = 1 / (n·(n + |x0|)) lies between 1/8 and 1. For a subnormal
+            // ‖x‖ the scale stops at 2^−1022, so n < 1 and β is larger, still finite.
             let unit = 1.0 / power_of_two_below(size);
             for value in v.iter_mut() {
                 *value *= unit;
@@ -161,8 +165,8 @@ impl Qr {
     ///
     /// Returns [`Error::InvalidData`] if a column of `a` is a linear combination of the
     /// columns before it ([`Qr::dependent_column`]), naming the column; if `b` is not of
-    /// shape `[rows, k]` or holds a NaN or infinite value; and if the solution does not fit
-    /// in f64.
+    /// shape `[rows, k]` or holds a NaN or infinite value; and if the solution, or a step
+    /// on the way to it (`Qᵀb` or back substitution), overflows f64.
     ///
     /// # Examples
     ///
@@ -214,8 +218,8 @@ impl Qr {
         }
         if out.iter().any(|x| !x.is_finite()) {
             return Err(Error::InvalidData(
-                "the least-squares solution does not fit in f64; rescale the matrix or the \
-                 right-hand side"
+                "the least-squares solution overflows f64 while solving; rescale the matrix or \
+                 the right-hand side"
                     .to_string(),
             ));
         }
@@ -440,15 +444,6 @@ mod tests {
         assert_eq!(qr.r_diagonal()[0], -1.0);
         assert_eq!(qr.factors[3], -2.0);
         assert_eq!(qr.r_diagonal()[1].abs(), 5.0);
-    }
-
-    /// Values near `f64::MAX` whose norm or `R` entries do not fit in f64 are refused,
-    /// naming the column, rather than factored into infinities.
-    #[test]
-    fn values_near_the_largest_f64_are_refused() {
-        let a = Tensor::from_vec(vec![1.0, f64::MAX, 1.0, f64::MAX], &[2, 2]).unwrap();
-        let err = Qr::new(a.view()).unwrap_err().to_string();
-        assert!(err.contains("column 1"), "{err}");
     }
 
     /// A matrix with no columns factors and solves to an empty result.
