@@ -76,7 +76,14 @@ impl Linear {
     /// use cavitation_core::{ParamStore, Rng};
     /// use cavitation_nn::{Init, Linear};
     /// let mut params = ParamStore::new();
-    /// let layer = Linear::with_init(&mut params, 4, 2, Init::HeNormal, Init::Constant(0.1), &mut Rng::seed(0));
+    /// let layer = Linear::with_init(
+    ///     &mut params,
+    ///     4,
+    ///     2,
+    ///     Init::HeNormal,
+    ///     Init::Constant(0.1),
+    ///     &mut Rng::seed(0),
+    /// );
     /// assert_eq!(params.value(layer.bias()).data(), &[0.1, 0.1]);
     /// ```
     pub fn with_init<T: Real>(

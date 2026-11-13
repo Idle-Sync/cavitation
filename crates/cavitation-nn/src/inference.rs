@@ -454,7 +454,10 @@ impl InferenceModel {
     /// let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
     /// model.set_neuron_mask(0, &NeuronMask::from_off(2, &[1])).unwrap();
     /// assert_eq!(model.infer(&[1.0]), &[1.0, 0.0]);
-    /// assert!(matches!(model.set_neuron_mask(1, &NeuronMask::all_on(2)), Err(Error::InvalidData(_))));
+    /// assert!(matches!(
+    ///     model.set_neuron_mask(1, &NeuronMask::all_on(2)),
+    ///     Err(Error::InvalidData(_))
+    /// ));
     /// ```
     pub fn set_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> Result<(), Error> {
         let Some(&(_, layer)) = self.shared.neurons.iter().find(|(l, _)| *l == linear) else {
