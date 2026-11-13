@@ -12,7 +12,8 @@
 //! - Training: [`Dataset`] and [`Batcher`], [`Trainer`] for one step at a time, and [`fit`]
 //!   for whole runs, with the [`Health`] checks on every step; [`Evaluator`] and [`evaluate`]
 //!   for the loss and accuracy or R² on held-out data, and [`Dataset::split_at`] to hold it
-//!   out.
+//!   out; [`Standardizer`] for standardising inputs or targets and folding that into the
+//!   first or last [`Linear`].
 //! - Looking inside: [`Hooks`] (each layer's values and gradients), [`NeuronMask`] (turn
 //!   neurons off) and [`Trace`].
 //! - [`InferenceModel`], for answers without the training graph (with each layer's output
@@ -93,6 +94,6 @@ pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
     Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,
-    History, Loss, LrSchedule, OptimizerConfig, Targets, TargetsView, Trainer, accuracy, evaluate,
-    fit, fit_with_hooks,
+    History, Loss, LrSchedule, OptimizerConfig, Standardizer, Targets, TargetsView, Trainer,
+    accuracy, evaluate, fit, fit_with_hooks,
 };

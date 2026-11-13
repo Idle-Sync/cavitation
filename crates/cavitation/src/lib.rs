@@ -169,9 +169,9 @@ pub mod prelude {
         Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks, InferenceModel,
         Init, Layer, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss,
         LrSchedule, Mish, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu, Relu6,
-        Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, StepInputs, Tanh,
-        Targets, TargetsView, Trace, Trainer, Warning, WarningKind, accuracy, evaluate, fit,
-        fit_with_hooks, load, load_lenient, load_with, save,
+        Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, Standardizer,
+        StepInputs, Tanh, Targets, TargetsView, Trace, Trainer, Warning, WarningKind, accuracy,
+        evaluate, fit, fit_with_hooks, load, load_lenient, load_with, save,
     };
 }
 
