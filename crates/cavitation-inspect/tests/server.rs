@@ -998,3 +998,30 @@ fn command_queue_is_bounded() {
     assert_eq!(drained, 64);
     assert_eq!(request(&inspector, "POST", &target, "").status, 204);
 }
+
+/// A connection that has been answered no longer counts against the limit on connections
+/// sending a request: with 32 answered connections still held open by the client, as a
+/// browser keeping connections alive does, a 33rd request is still answered.
+#[test]
+fn answered_connections_do_not_hold_request_slots() {
+    let inspector = start();
+    let a = addr(&inspector);
+    let raw = format!("GET / HTTP/1.1\r\nHost: {a}\r\n\r\n");
+    let mut held = Vec::new();
+    for i in 0..33 {
+        let mut stream = connect(a);
+        stream.write_all(raw.as_bytes()).unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        // The server answers and shuts its side down; the client keeps its side open.
+        loop {
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        assert_eq!(parse_response(&bytes).status, 200, "request {i}");
+        held.push(stream);
+    }
+}

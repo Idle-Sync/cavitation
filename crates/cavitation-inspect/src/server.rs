@@ -496,6 +496,9 @@ fn connection(mut stream: TcpStream, shared: &Shared) {
         }
         Head::Closed | Head::TimedOut | Head::Stopped => return,
     };
+    // The head is read: from here the connection no longer counts against the limit on
+    // connections sending a request, even while its answer lingers or its stream runs.
+    drop(pending);
     match outcome {
         Outcome::Reply(reply) => {
             let sent = http::respond(
@@ -512,7 +515,6 @@ fn connection(mut stream: TcpStream, shared: &Shared) {
             }
         }
         Outcome::Events => {
-            drop(pending);
             let Some(id) = shared.hub.register() else {
                 let reply = Reply::text(503, "too many event streams are open");
                 let _ = http::respond(
