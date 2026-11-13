@@ -138,6 +138,10 @@ impl<T: Real> ParamValues<T> {
 
 /// The gradients of every parameter in a [`ParamStore`], indexed by [`ParamId`].
 ///
+/// A store holds one set, [`ParamStore::grads`]. [`ParamGrads::like`] makes another for the
+/// same store, so a second backward pass (an inspector's probe, say) can run without
+/// touching the gradients training uses.
+///
 /// Each gradient is either current or stale. [`ParamStore::zero_grad`] marks every gradient
 /// stale without writing to it; a stale gradient reads as zeros. The first contribution
 /// after that overwrites the buffer and later ones add to it, which saves a zeroing pass
@@ -160,8 +164,13 @@ impl<T: Real> ParamValues<T> {
 pub struct ParamGrads<T: Real = f32> {
     /// The id of the store these gradients belong to.
     store: u32,
-    /// One gradient buffer per parameter, shaped like its value.
-    tensors: Vec<Tensor<T>>,
+    /// The shape of each parameter's gradient: its value's shape when the parameter was
+    /// added, or when the set was made with [`ParamGrads::like`].
+    shapes: Vec<Shape>,
+    /// One gradient buffer per parameter, as long as its shape once made. A set made with
+    /// [`ParamGrads::like`] starts with every buffer empty (unallocated) and makes each the
+    /// first time it is written; an unmade buffer is stale.
+    bufs: Vec<Vec<T>>,
     /// Whether each gradient is stale: its buffer holds old data and it reads as zeros.
     stale: Vec<bool>,
     /// Zeros as long as the largest parameter; stale gradients are views into it.
@@ -169,6 +178,71 @@ pub struct ParamGrads<T: Real = f32> {
 }
 
 impl<T: Real> ParamGrads<T> {
+    /// A second gradient set for the store whose values are `values`, with one stale
+    /// gradient per parameter the store holds now. A backward pass into it writes here and
+    /// leaves [`ParamStore::grads`] untouched, stale flags included.
+    ///
+    /// Each gradient buffer is allocated the first time something writes to it (a backward
+    /// pass that reaches the parameter, or [`accumulate`](Self::accumulate)) and reused from
+    /// then on. Making the set allocates its bookkeeping and one zero buffer as long as the
+    /// largest parameter, nothing per parameter.
+    ///
+    /// A parameter added to the store afterwards has no gradient here: a backward pass that
+    /// reaches it panics. Make a new set after adding parameters.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamGrads, ParamStore, Tensor};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 3.0f32));
+    /// let mut second = ParamGrads::like(&store.values);
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let v = tape.param(p);
+    /// let loss = tape.mul(v, v);
+    /// tape.backward(loss, &mut second);
+    /// drop(tape);
+    /// assert!(store.grads.is_stale(p)); // the store's own gradients are untouched
+    /// assert!(!second.is_stale(p));
+    /// assert_eq!(second.accumulate(p).0.data(), &[6.0]);
+    /// ```
+    pub fn like(values: &ParamValues<T>) -> ParamGrads<T> {
+        let largest = values.tensors.iter().map(|t| t.data().len()).max();
+        ParamGrads {
+            store: values.store,
+            shapes: values.tensors.iter().map(|t| *t.shape()).collect(),
+            bufs: values.tensors.iter().map(|_| Vec::new()).collect(),
+            stale: vec![true; values.tensors.len()],
+            zeros: vec![T::ZERO; largest.unwrap_or(0)],
+        }
+    }
+
+    /// The position of `id` in this set.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `id` was created by another store, or was added to the store after this
+    /// set was made with [`like`](Self::like).
+    fn index(&self, id: ParamId) -> usize {
+        let i = index_in(self.store, id);
+        assert!(
+            i < self.shapes.len(),
+            "parameter {i} was added to the store after this gradient set was made \
+             (it has {} parameters); make a new one with ParamGrads::like",
+            self.shapes.len()
+        );
+        i
+    }
+
+    /// The gradient buffer at position `i`, allocated (as zeros) if this is its first use.
+    fn made(&mut self, i: usize) -> &mut [T] {
+        let len = self.shapes[i].len();
+        let buf = &mut self.bufs[i];
+        if buf.len() != len {
+            *buf = vec![T::ZERO; len];
+        }
+        buf
+    }
+
     /// Whether the gradient of `id` is stale: it reads as zeros, and the next contribution
     /// overwrites its buffer instead of adding to it.
     ///
@@ -183,16 +257,17 @@ impl<T: Real> ParamGrads<T> {
     /// assert!(store.grads.is_stale(p));
     /// ```
     pub fn is_stale(&self, id: ParamId) -> bool {
-        self.stale[index_in(self.store, id)]
+        self.stale[self.index(id)]
     }
 
     /// The gradient buffer of `id` for writing, and whether it was stale. The writer must
     /// overwrite every element when it was stale and add to the buffer otherwise. The
-    /// gradient is current from then on, even if the write never happens.
+    /// gradient is current from then on, even if the write never happens. In a set made with
+    /// [`like`](Self::like), the first call for a parameter allocates its buffer.
     ///
     /// # Panics
     ///
-    /// Panics if `id` was created by another store.
+    /// Panics if `id` was created by another store, or added to it after this set was made.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -205,26 +280,29 @@ impl<T: Real> ParamGrads<T> {
     /// assert_eq!(store.grad(p).data(), &[2.0]);
     /// ```
     pub fn accumulate(&mut self, id: ParamId) -> (TensorViewMut<'_, T>, bool) {
-        let i = index_in(self.store, id);
+        let i = self.index(id);
+        let shape = self.shapes[i];
         let stale = std::mem::replace(&mut self.stale[i], false);
-        (self.tensors[i].view_mut(), stale)
+        (TensorViewMut::from_parts(self.made(i), shape), stale)
     }
 
     /// The gradient buffer of `id` and its stale flag, left unchanged, for a writer that
-    /// clears the flag only once its write has succeeded.
+    /// clears the flag only once its write has succeeded. In a set made with
+    /// [`like`](Self::like), the first call for a parameter allocates its buffer.
     ///
     /// # Panics
     ///
     /// Panics if `value_shape`, the shape of the parameter's value, differs from the
-    /// gradient buffer's shape.
+    /// gradient buffer's shape, or if the parameter was added after this set was made.
     pub(crate) fn buffer_and_flag(
         &mut self,
         id: ParamId,
         value_shape: &Shape,
     ) -> (&mut [T], &mut bool) {
-        let i = index_in(self.store, id);
-        check_shapes(i, value_shape, self.tensors[i].shape());
-        (self.tensors[i].data_mut(), &mut self.stale[i])
+        let i = self.index(id);
+        check_shapes(i, value_shape, &self.shapes[i]);
+        self.made(i);
+        (&mut self.bufs[i], &mut self.stale[i])
     }
 
     /// The id of the store these gradients belong to.
@@ -234,13 +312,12 @@ impl<T: Real> ParamGrads<T> {
 
     /// The gradient of `id`: a view of zeros when it is stale.
     fn view(&self, id: ParamId) -> TensorView<'_, T> {
-        let i = index_in(self.store, id);
-        let t = &self.tensors[i];
+        let i = self.index(id);
+        let shape = self.shapes[i];
         if self.stale[i] {
-            let shape: Shape = *t.shape();
             TensorView::from_parts(&self.zeros[..shape.len()], shape)
         } else {
-            t.view()
+            TensorView::from_parts(&self.bufs[i], shape)
         }
     }
 }
@@ -305,7 +382,8 @@ impl<T: Real> ParamStore<T> {
             },
             grads: ParamGrads {
                 store,
-                tensors: Vec::new(),
+                shapes: Vec::new(),
+                bufs: Vec::new(),
                 stale: Vec::new(),
                 zeros: Vec::new(),
             },
@@ -331,9 +409,8 @@ impl<T: Real> ParamStore<T> {
         if self.grads.zeros.len() < len {
             self.grads.zeros.resize(len, T::ZERO);
         }
-        self.grads
-            .tensors
-            .push(Tensor::zeros_generic(value.shape().dims()));
+        self.grads.shapes.push(*value.shape());
+        self.grads.bufs.push(vec![T::ZERO; len]);
         self.grads.stale.push(true);
         self.values.tensors.push(value);
         id
@@ -343,7 +420,8 @@ impl<T: Real> ParamStore<T> {
     /// zeros buffer keeps its size. Does nothing if the store holds `len` or fewer.
     pub(crate) fn truncate(&mut self, len: usize) {
         self.values.tensors.truncate(len);
-        self.grads.tensors.truncate(len);
+        self.grads.shapes.truncate(len);
+        self.grads.bufs.truncate(len);
         self.grads.stale.truncate(len);
     }
 
@@ -473,7 +551,7 @@ impl<T: Real> ParamStore<T> {
             .enumerate()
             .map(move |(index, value)| {
                 let id = ParamId { index, store };
-                check_shapes(index, value.shape(), grads.tensors[index].shape());
+                check_shapes(index, value.shape(), &grads.shapes[index]);
                 let grad = (!grads.stale[index]).then(|| grads.view(id));
                 (id, value, grad)
             })
@@ -561,6 +639,46 @@ mod tests {
         let v = tape.param(p);
         let loss = tape.sum(v);
         tape.backward(loss, &mut store.grads);
+    }
+
+    /// A second set makes no gradient buffer until one is written, then reuses it, and
+    /// reads as zeros until then.
+    #[test]
+    fn like_makes_buffers_on_first_use() {
+        let mut store = ParamStore::new();
+        let a = store.add(Tensor::full(&[2, 3], 1.0f32));
+        let b = store.add(Tensor::full(&[4], 1.0f32));
+        let mut second = ParamGrads::like(&store.values);
+        assert!(second.bufs.iter().all(|buf| buf.capacity() == 0));
+        assert_eq!(second.view(a).data(), &[0.0; 6]);
+        assert_eq!(second.view(b).shape().dims(), &[4]);
+        second.accumulate(a).0.data_mut().fill(2.0);
+        let made = second.bufs[0].as_ptr();
+        assert_eq!(second.bufs[1].capacity(), 0, "b is not written yet");
+        let (mut g, stale) = second.accumulate(a);
+        assert!(!stale);
+        g.data_mut()[0] += 1.0;
+        assert_eq!(second.bufs[0].as_ptr(), made, "the buffer is reused");
+        assert_eq!(second.view(a).data(), &[3.0, 2.0, 2.0, 2.0, 2.0, 2.0]);
+        assert!(store.grads.is_stale(a));
+    }
+
+    /// A backward pass into a second set that reaches a parameter added after the set was
+    /// made panics, saying what to do.
+    #[test]
+    #[should_panic(
+        expected = "parameter 1 was added to the store after this gradient set was made"
+    )]
+    fn like_refuses_parameters_added_later() {
+        let mut store = ParamStore::new();
+        store.add(Tensor::full(&[1], 1.0f32));
+        let mut second = ParamGrads::like(&store.values);
+        let late = store.add(Tensor::full(&[1], 2.0f32));
+        let mut graph = crate::Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(late);
+        let loss = tape.add(v, v);
+        tape.backward(loss, &mut second);
     }
 
     /// Writing elements through `value_mut` is fine: the shape is unchanged.

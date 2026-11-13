@@ -1,10 +1,13 @@
-//! Gradient checks of the operations, through the numerical check harness.
+//! Gradient checks of the operations, through the numerical check harness, and checks that
+//! the timed backward pass and a second gradient set give the plain pass's gradients.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use cavitation_core::{
-    CustomOp, Gate, GeluApprox, GradcheckReport, Graph, ParamStore, Real, Reduction, Rng, Shape,
-    Tape, Tensor, TensorView, TensorViewMut, Var, gradcheck, gradcheck_params,
+    CustomOp, Gate, GeluApprox, GradcheckReport, Graph, ParamGrads, ParamId, ParamStore, Real,
+    Reduction, Rng, Shape, Tape, Tensor, TensorView, TensorViewMut, Var, gradcheck,
+    gradcheck_params,
 };
 
 /// Builds a one-dimensional `f64` tensor from a slice.
@@ -636,4 +639,159 @@ fn custom_op_same_var_twice() {
     tape.backward(loss, &mut store.grads);
     drop(tape);
     assert_eq!(store.grad(p).data(), &[1.0, -3.0, 4.0]);
+}
+
+/// The digits-shaped network written with tape operations: weights stored
+/// `[outputs, inputs]` as a `Linear` keeps them, 64 → 32 → 10 with ReLU between, and
+/// softmax cross-entropy over a 32-row batch, all seeded.
+struct Digits {
+    /// The two weights and two biases.
+    params: ParamStore,
+    /// Layer 1's weight, layer 1's bias, layer 2's weight, layer 2's bias.
+    ids: [ParamId; 4],
+    /// The batch: 32 rows of 64 features in `[-1, 1)`.
+    x: Tensor,
+    /// A class label from 0 to 9 for each row.
+    labels: Vec<usize>,
+}
+
+impl Digits {
+    /// The seeded network and batch.
+    fn new() -> Digits {
+        let mut rng = Rng::seed(23);
+        let mut params = ParamStore::new();
+        let mut uniform = |dims: &[usize], scale: f64| {
+            let n: usize = dims.iter().product();
+            let data = (0..n)
+                .map(|_| rng.range(-scale, scale) as f32)
+                .collect::<Vec<_>>();
+            Tensor::from_vec(data, dims).unwrap()
+        };
+        let w1 = uniform(&[32, 64], 0.3);
+        let b1 = uniform(&[32], 0.1);
+        let w2 = uniform(&[10, 32], 0.4);
+        let b2 = uniform(&[10], 0.1);
+        let x = uniform(&[32, 64], 1.0);
+        let ids = [w1, b1, w2, b2].map(|t| params.add(t));
+        let labels = (0..32).map(|i| (i * 7) % 10).collect();
+        Digits {
+            params,
+            ids,
+            x,
+            labels,
+        }
+    }
+
+    /// Records the forward pass and the loss on `tape`; returns the loss and each layer's
+    /// output (the first linear, the ReLU, the second linear), the marks of a timed pass.
+    fn record(&self, tape: &mut Tape<'_>) -> (Var, [Var; 3]) {
+        let [w1, b1, w2, b2] = self.ids.map(|id| tape.param(id));
+        let x = tape.input(self.x.view());
+        let z1 = tape.matmul_nt(x, w1);
+        let z1 = tape.add(z1, b1);
+        let a1 = tape.relu(z1);
+        let z2 = tape.matmul_nt(a1, w2);
+        let z2 = tape.add(z2, b2);
+        let loss = tape.softmax_cross_entropy(z2, &self.labels, Reduction::Mean);
+        (loss, [z1, a1, z2])
+    }
+}
+
+/// The bits of every element of `data`.
+fn bits(data: &[f32]) -> Vec<u32> {
+    data.iter().map(|v| v.to_bits()).collect()
+}
+
+/// `backward_timed` is the same pass as `backward`: on the digits-shaped network every
+/// parameter gradient and every marked value's gradient are equal bit for bit, at the
+/// kernel level `CAVITATION_KERNEL` sets for this process (the full checks run the suite
+/// at each level the machine supports).
+#[test]
+fn backward_timed_is_bit_identical() {
+    let level = cavitation_core::kernels::level();
+    let mut d = Digits::new();
+    let mut graph = Graph::new();
+
+    let mut tape = graph.tape(&d.params.values);
+    let (loss, marks) = d.record(&mut tape);
+    tape.backward(loss, &mut d.params.grads);
+    let mark_grads: Vec<Vec<u32>> = marks
+        .iter()
+        .map(|&m| bits(tape.grad(m).unwrap().data()))
+        .collect();
+    drop(tape);
+    let want: Vec<Vec<u32>> = d
+        .ids
+        .iter()
+        .map(|&id| bits(d.params.grad(id).data()))
+        .collect();
+
+    d.params.zero_grad();
+    let mut times = [Duration::ZERO; 4];
+    let mut tape = graph.tape(&d.params.values);
+    let (loss, marks) = d.record(&mut tape);
+    tape.backward_timed(loss, &mut d.params.grads, &marks, &mut times);
+    for (j, &m) in marks.iter().enumerate() {
+        assert_eq!(
+            bits(tape.grad(m).unwrap().data()),
+            mark_grads[j],
+            "mark {j}, level {level}"
+        );
+    }
+    drop(tape);
+    for (k, &id) in d.ids.iter().enumerate() {
+        assert_eq!(
+            bits(d.params.grad(id).data()),
+            want[k],
+            "parameter {k}, level {level}"
+        );
+    }
+}
+
+/// A backward pass into a second gradient set made with `ParamGrads::like` leaves the
+/// store's own gradients as they were: stale while stale, and unchanged once written. The
+/// second set gets the same gradients a backward into the store's gives.
+#[test]
+fn second_gradient_set_leaves_the_store() {
+    let mut d = Digits::new();
+    let mut graph = Graph::new();
+    let mut second = ParamGrads::like(&d.params.values);
+
+    let mut tape = graph.tape(&d.params.values);
+    let (loss, _) = d.record(&mut tape);
+    tape.backward(loss, &mut second);
+    drop(tape);
+    for &id in &d.ids {
+        assert!(d.params.grads.is_stale(id));
+        assert!(!second.is_stale(id));
+    }
+
+    let mut tape = graph.tape(&d.params.values);
+    let (loss, _) = d.record(&mut tape);
+    tape.backward(loss, &mut d.params.grads);
+    drop(tape);
+    let want: Vec<Vec<u32>> = d
+        .ids
+        .iter()
+        .map(|&id| bits(d.params.grad(id).data()))
+        .collect();
+
+    // Another pass into the second set, after it was marked stale, leaves the store's
+    // current gradients untouched.
+    let mut second = ParamGrads::like(&d.params.values);
+    let mut tape = graph.tape(&d.params.values);
+    let (loss, _) = d.record(&mut tape);
+    tape.backward(loss, &mut second);
+    drop(tape);
+    for (k, &id) in d.ids.iter().enumerate() {
+        assert!(!d.params.grads.is_stale(id));
+        assert_eq!(
+            bits(d.params.grad(id).data()),
+            want[k],
+            "store parameter {k}"
+        );
+        let (got, stale) = second.accumulate(id);
+        assert!(!stale, "parameter {k} of the second set");
+        assert_eq!(bits(got.data()), want[k], "second set parameter {k}");
+    }
 }

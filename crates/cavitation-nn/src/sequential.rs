@@ -2,6 +2,7 @@
 //! their outputs, and a record of each layer's input and output.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use cavitation_core::{ParamId, Real, Tape, Var};
 
@@ -14,6 +15,10 @@ use crate::{Layer, Linear, NeuronMask};
 ///
 /// Fill it with [`Sequential::forward_traced`]. Reuse one trace for every step: it keeps its
 /// capacity, so tracing allocates nothing after the first step.
+///
+/// With [`set_timing`](Trace::set_timing) on, the trace also records how long each layer's
+/// forward pass took ([`forward_time`](Trace::forward_time)). Timing is off by default and
+/// then costs one branch per layer.
 ///
 /// ```
 /// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
@@ -37,6 +42,11 @@ pub struct Trace {
     inputs: Vec<Var>,
     /// The output of each layer.
     outputs: Vec<Var>,
+    /// Whether [`Sequential::forward_traced`] records each layer's forward time.
+    timing: bool,
+    /// Each layer's forward time from the last traced pass made with timing on; empty after
+    /// a pass made with timing off.
+    times: Vec<Duration>,
 }
 
 impl Trace {
@@ -65,7 +75,60 @@ impl Trace {
         Trace {
             inputs: Vec::with_capacity(layers),
             outputs: Vec::with_capacity(layers),
+            timing: false,
+            times: Vec::new(),
         }
+    }
+
+    /// Turns forward timing on or off for the passes that follow. With it on,
+    /// [`Sequential::forward_traced`] reads the clock before the first layer and after each
+    /// layer (its mask included) and records the difference; the first timed pass allocates
+    /// room for one time per layer, and later ones reuse it. With it off, the default, no
+    /// clock is read and nothing is allocated for times.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Linear, Sequential, Trace};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&params.values);
+    /// let x = tape.input(Tensor::full(&[4, 2], 1.0f32).view());
+    /// let mut trace = Trace::new();
+    /// trace.set_timing(true);
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// let _took = trace.forward_time(0);
+    /// ```
+    pub fn set_timing(&mut self, on: bool) {
+        self.timing = on;
+    }
+
+    /// How long layer `i`'s forward pass took (its mask included) in the last traced pass,
+    /// or zero when that pass was made with timing off (see [`set_timing`](Self::set_timing)).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not a recorded layer.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{Relu, Sequential, Trace};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let x = tape.input(Tensor::full(&[1, 2], 1.0f32).view());
+    /// let mut trace = Trace::new(); // timing off
+    /// Sequential::new().push(Relu).forward_traced(&mut tape, x, &mut trace);
+    /// assert_eq!(trace.forward_time(0), Duration::ZERO);
+    /// ```
+    pub fn forward_time(&self, i: usize) -> Duration {
+        assert!(
+            i < self.len(),
+            "trace: layer {i} out of range for {} layers",
+            self.len()
+        );
+        self.times.get(i).copied().unwrap_or(Duration::ZERO)
     }
 
     /// The number of layers recorded.
@@ -755,13 +818,21 @@ impl<T: Real> Sequential<T> {
         self.run(tape, x, Some(trace))
     }
 
-    /// The forward pass, with the width checks and the optional trace.
+    /// The forward pass, with the width checks and the optional trace, timed per layer when
+    /// the trace's timing is on.
     fn run(&self, tape: &mut Tape<'_, T>, x: Var, mut trace: Option<&mut Trace>) -> Var {
+        // The clock of the last layer boundary, read only when timing.
+        let mut clock = None;
         if let Some(trace) = trace.as_deref_mut() {
             trace.inputs.clear();
             trace.outputs.clear();
+            trace.times.clear();
             trace.inputs.reserve(self.layers.len());
             trace.outputs.reserve(self.layers.len());
+            if trace.timing {
+                trace.times.reserve(self.layers.len());
+                clock = Some(Instant::now());
+            }
         }
         let mut x = x;
         for (i, layer) in self.layers.iter().enumerate() {
@@ -801,6 +872,11 @@ impl<T: Real> Sequential<T> {
                 y = tape.keep_where(y, keep);
             }
             if let Some(trace) = trace.as_deref_mut() {
+                if let Some(last) = clock.as_mut() {
+                    let now = Instant::now();
+                    trace.times.push(now - *last);
+                    *last = now;
+                }
                 trace.inputs.push(x);
                 trace.outputs.push(y);
             }

@@ -6,8 +6,9 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
-use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
+use cavitation_core::{Graph, ParamGrads, ParamStore, Reduction, Rng, Tensor, TensorView, Var};
 use cavitation_nn::{
     Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats,
     Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential,
@@ -678,6 +679,109 @@ fn trace_with_capacity_allocates_nothing() -> usize {
     made
 }
 
+/// The manual training loop of [`manual_loop`] with Adam, through `forward_traced` with a
+/// trace whose timing was on for the warm-up epoch and is then switched off: the second
+/// epoch, with timing off, must allocate nothing. Returns its allocations.
+fn forward_timing_off_allocates_nothing() -> usize {
+    let data = synthetic_1437();
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut optimizer = Adam::new(1e-3);
+    let mut graph = Graph::new();
+    let mut trace = Trace::new();
+    trace.set_timing(true);
+    let mut batcher = Batcher::new(data.len(), 128, Some(3));
+    let mut batch = Batch::new(&data, 128);
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for epoch in 0..2 {
+        if epoch == 1 {
+            trace.set_timing(false);
+            before = allocations();
+        }
+        batcher.epoch();
+        for range in batcher.batches() {
+            let view = batcher.gather(&data, range, &mut batch);
+            let TargetsView::Classes(labels) = view.targets else {
+                unreachable!("the set has class labels")
+            };
+            let mut tape = graph.tape(&params.values);
+            let x = tape.input(view.x);
+            let logits = net.forward_traced(&mut tape, x, &mut trace);
+            let loss = tape.softmax_cross_entropy(logits, labels, Reduction::Mean);
+            sink += tape.value(loss).data()[0];
+            tape.backward(loss, &mut params.grads);
+            drop(tape);
+            optimizer.step(&mut params);
+            params.zero_grad();
+        }
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite() && sink > 0.0);
+    made
+}
+
+/// The manual training loop with Adam, timed: forward timing on, each layer's output kept
+/// as a mark in a reused list, and `backward_timed` into the caller's `times`. Also runs a
+/// second backward pass each step into a `ParamGrads::like` set on a graph of its own, as
+/// an inspector's probe does. One warm-up epoch, then counts the allocations of a second.
+fn timed_step_allocates_nothing() -> usize {
+    let data = synthetic_1437();
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut optimizer = Adam::new(1e-3);
+    let mut graph = Graph::new();
+    let mut probe_graph = Graph::new();
+    let mut second = ParamGrads::like(&params.values);
+    let mut trace = Trace::new();
+    trace.set_timing(true);
+    let mut marks: Vec<Var> = Vec::new();
+    let mut times = vec![Duration::ZERO; net.len() + 1];
+    let mut forward = Duration::ZERO;
+    let mut batcher = Batcher::new(data.len(), 128, Some(3));
+    let mut batch = Batch::new(&data, 128);
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for epoch in 0..2 {
+        if epoch == 1 {
+            before = allocations();
+        }
+        batcher.epoch();
+        for range in batcher.batches() {
+            let view = batcher.gather(&data, range, &mut batch);
+            let TargetsView::Classes(labels) = view.targets else {
+                unreachable!("the set has class labels")
+            };
+            let mut tape = graph.tape(&params.values);
+            let x = tape.input(view.x);
+            let logits = net.forward_traced(&mut tape, x, &mut trace);
+            let loss = tape.softmax_cross_entropy(logits, labels, Reduction::Mean);
+            sink += tape.value(loss).data()[0];
+            marks.clear();
+            marks.extend((0..trace.len()).map(|i| trace.output(i)));
+            forward += (0..trace.len())
+                .map(|i| trace.forward_time(i))
+                .sum::<Duration>();
+            tape.backward_timed(loss, &mut params.grads, &marks, &mut times);
+            drop(tape);
+
+            let mut probe = probe_graph.tape(&params.values);
+            let x = probe.input(view.x);
+            let logits = net.forward(&mut probe, x);
+            let loss = probe.softmax_cross_entropy(logits, labels, Reduction::Mean);
+            probe.backward(loss, &mut second);
+            drop(probe);
+
+            optimizer.step(&mut params);
+            params.zero_grad();
+        }
+    }
+    let made = allocations() - before;
+    assert!(sink.is_finite() && sink > 0.0);
+    assert!(forward > Duration::ZERO && times.iter().any(|t| *t > Duration::ZERO));
+    made
+}
+
 /// ReLU written as an activation of your own, so a network using it has no inference form
 /// and evaluates on the tape.
 struct MyRelu;
@@ -851,7 +955,7 @@ fn evaluator_neuron_mask_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 18] = [
+    let scenarios: [Scenario; 20] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -876,6 +980,11 @@ fn main() -> ExitCode {
             "trace_with_capacity_allocates_nothing",
             trace_with_capacity_allocates_nothing,
         ),
+        (
+            "forward_timing_off_allocates_nothing",
+            forward_timing_off_allocates_nothing,
+        ),
+        ("timed_step_allocates_nothing", timed_step_allocates_nothing),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {
