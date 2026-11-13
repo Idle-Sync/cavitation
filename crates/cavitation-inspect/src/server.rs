@@ -18,6 +18,7 @@ use cavitation_nn::Dataset;
 
 use crate::commands::{Command, CommandQueue, QUEUE_CAPACITY};
 use crate::http::{self, Head, Method, Request};
+use crate::snapshot::Training;
 use crate::sse::Hub;
 use crate::token::new_token;
 
@@ -111,11 +112,11 @@ impl Default for InspectorConfig {
 }
 
 /// What the server's threads share.
-struct Shared {
+pub(crate) struct Shared {
     /// The snapshots, events and clients.
-    hub: Hub,
+    pub(crate) hub: Hub,
     /// Commands from the page, waiting for the training side.
-    commands: CommandQueue,
+    pub(crate) commands: CommandQueue,
     /// This run's token.
     token: String,
     /// The `Host` values that name this server, lowercase.
@@ -149,6 +150,9 @@ struct Shared {
 /// `POST /api/{mask,lr,pause,resume,probe,neuron,ablate,shrink,cancel,finish}?token=…`,
 /// each answered 204, or 503 when 64 commands are already waiting.
 ///
+/// To train under it, call [`fit`](crate::fit) in place of `cavitation_nn::fit`; the event
+/// stream then carries the events [`wire`](crate::wire) describes.
+///
 /// This version of the crate serves a placeholder page at `/`, which says that the server is
 /// running and where its event stream is; the export is a minimal document of the same kind.
 ///
@@ -168,13 +172,16 @@ struct Shared {
 /// ```
 pub struct Inspector {
     /// The configuration it was started with.
-    config: InspectorConfig,
+    pub(crate) config: InspectorConfig,
     /// The address it is bound to (the real port when the configuration asked for 0).
     address: SocketAddr,
     /// What its threads share.
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
     /// The accept thread, joined on drop.
     accept: Option<JoinHandle<()>>,
+    /// The training side's state: the probe, the evaluation, the pause and the events
+    /// waiting to be published.
+    pub(crate) training: Training,
 }
 
 impl fmt::Debug for Inspector {
@@ -275,6 +282,7 @@ impl Inspector {
             address,
             shared,
             accept: Some(accept),
+            training: Training::new(),
         })
     }
 
@@ -352,6 +360,19 @@ impl Inspector {
     pub fn try_command(&self) -> Option<Command> {
         self.shared.commands.try_pop()
     }
+
+    /// How many snapshots the training side has captured (statistics, probe row and neuron,
+    /// taken together) over the inspector's life. It stays 0 while no client is connected,
+    /// since nothing is captured then.
+    ///
+    /// ```
+    /// use cavitation_inspect::{Inspector, InspectorConfig};
+    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// assert_eq!(Inspector::start(config).unwrap().snapshots_taken(), 0);
+    /// ```
+    pub fn snapshots_taken(&self) -> u64 {
+        self.training.captures
+    }
 }
 
 impl Drop for Inspector {
@@ -362,6 +383,11 @@ impl Drop for Inspector {
     ///
     /// If the wake-up connection cannot be made (a firewall refusing loopback connections),
     /// the accept thread is left to end at the next connection instead of being waited for.
+    ///
+    /// A run paused from the page cannot be waiting here: [`fit`](crate::fit) holds the
+    /// inspector for the whole run, so it can only be dropped afterwards. The pause itself
+    /// ends when the hub closes, when the page resumes it, or when no client has been
+    /// connected for `idle_resume`.
     fn drop(&mut self) {
         self.shared.hub.close();
         let wake = match self.address.ip() {

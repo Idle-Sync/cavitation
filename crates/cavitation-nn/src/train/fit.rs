@@ -96,18 +96,31 @@ impl Loss {
         }
     }
 
-    /// Records this loss of `out` against `targets` on `tape` and returns the loss variable.
+    /// Records this loss of `out` against `targets` on `tape` and returns the loss variable,
+    /// exactly as [`Trainer`] records it in each step (with [`Reduction::Mean`], or
+    /// [`Reduction::BatchMean`] for [`KlDiv`](Loss::KlDiv)). Value targets are recorded as
+    /// an input first. Use it to measure the training loss on a tape of your own, such as
+    /// one row run forward and backward beside training.
     ///
     /// # Panics
     ///
-    /// Panics as [`check_targets`](Loss::check_targets) does, and as the tape operation
-    /// does on shapes it rejects.
-    pub(super) fn record(
-        self,
-        tape: &mut Tape<'_, f32>,
-        out: Var,
-        targets: TargetsView<'_, f32>,
-    ) -> Var {
+    /// Panics if the kind of `targets` is not the kind the loss needs (class labels for
+    /// [`CrossEntropy`](Loss::CrossEntropy) and [`Nll`](Loss::Nll), values for the others;
+    /// the message names both), and as the tape operation does on shapes it rejects.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{Loss, TargetsView};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let out = tape.input(Tensor::from_vec(vec![1.0f32, 3.0], &[2, 1]).unwrap().view());
+    /// let target = Tensor::from_vec(vec![0.0f32, 1.0], &[2, 1]).unwrap();
+    /// let loss = Loss::Mse.record(&mut tape, out, TargetsView::Values(target.view()));
+    /// // ((1 - 0)² + (3 - 1)²) / 2
+    /// assert_eq!(tape.value(loss).data(), &[2.5]);
+    /// ```
+    pub fn record(self, tape: &mut Tape<'_, f32>, out: Var, targets: TargetsView<'_, f32>) -> Var {
         self.check_targets(targets);
         let mean = Reduction::Mean;
         match targets {

@@ -14,6 +14,13 @@
 //!   skipped.
 //! - [`commands`]: what the page asks for (switch a neuron, change the learning rate,
 //!   pause, resume, ...), queued for the training side to read between steps.
+//! - [`fit`]: training under the inspector. Between steps it carries out the page's
+//!   commands and, while a client is connected, captures snapshots at most `snapshot_hz`
+//!   times a second; at epoch ends it runs a held-out evaluation when the time budget
+//!   allows.
+//! - [`probe::Probe`]: one row run forward and backward beside training, on buffers of its
+//!   own, for the values of every layer and of one neuron.
+//! - [`wire`]: the JSON of every event, field by field.
 //! - [`http`]: the request parser and the checks every request passes.
 //! - [`json::JsonWriter`]: JSON without NaN or infinity, safe inside an HTML `<script>`.
 //! - [`token::new_token`]: the per-run 128-bit token.
@@ -55,8 +62,12 @@
 pub mod commands;
 pub mod http;
 pub mod json;
+pub mod probe;
 mod server;
+mod snapshot;
 pub mod sse;
 pub mod token;
+pub mod wire;
 
 pub use server::{Inspector, InspectorConfig};
+pub use snapshot::fit;
