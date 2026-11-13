@@ -18,7 +18,7 @@ use cavitation_nn::{
     ModelHandle, Sequential, StepControl, StepInfo, Targets, TrainerHandle, fit_controlled,
 };
 
-use crate::commands::Command;
+use crate::commands::{Command, MAX_LEARNING_RATE};
 use crate::probe::Probe;
 use crate::server::{Inspector, InspectorConfig};
 use crate::sse::{Event, Hub, Snapshot};
@@ -26,6 +26,12 @@ use crate::wire::{self, EpochEvaluation, ModelInfo, RunState, Stats};
 
 /// How often a paused run looks for commands and for its clients leaving.
 const PAUSE_POLL: Duration = Duration::from_millis(5);
+
+/// A time no run reaches: a century after `now`, for a sampling period too long to add to
+/// the clock.
+fn far_future(now: Instant) -> Instant {
+    now + Duration::from_secs(100 * 365 * 24 * 3600)
+}
 
 /// An event that could not be published yet (the hub's lock was busy), kept to retry at the
 /// next step.
@@ -305,6 +311,12 @@ impl Training {
                  set by layer index"
             ));
         }
+        if model.linears().all(|(i, _)| i <= layer) {
+            return Err(format!(
+                "cannot switch neurons of Linear layer {linear}: it is the output layer, and \
+                 switching an output off would change what the network answers"
+            ));
+        }
         if let Some(mask) = model.mask(at)
             && mask.width() != width
         {
@@ -344,12 +356,13 @@ impl Training {
                 }
             }
             Command::SetLearningRate(rate) => {
-                if rate.is_finite() && rate >= 0.0 {
+                if rate.is_finite() && (0.0..=MAX_LEARNING_RATE).contains(&rate) {
                     trainer.override_learning_rate(rate);
                     self.capture_now = true;
                 } else {
                     self.say(format!(
-                        "the learning rate must be finite and at least 0, not {rate}"
+                        "the learning rate must be at least 0 and at most \
+                         {MAX_LEARNING_RATE}, not {rate}"
                     ));
                 }
             }
@@ -591,15 +604,16 @@ impl Inspector {
         if let Some(probe) = &config.probe {
             check_probe(probe, valid.then_some(train), fit.loss)?;
         }
-        let probe = std::mem::replace(&mut t.probe, Probe::new());
+        // A fresh state, probe included: the probe's gradient set belongs to one parameter
+        // store, and this run's store may be another.
         let captures = t.captures;
         *t = Training::new();
-        t.probe = probe;
         t.captures = captures;
         t.loss = fit.loss;
         t.epochs = fit.epochs;
         t.batch = fit.batch.max(1);
-        t.period = Duration::from_secs_f64(1.0 / config.snapshot_hz);
+        // `start` checked that the period fits a `Duration`.
+        t.period = Duration::try_from_secs_f64(1.0 / config.snapshot_hz).unwrap_or(Duration::MAX);
         if valid {
             t.input_width = train.features();
             if config.probe.is_none() {
@@ -717,7 +731,8 @@ impl StepControl for Inspector {
                 && t.capture(config, hub, model.model(), params, trainer.learning_rate())
             {
                 // A capture the hub's lock refused is taken again at the next step.
-                t.next_sample = Some(now + t.period);
+                // A period too long to add to the clock means no further sample this run.
+                t.next_sample = Some(now.checked_add(t.period).unwrap_or_else(|| far_future(now)));
                 trainer.profile_next_step();
             }
         }

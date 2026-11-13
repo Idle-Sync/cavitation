@@ -502,12 +502,20 @@ fn pause_resumes_when_client_leaves() {
 }
 
 /// A learning rate sent from the page replaces the cosine schedule for the rest of the run.
+///
+/// Every step is sampled (`snapshot_hz` 10⁶), and the events are read to the end of the run
+/// with the snapshots that follow it, so the last `stats` comes from the last epoch however
+/// fast the machine trains.
 #[test]
 fn learning_rate_command_overrides_schedule() {
     let data = digits(512, 11);
     let mut params = ParamStore::new();
     let mut model = network(&mut params, 32);
-    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let mut inspector = Inspector::start(InspectorConfig {
+        snapshot_hz: 1e6,
+        ..inspector_config()
+    })
+    .unwrap();
     let (addr, token) = endpoint(&inspector);
     let (open, epochs) = gate();
     thread::scope(|s| {
@@ -528,36 +536,42 @@ fn learning_rate_command_overrides_schedule() {
             cavitation_inspect::fit(&mut model, &mut params, &data, config, &mut inspector)
         });
         let paused = client.pause(addr, &token, &open);
-        // The run pauses early in epoch 2, which the schedule sets below the first rate.
+        // The run pauses in epoch 1 or early in epoch 2, where the schedule is between 0.048
+        // and 0.05.
         let scheduled = paused.json.get("learning_rate").num();
         assert!(scheduled > 0.04 && scheduled <= 0.05, "{scheduled}");
+        let paused_epoch = paused.json.get("epoch").num();
+        assert!(paused_epoch <= 2.0, "paused in epoch {paused_epoch}");
         assert_eq!(post(addr, &token, "lr", "value=0.00123"), 204);
         // Refused by the server before it reaches the run.
         assert_eq!(post(addr, &token, "lr", "value=-1"), 400);
         assert_eq!(post(addr, &token, "resume", ""), 204);
-        let changed = client.wait_for("stats", |j| j.get("learning_rate").num() == 0.00123);
-        let from = changed.json.get("step").num();
-        // Every later snapshot, through the later epochs the schedule would set, keeps it.
-        let mut last_epoch = 0.0;
-        loop {
-            let m = client.next("the end of the run");
-            if m.name == "stats" && m.json.get("step").num() >= from {
-                assert_eq!(m.json.get("learning_rate").num(), 0.00123);
-                last_epoch = m.json.get("epoch").num();
-            }
-            if m.name == "status" && m.json.get("state").str() == "finished" {
-                break;
-            }
-        }
-        assert_eq!(last_epoch, 8.0);
         run.join().unwrap().unwrap();
+        let stats: Vec<Message> = client
+            .until_finished()
+            .into_iter()
+            .filter(|m| m.name == "stats")
+            .collect();
+        let from = stats
+            .iter()
+            .position(|m| m.json.get("learning_rate").num() == 0.00123)
+            .expect("no stats snapshot shows the new rate");
+        // Every later snapshot keeps it, through the epochs the schedule would have set.
+        for m in &stats[from..] {
+            assert_eq!(m.json.get("learning_rate").num(), 0.00123);
+        }
+        let last = stats.last().unwrap();
+        assert_eq!(
+            last.json.get("epoch").num(),
+            8.0,
+            "the last stats is not from epoch 8"
+        );
         client.close();
     });
 }
 
-/// Spec criterion 8's inspector test: with one client reading and snapshots at 1,000 per
-/// second (no commands), training gives the parameters of plain `fit`, bit for bit, on 1
-/// and on 4 threads. The thread count is process-wide, and training is bit-identical at any
+/// With one client reading and a probe run after nearly every step (no commands), training
+/// gives the parameters of plain `fit`, bit for bit, on 1 and on 4 threads. The thread count is process-wide, and training is bit-identical at any
 /// count, so tests running beside this one are not disturbed.
 #[test]
 fn probe_leaves_training_untouched() {
@@ -570,11 +584,16 @@ fn probe_leaves_training_untouched() {
 
         let mut params = ParamStore::new();
         let mut model = network(&mut params, 128);
-        let mut inspector = Inspector::start(inspector_config()).unwrap();
+        // A capture is due after every step; each capture runs the probe.
+        let mut inspector = Inspector::start(InspectorConfig {
+            snapshot_hz: 1e6,
+            ..inspector_config()
+        })
+        .unwrap();
         let (addr, token) = endpoint(&inspector);
         let client = Client::open(addr, &token);
         wait_clients(&inspector, 1);
-        cavitation_inspect::fit(
+        let history = cavitation_inspect::fit(
             &mut model,
             &mut params,
             &data,
@@ -582,7 +601,14 @@ fn probe_leaves_training_untouched() {
             &mut inspector,
         )
         .unwrap();
-        assert!(inspector.snapshots_taken() > 0, "no snapshot was captured");
+        // 640 rows in batches of 32: 20 steps an epoch.
+        assert_eq!(history.epochs.len(), 2);
+        let steps = 40;
+        let probed = inspector.snapshots_taken();
+        assert!(
+            probed >= steps - 2,
+            "the probe ran after only {probed} of {steps} steps"
+        );
         let probes = client
             .until_finished()
             .into_iter()
@@ -769,6 +795,49 @@ fn width_one_output_probe() {
     client.close();
 }
 
+/// One inspector serves two runs whose parameters live in different stores: the second run
+/// probes its own store (the probe is rebuilt for each run) instead of panicking.
+#[test]
+fn two_runs_on_two_stores() {
+    let data = digits(256, 23);
+    let mut inspector = Inspector::start(InspectorConfig {
+        snapshot_hz: 1e6,
+        ..inspector_config()
+    })
+    .unwrap();
+    let (addr, token) = endpoint(&inspector);
+    let client = Client::open(addr, &token);
+    wait_clients(&inspector, 1);
+    let mut first_params = ParamStore::new();
+    let mut first = network(&mut first_params, 16);
+    cavitation_inspect::fit(
+        &mut first,
+        &mut first_params,
+        &data,
+        fit_config(1),
+        &mut inspector,
+    )
+    .unwrap();
+    let after_first = inspector.snapshots_taken();
+    assert!(after_first > 0);
+    client.until_finished();
+    let mut second_params = ParamStore::new();
+    let mut second = network(&mut second_params, 24);
+    cavitation_inspect::fit(
+        &mut second,
+        &mut second_params,
+        &data,
+        fit_config(1),
+        &mut inspector,
+    )
+    .unwrap();
+    assert!(inspector.snapshots_taken() > after_first);
+    let events = client.until_finished();
+    let probe = find(&events, "probe");
+    assert_eq!(probe.json.get("layers").at(1).get("a").arr().len(), 24);
+    client.close();
+}
+
 /// With no client connected, nothing is captured.
 #[test]
 fn no_capture_without_clients() {
@@ -844,6 +913,11 @@ fn bad_commands_get_a_status_message() {
         for (command, query) in [
             ("mask", "linear=0&neuron=32&on=0"),
             ("mask", "linear=2&neuron=0&on=0"),
+            // The output layer: switching it off would change what the network answers.
+            ("mask", "linear=1&neuron=3&on=0"),
+            // Above the page's maximum learning rate.
+            ("lr", "value=11"),
+            ("lr", "value=1e300"),
             ("probe", "index=512"),
             ("neuron", "layer=3&neuron=0"),
             ("neuron", "layer=1&neuron=32"),
@@ -860,6 +934,7 @@ fn bad_commands_get_a_status_message() {
         client.close();
     });
     assert!(model.neuron_mask(0).is_none());
+    assert!(model.neuron_mask(2).is_none());
 }
 
 /// A parsed JSON value: enough of JSON to check the events.

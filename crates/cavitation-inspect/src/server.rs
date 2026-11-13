@@ -219,8 +219,16 @@ impl Inspector {
     ///
     /// [`Error::Net`] naming the address when it cannot listen there (for example, the
     /// port is in use) or cannot start its thread; [`Error::InvalidData`] when
-    /// `snapshot_hz` is not finite and above 0, or `max_clients`, `client_queue`,
-    /// `write_timeout` or `read_timeout` is 0.
+    /// `snapshot_hz` is not finite and above 0 or so small that one period does not fit a
+    /// [`Duration`], or `max_clients`, `client_queue`, `write_timeout` or `read_timeout`
+    /// is 0.
+    ///
+    /// ```
+    /// use cavitation_inspect::{Inspector, InspectorConfig};
+    /// let address = "127.0.0.1:0".parse().unwrap();
+    /// let tiny = InspectorConfig { address, snapshot_hz: 1e-20, ..Default::default() };
+    /// assert!(Inspector::start(tiny).is_err());
+    /// ```
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
@@ -231,8 +239,10 @@ impl Inspector {
     /// ```
     pub fn start(config: InspectorConfig) -> Result<Inspector, Error> {
         require(
-            config.snapshot_hz.is_finite() && config.snapshot_hz > 0.0,
-            "snapshot_hz must be finite and above 0",
+            config.snapshot_hz.is_finite()
+                && config.snapshot_hz > 0.0
+                && Duration::try_from_secs_f64(1.0 / config.snapshot_hz).is_ok(),
+            "snapshot_hz must be finite and above 0, with a period that fits a Duration",
         )?;
         require(config.max_clients > 0, "max_clients must be at least 1")?;
         require(config.client_queue > 0, "client_queue must be at least 1")?;
