@@ -20,6 +20,7 @@ version = "0.1.0"
 dependencies = [
  "cavitation-core",
  "cavitation-datasets",
+ "cavitation-ml",
  "cavitation-nn",
 ]
 
@@ -45,6 +46,13 @@ version = "0.1.0"
 dependencies = [
  "cavitation-core",
  "cavitation-nn",
+]
+
+[[package]]
+name = "cavitation-ml"
+version = "0.1.0"
+dependencies = [
+ "cavitation-core",
 ]
 
 [[package]]

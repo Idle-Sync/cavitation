@@ -4,8 +4,10 @@
 //! builds on the tensor and autograd core and the layers, optimisers and training
 //! crates.
 //!
-//! Both crates are re-exported by name (`cavitation::cavitation_core`,
+//! The core and nn crates are re-exported by name (`cavitation::cavitation_core`,
 //! `cavitation::cavitation_nn`), and [`prelude`] gathers the names most programs need.
+//! With the `ml` feature, on by default, the classic machine learning crate is re-exported
+//! too, as `cavitation::cavitation_ml`: least squares and regression in `f64`.
 //!
 //! # Three levels of use
 //!
@@ -118,6 +120,18 @@
 //! [`Layer`]: cavitation_nn::Layer
 
 pub use cavitation_core;
+/// Classic machine learning in `f64`: least squares by Householder QR, and the regression
+/// models built on it. Present with the `ml` feature, which is on by default.
+///
+/// ```
+/// use cavitation::cavitation_core::Tensor;
+/// use cavitation::cavitation_ml::linalg::lstsq;
+/// let a = Tensor::from_vec(vec![1.0, 1.0], &[2, 1]).unwrap();
+/// let b = Tensor::from_vec(vec![1.0, 3.0], &[2, 1]).unwrap();
+/// assert!((lstsq(a.view(), b.view()).unwrap().data()[0] - 2.0).abs() < 1e-15);
+/// ```
+#[cfg(feature = "ml")]
+pub use cavitation_ml;
 pub use cavitation_nn;
 
 /// The names most programs need, for `use cavitation::prelude::*;`: tensors and autograd,
