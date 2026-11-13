@@ -10,6 +10,8 @@ cargo run --release --example shrink_digits -p cavitation -- --ablate --lottery
 
 Without the two flags it only trains, shrinks, compacts and saves. The tools are in `cavitation::cavitation_nn::shrink`; they are not in the prelude.
 
+The printed blocks in this chapter come from that command, run on an Intel Celeron N5105 (4 cores) at kernel level `sse4.2`, rustc 1.99.1. The accuracies are the same on every run there; on other kernel levels the rounding differs and so can the figures.
+
 ## The network and the rows it never sees
 
 The network is the digits network of the known result: 64 inputs (an 8×8 image), 256 and 128 ReLU neurons, 10 outputs, 50,826 parameters, trained with Adam at 0.002 in batches of 32 for 20 epochs. Here it is trained on the first 1,149 of the 1,437 training digits only:
@@ -132,7 +134,7 @@ and the ticket is the final masks on those weights:
 {{#include ../../crates/cavitation/examples/shrink_digits.rs:lottery}}
 ```
 
-Measured with the example's `--lottery` flag (the accuracies are the same on every run at kernel level `sse4.2`):
+Measured on an Intel Celeron N5105 (4 cores) at kernel level `sse4.2`, rustc 1.99.1, with `cargo run --release --example shrink_digits -p cavitation -- --ablate --lottery` (the accuracies are the same on every run there):
 
 | 64 + 32 network, 44 epochs of training in all | test accuracy |
 |---|---|

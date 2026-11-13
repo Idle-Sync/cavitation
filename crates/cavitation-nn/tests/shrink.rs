@@ -1982,3 +1982,190 @@ fn zero_epochs_leave_the_parameters() {
         assert_same_store(&net, store, &before);
     }
 }
+
+/// Runs `shrink` on `net` with a counter on `on_step`, and returns the result and the
+/// number of steps the callback saw.
+fn counted_shrink(
+    net: &mut Sequential,
+    params: &mut ParamStore,
+    ranking: Ranking,
+) -> (Result<cavitation_nn::shrink::ShrinkReport, Error>, usize) {
+    let steps = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = steps.clone();
+    let config = ShrinkConfig {
+        ranking,
+        criterion: Some(ALWAYS),
+        max_removed_bp: 3000,
+        on_step: Some(Box::new(move |_: &ShrinkStep| {
+            count.set(count.get() + 1);
+            Flow::Continue
+        })),
+        ..quick(clusters(30, 4, 6))
+    };
+    let result = shrink(net, params, &clusters(48, 4, 7), config);
+    (result, steps.get())
+}
+
+/// Neurons that reach a `Softmax` or a `Glu` before the next `Linear` are not removed by a
+/// mask (a softmax still counts a 0 input, a GLU still passes half of a value whose gate
+/// is 0), so `shrink` refuses them before any training, naming the layer, for every
+/// ranking; the model and parameters are not changed.
+#[test]
+fn softmax_and_glu_refused_before_training() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(12);
+    let softmax = Sequential::new()
+        .push(linear(&mut params, 4, 8, &mut rng))
+        .push(Tanh)
+        .push(Softmax)
+        .push(linear(&mut params, 8, 3, &mut rng));
+    let glu = Sequential::new()
+        .push(linear(&mut params, 4, 16, &mut rng))
+        .push(cavitation_nn::Glu {
+            gate: cavitation_core::Gate::Sigmoid,
+        })
+        .push(linear(&mut params, 8, 3, &mut rng));
+    for (net, words) in [(softmax, "layer 2 (softmax)"), (glu, "layer 1 (glu)")] {
+        for ranking in [Ranking::Activity, Ranking::OutNorm, Ranking::Random(1)] {
+            let (mut net, mut values) = (net.clone(), params.clone());
+            let (result, steps) = counted_shrink(&mut net, &mut values, ranking);
+            let err = result.unwrap_err();
+            let Error::Unsupported(msg) = err else {
+                panic!("expected Unsupported, got {err:?}");
+            };
+            assert!(msg.contains(words) && msg.contains("not a Linear"), "{msg}");
+            assert_eq!(steps, 0);
+            assert!(net.neuron_mask(0).is_none());
+            assert_same_store(&net, &values, &params);
+        }
+    }
+}
+
+/// Where masking removes neurons but `compact` cannot rebuild the result, `shrink` runs,
+/// warns at the start with `NotCompactable` naming the layer, and `compact` then refuses
+/// the chosen network: a layer of your own with parameters (after the output layer), and
+/// an element-wise layer of your own without parameters in a shrunk run.
+#[test]
+fn not_compactable_runs_and_warns() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(13);
+    let alpha = params.add(Tensor::from_vec(vec![1.5], &[1]).unwrap());
+    let with_parameters = Sequential::new()
+        .push(linear(&mut params, 4, 8, &mut rng))
+        .push(Relu)
+        .push(linear(&mut params, 8, 3, &mut rng))
+        .push(ScaledTanh { alpha });
+    let own_elementwise = Sequential::new()
+        .push(linear(&mut params, 4, 8, &mut rng))
+        .push(Relu)
+        .push(PositionScale)
+        .push(linear(&mut params, 8, 3, &mut rng));
+    for (mut net, layer, words) in [
+        (with_parameters, 3, "scaled_tanh has parameters"),
+        (own_elementwise, 2, "position_scale"),
+    ] {
+        let (result, steps) = counted_shrink(&mut net, &mut params.clone(), Ranking::OutNorm);
+        let report = result.unwrap();
+        assert_eq!(steps, 3);
+        assert!(report.chosen.is_some());
+        let not_compactable: Vec<_> = report
+            .warnings
+            .iter()
+            .filter_map(|w| match w {
+                ShrinkWarning::NotCompactable { layer, reason } => Some((*layer, reason)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(not_compactable.len(), 1, "{:?}", report.warnings);
+        assert_eq!(not_compactable[0].0, layer);
+        assert!(
+            not_compactable[0].1.contains(words),
+            "{}",
+            not_compactable[0].1
+        );
+        let text = report.warnings[0].to_string();
+        assert!(text.contains("compact cannot rebuild"), "{text}");
+        assert!(matches!(compact(&net, &params), Err(Error::Unsupported(_))));
+    }
+}
+
+/// Every network shape `shrink` accepts without a `NotCompactable` warning compacts after
+/// the run, for each built-in ranking, and the chosen step's parameter count is the
+/// compacted network's: ReLU, Tanh then Sigmoid, a per-neuron and a one-slope `Prelu`, no
+/// activation, an activation of your own (run on the tape), and two hidden layers.
+#[test]
+fn every_accepted_shape_compacts() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(14);
+    let mut l = |i: usize, o: usize| linear(&mut params, i, o, &mut rng);
+    let shapes: Vec<(&str, Sequential)> = vec![
+        (
+            "relu",
+            Sequential::new().push(l(4, 10)).push(Relu).push(l(10, 3)),
+        ),
+        (
+            "tanh then sigmoid",
+            Sequential::new()
+                .push(l(4, 10))
+                .push(Tanh)
+                .push(Sigmoid)
+                .push(l(10, 3)),
+        ),
+        (
+            "no activation",
+            Sequential::new().push(l(4, 10)).push(l(10, 3)),
+        ),
+        (
+            "own activation",
+            Sequential::new()
+                .push(l(4, 10))
+                .push(ActivationLayer::new(MyRelu))
+                .push(l(10, 3)),
+        ),
+        (
+            "two hidden",
+            Sequential::new()
+                .push(l(4, 12))
+                .push(Relu)
+                .push(l(12, 10))
+                .push(Relu)
+                .push(l(10, 3)),
+        ),
+    ];
+    let mut shapes = shapes;
+    for slopes in [10, 1] {
+        let first = linear(&mut params, 4, 10, &mut rng);
+        let prelu = Prelu::new(&mut params, slopes);
+        let last = linear(&mut params, 10, 3, &mut rng);
+        let name = if slopes == 1 {
+            "one-slope prelu"
+        } else {
+            "prelu"
+        };
+        shapes.push((name, Sequential::new().push(first).push(prelu).push(last)));
+    }
+    for (name, net) in shapes {
+        for ranking in [Ranking::OutNorm, Ranking::Activity, Ranking::Random(2)] {
+            let what = format!("{name}, {ranking:?}");
+            let (mut net, mut values) = (net.clone(), params.clone());
+            let (result, _) = counted_shrink(&mut net, &mut values, ranking);
+            let report = result.unwrap();
+            assert!(
+                report
+                    .warnings
+                    .iter()
+                    .all(|w| !matches!(w, ShrinkWarning::NotCompactable { .. })),
+                "{what}: {:?}",
+                report.warnings
+            );
+            let chosen = &report.steps[report.chosen.expect("ALWAYS is met")];
+            let (small, small_values) = compact(&net, &values).expect(&what);
+            let count: usize = small
+                .parameter_names()
+                .iter()
+                .map(|(_, id)| small_values.value(*id).data().len())
+                .sum();
+            assert_eq!(chosen.parameters, count, "{what}");
+        }
+    }
+}

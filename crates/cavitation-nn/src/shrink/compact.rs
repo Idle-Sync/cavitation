@@ -144,21 +144,45 @@ pub fn compact<T: Real>(
 
 /// Refuses, naming it, a layer with parameters that is neither a `Linear` nor a `Prelu`.
 fn check_parameters<T: Real>(model: &Sequential<T>) -> Result<(), Error> {
-    for i in 0..model.len() {
-        let layer = model.layer(i);
-        if layer.as_linear().is_none()
-            && layer.as_prelu().is_none()
-            && !layer.parameters().is_empty()
-        {
-            return Err(Error::Unsupported(format!(
-                "compact: layer {i} ({}) has parameters, and only Linear and Prelu layers can \
-                 be rebuilt in the new store; build the network from Linear, Prelu and layers \
-                 without parameters to compact it",
-                layer.name()
-            )));
-        }
+    if let Some(i) = foreign_parameters(model) {
+        return Err(Error::Unsupported(format!(
+            "compact: layer {i} ({}) has parameters, and only Linear and Prelu layers can be \
+             rebuilt in the new store; build the network from Linear, Prelu and layers without \
+             parameters to compact it",
+            model.layer(i).name()
+        )));
     }
     Ok(())
+}
+
+/// The first layer of `model` with parameters that is neither a `Linear` nor a `Prelu`:
+/// compaction cannot move its parameters to a new store. One of the layout checks
+/// [`compact`] makes, shared with the shrink tool.
+pub(super) fn foreign_parameters<T: Real>(model: &Sequential<T>) -> Option<usize> {
+    (0..model.len()).find(|&i| {
+        let layer = model.layer(i);
+        layer.as_linear().is_none() && layer.as_prelu().is_none() && !layer.parameters().is_empty()
+    })
+}
+
+/// The `Linear` that receives the neurons of the `Linear` at layer `linear`: the layer
+/// right after [`Sequential::neuron_layer`], or `None` if that layer is not a `Linear`
+/// (a `Softmax` or a `Glu`, say, through which a switched-off neuron still has an effect).
+/// One of the layout checks [`compact`] makes, shared with the shrink tool.
+pub(super) fn linear_after_run<T: Real>(model: &Sequential<T>, linear: usize) -> Option<&Linear> {
+    model.linear(model.neuron_layer(linear) + 1)
+}
+
+/// The first layer in the run of element-wise layers after the `Linear` at layer `linear`
+/// that is neither an activation (a built-in or an `ActivationLayer`) nor a `Prelu`:
+/// compaction moves neurons to lower positions, and only for those layers is it known that
+/// every position is treated alike. One of the layout checks [`compact`] makes, shared
+/// with the shrink tool.
+pub(super) fn unvouched_layer<T: Real>(model: &Sequential<T>, linear: usize) -> Option<usize> {
+    (linear + 1..=model.neuron_layer(linear)).find(|&l| {
+        let layer = model.layer(l);
+        layer.as_prelu().is_none() && layer.activation().is_none()
+    })
 }
 
 /// For each layer, the `Linear` whose neurons its output holds: the layer itself for a
@@ -215,7 +239,7 @@ fn placed_masks<T: Real>(
             ));
         };
         let next = model.neuron_layer(linear) + 1;
-        if model.linear(next).is_none() {
+        if linear_after_run(model, linear).is_none() {
             return Err(not_reaching(format!(
                 "reach layer {next} ({}), which is not a Linear",
                 model.layer(next).name()
@@ -253,9 +277,17 @@ fn check_narrowed_run<T: Real>(
     masked: &[usize],
 ) -> Result<(), Error> {
     let (width, end) = (linear_width(model, linear), model.neuron_layer(linear));
+    if let Some(l) = unvouched_layer(model, linear) {
+        return Err(Error::Unsupported(format!(
+            "compact: layer {l} ({}) is element-wise but compact cannot tell whether it \
+             treats every position alike, so it cannot follow the linear layer {linear} once \
+             neurons are removed from it; use an activation (a built-in or an \
+             ActivationLayer) or a Prelu there, or clear the masks on layers {masked:?}",
+            model.layer(l).name()
+        )));
+    }
     for l in linear + 1..=end {
-        let layer = model.layer(l);
-        if let Some(prelu) = layer.as_prelu() {
+        if let Some(prelu) = model.layer(l).as_prelu() {
             let slopes = params.value(prelu.weight()).data().len();
             if slopes != 1 && slopes != width {
                 return Err(Error::InvalidData(format!(
@@ -263,18 +295,9 @@ fn check_narrowed_run<T: Real>(
                      {linear} before it outputs width {width}"
                 )));
             }
-        } else if layer.activation().is_none() {
-            return Err(Error::Unsupported(format!(
-                "compact: layer {l} ({}) is element-wise but compact cannot tell whether it \
-                 treats every position alike, so it cannot follow the linear layer {linear} \
-                 once neurons are removed from it; use an activation (a built-in or an \
-                 ActivationLayer) or a Prelu there, or clear the masks on layers {masked:?}",
-                layer.name()
-            )));
         }
     }
-    let next = model
-        .linear(end + 1)
+    let next = linear_after_run(model, linear)
         .expect("placed_masks checked that a Linear follows the run");
     if next.inputs() != width {
         return Err(Error::InvalidData(format!(

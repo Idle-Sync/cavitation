@@ -8,11 +8,12 @@ use std::fmt;
 use cavitation_core::{Error, ParamStore, Rng};
 
 use super::ablate::{check_hidden, points_lost};
+use super::compact::{foreign_parameters, linear_after_run, unvouched_layer};
 use super::{LayerActivity, activity, neurons_on};
 use crate::train::check_dataset;
 use crate::{
-    Dataset, Evaluation, FitConfig, Flow, Health, Linear, Loss, LrSchedule, NeuronMask,
-    OptimizerConfig, Sequential, Targets, evaluate, fit,
+    Dataset, Evaluation, FitConfig, Flow, Health, Loss, LrSchedule, NeuronMask, OptimizerConfig,
+    Sequential, Targets, evaluate, fit,
 };
 
 /// The rows run at a time when measuring activity and evaluating on the validation set.
@@ -36,6 +37,7 @@ const FULL_BP: u32 = 10_000;
 /// assert!(matches!(config.ranking, Ranking::Custom(_)));
 /// assert!(matches!(ShrinkConfig::default().ranking, Ranking::OutNorm));
 /// ```
+#[non_exhaustive]
 pub enum Ranking {
     /// The Euclidean norm of the neuron's outgoing weights: its column in the weight of the
     /// `Linear` that follows its layer. A neuron whose output the next layer barely uses
@@ -119,6 +121,7 @@ pub struct RankContext<'a> {
 /// assert_ne!(strict, loose);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Criterion {
     /// The validation accuracy is at least the baseline's minus `points` accuracy points.
     /// The drop is counted in whole rows, as [`Ablation::drop`](super::Ablation::drop)
@@ -174,6 +177,7 @@ impl Criterion {
 /// assert_ne!(given, carved);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Validation {
     /// These rows, which the model must not have seen in training.
     Given(Dataset),
@@ -235,8 +239,9 @@ impl Default for RetrainConfig {
 /// How [`shrink`] runs. Taken by value, because it can hold callbacks. Levels are in whole
 /// basis points of each layer's width: 1 bp is 0.01%, 10,000 bp the whole layer.
 ///
-/// The default shrinks every hidden `Linear`, removes neurons that never fire first and
-/// then the lowest out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
+/// The default shrinks every hidden `Linear`, removes first the neurons whose output is 0
+/// on every training row (for a ReLU, those that never fire) and then the lowest
+/// out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
 /// 9,500, retrains as [`RetrainConfig::default`], keeps the latest step that loses at most
 /// 1 accuracy point (class targets), and stops after 2 misses in a row. It has no
 /// validation set: set [`validation`](Self::validation).
@@ -297,7 +302,8 @@ pub struct ShrinkConfig {
 }
 
 impl Default for ShrinkConfig {
-    /// Every hidden `Linear`, dead neurons first and then out-norm, levels 1,000 to 7,000
+    /// Every hidden `Linear`, neurons whose output is 0 on every training row first and
+    /// then out-norm, levels 1,000 to 7,000
     /// bp by 1,000 and on to 9,500 by 500, patience 2, the default criterion, no validation
     /// set, the default retraining, no checkpoints, no callback.
     fn default() -> ShrinkConfig {
@@ -368,7 +374,9 @@ pub struct ShrinkStep {
     /// [`ShrinkConfig::linears`] (or of the model's hidden `Linear`s when that is empty).
     pub kept: Vec<usize>,
     /// The number of parameters the network has once its off neurons are removed for good
-    /// with [`compact`](super::compact()).
+    /// with [`compact`](super::compact()). When the report has a
+    /// [`ShrinkWarning::NotCompactable`], `compact` refuses the network: the count is then
+    /// what the network's on neurons use, and the network runs only masked.
     pub parameters: usize,
     /// The retrained network's measures on the validation set.
     pub validation: Evaluation,
@@ -390,7 +398,7 @@ pub struct ShrinkStep {
 /// let w = ShrinkWarning::SmallValidation { rows: 150, row_points: 100.0 / 150.0, threshold: 1.0 };
 /// assert!(w.to_string().contains("150 rows"));
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum ShrinkWarning {
     /// One validation row is worth more than half the allowed accuracy drop
@@ -404,12 +412,26 @@ pub enum ShrinkWarning {
         /// The allowed drop, [`Criterion::AccuracyDrop`]'s `points`.
         threshold: f64,
     },
+    /// Switching neurons off works on this network, so the run and its measures are sound,
+    /// but [`compact`](super::compact()) cannot rebuild the result as a smaller dense
+    /// network: use the chosen network masked. Given at the start of the run.
+    NotCompactable {
+        /// The layer `compact` refuses.
+        layer: usize,
+        /// Why, in a sentence.
+        reason: String,
+    },
 }
 
 impl fmt::Display for ShrinkWarning {
-    /// A sentence saying what was found and how many rows would be enough.
+    /// A sentence saying what was found and what to do about it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
+            ShrinkWarning::NotCompactable { layer, ref reason } => write!(
+                f,
+                "layer {layer}: {reason}, so compact cannot rebuild the shrunk network; it \
+                 runs masked, with every off neuron's work still done"
+            ),
             ShrinkWarning::SmallValidation {
                 rows,
                 row_points,
@@ -500,7 +522,10 @@ pub struct ShrinkReport {
 /// `model` and `params` hold the kept step's network: its neuron masks on the listed
 /// `Linear`s and its retrained parameters. If no step met the criterion they are as they
 /// were given. Call [`compact`](super::compact()) on the result for the smaller dense
-/// network that runs faster.
+/// network that runs faster. When `compact` would refuse the network (a layer of your own
+/// with parameters, or an element-wise layer of your own after a shrunk `Linear`), the run
+/// still works and the report starts with a [`ShrinkWarning::NotCompactable`]: the result
+/// can be used masked, but not compacted.
 ///
 /// What the run finds is a size and a network of that size. A network of the same size
 /// trained from scratch may match the pruned one or fall short of it, depending on the
@@ -528,9 +553,10 @@ pub struct ShrinkReport {
 /// batch is 0; if a listed layer's neuron mask does not have its width; and as
 /// [`evaluate`] does for the validation set. Returns [`Error::Unsupported`] if a listed
 /// `Linear`, or a layer between it and the layer that holds its neurons, carries a mask
-/// set with [`Sequential::set_mask`] (clear it and mask by `Linear` instead), and, for
-/// [`Ranking::OutNorm`], if the layer after a listed `Linear`'s neurons is not a `Linear`
-/// that takes them. During the run, returns the errors of [`activity()`](super::activity())
+/// set with [`Sequential::set_mask`] (clear it and mask by `Linear` instead), and if the
+/// layer after a listed `Linear`'s neurons is not a `Linear` (a `Softmax` or a `Glu`, say),
+/// where a switched-off neuron still has an effect, so that masking it does not remove
+/// it. During the run, returns the errors of [`activity()`](super::activity())
 /// and [`fit`] (an [`Error::NonFinite`] from a NaN or infinite loss or gradient among
 /// them), and [`Error::InvalidData`] if a [`Ranking::Custom`] function returns the wrong
 /// number of scores; `model` and `params` are then put back as they were given.
@@ -604,11 +630,7 @@ pub(crate) fn run(
     let (train, validation) = split(train, config.validation.take())?;
     let linears = hidden_linears(model, &config.linears)?;
     check_masks(model, &linears)?;
-    if matches!(config.ranking, Ranking::OutNorm) {
-        for &linear in &linears {
-            out_linear(model, linear)?;
-        }
-    }
+    let mut warnings = check_layout(model, &linears)?;
     let criterion = criterion(config.criterion, &train.targets)?;
     check_numbers(&config)?;
     let levels = levels(
@@ -618,7 +640,6 @@ pub(crate) fn run(
         config.max_removed_bp,
     );
     let rows = validation.len();
-    let mut warnings = Vec::new();
     if let Criterion::AccuracyDrop { points } = criterion {
         let row_points = 100.0 / rows as f64;
         if row_points > points / 2.0 {
@@ -831,7 +852,8 @@ impl Run<'_, '_> {
     ) -> Result<Vec<f64>, Error> {
         let scores = match &mut self.config.ranking {
             Ranking::OutNorm => {
-                let next = out_linear(self.model, linear)?;
+                let next = linear_after_run(self.model, linear)
+                    .expect("check_layout found a Linear after each run");
                 let (w, inputs) = (self.params.value(next.weight()).data(), next.inputs());
                 on.iter()
                     .map(|&j| {
@@ -1019,21 +1041,50 @@ fn check_masks(model: &Sequential, linears: &[usize]) -> Result<(), Error> {
     Ok(())
 }
 
-/// The `Linear` right after the neurons of the `Linear` at `linear`, which takes them,
-/// for [`Ranking::OutNorm`]; `Unsupported` if there is none.
-fn out_linear(model: &Sequential, linear: usize) -> Result<&Linear, Error> {
-    let next = model.neuron_layer(linear) + 1;
-    let width = model.linear(linear).expect("a hidden Linear").outputs();
-    match model.linear(next) {
-        Some(out) if out.inputs() == width => Ok(out),
-        _ => Err(Error::Unsupported(format!(
-            "shrink: Ranking::OutNorm reads each neuron's column in the weight of the Linear \
-             that takes it, but layer {next} ({}), after the neurons of the linear layer \
-             {linear}, is not a Linear that takes {width} inputs; choose Ranking::Activity, \
-             Ranking::Random or Ranking::Custom",
-            model.layer(next).name()
-        ))),
+/// Checks, before any training, that switching off a neuron of each listed `Linear`
+/// removes it: its neurons must reach the next `Linear` through element-wise layers only
+/// (`Unsupported` otherwise, naming the layer they reach). Returns a
+/// [`ShrinkWarning::NotCompactable`] for each layer [`compact`](super::compact()) would
+/// refuse in the result: a layer of your own with parameters anywhere, or an element-wise
+/// layer in a listed run that is neither an activation nor a `Prelu`. These are the
+/// layout checks `compact` makes.
+fn check_layout(model: &Sequential, linears: &[usize]) -> Result<Vec<ShrinkWarning>, Error> {
+    let mut warnings = Vec::new();
+    for &linear in linears {
+        if linear_after_run(model, linear).is_none() {
+            let next = model.neuron_layer(linear) + 1;
+            return Err(Error::Unsupported(format!(
+                "shrink: the neurons of the linear layer {linear} reach layer {next} ({}), \
+                 which is not a Linear, so switching one off does not remove it (a softmax \
+                 still counts a 0 input, a GLU still passes half of a value whose gate is 0); \
+                 shrink only Linear layers whose run of element-wise layers leads to the next \
+                 Linear, listed in ShrinkConfig::linears",
+                model.layer(next).name()
+            )));
+        }
+        if let Some(layer) = unvouched_layer(model, linear) {
+            warnings.push(ShrinkWarning::NotCompactable {
+                layer,
+                reason: format!(
+                    "the element-wise layer {} after the linear layer {linear} is neither an \
+                     activation (a built-in or an ActivationLayer) nor a Prelu, and compact \
+                     cannot tell whether it treats every position alike",
+                    model.layer(layer).name()
+                ),
+            });
+        }
     }
+    if let Some(layer) = foreign_parameters(model) {
+        warnings.push(ShrinkWarning::NotCompactable {
+            layer,
+            reason: format!(
+                "the layer {} has parameters and is neither a Linear nor a Prelu, so compact \
+                 cannot move them to a new store",
+                model.layer(layer).name()
+            ),
+        });
+    }
+    Ok(warnings)
 }
 
 /// The criterion to use: the one given (its number checked), or `AccuracyDrop` of 1 point
@@ -1162,7 +1213,7 @@ mod tests {
     //! stop rule on a scripted validation measurement.
 
     use super::*;
-    use crate::{Relu, Targets};
+    use crate::{Linear, Relu, Targets};
     use cavitation_core::Tensor;
 
     /// An evaluation with the given loss and accuracy.
