@@ -72,7 +72,7 @@ The exact answer is the bottom of the bowl; the gradient path is only as good as
 on the raw data the gradient path ends 2.2e0 from the exact answer (largest difference as above); the exact path does not care about scale
 ```
 
-A relative difference of 2.2 is a coefficient that is off by more than its own size, and the call still returns `Ok`: nothing in the training failed, it just did not arrive. (With the health checks on, the run prints an exploding-weights warning on epoch after epoch; the example silences it to keep its output short.) The exact path fits the raw data without trouble. So the rule is to standardise before the gradient path, and to fold the scaling back in afterwards.
+A relative difference of 2.2 is a coefficient that is off by more than its own size, and the call still returns `Ok`: nothing in the training failed, it just did not arrive. (With the health checks on, the run prints an exploding-gradient warning (a gradient norm above `Health::grad_norm_high`, 1e3 by default) epoch after epoch; the example silences it to keep its output short.) The exact path fits the raw data without trouble. So the rule is to standardise before the gradient path, and to fold the scaling back in afterwards.
 
 The same thing happens when the penalty is weak. In logistic regression `c` is the inverse penalty strength, so a large `c` is a weak penalty, and the weights are allowed to grow before the penalty stops them. On standardised Breast Cancer data:
 
