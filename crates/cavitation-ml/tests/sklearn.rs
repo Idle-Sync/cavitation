@@ -356,3 +356,131 @@ fn standard_scaler_matches() {
         }
     }
 }
+
+/// The fixture's rows as a data set of `T`: `x` as `[rows, features]` and `y` as
+/// `[rows, outputs]` value targets. For `f32` the values must be exactly representable,
+/// which holds for the synthetic cases (rounded through `f32` before scikit-learn fitted
+/// them); the standardised data set cases are not, and are read as `f64`.
+fn value_dataset<T: cavitation_core::Real>(x: &Matrix, y: &Matrix) -> Dataset<T> {
+    use cavitation_core::Tensor;
+    let convert = |m: &Matrix| -> Vec<T> {
+        m.data
+            .iter()
+            .map(|&v| {
+                let t = T::from_f64(v);
+                assert_eq!(t.to_f64(), v, "{v} is not exactly representable");
+                t
+            })
+            .collect()
+    };
+    Dataset {
+        x: Tensor::from_vec(convert(x), &x.shape).unwrap(),
+        targets: Targets::Values(Tensor::from_vec(convert(y), &y.shape).unwrap()),
+    }
+}
+
+/// The `LinearRegression` the fixture's parameters describe: `fit_intercept` (default
+/// true) and, for `Ridge`, `alpha`.
+fn regression_for(f: &Fixture) -> cavitation_ml::LinearRegression {
+    let fit_intercept = f
+        .params
+        .get("fit_intercept")
+        .is_none_or(|v| v.as_bool().unwrap());
+    let alpha = f.params.get("alpha").map_or(0.0, |v| v.as_f64().unwrap());
+    cavitation_ml::LinearRegression {
+        fit_intercept,
+        alpha,
+    }
+}
+
+/// Fits the fixture `name` (as `f32` data when `f32` is true, otherwise `f64`) and checks
+/// every coefficient and intercept against scikit-learn's within `1e-9 · max(1, |sklearn|)`.
+/// Returns the fitted model and the largest difference relative to `max(1, |sklearn|)`,
+/// which the test prints.
+fn check_regression(name: &str, f32_data: bool) -> (cavitation_ml::LinearModel, f64) {
+    let f = fixture(name);
+    let (x, y) = (f.x.as_ref().unwrap(), f.y.as_ref().unwrap());
+    let regression = regression_for(&f);
+    let model = if f32_data {
+        regression.fit(&value_dataset::<f32>(x, y)).unwrap()
+    } else {
+        regression.fit(&value_dataset::<f64>(x, y)).unwrap()
+    };
+    let coef = f.coef.as_ref().unwrap();
+    assert_eq!(model.coef.shape().dims(), coef.shape.as_slice(), "{name}");
+    let ours = model.coef.data().iter().chain(&model.intercept);
+    let theirs = coef.data.iter().chain(&f.intercept);
+    let mut worst = 0.0f64;
+    for (i, (&a, &b)) in ours.zip(theirs).enumerate() {
+        let gap = (a - b).abs() / b.abs().max(1.0);
+        worst = worst.max(gap);
+        assert!(
+            gap <= 1e-9,
+            "{name}: value {i} is {a}, scikit-learn's {b} (gap {gap:e})"
+        );
+    }
+    eprintln!("{name}: largest gap {worst:e} relative to max(1, |scikit-learn|)");
+    (model, worst)
+}
+
+/// Exact least squares matches scikit-learn's `LinearRegression` on every `ols-*` case,
+/// with and without an intercept, one output and three.
+#[test]
+fn ols_fixtures_match() {
+    for name in ["ols-small", "ols-multi", "ols-no-intercept"] {
+        check_regression(name, true);
+    }
+}
+
+/// A constant column gets the coefficient 0 exactly (scikit-learn's is within 1e-12 of 0),
+/// and the other coefficients match.
+#[test]
+fn ols_constant_column_matches() {
+    let (model, _) = check_regression("ols-constant-column", true);
+    assert_eq!(model.coef.data()[2], 0.0);
+}
+
+/// Ridge (rows of √α·I appended to the centred matrix) matches scikit-learn's `Ridge` with
+/// the `cholesky` solver for α = 0.1 and α = 10.
+#[test]
+fn ridge_fixtures_match() {
+    for name in ["ridge-0.1", "ridge-10"] {
+        check_regression(name, true);
+    }
+}
+
+/// OLS and ridge (α = 1) on the standardised Concrete training rows match scikit-learn. The
+/// rows are standardised in `f64`, as scikit-learn fitted them, so they are read as `f64`.
+#[test]
+fn concrete_fixtures_match() {
+    for name in ["concrete-ols", "concrete-ridge-1"] {
+        check_regression(name, false);
+    }
+}
+
+/// `LinearModel::score` gives scikit-learn's `r2_score` (uniform average over outputs)
+/// within 1e-12 relative, for one output and three. The model is the identity (coefficients
+/// `I`, intercept 0), so its predictions are the fixture's `y_pred` exactly.
+#[test]
+fn r2_score_matches() {
+    use cavitation_core::Tensor;
+    for name in ["r2-score", "r2-score-multi"] {
+        let f = fixture(name);
+        let y = f.y.as_ref().unwrap();
+        let y_pred = matrix(&f.json["y_pred"], name);
+        let k = y.shape[1];
+        let identity: Vec<f64> = (0..k * k)
+            .map(|i| if i % (k + 1) == 0 { 1.0 } else { 0.0 })
+            .collect();
+        let model = cavitation_ml::LinearModel {
+            coef: Tensor::from_vec(identity, &[k, k]).unwrap(),
+            intercept: vec![0.0; k],
+        };
+        let score = model.score(&value_dataset::<f32>(&y_pred, y)).unwrap();
+        let expected = f.json["score"].as_f64().unwrap();
+        assert!(
+            (score - expected).abs() <= 1e-12 * expected.abs(),
+            "{name}: R² {score} against scikit-learn's {expected}"
+        );
+    }
+}
