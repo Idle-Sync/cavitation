@@ -16,6 +16,15 @@ use std::sync::{Mutex, PoisonError, TryLockError};
 /// ```
 pub const QUEUE_CAPACITY: usize = 64;
 
+/// The largest learning rate the page may set. A rate from the page above it is refused
+/// with a `status` message: a rate far beyond any useful one ends a run at its next step
+/// with a non-finite loss.
+///
+/// ```
+/// assert_eq!(cavitation_inspect::commands::MAX_LEARNING_RATE, 10.0);
+/// ```
+pub const MAX_LEARNING_RATE: f64 = 10.0;
+
 /// A request from the page, sent as `POST /api/...` and read by the training side between
 /// steps.
 ///
@@ -29,7 +38,8 @@ pub const QUEUE_CAPACITY: usize = 64;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     /// Switch neuron `neuron` of the `linear`-th `Linear` layer on or off
-    /// (`POST /api/mask?linear=&neuron=&on=`, `on` is `0` or `1`).
+    /// (`POST /api/mask?linear=&neuron=&on=`, `on` is `0` or `1`). Training refuses the
+    /// output `Linear` (one no later `Linear` reads), whose neurons are the network's answer.
     SetMask {
         /// Which `Linear` layer, counting only `Linear`s, from 0.
         linear: usize,
@@ -38,7 +48,8 @@ pub enum Command {
         /// `true` to switch it on, `false` to switch it off.
         on: bool,
     },
-    /// Use this learning rate from now on (`POST /api/lr?value=`; finite and above 0).
+    /// Use this learning rate from now on (`POST /api/lr?value=`; finite and above 0, and
+    /// at most [`MAX_LEARNING_RATE`] for training to apply it).
     SetLearningRate(f64),
     /// Pause training after the current step (`POST /api/pause`).
     Pause,

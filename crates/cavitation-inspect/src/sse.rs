@@ -16,7 +16,7 @@
 
 use std::collections::VecDeque;
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -195,6 +195,9 @@ pub struct Hub {
     changed: Condvar,
     /// Mirrors `State::closed` for loops that poll without taking the lock.
     stopping: AtomicBool,
+    /// Mirrors the length of `State::clients`, so the training side can read it without
+    /// taking the lock; written under the lock at every change.
+    connected: AtomicUsize,
 }
 
 impl Hub {
@@ -222,6 +225,7 @@ impl Hub {
             }),
             changed: Condvar::new(),
             stopping: AtomicBool::new(false),
+            connected: AtomicUsize::new(0),
         }
     }
 
@@ -331,6 +335,7 @@ impl Hub {
         }
         let capacity = state.queue_capacity;
         state.clients.retain(|c| c.queue.len() < capacity);
+        self.connected.store(state.clients.len(), Ordering::Release);
         let State {
             scratch,
             clients,
@@ -352,14 +357,15 @@ impl Hub {
         true
     }
 
-    /// The number of connected clients.
+    /// The number of connected clients, read without the lock, so the training side can
+    /// ask at every step without ever waiting for a writer.
     ///
     /// ```
     /// let hub = cavitation_inspect::sse::Hub::new(8, 256, std::time::Duration::from_secs(2));
     /// assert_eq!(hub.clients(), 0);
     /// ```
     pub fn clients(&self) -> usize {
-        self.lock().clients.len()
+        self.connected.load(Ordering::Acquire)
     }
 
     /// Closes the hub: every writer loop ends, waiting publishers return `false`, and
@@ -400,6 +406,7 @@ impl Hub {
             queue.push_back((Event::Model, model.clone()));
         }
         state.clients.push(Client { id, queue });
+        self.connected.store(state.clients.len(), Ordering::Release);
         Some(id)
     }
 
@@ -410,6 +417,7 @@ impl Hub {
         if let Some(i) = state.position(id) {
             state.clients.swap_remove(i);
         }
+        self.connected.store(state.clients.len(), Ordering::Release);
         drop(state);
         self.changed.notify_all();
     }
