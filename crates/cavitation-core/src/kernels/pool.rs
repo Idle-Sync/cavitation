@@ -867,8 +867,8 @@ mod tests {
 
     /// Prints the median time of an empty 4-task `run` on 4 threads, over 1,000 calls. The
     /// figure to quote comes from a run on its own, in release mode:
-    /// `cargo test -p cavitation-core --release --lib kernels::pool::tests::pool_round_trip_time -- --exact
-    /// --nocapture --test-threads=1`.
+    /// `cargo test -p cavitation-core --release --lib
+    /// kernels::pool::tests::pool_round_trip_time -- --exact --nocapture --test-threads=1`.
     #[test]
     fn pool_round_trip_time() {
         let _serial = serial();

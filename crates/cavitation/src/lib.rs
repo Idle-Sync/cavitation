@@ -153,6 +153,9 @@ pub use cavitation_nn;
 /// layers and activations (with the settings their fields take), optimisers, the training
 /// loop and its batches, evaluation, health checks, hooks, inference, saving and loading,
 /// the random generator, the gradient checks, and the traits for writing your own parts.
+/// With the `ml` feature (on by default) it adds linear and logistic regression and their
+/// fitted models, and with the `inspect` feature `Inspector` and `InspectorConfig`. The
+/// shrink tools stay in `cavitation_nn::shrink`.
 ///
 /// ```
 /// use cavitation::prelude::*;
@@ -166,18 +169,40 @@ pub use cavitation_nn;
 /// assert_eq!(net.len(), 4);
 ///
 /// // One `Trainer` step on a `Batch`, stopping on a non-finite value.
-/// let data = Dataset { x: Tensor::zeros(&[2, 2]), targets: Targets::Values(Tensor::zeros(&[2, 1])) };
+/// let data = Dataset {
+///     x: Tensor::zeros(&[2, 2]),
+///     targets: Targets::Values(Tensor::zeros(&[2, 1])),
+/// };
 /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 2);
 /// trainer.set_health(Health { on_non_finite: OnNonFinite::Stop, ..Health::default() });
 /// let mut batch = Batch::new(&data, 2);
 /// let view: BatchView<'_, f32> = Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch);
 /// assert!(trainer.step(&net, &mut params, view).unwrap().is_finite());
 /// ```
+///
+/// Linear regression from the prelude, with the `ml` feature:
+///
+/// ```
+/// # #[cfg(feature = "ml")]
+/// # {
+/// use cavitation::prelude::*;
+/// let x = Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap();
+/// let y = Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap();
+/// let data = Dataset { x, targets: Targets::Values(y) };
+/// let model: LinearModel = LinearRegression::default().fit(&data).unwrap();
+/// assert!((model.coef.data()[0] - 2.0).abs() < 1e-12);
+/// assert!((model.intercept[0] - 1.0).abs() < 1e-12);
+/// # }
+/// ```
 pub mod prelude {
     pub use cavitation_core::{
         CustomOp, Error, Gate, GeluApprox, Graph, KeyErrors, ParamId, ParamStore, Real, Reduction,
         Rng, Tape, Tensor, TensorView, Var, gradcheck, gradcheck_params,
     };
+    #[cfg(feature = "inspect")]
+    pub use cavitation_inspect::{Inspector, InspectorConfig};
+    #[cfg(feature = "ml")]
+    pub use cavitation_ml::{LinearModel, LinearRegression, LogisticModel, LogisticRegression};
     pub use cavitation_nn::{
         Activation, ActivationLayer, Adam, AdamW, BadInput, Batch, BatchView, Batcher, Celu,
         Dataset, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Flow, Gelu, Glu, GradStats,
@@ -199,7 +224,8 @@ pub mod prelude {
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The repository README, compiled only by `cargo test --doc` so that its Rust examples run
-/// as tests and cannot drift from the library.
-#[cfg(doctest)]
+/// as tests and cannot drift from the library. Its regression example needs the `ml`
+/// feature, which is on by default.
+#[cfg(all(doctest, feature = "ml"))]
 #[doc = include_str!("../../../README.md")]
 struct ReadmeDoctests;

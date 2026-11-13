@@ -67,7 +67,8 @@ fn check_not_torch_save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// let net = Sequential::new()
 ///     .push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)))
 ///     .push(Relu);
-/// let path = std::env::temp_dir().join(format!("cavitation-doc-save-{}.safetensors", std::process::id()));
+/// let path = std::env::temp_dir()
+///     .join(format!("cavitation-doc-save-{}.safetensors", std::process::id()));
 /// save(&path, &net, &params)?;
 /// load(&path, &net, &mut params)?;
 /// std::fs::remove_file(&path).ok();
@@ -129,11 +130,15 @@ pub fn save(
 /// ));
 ///
 /// // Save a model, load the file into a fresh model with other weights, compare.
-/// let path = std::env::temp_dir().join(format!("cavitation-doc-load-{}.safetensors", std::process::id()));
+/// let path = std::env::temp_dir()
+///     .join(format!("cavitation-doc-load-{}.safetensors", std::process::id()));
 /// save(&path, &net, &params)?;
 /// let mut fresh_params = ParamStore::new();
 /// let fresh = Sequential::new().push(Linear::new(&mut fresh_params, 2, 3, &mut Rng::seed(9)));
-/// assert_ne!(params.value(net.parameter_names()[0].1).data(), fresh_params.value(fresh.parameter_names()[0].1).data());
+/// assert_ne!(
+///     params.value(net.parameter_names()[0].1).data(),
+///     fresh_params.value(fresh.parameter_names()[0].1).data()
+/// );
 /// load(&path, &fresh, &mut fresh_params)?;
 /// for ((_, a), (_, b)) in net.parameter_names().into_iter().zip(fresh.parameter_names()) {
 ///     assert_eq!(params.value(a).data(), fresh_params.value(b).data());
@@ -142,7 +147,9 @@ pub fn save(
 /// // A model whose Linear layer sits at index 1 does not match this file's keys `0.*`:
 /// // one error lists every key that is missing and every key that is unexpected.
 /// let mut other = ParamStore::new();
-/// let other_net = Sequential::new().push(Relu).push(Linear::new(&mut other, 2, 3, &mut Rng::seed(0)));
+/// let other_net = Sequential::new()
+///     .push(Relu)
+///     .push(Linear::new(&mut other, 2, 3, &mut Rng::seed(0)));
 /// let err = load(&path, &other_net, &mut other).unwrap_err();
 /// assert!(err.to_string().contains("missing keys (2): 1.weight, 1.bias"));
 /// assert!(err.to_string().contains("unexpected keys (2): 0.bias, 0.weight"));
@@ -182,7 +189,8 @@ pub fn load(
 ///     .push(Linear::new(&mut file_params, 2, 3, &mut rng))
 ///     .push(Prelu::new(&mut file_params, 1))
 ///     .push(Linear::new(&mut file_params, 3, 1, &mut rng));
-/// let path = std::env::temp_dir().join(format!("cavitation-doc-lenient-{}.safetensors", std::process::id()));
+/// let path = std::env::temp_dir()
+///     .join(format!("cavitation-doc-lenient-{}.safetensors", std::process::id()));
 /// save(&path, &with_prelu, &file_params)?;
 ///
 /// // The same network with ReLU: it has no slopes, so the file's `1.weight` is ignored.
@@ -323,7 +331,8 @@ impl<'a> LoadOptions<'a> {
 ///     .push(Relu)
 ///     .push(Relu)
 ///     .push(Linear::new(&mut file_params, 3, 1, &mut rng));
-/// let path = std::env::temp_dir().join(format!("cavitation-doc-load-with-{}.safetensors", std::process::id()));
+/// let path = std::env::temp_dir()
+///     .join(format!("cavitation-doc-load-with-{}.safetensors", std::process::id()));
 /// save(&path, &in_file, &file_params)?;
 ///
 /// // This model leaves the Dropouts out, so its Linear layers are at 0, 2 and 4.

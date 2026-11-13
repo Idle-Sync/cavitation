@@ -416,18 +416,30 @@ impl Hub {
 
     /// Everything published so far as one JSON object, for an export:
     /// `{"model", "stats", "probe", "neuron", "profile", "network", "status", "epochs",
-    /// "ablations", "shrinks"}`, each the latest payload of that name or `null` when none was published,
-    /// and the last three arrays of the kept events, oldest first.
+    /// "ablations", "shrinks"}`, each the latest payload of that name or `null` when none was
+    /// published, and the last three arrays of the kept events, oldest first.
     ///
     /// ```
     /// use cavitation_inspect::sse::{Event, Hub, Snapshot};
     /// use std::time::Duration;
     /// let hub = Hub::new(8, 256, Duration::from_secs(2));
-    /// hub.publish_snapshot(Snapshot::Stats, |w| { w.begin_object().key("step").uint(3).end_object(); });
-    /// hub.publish_event(Event::Epoch, |w| { w.begin_object().key("epoch").uint(1).end_object(); }, true);
+    /// hub.publish_snapshot(Snapshot::Stats, |w| {
+    ///     w.begin_object().key("step").uint(3).end_object();
+    /// });
+    /// hub.publish_event(
+    ///     Event::Epoch,
+    ///     |w| {
+    ///         w.begin_object().key("epoch").uint(1).end_object();
+    ///     },
+    ///     true,
+    /// );
     /// assert_eq!(
     ///     hub.export_json(),
-    ///     r#"{"model":null,"stats":{"step":3},"probe":null,"neuron":null,"profile":null,"network":null,"status":null,"epochs":[{"epoch":1}],"ablations":[],"shrinks":[]}"#
+    ///     concat!(
+    ///         r#"{"model":null,"stats":{"step":3},"probe":null,"neuron":null,"#,
+    ///         r#""profile":null,"network":null,"status":null,"epochs":[{"epoch":1}],"#,
+    ///         r#""ablations":[],"shrinks":[]}"#,
+    ///     )
     /// );
     /// ```
     pub fn export_json(&self) -> String {

@@ -576,8 +576,9 @@ fn learning_rate_command_overrides_schedule() {
 }
 
 /// With one client reading and a probe run after nearly every step (no commands), training
-/// gives the parameters of plain `fit`, bit for bit, on 1 and on 4 threads. The thread count is process-wide, and training is bit-identical at any
-/// count, so tests running beside this one are not disturbed.
+/// gives the parameters of plain `fit`, bit for bit, on 1 and on 4 threads. The thread count is
+/// process-wide, and training is bit-identical at any count, so tests running beside this one are
+/// not disturbed.
 #[test]
 fn probe_leaves_training_untouched() {
     let data = digits(640, 12);

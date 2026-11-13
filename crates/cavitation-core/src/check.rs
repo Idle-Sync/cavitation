@@ -124,10 +124,10 @@ pub fn gradcheck(
 /// `|numeric - analytic| <= 1e-7 + 1e-5 * max(|numeric|, |analytic|)`).
 ///
 /// The inputs are added to `params` as extra parameters so that they receive gradients;
-/// they are removed again before the call returns, so the store is unchanged. `build` receives one variable per input, in order,
-/// and reads the parameters it needs through their [`ParamId`]s. Parameter values are
-/// perturbed in place and restored exactly. The store's gradients are zeroed before and
-/// after the analytic pass.
+/// they are removed again before the call returns, so the store is unchanged. `build` receives one
+/// variable per input, in order, and reads the parameters it needs through their [`ParamId`]s.
+/// Parameter values are perturbed in place and restored exactly. The store's gradients are zeroed
+/// before and after the analytic pass.
 ///
 /// Failures name checked tensors by position: the parameters that were in the store
 /// before the call come first, then the inputs.
