@@ -14,3 +14,12 @@ workspace = true
 
 [dependencies]
 cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
+
+[dev-dependencies]
+# Reads the scikit-learn fixtures in tests/fixtures/sklearn (JSON); `float_roundtrip` reads
+# every number to the exact f64 it was written from (the default parser can be 1 ulp off).
+serde_json = { version = "1", features = ["float_roundtrip"] }
+# The Concrete and Breast Cancer rows that the data set fixtures refer to.
+cavitation-datasets = { path = "../cavitation-datasets" }
+# `Targets`, to read those rows' targets.
+cavitation-nn = { path = "../cavitation-nn" }

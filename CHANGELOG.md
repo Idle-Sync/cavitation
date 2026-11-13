@@ -8,6 +8,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 - A new crate, `cavitation-ml` (re-exported as `cavitation::cavitation_ml` by the `cavitation` crate's `ml` feature, on by default), for classic models in `f64`. It starts with least squares: `linalg::lstsq` and `linalg::Qr` (Householder QR from a row-major tensor or, with `Qr::from_columns`, a column-major buffer, whose wrong length is `Error::ShapeMismatch` as for `Tensor::from_vec`; with `solve`, `r_diagonal`, `column_norms` and `dependent_column`, which finds the first column with `|R_jj| ≤ rows · ε · ‖a_j‖`, so the test does not depend on the columns' scale; norms and reflectors are scaled by exact powers of two, so columns from about 1e-300 to 1e300 factor correctly) return `Error::InvalidData` for a matrix with more columns than rows, non-finite values, or a column that is a linear combination of the columns before it, naming the column, or a column whose norm is within a factor of about 4 of `f64::MAX`; `Qr::solve` refuses a dependent matrix too, and a solution that overflows f64; `linalg::qr_reference` is the plain twin the shipped solver is tested against.
 
+### Data, examples, guide and benchmark
+
+- `cavitation_datasets::concrete` and `cavitation_datasets::breast_cancer`: `load` reads the UCI Concrete Compressive Strength (1,030 rows, eight inputs, the strength in MPa as a value target) and Breast Cancer Wisconsin (Diagnostic) (569 rows, 30 features, 0 malignant and 1 benign) data sets, included in `data/` under CC BY 4.0 and rebuilt from UCI's archives by `scripts/data/make_tabular_csvs.py`, shuffled as the digits split into 824 and 455 training rows; `scripts/fixtures/make_sklearn_fixtures.py` writes the scikit-learn 1.9.1 fixtures (`LinearRegression`, `Ridge`, `LogisticRegression` from `newton-cholesky` and `lbfgs`, multinomial, `StandardScaler`, `r2_score`) that `cavitation-ml` is tested against.
+
 ## v0.1.0 (2026-11-13)
 
 The first release: a CPU neural network library for multilayer perceptrons whose every value and gradient can be read during training.

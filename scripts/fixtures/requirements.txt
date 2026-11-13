@@ -1,4 +1,5 @@
-# PyTorch and its dependencies, pinned to the versions the fixtures were written with. On Linux
+# PyTorch, scikit-learn and their dependencies, pinned to the versions the fixtures were written
+# with (xlrd reads the Concrete workbook for scripts/data/make_tabular_csvs.py). On Linux
 # torch is the CPU build from the PyTorch CPU index (which has no macOS wheels); on macOS it is
 # the same version from PyPI. The index flags below do the rest.
 # Install with:
@@ -19,3 +20,10 @@ networkx==3.7
 setuptools==84.2.1
 sympy==1.14.0
 typing-extensions==4.16.0
+scikit-learn==1.9.1
+scipy==1.18.1
+joblib==1.6.0
+threadpoolctl==3.8.0
+narwhals==2.28.0
+cloudpickle==3.1.2
+xlrd==2.0.2

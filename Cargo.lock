@@ -53,6 +53,9 @@ name = "cavitation-ml"
 version = "0.1.0"
 dependencies = [
  "cavitation-core",
+ "cavitation-datasets",
+ "cavitation-nn",
+ "serde_json",
 ]
 
 [[package]]
