@@ -1,5 +1,6 @@
 //! Training: datasets, targets and batches (in `data`), and the training step
-//! ([`Trainer`]), [`fit`] and [`accuracy`] (in `fit`), held-out measurement
+//! ([`Trainer`]), [`fit`], [`fit_controlled`] with its [`StepControl`], and [`accuracy`] (in
+//! `fit`), held-out measurement
 //! ([`Evaluator`] and [`evaluate`], in `evaluate`), [`Standardizer`], which standardises
 //! inputs or targets and folds that into a network (in `standardize`), and [`Flow`], which a
 //! progress callback returns to go on or stop.
@@ -12,8 +13,8 @@ mod standardize;
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
 pub use evaluate::{Evaluation, Evaluator, evaluate};
 pub use fit::{
-    EpochReport, FitConfig, History, Loss, LrSchedule, OptimizerConfig, Trainer, accuracy, fit,
-    fit_with_hooks,
+    EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig, StepControl,
+    StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled, fit_with_hooks,
 };
 pub(crate) use fit::{check_dataset, check_widths};
 pub use standardize::Standardizer;
