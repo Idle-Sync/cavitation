@@ -22,6 +22,14 @@
 //!   return `Ok` with a model far from the exact one. Both return a [`LinearModel`], which
 //!   predicts, scores R² and converts to and from a one-layer `Sequential` that saves as a
 //!   PyTorch `nn.Linear`.
+//! - [`LogisticRegression`]: L2-penalised (or unpenalised) logistic regression, matching
+//!   scikit-learn's `LogisticRegression`. [`LogisticRegression::fit`] solves two classes
+//!   exactly by Newton's method, each step a weighted least-squares problem solved by QR, and
+//!   reports separable classes without a penalty instead of returning coefficients that grow
+//!   without bound; [`LogisticRegression::fit_gradient`] trains a `Linear` layer on
+//!   cross-entropy with the same [`GradientConfig`], for two classes or more. Both return a
+//!   [`LogisticModel`], which gives probabilities, predictions, accuracy and the objective,
+//!   and converts to a one-layer `Sequential` giving the logits.
 //!
 //! Everything here works in `f64`, on [`Tensor`](cavitation_core::Tensor)s and
 //! [`TensorView`](cavitation_core::TensorView)s from `cavitation-core`, and returns
@@ -49,6 +57,8 @@
 mod gradient;
 pub mod linalg;
 mod linear;
+mod logistic;
 
 pub use gradient::GradientConfig;
 pub use linear::{LinearModel, LinearRegression};
+pub use logistic::{LogisticModel, LogisticRegression};

@@ -1,6 +1,8 @@
-//! The gradient path of linear regression: [`LinearRegression::fit_gradient`] trains one
-//! [`Linear`] layer by gradient descent (full-batch by default, or in minibatches) on the
-//! same objective the exact path solves, and [`GradientConfig`] says how.
+//! The gradient path of linear and logistic regression: [`LinearRegression::fit_gradient`]
+//! and [`LogisticRegression::fit_gradient`](crate::LogisticRegression::fit_gradient) train
+//! one [`Linear`] layer by gradient descent (full-batch by default, or in minibatches) on the
+//! same objective their exact paths solve, through one shared loop, and [`GradientConfig`]
+//! says how.
 
 use std::time::Instant;
 
@@ -12,15 +14,18 @@ use cavitation_nn::{
 
 use crate::linear::{LinearModel, LinearRegression, Shape, check_alpha, check_values, targets};
 
-/// How [`LinearRegression::fit_gradient`] trains. Taken by value, because it holds the
-/// health checks' sink.
+/// How [`LinearRegression::fit_gradient`] and
+/// [`LogisticRegression::fit_gradient`](crate::LogisticRegression::fit_gradient) train.
+/// Taken by value, because it holds the health checks' sink.
 ///
 /// The default is 1,000 epochs of full-batch gradient descent (every row in every step),
 /// Adam at a learning rate of 0.5 without weight decay, cosine annealing towards 0, rows
 /// shuffled with seed 0, weights initialised with seed 0, and the default [`Health`]
 /// checks. On the Concrete training rows with standardised inputs (824 rows, 8 inputs) it
 /// reaches the exact solution within `1e-3 · max(1, |exact|)` of every coefficient and
-/// intercept, with and without a ridge penalty; the gap measured there is below 1e-5.
+/// intercept, with and without a ridge penalty; the gap measured there is below 1e-5. On
+/// the Breast Cancer training rows with standardised inputs (455 rows, 30 inputs), logistic
+/// regression with `c = Some(1.0)` reaches its exact solution within about 5e-7.
 ///
 /// Why full batches: the objective is convex, and the full gradient points at its one
 /// minimum, so the iterates settle on it. A minibatch gradient carries the noise of the rows
@@ -219,108 +224,190 @@ impl LinearRegression {
             features,
             outputs,
         } = check_values(data)?;
-        if config.batch == 0 {
-            return Err(Error::InvalidData(
-                "GradientConfig: the batch size must be at least 1".to_string(),
-            ));
-        }
-        let mut params = ParamStore::new();
-        let linear = Linear::new(
-            &mut params,
+        let bias = self.fit_intercept.then(|| {
+            let y = targets(data).data();
+            (0..outputs)
+                .map(|q| {
+                    let sum: f64 = y
+                        .iter()
+                        .skip(q)
+                        .step_by(outputs)
+                        .map(|&v| f64::from(v))
+                        .sum();
+                    (sum / rows as f64) as f32
+                })
+                .collect()
+        });
+        let penalty = (self.alpha / (rows as f64 * outputs as f64)) as f32;
+        let setup = Setup {
             features,
             outputs,
-            &mut Rng::seed(config.init_seed),
-        );
-        let (weight, bias) = (linear.weight(), linear.bias());
-        if self.fit_intercept {
-            let y = targets(data).data();
-            let start = params.value_mut(bias).data_mut();
-            for (q, b) in start.iter_mut().enumerate() {
-                let sum: f64 = y
-                    .iter()
-                    .skip(q)
-                    .step_by(outputs)
-                    .map(|&v| f64::from(v))
-                    .sum();
-                *b = (sum / rows as f64) as f32;
-            }
-        }
-        let model = Sequential::new().push(linear);
-        let names = model.parameter_names();
-        let penalty = (self.alpha / (rows as f64 * outputs as f64)) as f32;
-        let mut optimizer = config.optimizer.build();
-        let mut monitor = HealthMonitor::new(config.health).with_loss(Loss::Mse);
-        let (mut graph, mut trace) = (Graph::new(), Trace::with_capacity(1));
-        let size = config.batch.min(rows);
-        let mut batcher = Batcher::new(rows, size, config.shuffle_seed);
-        let mut batch = Batch::new(data, size);
-        let mut history = History {
-            epochs: Vec::with_capacity(config.epochs.min(1024)),
+            loss: StepLoss::Mse,
+            penalty,
+            fit_intercept: self.fit_intercept,
+            bias,
         };
-        let initial_lr = optimizer.learning_rate();
-        let mut step = 0u64;
-        for epoch in 1..=config.epochs {
-            let lr = config
-                .schedule
-                .learning_rate(initial_lr, epoch - 1, config.epochs);
-            optimizer.set_learning_rate(lr);
-            let start = Instant::now();
-            batcher.epoch();
-            let mut total = 0.0f64;
-            for range in batcher.batches() {
-                step += 1;
-                let batch_rows = range.len() as f64;
-                let order = &batcher.order()[range.clone()];
-                let view = batcher.gather(data, range.clone(), &mut batch);
-                let checked = {
-                    let mut tape = graph.tape(&params.values);
-                    let x = tape.input(view.x);
-                    let out = model.forward_traced(&mut tape, x, &mut trace);
-                    let TargetsView::Values(y) = view.targets else {
-                        unreachable!("check_values refuses class targets")
-                    };
-                    let y_var = tape.input(y);
-                    let mut loss = tape.mse(out, y_var, Reduction::Mean);
-                    if penalty > 0.0 {
-                        let w = tape.param(weight);
-                        let squares = tape.mul(w, w);
-                        let sum = tape.sum(squares);
-                        let term = tape.scale(sum, penalty);
-                        loss = tape.add(loss, term);
-                    }
-                    let value = tape.value(loss).data()[0];
-                    total += f64::from(value) * batch_rows;
-                    tape.backward(loss, &mut params.grads);
-                    let inputs = StepInputs {
-                        x: view.x,
-                        targets: TargetsView::Values(y),
-                        rows: Some(order),
-                    };
-                    monitor.after_backward(step, value, &tape, &trace, &model, inputs)
-                };
-                let checked = checked.and_then(|()| {
-                    optimizer.step(&mut params);
-                    monitor.after_update(step, optimizer.last_stats(), &names)
-                });
-                params.zero_grad();
-                if !self.fit_intercept {
-                    params.value_mut(bias).data_mut().fill(0.0);
-                }
-                checked?;
-            }
-            monitor.end_epoch(epoch)?;
-            history.epochs.push(EpochReport {
-                epoch,
-                mean_loss: total / rows as f64,
-                rows,
-                seconds: start.elapsed().as_secs_f64(),
-            });
-        }
-        if !self.fit_intercept {
-            params.value_mut(bias).data_mut().fill(0.0);
-        }
+        let (model, params, history) = train(data, config, setup)?;
         Ok((LinearModel::from_sequential(&model, &params)?, history))
     }
+}
+
+/// The loss each step of [`train`] minimises, before the penalty on the weight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StepLoss {
+    /// The mean squared error against value targets, as [`Loss::Mse`].
+    Mse,
+    /// Binary cross-entropy on the logits against value targets of 0 and 1, as
+    /// [`Loss::BinaryCrossEntropyWithLogits`].
+    BceWithLogits,
+    /// Softmax cross-entropy on the logits against class labels, as [`Loss::CrossEntropy`].
+    CrossEntropy,
+}
+
+/// The layer [`train`] trains and the objective it trains it on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Setup {
+    /// The layer's input columns.
+    pub(crate) features: usize,
+    /// The layer's outputs.
+    pub(crate) outputs: usize,
+    /// The data term of each step's loss.
+    pub(crate) loss: StepLoss,
+    /// The factor on `‖W‖²` added to each step's loss (0 for none); the bias is never
+    /// penalised.
+    pub(crate) penalty: f32,
+    /// Whether the bias is trained; without it the bias is held at 0.
+    pub(crate) fit_intercept: bool,
+    /// The bias to start from, one value per output; `None` keeps the layer's zeros.
+    pub(crate) bias: Option<Vec<f32>>,
+}
+
+/// The gradient loop both regressions share: trains one [`Linear`] layer (weights
+/// initialised with `config.init_seed`, bias from `setup.bias`) on `data` by
+/// `config.optimizer` in batches of `config.batch` rows, minimising per step the mean of
+/// `setup.loss` over the batch plus `setup.penalty · ‖W‖²`, with the [`HealthMonitor`]
+/// checks of `config.health` on every step. Returns the network, its parameters and each
+/// epoch's report (the row-weighted mean of the step losses, penalty included).
+///
+/// `data`'s targets must suit `setup.loss`: values for [`StepLoss::Mse`] and
+/// [`StepLoss::BceWithLogits`] (`[rows, outputs]`), class labels below `setup.outputs` for
+/// [`StepLoss::CrossEntropy`]; the callers check this.
+///
+/// # Errors
+///
+/// [`Error::InvalidData`] if `config.batch` is 0; the health checks' errors, such as
+/// [`Error::NonFinite`], during training.
+pub(crate) fn train(
+    data: &Dataset,
+    config: GradientConfig,
+    setup: Setup,
+) -> Result<(Sequential, ParamStore, History), Error> {
+    if config.batch == 0 {
+        return Err(Error::InvalidData(
+            "GradientConfig: the batch size must be at least 1".to_string(),
+        ));
+    }
+    let rows = data.len();
+    let mut params = ParamStore::new();
+    let linear = Linear::new(
+        &mut params,
+        setup.features,
+        setup.outputs,
+        &mut Rng::seed(config.init_seed),
+    );
+    let (weight, bias) = (linear.weight(), linear.bias());
+    if let Some(start) = &setup.bias {
+        params.value_mut(bias).data_mut().copy_from_slice(start);
+    }
+    let model = Sequential::new().push(linear);
+    let names = model.parameter_names();
+    let penalty = setup.penalty;
+    let mut optimizer = config.optimizer.build();
+    let health_loss = match setup.loss {
+        StepLoss::Mse => Loss::Mse,
+        StepLoss::BceWithLogits => Loss::BinaryCrossEntropyWithLogits,
+        StepLoss::CrossEntropy => Loss::CrossEntropy,
+    };
+    let mut monitor = HealthMonitor::new(config.health).with_loss(health_loss);
+    let (mut graph, mut trace) = (Graph::new(), Trace::with_capacity(1));
+    let size = config.batch.min(rows);
+    let mut batcher = Batcher::new(rows, size, config.shuffle_seed);
+    let mut batch = Batch::new(data, size);
+    let mut history = History {
+        epochs: Vec::with_capacity(config.epochs.min(1024)),
+    };
+    let initial_lr = optimizer.learning_rate();
+    let mut step = 0u64;
+    for epoch in 1..=config.epochs {
+        let lr = config
+            .schedule
+            .learning_rate(initial_lr, epoch - 1, config.epochs);
+        optimizer.set_learning_rate(lr);
+        let start = Instant::now();
+        batcher.epoch();
+        let mut total = 0.0f64;
+        for range in batcher.batches() {
+            step += 1;
+            let batch_rows = range.len() as f64;
+            let order = &batcher.order()[range.clone()];
+            let view = batcher.gather(data, range.clone(), &mut batch);
+            let checked = {
+                let mut tape = graph.tape(&params.values);
+                let x = tape.input(view.x);
+                let out = model.forward_traced(&mut tape, x, &mut trace);
+                let mut loss = match (setup.loss, view.targets) {
+                    (StepLoss::Mse, TargetsView::Values(y)) => {
+                        let y_var = tape.input(y);
+                        tape.mse(out, y_var, Reduction::Mean)
+                    }
+                    (StepLoss::BceWithLogits, TargetsView::Values(y)) => {
+                        let y_var = tape.input(y);
+                        tape.binary_cross_entropy_with_logits(out, y_var, Reduction::Mean)
+                    }
+                    (StepLoss::CrossEntropy, TargetsView::Classes(labels)) => {
+                        tape.softmax_cross_entropy(out, labels, Reduction::Mean)
+                    }
+                    _ => unreachable!("the callers pass targets that suit the loss"),
+                };
+                if penalty > 0.0 {
+                    let w = tape.param(weight);
+                    let squares = tape.mul(w, w);
+                    let sum = tape.sum(squares);
+                    let term = tape.scale(sum, penalty);
+                    loss = tape.add(loss, term);
+                }
+                let value = tape.value(loss).data()[0];
+                total += f64::from(value) * batch_rows;
+                tape.backward(loss, &mut params.grads);
+                let inputs = StepInputs {
+                    x: view.x,
+                    targets: view.targets,
+                    rows: Some(order),
+                };
+                monitor.after_backward(step, value, &tape, &trace, &model, inputs)
+            };
+            let checked = checked.and_then(|()| {
+                optimizer.step(&mut params);
+                monitor.after_update(step, optimizer.last_stats(), &names)
+            });
+            params.zero_grad();
+            if !setup.fit_intercept {
+                params.value_mut(bias).data_mut().fill(0.0);
+            }
+            checked?;
+        }
+        monitor.end_epoch(epoch)?;
+        history.epochs.push(EpochReport {
+            epoch,
+            mean_loss: total / rows as f64,
+            rows,
+            seconds: start.elapsed().as_secs_f64(),
+        });
+    }
+    if !setup.fit_intercept {
+        params.value_mut(bias).data_mut().fill(0.0);
+    }
+    Ok((model, params, history))
 }
 
 #[cfg(test)]
