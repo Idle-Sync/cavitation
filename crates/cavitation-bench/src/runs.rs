@@ -1405,8 +1405,8 @@ pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
 /// Times every case on `n` values spread evenly over [-4, 4) (each call first copies them
 /// into the working buffer, so every call sees the same inputs; the copy is included):
 /// [`ACTIVATION_ROUNDS`] rounds, each running every case, starting one case later each
-/// round, for enough calls to take about 20 µs. Returns, for each case, the median over
-/// rounds of nanoseconds per value.
+/// round, with enough calls for about 20,000 values per case per round. Returns, for each
+/// case, the median over rounds of nanoseconds per value.
 pub fn time_activations(cases: &[ActivationCase], n: usize) -> Vec<f64> {
     let input: Vec<f32> = (0..n).map(|i| -4.0 + 8.0 * i as f32 / n as f32).collect();
     let mut buf = input.clone();
