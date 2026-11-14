@@ -4,6 +4,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.2.0 (2026-11-14)
+
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
