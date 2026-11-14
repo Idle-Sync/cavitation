@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
+- `shrink::ShrinkConfig` has a new public field, `fold_means`, so code that builds a `ShrinkConfig` with a struct literal and no `..ShrinkConfig::default()` must set it.
 
 ### Workspace
 
@@ -40,6 +41,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `Trainer::override_learning_rate`, `Trainer::learning_rate`, `Trainer::profile_next_step` and `Trainer::last_profile` (each layer's forward and backward time, the loss, the optimiser and the whole step; steps not profiled read no clock and allocate nothing), and `Trace::set_timing` and `Trace::forward_time`.
 - `Standardizer`: each column's mean and population standard deviation, `transform` and `inverse_transform`, and `fold_into_input` and `fold_into_output`, which write the scaling into the first or last `Linear` so a trained network takes raw inputs or answers in the targets' units.
 - `shrink::ablate_controlled`: `ablate_with` whose callback returns a `Flow`, so a sweep can stop early.
+- `ShrinkConfig::fold_means` (off by default): `shrink` folds each removed neuron's mean output on the training rows into the next `Linear`'s bias before retraining, measured on the network with the step's earlier layers already shrunk; for a neuron whose output is constant the network's outputs do not change, within rounding. `shrink::train_found_size` trains a network of the size a shrunk network has from new starting values (`shrink::FromScratch`: the weight and bias `Init`, a seed and the `FitConfig` recipe) and returns both networks' measures on the rows you give, with the fresh network, in a `shrink::FoundSize`; the `shrink_digits` example's `--lottery` uses it.
 - `Loss::record` is public, so a tape of your own can record the training loss.
 
 ### Data, examples, guide and benchmark

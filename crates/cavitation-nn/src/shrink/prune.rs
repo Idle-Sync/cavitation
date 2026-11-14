@@ -243,13 +243,14 @@ impl Default for RetrainConfig {
 /// on every training row (for a ReLU, those that never fire) and then the lowest
 /// out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
 /// 9,500, retrains as [`RetrainConfig::default`], keeps the latest step that loses at most
-/// 1 accuracy point (class targets), and stops after 2 misses in a row. It has no
-/// validation set: set [`validation`](Self::validation).
+/// 1 accuracy point (class targets), and stops after 2 misses in a row. It does not fold
+/// removed neurons' mean outputs into the next bias. It has no validation set: set
+/// [`validation`](Self::validation).
 ///
 /// ```
 /// use cavitation_nn::shrink::{Ranking, ShrinkConfig};
 /// let config = ShrinkConfig::default();
-/// assert!(config.linears.is_empty() && config.dead_first);
+/// assert!(config.linears.is_empty() && config.dead_first && !config.fold_means);
 /// assert!(matches!(config.ranking, Ranking::OutNorm));
 /// assert_eq!(
 ///     (config.step_bp, config.fine_from_bp, config.fine_step_bp, config.max_removed_bp),
@@ -270,6 +271,16 @@ pub struct ShrinkConfig {
     /// never fire) go before the ranking's order; removing them changes nothing. On by
     /// default.
     pub dead_first: bool,
+    /// Whether each removed neuron's mean output on the training rows is folded into the
+    /// bias of the `Linear` that receives it, `b[i] += W[i, j] · mean_j`, so that the next
+    /// layer still gets the neuron's average contribution. The mean is measured at each
+    /// step, before retraining, on the network as it stands once the step has removed the
+    /// neurons of the listed layers before this one (and folded theirs), read where the
+    /// neuron's output is final ([`LayerActivity::mean`]). For a neuron whose output is the
+    /// same on every row the fold is exact: the network's outputs do not change, within
+    /// rounding. The fold changes the parameters, so it is in the step's checkpoint and in
+    /// the network the run keeps. Off by default.
+    pub fold_means: bool,
     /// The step between levels, in basis points, up to `fine_from_bp`. Default 1,000.
     pub step_bp: u32,
     /// The level from which the steps are `fine_step_bp`. Default 7,000.
@@ -311,6 +322,7 @@ impl Default for ShrinkConfig {
             linears: Vec::new(),
             ranking: Ranking::OutNorm,
             dead_first: true,
+            fold_means: false,
             step_bp: 1000,
             fine_from_bp: 7000,
             fine_step_bp: 500,
@@ -332,6 +344,7 @@ impl fmt::Debug for ShrinkConfig {
             .field("linears", &self.linears)
             .field("ranking", &self.ranking)
             .field("dead_first", &self.dead_first)
+            .field("fold_means", &self.fold_means)
             .field("step_bp", &self.step_bp)
             .field("fine_from_bp", &self.fine_from_bp)
             .field("fine_step_bp", &self.fine_step_bp)
@@ -510,7 +523,10 @@ pub struct ShrinkReport {
 ///    network as the previous step left it;
 /// 2. switches off, in each layer, the neurons it must lose: with
 ///    [`dead_first`](ShrinkConfig::dead_first), first those whose output is 0 on every
-///    training row, then the lowest-ranked;
+///    training row, then the lowest-ranked. With [`fold_means`](ShrinkConfig::fold_means),
+///    the layers are taken in order of index, and before a layer's neurons go their mean
+///    outputs, measured on the network with the earlier layers already shrunk, are folded
+///    into the next `Linear`'s bias;
 /// 3. retrains the network on the training rows as [`ShrinkConfig::retrain`] says, with a
 ///    fresh optimiser (masked neurons pass no gradient, so they stay off);
 /// 4. measures it on the validation set, records the step, and calls `on_step`
@@ -529,9 +545,9 @@ pub struct ShrinkReport {
 ///
 /// What the run finds is a size and a network of that size. A network of the same size
 /// trained from scratch may match the pruned one or fall short of it, depending on the
-/// problem and the training: train one, for as many epochs in all, and compare before you
-/// settle on the pruned network. The guide's chapter on shrinking does this for the digits
-/// network.
+/// problem and the training: train one, for as many epochs in all, with
+/// [`train_found_size`](super::train_found_size()), and compare before you settle on the
+/// pruned network. The guide's chapter on shrinking does this for the digits network.
 ///
 /// Neurons the model already has off in a neuron mask stay off. The masks the run sets
 /// are neuron masks, by `Linear` ([`Sequential::set_neuron_mask`]); masks on other layers
@@ -767,8 +783,12 @@ impl Run<'_, '_> {
                 let keep = kept_at(widths[k], level);
                 masks.push((linear, self.mask_for(linear, keep, &stats[k], &mut rng)?));
             }
-            for (linear, mask) in &masks {
-                self.model.set_neuron_mask(*linear, mask.clone());
+            if self.config.fold_means {
+                self.fold_and_mask(&masks, &stats)?;
+            } else {
+                for (linear, mask) in &masks {
+                    self.model.set_neuron_mask(*linear, mask.clone());
+                }
             }
             self.retrain()?;
             let validation = (self.measure)(self.model, self.params, self.validation)?;
@@ -807,6 +827,58 @@ impl Run<'_, '_> {
             }
         }
         Ok((steps, best))
+    }
+
+    /// Sets the step's `masks`, one listed layer at a time in order of layer index, and
+    /// before each folds the mean output of every neuron the mask newly switches off into
+    /// the bias of the next `Linear`: `b[i] += Σⱼ W[i, j] · mean_j`, summed in `f64` and
+    /// rounded once. The means of the first layer that loses neurons are `stats`, measured
+    /// before the step changed anything; those of a later layer are measured again, on the
+    /// network with the earlier layers' masks and folds in place. A mean of exactly 0 (a
+    /// dead neuron) adds nothing, even against an infinite weight.
+    fn fold_and_mask(
+        &mut self,
+        masks: &[(usize, NeuronMask)],
+        stats: &[LayerActivity],
+    ) -> Result<(), Error> {
+        let mut order: Vec<usize> = (0..masks.len()).collect();
+        order.sort_by_key(|&k| masks[k].0);
+        let mut changed = false;
+        for k in order {
+            let (linear, ref mask) = masks[k];
+            let before = neurons_on(self.model, linear);
+            let removed: Vec<usize> = (0..before.len())
+                .filter(|&j| before[j] && !mask.is_on(j))
+                .collect();
+            if !removed.is_empty() {
+                let measured;
+                let mean = if changed {
+                    measured =
+                        activity(self.model, self.params, self.train, &[linear], EVAL_BATCH)?;
+                    &measured[0].mean
+                } else {
+                    &stats[k].mean
+                };
+                let next = linear_after_run(self.model, linear)
+                    .expect("check_layout found a Linear after each run");
+                let (inputs, weight, bias) = (next.inputs(), next.weight(), next.bias());
+                let w = self.params.value(weight).data().to_vec();
+                let b = self.params.value_mut(bias).data_mut();
+                for (i, b) in b.iter_mut().enumerate() {
+                    let row = &w[i * inputs..(i + 1) * inputs];
+                    let mut sum = f64::from(*b);
+                    for &j in &removed {
+                        if mean[j] != 0.0 {
+                            sum += f64::from(row[j]) * mean[j];
+                        }
+                    }
+                    *b = sum as f32;
+                }
+                changed = true;
+            }
+            self.model.set_neuron_mask(linear, mask.clone());
+        }
+        Ok(())
     }
 
     /// The neuron mask of the `Linear` at `linear` that keeps `keep` of its neurons (or

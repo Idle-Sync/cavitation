@@ -5,7 +5,8 @@
 //!   output's position and within the documented rounding bound on the others; the masks
 //!   and layers it cannot compact are refused with a message that says what to do.
 //! - `shrink::ablate`: the ablation sweep, after the compaction tests.
-//! - `shrink::shrink`: the shrink tool, at the end.
+//! - `shrink::shrink`: the shrink tool, then its `fold_means` option.
+//! - `shrink::train_found_size`: the from-scratch comparison, at the end.
 //!
 //! The kernel level is the one `CAVITATION_KERNEL` sets for the test process, except in
 //! `matvec_drops_zero_terms_at_every_level`, which names each level it runs.
@@ -14,12 +15,13 @@ use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{Level, MatRef, supported};
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Real, Rng, Tape, Tensor, Var};
 use cavitation_nn::shrink::{
-    Ablation, Criterion, Ranking, RetrainConfig, ShrinkConfig, ShrinkStep, ShrinkWarning,
-    Validation, ablate, ablate_controlled, ablate_with, activity, compact, shrink,
+    Ablation, Criterion, FromScratch, RankContext, Ranking, RetrainConfig, ShrinkConfig,
+    ShrinkStep, ShrinkWarning, Validation, ablate, ablate_controlled, ablate_with, activity,
+    compact, shrink, train_found_size,
 };
 use cavitation_nn::{
-    Activation, ActivationLayer, Dataset, Evaluator, Flow, InferenceModel, Layer, Linear, Loss,
-    NeuronMask, Prelu, Relu, Sequential, Sigmoid, Softmax, Tanh, Targets, Trace, load, save,
+    Activation, ActivationLayer, Dataset, Evaluator, Flow, InferenceModel, Init, Layer, Linear,
+    Loss, NeuronMask, Prelu, Relu, Sequential, Sigmoid, Softmax, Tanh, Targets, Trace, load, save,
 };
 
 /// The number of seeded inputs each comparison runs.
@@ -2213,4 +2215,271 @@ fn every_accepted_shape_compacts() {
             assert_eq!(chosen.parameters, count, "{what}");
         }
     }
+}
+
+// Folding removed neurons' means into the next bias.
+
+/// A 4 → 8 → ReLU → 6 → ReLU → 3 network, seeded as [`network`] is, whose neuron 2 of
+/// layer 0 and neuron 1 of layer 2 have no incoming weight and a positive bias, so their
+/// outputs are 0.7 and 0.4 on every row.
+fn constant_pair(params: &mut ParamStore) -> Sequential {
+    let mut rng = Rng::seed(21);
+    let net = Sequential::new()
+        .push(linear(params, 4, 8, &mut rng))
+        .push(Relu)
+        .push(linear(params, 8, 6, &mut rng))
+        .push(Relu)
+        .push(linear(params, 6, 3, &mut rng));
+    for (layer, neuron, value) in [(0, 2, 0.7), (2, 1, 0.4)] {
+        let l = net.linear(layer).unwrap();
+        let inputs = l.inputs();
+        params.value_mut(l.bias()).data_mut()[neuron] = value;
+        for w in &mut params.value_mut(l.weight()).data_mut()[neuron * inputs..][..inputs] {
+            *w = 0.0;
+        }
+    }
+    net
+}
+
+/// One step of 2,000 bp with no retraining that removes exactly `neurons[k]` from the
+/// `k`-th hidden `Linear` (layers 0 and 2), with `fold_means` as given.
+fn remove_exactly(neurons: [usize; 2], fold_means: bool, validation: Dataset) -> ShrinkConfig {
+    ShrinkConfig {
+        step_bp: 2000,
+        max_removed_bp: 2000,
+        dead_first: false,
+        fold_means,
+        criterion: Some(ALWAYS),
+        ranking: Ranking::Custom(Box::new(move |ctx: &RankContext<'_>| {
+            let target = if ctx.linear == 0 {
+                neurons[0]
+            } else {
+                neurons[1]
+            };
+            ctx.on
+                .iter()
+                .map(|&j| if j == target { 0.0 } else { 1.0 })
+                .collect()
+        })),
+        retrain: RetrainConfig {
+            epochs: 0,
+            ..RetrainConfig::default()
+        },
+        ..quick(validation)
+    }
+}
+
+/// `fold_means` is off by default, and the config's `Debug` shows it.
+#[test]
+fn fold_means_is_off_by_default() {
+    let config = ShrinkConfig::default();
+    assert!(!config.fold_means);
+    assert!(format!("{config:?}").contains("fold_means: false"));
+}
+
+/// With no retraining, removing a neuron whose output is the same on every row from each of
+/// two hidden layers, with `fold_means`, leaves the network's outputs as they were: within
+/// the sum of the two networks' GEMM bounds (each is within its own of the exact result,
+/// and the exact results differ only by the rounding of each folded bias, which the
+/// folded network's bound covers). Without the fold, the outputs move by far more.
+#[test]
+fn folding_a_constant_neuron_keeps_the_outputs() {
+    let x = inputs(64, 4, 22);
+    let mut original_params = ParamStore::new();
+    let original = constant_pair(&mut original_params);
+    let want = tape_output(&original, &original_params, &x, 64);
+    let want_bound = gemm_bound(&original, &original_params, &x, 64);
+    let train = clusters(48, 4, 23);
+    for fold in [true, false] {
+        let (mut net, mut params) = (original.clone(), original_params.clone());
+        let config = remove_exactly([2, 1], fold, clusters(30, 4, 24));
+        let report = shrink(&mut net, &mut params, &train, config).unwrap();
+        assert_eq!(report.steps[0].kept, [7, 5]);
+        assert_eq!(off_in(&report.steps[0], 0), [2]);
+        assert_eq!(off_in(&report.steps[0], 2), [1]);
+        // The kept network is the step's checkpoint, fold included.
+        let (_, store) = report.steps[0].checkpoint.as_ref().unwrap();
+        assert_same_store(&net, &params, store);
+        let got = tape_output(&net, &params, &x, 64);
+        let bound: Vec<f64> = gemm_bound(&net, &params, &x, 64)
+            .iter()
+            .zip(&want_bound)
+            .map(|(a, b)| a + b)
+            .collect();
+        if fold {
+            assert_within(&got, &want, &bound, "folded");
+        } else {
+            let moved = got
+                .iter()
+                .zip(&want)
+                .zip(&bound)
+                .any(|((g, w), b)| (f64::from(*g) - f64::from(*w)).abs() > 100.0 * b);
+            assert!(moved, "without the fold the outputs should move");
+        }
+    }
+}
+
+/// Each layer's means are measured after the earlier layers have lost their neurons and
+/// folded their means: the change in the output layer's bias is `W[:, j] · mean_j` for the
+/// neuron `j` removed from layer 2, with `mean_j` measured on the network with layer 0
+/// already pruned and folded, which differs from its mean in the network as given.
+#[test]
+fn later_means_are_measured_after_earlier_folds() {
+    let mut params = ParamStore::new();
+    let original = network(&mut params);
+    let before = params.clone();
+    let train = clusters(80, 64, 25);
+    let mut net = original.clone();
+    // Remove 20% of each hidden layer, the lowest indices first: neurons 0 to 50 of layer
+    // 0 (205 of 256 kept) and 0 to 24 of layer 2 (103 of 128 kept).
+    let mut config = remove_exactly([0, 0], true, clusters(30, 64, 26));
+    config.ranking = Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
+        ctx.on.iter().map(|&j| j as f64).collect()
+    }));
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert_eq!(report.steps[0].kept, [205, 103]);
+    let removed: Vec<usize> = off_in(&report.steps[0], 2);
+    assert_eq!(removed, (0..25).collect::<Vec<_>>());
+    // The network as it stood when layer 2's means were measured: layer 0 pruned and
+    // folded, layer 2 whole (its own fold only changed layer 4's bias).
+    let mut at_measure = net.clone();
+    at_measure.clear_neuron_mask(2);
+    let after = activity(&at_measure, &params, &train, &[2], 256).unwrap();
+    let given = activity(&original, &before, &train, &[2], 256).unwrap();
+    let out = net.linear(4).unwrap();
+    let (w, inputs) = (before.value(out.weight()).data(), out.inputs());
+    let (old_b, new_b) = (
+        before.value(out.bias()).data(),
+        params.value(out.bias()).data(),
+    );
+    let mut differs = false;
+    for i in 0..out.outputs() {
+        let fold = |mean: &[f64]| -> f64 {
+            removed
+                .iter()
+                .map(|&j| f64::from(w[i * inputs + j]) * mean[j])
+                .sum()
+        };
+        let (want, stale) = (fold(&after[0].mean), fold(&given[0].mean));
+        let got = f64::from(new_b[i]) - f64::from(old_b[i]);
+        let tolerance = 1.2e-7 * f64::from(new_b[i]).abs().max(f64::from(old_b[i]).abs());
+        assert!(
+            (got - want).abs() <= tolerance,
+            "output {i}: bias moved by {got}, the fold of the means after layer 0 is {want}"
+        );
+        differs |= (stale - want).abs() > 1e3 * tolerance;
+    }
+    assert!(differs, "layer 0's pruning should change layer 2's means");
+}
+
+/// Without retraining, removing 70% of the hidden layer by activity costs less when the
+/// removed neurons' means are folded into the next bias: on the trained 8 → 32 → 3 network,
+/// 10 neurons kept, the validation accuracy on 600 rows is 93.50% without the fold and
+/// 95.33% with it (measured on the `sse4.2` level), and the loss is lower.
+#[test]
+fn folding_helps_without_retraining() {
+    let mut measured = Vec::new();
+    for fold in [false, true] {
+        let mut params = ParamStore::new();
+        let (mut net, train) = trained(&mut params);
+        let config = ShrinkConfig {
+            ranking: Ranking::Activity,
+            step_bp: 7000,
+            max_removed_bp: 7000,
+            fold_means: fold,
+            criterion: Some(ALWAYS),
+            retrain: RetrainConfig {
+                epochs: 0,
+                ..RetrainConfig::default()
+            },
+            ..quick(clusters(600, 8, 27))
+        };
+        let report = shrink(&mut net, &mut params, &train, config).unwrap();
+        assert_eq!(report.steps[0].kept, [10]);
+        measured.push(report.steps[0].validation);
+    }
+    let (without, with) = (measured[0], measured[1]);
+    assert!(with.loss < without.loss, "{with:?} against {without:?}");
+    let right = |e: cavitation_nn::Evaluation| (e.accuracy.unwrap() * 600.0).round() as usize;
+    assert!(
+        right(with) >= right(without) + 6,
+        "{with:?} against {without:?}"
+    );
+}
+
+// Training the found size from scratch.
+
+/// `train_found_size` measures the pruned network as `evaluate` does, and trains a fresh
+/// network that is, bit for bit, the network of the kept widths built by hand with the same
+/// starting values and seed and trained with `fit` on the same recipe; a network `compact`
+/// refuses is refused with its error.
+#[test]
+fn train_found_size_matches_a_network_built_by_hand() {
+    let mut params = ParamStore::new();
+    let (mut net, train) = trained(&mut params);
+    net.set_neuron_mask(0, NeuronMask::from_off(32, &chosen(32, 20, 3)));
+    let test = clusters(150, 8, 28);
+    let recipe = |epochs| cavitation_nn::FitConfig {
+        epochs,
+        health: cavitation_nn::Health::quiet(),
+        ..cavitation_nn::FitConfig::default()
+    };
+    let scratch = FromScratch {
+        weights: Init::HeUniform,
+        seed: 5,
+        fit: recipe(4),
+        ..FromScratch::default()
+    };
+    let found = train_found_size(&net, &params, &train, &test, scratch).unwrap();
+
+    let mut by_hand_params = ParamStore::new();
+    let mut rng = Rng::seed(5);
+    let by_hand = Sequential::new()
+        .push(Linear::with_init(
+            &mut by_hand_params,
+            8,
+            12,
+            Init::HeUniform,
+            Init::Zeros,
+            &mut rng,
+        ))
+        .push(Relu)
+        .push(Linear::with_init(
+            &mut by_hand_params,
+            12,
+            3,
+            Init::HeUniform,
+            Init::Zeros,
+            &mut rng,
+        ));
+    let history = cavitation_nn::fit(&by_hand, &mut by_hand_params, &train, recipe(4)).unwrap();
+    assert_eq!(found.history.epochs.len(), 4);
+    for (a, b) in found.history.epochs.iter().zip(&history.epochs) {
+        assert_eq!(a.mean_loss.to_bits(), b.mean_loss.to_bits());
+    }
+    assert_eq!(found.model.linear(0).unwrap().outputs(), 12);
+    assert!(found.model.neuron_mask(0).is_none());
+    let names = found.model.parameter_names();
+    for ((name, got), (want_name, want)) in names.iter().zip(by_hand.parameter_names()) {
+        assert_eq!(*name, want_name);
+        let (got, want) = (found.params.value(*got), by_hand_params.value(want));
+        assert_bits(got.data(), want.data(), name);
+    }
+    let loss = Loss::CrossEntropy;
+    let scratch_eval = cavitation_nn::evaluate(&by_hand, &by_hand_params, &test, loss, 256);
+    assert_eq!(found.scratch, scratch_eval.unwrap());
+    let pruned_eval = cavitation_nn::evaluate(&net, &params, &test, loss, 256).unwrap();
+    assert_eq!(found.pruned, pruned_eval);
+
+    // A layer of your own with parameters: compact's refusal.
+    let mut rng = Rng::seed(29);
+    let alpha = params.add(Tensor::from_vec(vec![1.5], &[1]).unwrap());
+    let mut foreign = Sequential::new()
+        .push(linear(&mut params, 8, 6, &mut rng))
+        .push(Relu)
+        .push(linear(&mut params, 6, 3, &mut rng))
+        .push(ScaledTanh { alpha });
+    foreign.set_neuron_mask(0, NeuronMask::from_off(6, &[1]));
+    let err = train_found_size(&foreign, &params, &train, &test, FromScratch::default());
+    assert!(matches!(err, Err(Error::Unsupported(_))));
 }
