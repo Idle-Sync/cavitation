@@ -108,6 +108,8 @@ The activations that take a parameter default to PyTorch's values, so `LeakyRelu
 
 `load` is strict. Every parameter must be in the file with its exact shape and type, and the file must have no other key. One `Error::Keys` lists every missing, unexpected and wrong-shape key together, and says when a weight looks transposed. Nothing is written into the parameters unless every check passes. A file made by `torch.save` (a zip archive or a pickle) is refused with a message that says to save with safetensors instead.
 
+A layer built with `nn.Linear(inputs, outputs, bias=False)` is `Linear::without_bias(&mut params, inputs, outputs, init, &mut rng)` in Rust, or `Linear::from_weight` when you already have the weight. It computes `x · Wᵀ`, its only key is `{i}.weight`, and its `state_dict` loads with `load`. A `Linear::new` in its place would ask for a `{i}.bias` the file does not have, and `load` would report it as missing. `save` writes a bias-free layer the same way, and PyTorch loads the file into the `bias=False` network.
+
 `load_lenient` ignores the keys the model does not have and returns them, so you can see what was dropped, for example the slopes of a PReLU loaded into a network that uses ReLU. For a file whose names differ from the model's, because of a `module.` prefix from `DataParallel` or because layers sit at other indices, `load_with` takes `LoadOptions` with a renaming function, and `LoadOptions::strip_prefix` covers the prefix.
 
 Training in PyTorch and running in Cavitation then takes three steps: build the same `Sequential` in Rust, `load` the file, and compare an output on a few rows before trusting it.

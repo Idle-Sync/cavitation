@@ -12,7 +12,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `shrink::ShrinkConfig` has a new public field, `fold_means`, so code that builds a `ShrinkConfig` with a struct literal and no `..ShrinkConfig::default()` must set it.
 - `OnNonFinite` has a new variant, `Skip`, and is now `#[non_exhaustive]`: a `match` on it outside `cavitation-nn` needs a wildcard arm (which also covers later variants). Building a value, such as `OnNonFinite::Stop`, works as before.
 - `Linear::bias` returns `Option<ParamId>`, `None` for a layer without a bias. A layer from `Linear::new`, `with_init` or `from_values` always has one, so `layer.bias().unwrap()` is the old value.
-- `InferenceLayer::Linear`'s `bias` field is `Option<Vec<f32>>`, `None` for a layer without a bias.
+- `InferenceLayer::Linear`'s `bias` field is `Option<Vec<f32>>`, `None` for a layer without a bias. A layer of your own that returns this form from `Layer::inference` builds it with `bias: Some(values)` (or `None` for no bias), and code that reads the field uses `bias.as_deref()`, which gives an `Option<&[f32]>`.
 
 ### Workspace
 

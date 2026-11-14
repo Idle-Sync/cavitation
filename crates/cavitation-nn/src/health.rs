@@ -516,8 +516,9 @@ impl fmt::Display for Warning {
                     f.write_str(", …")?;
                 }
                 f.write_str(
-                    "]; try a lower learning rate, a positive bias initialisation or a leaky \
-                     activation such as LeakyRelu",
+                    "]; try a lower learning rate, a leaky activation such as LeakyRelu, or a \
+                     positive bias initialisation on the Linear before it (one built with \
+                     Linear::without_bias has no bias: build it with a bias first)",
                 )
             }
         }
@@ -2590,8 +2591,9 @@ mod tests {
                  has not fallen 10,000-fold is a vanishing gradient); a norm of exactly 0 means no \
                  gradient reached it, which points at dead ReLUs or a saturated output",
                 "epoch 1: 2 of 4 (50%) neurons of layer 1 output 0 for every sample (dead ReLU): \
-                 [0, 3]; try a lower learning rate, a positive bias initialisation or a leaky \
-                 activation such as LeakyRelu",
+                 [0, 3]; try a lower learning rate, a leaky activation such as LeakyRelu, or a \
+                 positive bias initialisation on the Linear before it (one built with \
+                 Linear::without_bias has no bias: build it with a bias first)",
             ]
         );
     }

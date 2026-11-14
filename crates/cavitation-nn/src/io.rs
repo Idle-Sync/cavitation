@@ -1308,7 +1308,20 @@ mod tests {
     /// from its position `k` (counting through the parameters in order) to
     /// `(k * 7919 mod 199) * 0.01 - 1` in f32, so its values come from neither initialiser.
     fn rust_fixture_model() -> (Sequential<f32>, ParamStore<f32>) {
-        let (net, mut params) = mlp(0);
+        fixture_values(mlp(0))
+    }
+
+    /// The model behind `from-rust-no-bias.safetensors`: `Linear(4, 8, bias=False), ReLU,
+    /// Linear(8, 3)` with its parameters set as [`rust_fixture_model`] sets them.
+    fn rust_fixture_model_without_bias() -> (Sequential<f32>, ParamStore<f32>) {
+        fixture_values(mlp_without_first_bias(0))
+    }
+
+    /// `net` with every parameter in `params` set from its position `k` (counting through
+    /// the parameters in order) to `(k * 7919 mod 199) * 0.01 - 1` in f32.
+    fn fixture_values(
+        (net, mut params): (Sequential<f32>, ParamStore<f32>),
+    ) -> (Sequential<f32>, ParamStore<f32>) {
         let mut k = 0u32;
         for (_, id) in net.parameter_names() {
             for v in params.value_mut(id).data_mut() {
@@ -1333,10 +1346,30 @@ mod tests {
     /// the PyTorch check after that.
     #[test]
     fn save_writes_the_file_pytorch_was_checked_against() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
         let (net, params) = rust_fixture_model();
-        let path = temp_path("from-rust");
-        save(&path, &net, &params).unwrap();
+        check_rust_file("from-rust", &net, &params);
+    }
+
+    /// The same for a network whose first `Linear` has no bias: `save` writes
+    /// `from-rust-no-bias.safetensors` byte for byte, with only `0.weight` for that layer,
+    /// and `make_fixtures.py --check-rust-save` loads it strictly into PyTorch's
+    /// `Linear(4, 8, bias=False), ReLU, Linear(8, 3)`.
+    #[test]
+    fn save_writes_the_bias_free_file_pytorch_was_checked_against() {
+        let (net, params) = rust_fixture_model_without_bias();
+        let names: Vec<String> = net.parameter_names().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["0.weight", "2.weight", "2.bias"]);
+        check_rust_file("from-rust-no-bias", &net, &params);
+    }
+
+    /// Checks that `save` writes `tests/fixtures/state-dict/{stem}.safetensors` for `net`
+    /// byte for byte and that `{stem}-io.json` holds its parameter values; with
+    /// `CAVITATION_WRITE_FIXTURES` set, writes both files instead (the JSON with the inputs
+    /// of `mlp-io.json` and the network's outputs on them).
+    fn check_rust_file(stem: &str, net: &Sequential<f32>, params: &ParamStore<f32>) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+        let path = temp_path(stem);
+        save(&path, net, params).unwrap();
         let written = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let names = net.parameter_names();
@@ -1373,21 +1406,20 @@ mod tests {
                 "input": tensor_json(&[rows, 4], &input),
                 "output": tensor_json(&[rows, 3], &output),
             });
-            std::fs::write(dir.join("from-rust.safetensors"), &written).unwrap();
-            std::fs::write(dir.join("from-rust-io.json"), format!("{body}\n")).unwrap();
+            std::fs::write(dir.join(format!("{stem}.safetensors")), &written).unwrap();
+            std::fs::write(dir.join(format!("{stem}-io.json")), format!("{body}\n")).unwrap();
             return;
         }
 
-        let committed = std::fs::read(dir.join("from-rust.safetensors")).unwrap();
+        let committed = std::fs::read(dir.join(format!("{stem}.safetensors"))).unwrap();
         assert!(
             written == committed,
-            "save no longer writes tests/fixtures/state-dict/from-rust.safetensors; if the \
-             change is meant, rewrite it with CAVITATION_WRITE_FIXTURES=1 and rerun \
-             make_fixtures.py --check-rust-save"
+            "save no longer writes tests/fixtures/state-dict/{stem}.safetensors; if the change \
+             is meant, rewrite it with CAVITATION_WRITE_FIXTURES=1 and rerun make_fixtures.py \
+             --check-rust-save"
         );
-        let io: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("from-rust-io.json")).unwrap())
-                .unwrap();
+        let text = std::fs::read_to_string(dir.join(format!("{stem}-io.json"))).unwrap();
+        let io: Value = serde_json::from_str(&text).unwrap();
         for (name, id) in &names {
             let stored: Vec<u32> = io["params"][name.as_str()]["data"]
                 .as_array()

@@ -2117,6 +2117,70 @@ pub(crate) mod tests {
         model.set_mask(1, &NeuronMask::all_on(32)).unwrap();
     }
 
+    /// `refresh_in_place` updates a `Linear` without a bias in place, bit for bit a fresh
+    /// compile, and returns `false` when the compiled layer and the current one disagree on
+    /// having a bias (either way round), after which `refresh` gives the new network's
+    /// outputs. A `fits_in_place` that ignored the bias would take the in-place path there
+    /// and keep a missing or stale bias.
+    #[test]
+    fn refresh_in_place_without_a_bias() {
+        // A 5 → 6 → ReLU → 3 network whose first `Linear` has a bias exactly when `biased`
+        // is true; the output layer always has one. Biases are non-zero, so a dropped or
+        // stale bias changes the outputs.
+        let build = |biased: bool, seed: u64| {
+            let mut params = ParamStore::new();
+            let mut rng = Rng::seed(seed);
+            let first = if biased {
+                Linear::new(&mut params, 5, 6, &mut rng)
+            } else {
+                Linear::without_bias(&mut params, 5, 6, Init::HeUniform, &mut rng)
+            };
+            let last = Linear::new(&mut params, 6, 3, &mut rng);
+            for id in [first.bias(), last.bias()].into_iter().flatten() {
+                for b in params.value_mut(id).data_mut() {
+                    *b = rng.range(0.1, 0.3) as f32;
+                }
+            }
+            let net = Sequential::new().push(first).push(Relu).push(last);
+            (net, params)
+        };
+        let x = inputs(9, 5, 43);
+        let view = TensorView::from_slice(&x, &[9, 5]).unwrap();
+        let fresh = |net: &Sequential, params: &ParamStore| {
+            let mut model = InferenceModel::compile(net, params).unwrap();
+            model.infer_batch(view).data().to_vec()
+        };
+
+        // (a) Bias-free to bias-free, new values: in place, bit for bit a fresh compile.
+        let (bare, mut bare_params) = build(false, 44);
+        let mut model = InferenceModel::compile(&bare, &bare_params).unwrap();
+        let before = model.infer_batch(view).data().to_vec();
+        for (_, id) in bare.parameter_names() {
+            for v in bare_params.value_mut(id).data_mut() {
+                *v = *v * 0.75 + 0.01;
+            }
+        }
+        assert!(model.refresh_in_place(&bare, &bare_params));
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &fresh(&bare, &bare_params), "bias-free, in place");
+        assert_ne!(got, before);
+
+        // (b) Compiled bias-free, now a same-width layer with a bias: not in place, and
+        // `refresh` gives that network's outputs.
+        let (biased, biased_params) = build(true, 45);
+        assert!(!model.refresh_in_place(&biased, &biased_params));
+        model.refresh(&biased, &biased_params).unwrap();
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &fresh(&biased, &biased_params), "bias added");
+
+        // (c) The reverse: compiled with a bias, now without one.
+        let mut model = InferenceModel::compile(&biased, &biased_params).unwrap();
+        assert!(!model.refresh_in_place(&bare, &bare_params));
+        model.refresh(&bare, &bare_params).unwrap();
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &fresh(&bare, &bare_params), "bias removed");
+    }
+
     /// `refresh_in_place` copies new weights, PReLU slopes and mask values into the
     /// compiled model, giving bit for bit the outputs of compiling afresh (a `Linear` fused
     /// with a ReLU, a per-channel PReLU, a model mask and a mask step `compile_with_masks`

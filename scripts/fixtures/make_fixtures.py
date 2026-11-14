@@ -38,7 +38,15 @@ values, runs the network and requires both PyTorch's f32 outputs and the library
 included, and the first layer's bound carried through the second layer's weights). To rewrite
 the two files after a deliberate change to `save`, run
 `CAVITATION_WRITE_FIXTURES=1 cargo test --release -p cavitation-nn --lib save_writes_the_file`,
-then this check, run from the repository root (`--out` defaults to `crates`):
+then this check, run from the repository root (`--out` defaults to `crates`).
+
+The same check runs on a second pair, `from-rust-no-bias.safetensors` and
+`from-rust-no-bias-io.json`, which the Rust test
+`save_writes_the_bias_free_file_pytorch_was_checked_against` keeps equal to what `save` writes
+for `Linear(4, 8, bias=False), ReLU, Linear(8, 3)`: the file must hold only `0.weight` for the
+first layer and load with strict keys into that PyTorch network. Rewrite it with
+`CAVITATION_WRITE_FIXTURES=1 cargo test --release -p cavitation-nn --lib save_writes_the_bias_free_file`.
+The command:
 
     scripts/fixtures/.venv/bin/python -I scripts/fixtures/make_fixtures.py --check-rust-save
 
@@ -624,7 +632,9 @@ def mlp_bound(model, x):
     `k` its terms (inputs plus the bias), and the first layer's bound carried through the
     second layer's absolute weights."""
     eps = 1.19e-7
-    w1, b1 = model[0].weight.double(), model[0].bias.double()
+    w1 = model[0].weight.double()
+    # A layer without a bias adds no term: its bias counts as 0.
+    b1 = model[0].bias.double() if model[0].bias is not None else torch.zeros(w1.shape[0], dtype=torch.float64)
     w2, b2 = model[2].weight.double(), model[2].bias.double()
     x = x.double()
     hidden_terms = (x.abs() @ w1.abs().T) + b1.abs()
@@ -635,13 +645,21 @@ def mlp_bound(model, x):
 
 
 def check_rust_save(crates_dir, saved=None):
-    """Loads the library-written safetensors file (by default the committed
-    `from-rust.safetensors`, or the file `saved`) into the PyTorch network and checks its
-    values and outputs against the committed `from-rust-io.json`; exits with a message on any
-    difference."""
+    """Checks both library-written files: `from-rust.safetensors` (or the file `saved`) in
+    `Linear(4, 8), ReLU, Linear(8, 3)`, then `from-rust-no-bias.safetensors` in
+    `Linear(4, 8, bias=False), ReLU, Linear(8, 3)`; exits with a message on any difference."""
+    check_rust_file(crates_dir, "from-rust", True, saved)
+    check_rust_file(crates_dir, "from-rust-no-bias", False)
+
+
+def check_rust_file(crates_dir, stem, first_bias, saved=None):
+    """Loads the library-written safetensors file `{stem}.safetensors` (or the file `saved`)
+    into the PyTorch network whose first `Linear` has a bias exactly when `first_bias` is
+    true, and checks its keys, values and outputs against the committed `{stem}-io.json`;
+    exits with a message on any difference."""
     in_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
-    state = load_file(saved or os.path.join(in_dir, "from-rust.safetensors"))
-    with open(os.path.join(in_dir, "from-rust-io.json")) as f:
+    state = load_file(saved or os.path.join(in_dir, stem + ".safetensors"))
+    with open(os.path.join(in_dir, stem + "-io.json")) as f:
         io = json.load(f)
 
     def tensor(t):
@@ -651,7 +669,13 @@ def check_rust_save(crates_dir, saved=None):
     for key in io["keys"]:
         check(state[key].dtype == torch.float32, f"{key}: {state[key].dtype}")
         check(torch.equal(state[key], tensor(io["params"][key])), f"{key}: values differ")
-    model = torch.nn.Sequential(torch.nn.Linear(4, 8), torch.nn.ReLU(), torch.nn.Linear(8, 3))
+    model = torch.nn.Sequential(
+        torch.nn.Linear(4, 8, bias=first_bias), torch.nn.ReLU(), torch.nn.Linear(8, 3)
+    )
+    check(
+        sorted(state) == sorted(model.state_dict()),
+        f"{stem}: keys {sorted(state)} != PyTorch's {sorted(model.state_dict())}",
+    )
     model.load_state_dict(state, strict=True)
     x = tensor(io["input"])
     ours = tensor(io["output"])
@@ -662,12 +686,12 @@ def check_rust_save(crates_dir, saved=None):
     for name, out in (("PyTorch", theirs), ("the library", ours)):
         diff = (out.double() - exact).abs()
         worst = (diff / bound).max().item()
-        check(bool((diff <= bound).all()), f"{name}'s outputs are outside the bound (worst {worst:.3g} of it)")
-        print(f"{name}: every output within the bound (worst {worst:.3g} of it)", file=sys.stderr)
+        check(bool((diff <= bound).all()), f"{stem}: {name}'s outputs are outside the bound (worst {worst:.3g} of it)")
+        print(f"{stem}: {name}: every output within the bound (worst {worst:.3g} of it)", file=sys.stderr)
     largest = (theirs - ours).abs().max().item()
     print(
-        f"from-rust.safetensors loads in torch {TORCH_VERSION} with strict keys, F32 values equal "
-        f"to the library's; largest output difference {largest:.3g}",
+        f"{stem}.safetensors loads in torch {TORCH_VERSION} with strict keys {list(state)}, F32 "
+        f"values equal to the library's; largest output difference {largest:.3g}",
         file=sys.stderr,
     )
 
