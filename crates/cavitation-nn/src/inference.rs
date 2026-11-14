@@ -1013,12 +1013,38 @@ impl Compiled {
                     );
                     width
                 }
-                InferenceLayer::MaxPool2d(geom) | InferenceLayer::AvgPool2d { geom, .. } => {
+                InferenceLayer::MaxPool2d(geom) => geom.out_width(),
+                InferenceLayer::AvgPool2d {
+                    geom,
+                    divisor_override,
+                    ..
+                } => {
+                    assert!(
+                        geom.dilation() == (1, 1) && *divisor_override != Some(0),
+                        "InferenceModel::compile: layer {i} ({name}) is an average pooling with \
+                         dilation {:?} and divisor {divisor_override:?}; it takes no dilation \
+                         and a divisor of at least 1",
+                        geom.dilation()
+                    );
                     geom.out_width()
                 }
                 InferenceLayer::AdaptiveAvgPool2d {
-                    channels, output, ..
-                } => channels * output.0 * output.1,
+                    channels,
+                    input,
+                    output,
+                } => {
+                    let out = channels
+                        .checked_mul(output.0)
+                        .and_then(|v| v.checked_mul(output.1))
+                        .filter(|_| input.0 > 0 && input.1 > 0 && output.0 > 0 && output.1 > 0);
+                    out.unwrap_or_else(|| {
+                        panic!(
+                            "InferenceModel::compile: layer {i} ({name}) pools {channels} \
+                             channels of {input:?} to {output:?}: every size must be at \
+                             least 1 and the output must fit in memory"
+                        )
+                    })
+                }
                 InferenceLayer::Conv2d { geom, weight, bias } => {
                     let biases = bias.as_ref().map_or(geom.out_channels(), Vec::len);
                     assert!(

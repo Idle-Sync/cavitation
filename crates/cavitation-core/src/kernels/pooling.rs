@@ -27,8 +27,9 @@ use crate::{Error, Real};
 /// The output size follows PyTorch: along each axis,
 /// `(size + 2 · padding − dilation · (kernel − 1) − 1) / stride + 1`, rounded down, or up
 /// with `ceil_mode`; with `ceil_mode`, a last window that would start in the padding past
-/// the image is dropped. The padding may be at most half the (dilated) window, as PyTorch
-/// requires, so every window holds at least one pixel of the image.
+/// the image is dropped. The padding may be at most half the window, as PyTorch requires,
+/// and a geometry in which some window's taps all miss the image (possible with dilation)
+/// is refused, so every window holds at least one pixel of the image.
 ///
 /// ```
 /// use cavitation_core::kernels::pooling::Pool2dGeom;
@@ -139,11 +140,9 @@ impl Pool2dGeom {
                  dilation {dilation:?}"
             ));
         }
-        let half = |k: usize, d: usize| d.saturating_mul(k - 1).saturating_add(1) / 2;
-        if padding.0 > half(kernel.0, dilation.0) || padding.1 > half(kernel.1, dilation.1) {
+        if padding.0 > kernel.0 / 2 || padding.1 > kernel.1 / 2 {
             return fail(format!(
-                "the padding {padding:?} must be at most half the window {kernel:?} (dilation \
-                 {dilation:?})"
+                "the padding {padding:?} must be at most half the window {kernel:?}"
             ));
         }
         let geom = Pool2dGeom {
@@ -167,6 +166,26 @@ impl Pool2dGeom {
                  {input:?} with padding {padding:?}"
             ));
         };
+        // With dilation a window's taps can all miss the image (falling in the padding on
+        // both sides); PyTorch writes an index outside the image there, which is refused here.
+        let misses = |out: usize, k: usize, st: usize, pd: usize, dl: usize, size: usize| {
+            (0..out).find(|&o| {
+                (0..k).all(|t| (o * st + t * dl).checked_sub(pd).is_none_or(|v| v >= size))
+            })
+        };
+        let missing = misses(rows, kernel.0, stride.0, padding.0, dilation.0, input.0)
+            .map(|o| ("row", o))
+            .or(
+                misses(cols, kernel.1, stride.1, padding.1, dilation.1, input.1)
+                    .map(|o| ("column", o)),
+            );
+        if let Some((axis, o)) = missing {
+            return fail(format!(
+                "output {axis} {o}'s window holds no pixel of the image: a {kernel:?} window \
+                 with dilation {dilation:?}, stride {stride:?} and padding {padding:?} on an \
+                 image of {input:?}"
+            ));
+        }
         let sizes = [
             channels
                 .checked_mul(input.0)
@@ -301,8 +320,8 @@ impl Pool2dGeom {
         self.channels * oh * ow
     }
 
-    /// The geometry as eleven numbers, in the order [`from_words`](Self::from_words) reads.
-    pub(crate) fn to_words(self) -> [usize; 11] {
+    /// The geometry as [`WORDS`] numbers, in the order [`from_words`](Self::from_words) reads.
+    pub(crate) fn to_words(self) -> [usize; WORDS] {
         [
             self.channels,
             self.input.0,
@@ -314,7 +333,8 @@ impl Pool2dGeom {
             self.padding.0,
             self.padding.1,
             self.dilation.0,
-            usize::from(self.ceil_mode) | (self.dilation.1 << 1),
+            self.dilation.1,
+            usize::from(self.ceil_mode),
         ]
     }
 
@@ -326,11 +346,14 @@ impl Pool2dGeom {
             kernel: (w[3], w[4]),
             stride: (w[5], w[6]),
             padding: (w[7], w[8]),
-            dilation: (w[9], w[10] >> 1),
-            ceil_mode: w[10] & 1 == 1,
+            dilation: (w[9], w[10]),
+            ceil_mode: w[11] == 1,
         }
     }
 }
+
+/// How many numbers [`Pool2dGeom::to_words`] writes.
+pub(crate) const WORDS: usize = 12;
 
 /// Panics, naming `what`, unless `len` is `expected`.
 fn check_len(what: &str, len: usize, expected: usize) {
@@ -648,7 +671,9 @@ pub fn adaptive_avg_pool2d<T: Real>(
                         acc += *v;
                     }
                 }
-                o_plane[oy * ow + ox] = acc / T::from_f64(((y1 - y0) * (x1 - x0)) as f64);
+                // PyTorch divides by the window's height, then by its width.
+                o_plane[oy * ow + ox] =
+                    acc / T::from_f64((y1 - y0) as f64) / T::from_f64((x1 - x0) as f64);
             }
         }
     }
@@ -695,7 +720,8 @@ pub fn adaptive_avg_pool2d_backward<T: Real>(
             let (y0, y1) = adaptive_window(oy, oh, h);
             for ox in 0..ow {
                 let (x0, x1) = adaptive_window(ox, ow, w);
-                let share = g[oy * ow + ox] / T::from_f64(((y1 - y0) * (x1 - x0)) as f64);
+                let share =
+                    g[oy * ow + ox] / T::from_f64((y1 - y0) as f64) / T::from_f64((x1 - x0) as f64);
                 for y in y0..y1 {
                     for v in &mut plane[y * w + x0..y * w + x1] {
                         *v += share;
@@ -735,8 +761,8 @@ mod tests {
             g((7, 7), (3, 3), (2, 2), (1, 1), (1, 1), true).unwrap(),
             (4, 4)
         );
-        // 6 with window 3, stride 2, padding 1: floor 3, ceil 4, and the 4th window would
-        // start at 6 >= 6 + 1? No: 3 · 2 = 6 < 7, so it stays.
+        // 6 with window 3, stride 2, padding 1: rounding up gives 4, and the 4th window
+        // starts at 3 · 2 = 6, inside the image and its padding (6 < 6 + 1), so it stays.
         assert_eq!(
             g((6, 6), (3, 3), (2, 2), (1, 1), (1, 1), true).unwrap(),
             (4, 4)
@@ -772,6 +798,44 @@ mod tests {
         assert!(
             Pool2dGeom::with_options(1, (4, 4), (2, 2), (1, 1), (0, 0), (0, 1), false).is_err()
         );
+    }
+
+    /// A dilated window whose taps all fall in the padding is refused, and the padding limit
+    /// is half the undilated window, as PyTorch checks it.
+    #[test]
+    fn windows_that_miss_the_image_are_refused() {
+        let e = Pool2dGeom::with_options(1, (1, 3), (1, 2), (1, 1), (0, 1), (1, 4), false)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("holds no pixel of the image"), "{e}");
+        // Kernel 3, dilation 2: padding 2 is more than 3 / 2 = 1.
+        assert!(
+            Pool2dGeom::with_options(1, (9, 9), (3, 3), (1, 1), (2, 2), (2, 2), false).is_err()
+        );
+        assert!(Pool2dGeom::with_options(1, (9, 9), (3, 3), (1, 1), (1, 1), (2, 2), false).is_ok());
+    }
+
+    /// A window covering the whole image gives a 1 × 1 output, the maximum or the mean;
+    /// adaptive pooling to a larger output than its input repeats pixels in overlapping
+    /// windows; and average pooling without the padding under `ceil_mode` divides by the
+    /// pixels summed.
+    #[test]
+    fn whole_image_larger_output_and_excluded_padding() {
+        let g = Pool2dGeom::new(1, (2, 3), (2, 3)).unwrap();
+        let x = [1.0f64, 5.0, 2.0, 4.0, 3.0, 9.0];
+        let (mut out, mut at) = (vec![0.0; 1], vec![0; 1]);
+        max_pool2d(&g, 1, &x, &mut out, Some(&mut at));
+        assert_eq!((out[0], at[0]), (9.0, 5));
+        avg_pool2d(&g, 1, &x, true, None, &mut out);
+        assert_eq!(out, [4.0]);
+        let mut out = vec![0.0; 3];
+        adaptive_avg_pool2d(1, 1, (1, 2), (1, 3), &[2.0, 4.0], &mut out);
+        assert_eq!(out, [2.0, 3.0, 4.0]);
+        let g = Pool2dGeom::with_options(1, (1, 5), (1, 2), (1, 2), (0, 1), (1, 1), true).unwrap();
+        assert_eq!(g.out_size(), (1, 3));
+        let mut out = vec![0.0; 3];
+        avg_pool2d(&g, 1, &[2.0, 4.0, 6.0, 8.0, 10.0], false, None, &mut out);
+        assert_eq!(out, [2.0, 5.0, 9.0]);
     }
 
     /// The words round trip, `ceil_mode` and the across dilation included.
@@ -818,9 +882,8 @@ mod tests {
     /// divides by the window clipped to the padded image, not the whole window.
     #[test]
     fn ceil_mode_divisor_counts_padding_not_overhang() {
-        // 5 wide, window 2, stride 2, padding 1, ceil: windows [-1, 1), [1, 3), [3, 5); the
-        // dropped 4th would start at 5. Then 6 wide, window 3, stride 2, no padding, ceil:
-        // windows [0, 3), [2, 5), [4, 7) clipped to [4, 6): divisor 2, not 3.
+        // 6 wide, window 3, stride 2, no padding, ceil: windows [0, 3), [2, 5) and [4, 7),
+        // the last clipped to [4, 6), so its divisor is 2, not 3.
         let g = Pool2dGeom::with_options(1, (1, 6), (1, 3), (1, 2), (0, 0), (1, 1), true).unwrap();
         assert_eq!(g.out_size(), (1, 3));
         let mut out = vec![0.0f32; 3];

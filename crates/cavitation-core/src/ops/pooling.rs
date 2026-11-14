@@ -3,8 +3,8 @@
 
 use crate::graph::{BackwardCtx, Var};
 use crate::kernels::pooling::{
-    Pool2dGeom, adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
-    max_pool2d, max_pool2d_backward,
+    Pool2dGeom, WORDS, adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d,
+    avg_pool2d_backward, max_pool2d, max_pool2d_backward,
 };
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
@@ -22,17 +22,6 @@ fn batch_of(op: &str, sx: &Shape, width: usize) -> usize {
         sx.dims()
     );
     sx.dims()[0]
-}
-
-/// How average pooling divides, packed into one label: `count_include_pad` in bit 0, the
-/// divisor override (0 for none) above it.
-fn pack_divisor(count_include_pad: bool, divisor_override: Option<usize>) -> usize {
-    usize::from(count_include_pad) | (divisor_override.unwrap_or(0) << 1)
-}
-
-/// The settings [`pack_divisor`] packed.
-fn unpack_divisor(word: usize) -> (bool, Option<usize>) {
-    (word & 1 == 1, Some(word >> 1).filter(|&d| d > 0))
 }
 
 impl<T: Real> Tape<'_, T> {
@@ -112,7 +101,12 @@ impl<T: Real> Tape<'_, T> {
             &mut out,
         );
         let start = self.push_labels(&geom.to_words());
-        self.push_labels(&[pack_divisor(count_include_pad, divisor_override)]);
+        // The divisor settings: whether the padding counts, and the override (0 for none,
+        // which `avg_pool2d` has already refused as an override).
+        self.push_labels(&[
+            usize::from(count_include_pad),
+            divisor_override.unwrap_or(0),
+        ]);
         let so = Shape::new(&[batch, geom.out_width()]);
         self.push(Op::AvgPool2d(x, start), so, out)
     }
@@ -163,9 +157,9 @@ pub(super) fn max_backward<T: Real>(
     ctx: &mut BackwardCtx<'_, T>,
 ) {
     let labels = ctx.labels();
-    let geom = Pool2dGeom::from_words(&labels[start..start + 11]);
+    let geom = Pool2dGeom::from_words(&labels[start..start + WORDS]);
     let batch = ctx.shape(x).dims()[0];
-    let winners = &labels[start + 11..][..batch * geom.out_width()];
+    let winners = &labels[start + WORDS..][..batch * geom.out_width()];
     if let Some(slot) = ctx.slot(x) {
         slot.update_with(|buf, beta| {
             if beta == T::ZERO {
@@ -185,8 +179,11 @@ pub(super) fn avg_backward<T: Real>(
     ctx: &mut BackwardCtx<'_, T>,
 ) {
     let labels = ctx.labels();
-    let geom = Pool2dGeom::from_words(&labels[start..start + 11]);
-    let (include, over) = unpack_divisor(labels[start + 11]);
+    let geom = Pool2dGeom::from_words(&labels[start..start + WORDS]);
+    let (include, over) = (
+        labels[start + WORDS] == 1,
+        Some(labels[start + WORDS + 1]).filter(|&d| d > 0),
+    );
     let batch = ctx.shape(x).dims()[0];
     if let Some(slot) = ctx.slot(x) {
         slot.update_with(|buf, beta| {
@@ -298,5 +295,26 @@ mod tests {
             store.grad(x).data(),
             &[0.0, 2.0, 0.0, 0.0, 0.0, 0.0, 2.0, 0.0]
         );
+    }
+
+    /// A NaN on the tape wins its max-pooling window, the last of two NaNs takes the
+    /// gradient, and average pooling spreads the NaN over its window's output.
+    #[test]
+    fn nan_through_the_tape() {
+        let mut store = ParamStore::new();
+        let x =
+            store.add(Tensor::from_vec(vec![1.0f32, f32::NAN, 3.0, f32::NAN], &[1, 4]).unwrap());
+        let geom = Pool2dGeom::new(1, (1, 4), (1, 4)).unwrap();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.param(x);
+        let m = tape.max_pool2d(v, geom);
+        assert!(tape.value(m).data()[0].is_nan());
+        let a = tape.avg_pool2d(v, geom, true, None);
+        assert!(tape.value(a).data()[0].is_nan());
+        let loss = tape.sum(m);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        assert_eq!(store.grad(x).data(), &[0.0, 0.0, 0.0, 1.0]);
     }
 }

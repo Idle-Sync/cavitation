@@ -53,10 +53,10 @@ pub(crate) enum Op<T: Real> {
     /// 2-D convolution: the images, the weight, the bias if any, and where the geometry's
     /// twelve numbers start in the graph's label buffer.
     Conv2d(Var, Var, Option<Var>, usize),
-    /// 2-D max pooling: the images, and where the geometry's eleven numbers start in the
+    /// 2-D max pooling: the images, and where the geometry's numbers start in the
     /// label buffer, each output's winner after them.
     MaxPool2d(Var, usize),
-    /// 2-D average pooling: the images, and where the geometry's eleven numbers start in the
+    /// 2-D average pooling: the images, and where the geometry's numbers start in the
     /// label buffer, the divisor settings after them.
     AvgPool2d(Var, usize),
     /// 2-D adaptive average pooling: the images, and where the channels, input size and

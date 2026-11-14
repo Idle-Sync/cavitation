@@ -658,6 +658,7 @@ def make_pool():
         ("2x2-p1-ceil-dropped", 1, 2, (5, 5), (2, 2), (2, 2), (1, 1), (1, 1), True),
         ("dilated", 1, 2, (9, 9), (3, 3), (1, 1), (0, 0), (2, 2), False),
         ("non-square", 2, 2, (5, 8), (2, 3), (1, 2), (1, 1), (1, 1), False),
+        ("dilated-padded-ceil", 1, 2, (8, 7), (3, 3), (2, 2), (1, 1), (2, 2), True),
     ]
     for name, batch, c, (h, w), k, st, pd, dl, ceil in max_cases:
         def pool(x, shape=(batch, c, h, w), k=k, st=st, pd=pd, dl=dl, ceil=ceil):
@@ -675,6 +676,7 @@ def make_pool():
         ("ceil-include", 1, 2, (6, 6), (3, 3), (2, 2), (1, 1), True, True, None),
         ("ceil-overhang", 1, 1, (1, 6), (1, 3), (1, 2), (0, 0), True, True, None),
         ("divisor", 2, 2, (5, 5), (2, 2), (1, 1), (1, 0), False, True, 3),
+        ("ceil-exclude", 1, 2, (6, 6), (3, 3), (2, 2), (1, 1), True, False, None),
     ]
     for name, batch, c, (h, w), k, st, pd, ceil, include, divisor in avg_cases:
         def pool(x, shape=(batch, c, h, w), k=k, st=st, pd=pd, ceil=ceil, include=include, divisor=divisor):
@@ -690,6 +692,7 @@ def make_pool():
         ("7-to-3", 2, 2, (7, 7), (3, 3)),
         ("5x8-to-2x3", 1, 3, (5, 8), (2, 3)),
         ("same", 1, 2, (4, 4), (4, 4)),
+        ("2-to-3", 1, 2, (2, 2), (3, 3)),
     ]:
         def pool(x, shape=(batch, c, h, w), out=(oh, ow)):
             return F.adaptive_avg_pool2d(x.reshape(shape), out).reshape(shape[0], -1)
