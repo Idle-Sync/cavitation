@@ -1272,14 +1272,16 @@ impl Run {
                     if cur.is_none() {
                         bufs[c][..n_in].copy_from_slice(&input[..n_in]);
                     }
-                    // In place: output (r, k) is written after its two inputs (r, k) and
-                    // (r, half + k) are read, and every later read is further along.
+                    // In place: row r's gate half becomes its gate values (that half is read
+                    // by row r only), then output (r, k) is written after its two inputs
+                    // (r, k) and (r, half + k) are read, and every later read is further along.
                     let buf = &mut bufs[c];
                     for r in 0..rows {
+                        gate_in_place(self.level, *gate, &mut buf[r * width + half..][..half]);
                         for k in 0..half {
                             let a = buf[r * width + k];
-                            let b = buf[r * width + half + k];
-                            buf[r * half + k] = a * gate_value(*gate, b);
+                            let g = buf[r * width + half + k];
+                            buf[r * half + k] = a * g;
                         }
                     }
                     cur = Some(c);
@@ -1377,18 +1379,20 @@ fn relu_value(v: f32) -> f32 {
     if v <= 0.0 { 0.0 } else { v }
 }
 
-/// The value of a gated linear unit's gate at `x`, as the tape computes it: its sigmoid,
-/// SiLU and tanh-GELU gates are the scalar forms, not the SIMD kernels of the `Sigmoid`,
-/// `Silu` and `Gelu` layers.
-fn gate_value(gate: Gate, x: f32) -> f32 {
+/// Replaces every value with a gated linear unit's gate at it, as the tape computes it:
+/// the sigmoid, SiLU and tanh-GELU gates on the SIMD kernels of `level`, the others one
+/// value at a time.
+fn gate_in_place(level: Level, gate: Gate, values: &mut [f32]) {
     let kind = match gate {
-        Gate::Sigmoid => return crate::activation::sigmoid(x),
-        Gate::Silu => return x * crate::activation::sigmoid(x),
-        Gate::Gelu(GeluApprox::Tanh) => return crate::activation::gelu_tanh_scalar(x),
+        Gate::Sigmoid => return sigmoid_f32_with(level, values),
+        Gate::Silu => return silu_f32_with(level, values),
+        Gate::Gelu(GeluApprox::Tanh) => return gelu_tanh_f32_with(level, values),
         Gate::Gelu(approx) => ActivationKind::Gelu(approx),
         Gate::Relu => ActivationKind::Relu,
     };
-    Activation::<f32>::f(&kind, x)
+    for v in values {
+        *v = Activation::<f32>::f(&kind, *v);
+    }
 }
 
 /// Applies a step that keeps the width to `data` in place, `width` values per row; `tanh`

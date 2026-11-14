@@ -29,6 +29,22 @@ pub enum Gate {
 }
 
 impl Gate {
+    /// Replaces every value with the gate's value at it: the sigmoid, SiLU and the tanh form
+    /// of GELU through [`Real::sigmoid_in_place`], [`Real::silu_in_place`] and
+    /// [`Real::gelu_tanh_in_place`] (the SIMD kernels in f32), the others one value at a time.
+    fn apply_in_place<T: Real>(self, values: &mut [T]) {
+        match self {
+            Gate::Sigmoid => T::sigmoid_in_place(values),
+            Gate::Silu => T::silu_in_place(values),
+            Gate::Gelu(GeluApprox::Tanh) => T::gelu_tanh_in_place(values),
+            Gate::Gelu(GeluApprox::Exact) | Gate::Relu => {
+                for v in values {
+                    *v = self.value(*v);
+                }
+            }
+        }
+    }
+
     /// The gate's value at `x`.
     fn value<T: Real>(self, x: T) -> T {
         match self {
@@ -97,8 +113,10 @@ impl<T: Real> Tape<'_, T> {
                 .zip(self.data(x).chunks_exact(width))
             {
                 let (a, b) = row.split_at(half);
-                for ((o, &a), &b) in o.iter_mut().zip(a).zip(b) {
-                    *o = a * gate.value(b);
+                o.copy_from_slice(b);
+                gate.apply_in_place(o);
+                for (o, &a) in o.iter_mut().zip(a) {
+                    *o = a * *o;
                 }
             }
         }
