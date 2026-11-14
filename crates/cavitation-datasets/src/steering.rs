@@ -88,10 +88,7 @@ pub fn network(params: &mut ParamStore, seed: u64) -> Sequential {
 
 /// The example's training recipe for `epochs` epochs (8 in the example): Adam at learning
 /// rate 0.002, batch 32, mean squared error on the angle in degrees, shuffle seed 3, and the
-/// default health checks without the dead-ReLU report. That report counts each position of
-/// a convolution's output as a neuron, and on these images many positions see only flat
-/// road or ground, so a ReLU after a convolution outputs 0 there for a whole epoch without
-/// being dead.
+/// default health checks.
 ///
 /// ```
 /// let config = cavitation_datasets::steering::recipe(8);
@@ -107,10 +104,7 @@ pub fn recipe(epochs: usize) -> FitConfig<'static> {
         },
         loss: Loss::Mse,
         shuffle_seed: Some(3),
-        health: Health {
-            dead_relu: false,
-            ..Health::default()
-        },
+        health: Health::default(),
         ..FitConfig::default()
     }
 }
