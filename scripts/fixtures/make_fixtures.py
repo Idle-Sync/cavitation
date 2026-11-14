@@ -604,6 +604,41 @@ def make_dropout():
         add_case(name, "dropout_with_mask", {"p": p, "keep": keep_list}, [rnd(*shape)], dropped)
 
 
+def make_conv():
+    """conv2d: `F.conv2d` on images flattened to rows, as the library takes them.
+
+    Each case records the images as `[batch, channels · height · width]`, the weight as
+    `[out, in, kh, kw]` and, unless the case has none, the bias. Built after every other
+    case, so its draws shift none of their inputs.
+    """
+    cases = [
+        # name, batch, in, out, (h, w), (kh, kw), stride, padding, dilation, bias
+        ("3x3", 2, 3, 4, (6, 6), (3, 3), (1, 1), (0, 0), (1, 1), True),
+        ("3x3-pad", 2, 3, 4, (6, 6), (3, 3), (1, 1), (1, 1), (1, 1), True),
+        ("stride2", 2, 2, 3, (7, 7), (3, 3), (2, 2), (1, 1), (1, 1), True),
+        ("dilated", 1, 2, 2, (9, 9), (3, 3), (1, 1), (2, 2), (2, 2), True),
+        ("non-square", 2, 3, 2, (5, 8), (2, 3), (1, 2), (1, 0), (1, 1), True),
+        ("1x1", 3, 4, 5, (4, 4), (1, 1), (1, 1), (0, 0), (1, 1), True),
+        ("1x1-stride2", 2, 4, 3, (5, 5), (1, 1), (2, 2), (0, 0), (1, 1), True),
+        ("no-bias", 2, 3, 4, (5, 5), (3, 3), (1, 1), (1, 1), (1, 1), False),
+        ("lenet-c1", 2, 1, 6, (28, 28), (5, 5), (1, 1), (2, 2), (1, 1), True),
+        ("full-kernel", 2, 2, 3, (3, 3), (3, 3), (1, 1), (0, 0), (1, 1), True),
+        ("pad-past-kernel", 2, 1, 2, (3, 3), (2, 2), (1, 1), (3, 2), (1, 1), True),
+        ("stride2-dilated2", 2, 2, 2, (9, 8), (3, 2), (2, 2), (1, 1), (2, 3), True),
+    ]
+    for name, batch, cin, cout, (h, w), kernel, stride, padding, dilation, bias in cases:
+        x = rnd(batch, cin * h * w)
+        weight = rnd(cout, cin, *kernel, scale=0.5)
+        inputs = [x, weight] + ([rnd(cout)] if bias else [])
+
+        def conv(x, weight, *b, shape=(batch, cin, h, w), s=stride, p=padding, d=dilation):
+            y = F.conv2d(x.reshape(shape), weight, b[0] if b else None, stride=s, padding=p, dilation=d)
+            return y.reshape(shape[0], -1)
+
+        params = {"input": [h, w], "stride": list(stride), "padding": list(padding), "dilation": list(dilation)}
+        add_case(f"conv2d-{name}", "conv2d", params, inputs, conv)
+
+
 def write_state_dict(crates_dir):
     """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` and its outputs for five inputs."""
     out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
@@ -822,6 +857,7 @@ def main():
     make_optimizers()
     make_select()
     make_dropout()
+    make_conv()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):

@@ -885,6 +885,12 @@ impl<T: Real> Tape<'_, T> {
         self.graph.pool.take(len)
     }
 
+    /// Returns a buffer from [`take_buffer`](Self::take_buffer) that no node keeps, such as
+    /// an operation's scratch space, to the graph's pool.
+    pub(crate) fn give_buffer(&mut self, buf: Vec<T>) {
+        self.graph.pool.give(buf);
+    }
+
     /// Adds `n` to the count of clamped logarithms.
     pub(crate) fn add_clamped_logs(&mut self, n: usize) {
         self.clamped_logs += n;

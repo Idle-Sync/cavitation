@@ -63,6 +63,7 @@
 //! ```
 
 mod activation;
+mod conv;
 mod dropout;
 mod health;
 mod hooks;
@@ -84,6 +85,7 @@ pub use activation::{
     Hardtanh, LeakyRelu, LogSigmoid, LogSoftmax, Mish, Prelu, Relu, Relu6, Selu, Sigmoid, Silu,
     Softmax, Softplus, Softsign, Tanh,
 };
+pub use conv::Conv2d;
 pub use dropout::{Dropout, Flatten, Identity};
 pub use health::{BadInput, Health, HealthMonitor, OnNonFinite, StepInputs, Warning, WarningKind};
 pub use hooks::{HookId, Hooks, LayerEvent};

@@ -18,11 +18,12 @@ use cavitation_core::kernels::activation::{
     celu_f32_with, elu_f32_with, gelu_tanh_f32_with, log_sigmoid_f32_with, mish_f32_with,
     selu_f32_with, sigmoid_f32_with, silu_f32_with, softplus_beta_f32_with, tanh_f32_with,
 };
+use cavitation_core::kernels::conv::{conv2d_forward, conv2d_scratch};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
 use cavitation_core::{
-    Error, Gate, GeluApprox, ParamStore, Real, TensorView, log_softmax_row, softmax_row,
+    Conv2dGeom, Error, Gate, GeluApprox, ParamStore, Real, TensorView, log_softmax_row, softmax_row,
 };
 
 use crate::{Activation, ActivationKind, NeuronMask, Sequential};
@@ -67,6 +68,16 @@ pub enum InferenceLayer {
     Mask(Vec<f32>),
     /// A layer that passes its input through at inference: `Dropout`, `Flatten`, `Identity`.
     Identity,
+    /// A 2-D convolution: its geometry, the weight (`[out, in, kh, kw]`, row-major) and the
+    /// bias (`[out]`), or `None` for a layer without one.
+    Conv2d {
+        /// The convolution's shape.
+        geom: Conv2dGeom,
+        /// The weight, `out · in · kh · kw` values.
+        weight: Vec<f32>,
+        /// The bias, `out` values, or `None`.
+        bias: Option<Vec<f32>>,
+    },
 }
 
 /// The closure [`InferenceModel::infer_batch_observed`] calls with each layer's index and
@@ -170,6 +181,9 @@ pub struct InferenceModel {
     /// Two buffers the steps write to in turn, each at least `max_width` values per row of
     /// the largest batch seen so far.
     bufs: [Vec<f32>; 2],
+    /// The convolution steps' scratch: a column matrix and a product, as long as the
+    /// largest batch seen so far needs ([`conv_scratch_len`]).
+    cols: Vec<f32>,
 }
 
 /// Compiles only while `InferenceModel` is `Send` and `Sync`, so a change that loses either
@@ -281,10 +295,12 @@ impl InferenceModel {
         }
         let (compiled, masks) = Compiled::build(model, params, layers)?;
         let max_width = compiled.max_width;
+        let cols = vec![0.0; conv_scratch_len(&compiled.steps, 1)];
         Ok(InferenceModel {
             shared: Arc::new(compiled),
             masks,
             bufs: [vec![0.0; max_width], vec![0.0; max_width]],
+            cols,
         })
     }
 
@@ -449,6 +465,16 @@ impl InferenceModel {
                         }
                     }
                     if let (Some(bias), Some(id)) = (bias.as_mut(), linear.bias()) {
+                        bias.copy_from_slice(values.get(id).data());
+                    }
+                }
+                Op::Layer(InferenceLayer::Conv2d { weight, bias, .. }) => {
+                    let conv = model
+                        .layer(step.layer)
+                        .as_conv2d()
+                        .expect("checked by fits_in_place");
+                    weight.copy_from_slice(values.get(conv.weight()).data());
+                    if let (Some(bias), Some(id)) = (bias.as_mut(), conv.bias()) {
                         bias.copy_from_slice(values.get(id).data());
                     }
                 }
@@ -643,6 +669,10 @@ impl InferenceModel {
             shared.input_width,
             input.len()
         );
+        let scratch = conv_scratch_len(&shared.steps, 1);
+        if self.cols.len() < scratch {
+            self.cols.resize(scratch, 0.0);
+        }
         let run = Run {
             level: kernels::level(),
             threads: 1,
@@ -650,7 +680,14 @@ impl InferenceModel {
             batched: false,
             steps: 0..shared.steps.len(),
         };
-        let at = run.forward(shared, &self.masks, input, &mut self.bufs, None);
+        let at = run.forward(
+            shared,
+            &self.masks,
+            input,
+            &mut self.bufs,
+            &mut self.cols,
+            None,
+        );
         &self.bufs[at][..shared.output_width]
     }
 
@@ -808,6 +845,10 @@ impl InferenceModel {
                 buf.resize(need, 0.0);
             }
         }
+        let scratch = conv_scratch_len(&shared.steps[steps.clone()], rows);
+        if self.cols.len() < scratch {
+            self.cols.resize(scratch, 0.0);
+        }
         let one = rows == 1;
         let run = Run {
             level: kernels::level(),
@@ -816,7 +857,14 @@ impl InferenceModel {
             batched: !one,
             steps,
         };
-        let at = run.forward(shared, &self.masks, inputs, &mut self.bufs, observe);
+        let at = run.forward(
+            shared,
+            &self.masks,
+            inputs,
+            &mut self.bufs,
+            &mut self.cols,
+            observe,
+        );
         &self.bufs[at][..rows * width]
     }
 
@@ -942,6 +990,16 @@ impl Compiled {
                         slopes.len()
                     );
                     width
+                }
+                InferenceLayer::Conv2d { geom, weight, bias } => {
+                    let biases = bias.as_ref().map_or(geom.out_channels(), Vec::len);
+                    assert!(
+                        weight.len() == geom.weight_len() && biases == geom.out_channels(),
+                        "InferenceModel::compile: layer {i} ({name}) has {} weights and \
+                         {biases} biases for {geom:?}",
+                        weight.len(),
+                    );
+                    geom.out_width()
                 }
                 InferenceLayer::Glu(_) => {
                     assert!(
@@ -1070,10 +1128,24 @@ impl Compiled {
                 InferenceLayer::Prelu(slopes) => layer
                     .as_prelu()
                     .is_some_and(|prelu| values.get(prelu.weight()).data().len() == slopes.len()),
+                InferenceLayer::Conv2d { geom, bias, .. } => {
+                    layer.as_conv2d().is_some_and(|conv| {
+                        conv.geom() == *geom
+                            && values.get(conv.weight()).data().len() == geom.weight_len()
+                            && match (bias, conv.bias()) {
+                                (Some(_), Some(id)) => {
+                                    values.get(id).data().len() == geom.out_channels()
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    })
+                }
                 InferenceLayer::Mask(_) => false,
                 other => {
                     layer.as_linear().is_none()
                         && layer.as_prelu().is_none()
+                        && layer.as_conv2d().is_none()
                         && layer.inference(values).as_ref() == Some(other)
                 }
             };
@@ -1143,6 +1215,31 @@ impl Compiled {
     }
 }
 
+/// The scratch one `Conv2d` step takes for `rows` images: the column matrix's length and
+/// the product's, none for a 1 × 1 kernel with stride 1 and no padding.
+fn conv_scratch(geom: &Conv2dGeom, rows: usize) -> (usize, usize) {
+    if geom.is_pointwise() {
+        (0, 0)
+    } else {
+        conv2d_scratch(geom, rows)
+    }
+}
+
+/// The scratch every `Conv2d` step of `steps` fits in for `rows` images.
+fn conv_scratch_len(steps: &[Step], rows: usize) -> usize {
+    steps
+        .iter()
+        .filter_map(|s| match &s.op {
+            Op::Layer(InferenceLayer::Conv2d { geom, .. }) => {
+                let (c, p) = conv_scratch(geom, rows);
+                Some(c + p)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The width a layer's form itself requires of its input: a `Linear`'s inputs, the slopes
 /// of a per-channel `Prelu`, a mask's width.
 fn declared_width(form: &InferenceLayer) -> Option<usize> {
@@ -1150,6 +1247,7 @@ fn declared_width(form: &InferenceLayer) -> Option<usize> {
         InferenceLayer::Linear { inputs, .. } => Some(*inputs),
         InferenceLayer::Prelu(slopes) if slopes.len() > 1 => Some(slopes.len()),
         InferenceLayer::Mask(keep) => Some(keep.len()),
+        InferenceLayer::Conv2d { geom, .. } => Some(geom.in_width()),
         _ => None,
     }
 }
@@ -1205,6 +1303,7 @@ impl Run {
         masks: &[Vec<f32>],
         input: &[f32],
         bufs: &mut [Vec<f32>; 2],
+        cols: &mut [f32],
         mut observe: Option<Observer<'_>>,
     ) -> usize {
         let rows = self.rows;
@@ -1243,6 +1342,24 @@ impl Run {
                         (w_t, bias.as_deref(), *inputs, *outputs, step.relu),
                         &src[..n_in],
                         &mut dst[..n_out],
+                    );
+                    cur = Some(to);
+                }
+                InferenceLayer::Conv2d { geom, weight, bias } => {
+                    let to = cur.map_or(0, |c| 1 - c);
+                    let [b0, b1] = bufs;
+                    let (src, dst): (&[f32], &mut [f32]) = match cur {
+                        None => (input, if to == 0 { b0 } else { b1 }),
+                        Some(0) => (b0, b1),
+                        Some(_) => (b1, b0),
+                    };
+                    self.conv2d(
+                        geom,
+                        weight,
+                        bias.as_deref(),
+                        &src[..n_in],
+                        &mut dst[..n_out],
+                        cols,
                     );
                     cur = Some(to);
                 }
@@ -1303,6 +1420,37 @@ impl Run {
             observe_step(step, &mut observe, &bufs[c][..n_out], rows);
         }
         cur.expect("the range holds at least one step")
+    }
+
+    /// One `Conv2d` step from `src` (`rows` input images) into `dst` (`rows` output images),
+    /// by [`conv2d_forward`] with the GEMM of this call's level and threads, as the tape
+    /// computes it: with the tape's bits, for one input as for a batch, except at the
+    /// Accelerate level, where a product of another shape can differ within the GEMM bound
+    /// (see [`conv2d_forward`]); `scratch` holds
+    /// the column matrix and the product ([`conv_scratch`]).
+    fn conv2d(
+        &self,
+        geom: &Conv2dGeom,
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        src: &[f32],
+        dst: &mut [f32],
+        scratch: &mut [f32],
+    ) {
+        let (cols_len, prod_len) = conv_scratch(geom, self.rows);
+        let (cols, rest) = scratch.split_at_mut(cols_len);
+        let (level, threads) = (self.level, self.threads);
+        conv2d_forward(
+            geom,
+            self.rows,
+            src,
+            weight,
+            bias,
+            dst,
+            cols,
+            &mut rest[..prod_len],
+            |a, b, c| gemm_f32_with(level, threads, 1.0, a, b, 0.0, c),
+        );
     }
 
     /// One `Linear` step, `(w_t, bias, inputs, outputs, relu)`, from `src` (`rows` rows of
@@ -1438,9 +1586,10 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         InferenceLayer::Identity => {}
         InferenceLayer::Linear { .. }
         | InferenceLayer::Glu(_)
+        | InferenceLayer::Conv2d { .. }
         | InferenceLayer::Softmax
         | InferenceLayer::LogSoftmax => {
-            unreachable!("Linear, Glu, Softmax and LogSoftmax steps run on their own")
+            unreachable!("Linear, Conv2d, Glu, Softmax and LogSoftmax steps run on their own")
         }
     }
 }

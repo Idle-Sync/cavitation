@@ -52,6 +52,19 @@ pub enum Init {
         /// The standard deviation: finite and not negative.
         std: f64,
     },
+    /// Uniform in `±1 / sqrt(fan_in)`: PyTorch's default for the weight and the bias of
+    /// `nn.Linear` and `nn.Conv2d` (`kaiming_uniform_(a = √5)` on the weight, which comes to
+    /// this bound, and the same bound on the bias).
+    ///
+    /// ```
+    /// use cavitation_core::{Rng, Tensor};
+    /// use cavitation_nn::Init;
+    /// let mut w = Tensor::<f32>::zeros(&[16, 27]);
+    /// Init::TorchDefault.fill(&mut w, 27, 16 * 9, &mut Rng::seed(0));
+    /// let bound = 1.0 / 27f32.sqrt();
+    /// assert!(w.data().iter().all(|v| v.abs() <= bound));
+    /// ```
+    TorchDefault,
 }
 
 impl Init {
@@ -99,6 +112,10 @@ impl Init {
             Init::HeNormal => {
                 let std = (2.0 / fans(fan_in)).sqrt();
                 normal(t, std, rng);
+            }
+            Init::TorchDefault => {
+                let bound = 1.0 / fans(fan_in).sqrt();
+                uniform(t, bound, rng);
             }
             Init::Normal { std } => {
                 assert!(

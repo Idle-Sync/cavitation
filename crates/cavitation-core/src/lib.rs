@@ -63,6 +63,7 @@ mod test_child;
 pub use check::{GradcheckFailure, GradcheckReport, gradcheck, gradcheck_params};
 pub use error::{Error, KeyErrors};
 pub use graph::{Graph, ParamGrads, ParamId, ParamStore, ParamValues, Tape, Var};
+pub use kernels::conv::Conv2dGeom;
 pub use ops::{CustomOp, Gate, GeluApprox, Reduction, log_softmax_row, softmax_row};
 pub use real::Real;
 pub use rng::{Rng, SplitMix64};
