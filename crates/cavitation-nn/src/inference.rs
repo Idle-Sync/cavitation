@@ -4,7 +4,7 @@
 //! [`InferenceModel::compile`] copies each layer's parameters into the layout the kernels
 //! read (a `Linear` weight transposed to `[inputs, outputs]`), turns each neuron mask into a
 //! step of its own, and fuses a `Linear` followed by a ReLU into one kernel call. One input
-//! runs through the matvec kernel on the calling thread; a batch runs through the GEMM.
+//! runs through the matvec kernel on the calling thread; a batch of two or more rows runs through the GEMM.
 //!
 //! The weights are shared by every clone of a compiled model; the masks' keep values are
 //! each instance's own, so [`InferenceModel::set_neuron_mask`] (by `Linear`) and
@@ -641,7 +641,10 @@ impl InferenceModel {
     /// for the current [`level`](cavitation_core::kernels::level) on
     /// [`threads`](cavitation_core::kernels::threads) threads, and returns the outputs,
     /// shape `[batch, output_width]` (in the model's own buffer, valid until the next call).
-    /// Allocates only when the batch is larger than any before it.
+    /// A batch of one row runs [`infer`](Self::infer)'s matvec path instead, on the calling
+    /// thread, and gives `infer`'s output bit for bit. Allocates only when the batch is
+    /// larger than any before it. [`infer_rows`](Self::infer_rows) takes the inputs as a
+    /// plain slice.
     ///
     /// # Panics
     ///
@@ -663,6 +666,38 @@ impl InferenceModel {
     /// ```
     pub fn infer_batch(&mut self, inputs: TensorView<f32>) -> TensorView<'_, f32> {
         self.batch("infer_batch", inputs, None)
+    }
+
+    /// [`infer_batch`](Self::infer_batch) on `rows` inputs laid out one after another in
+    /// `inputs` (`rows · input_width` values), without building a tensor: returns the
+    /// `rows · output_width` outputs, row after row, in the model's own buffer, valid until
+    /// the next call. The outputs are `infer_batch`'s, bit for bit; one row runs
+    /// [`infer`](Self::infer)'s path. Allocates only when `rows` is larger than any batch
+    /// before it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `inputs.len()` is not `rows · input_width`; the message names both.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{InferenceModel, Linear, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
+    /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[2.0, -1.0]);
+    /// params.value_mut(layer.bias().unwrap()).data_mut()[0] = 0.5;
+    /// let net = Sequential::new().push(layer);
+    /// let mut model = InferenceModel::compile(&net, &params).unwrap();
+    /// assert_eq!(model.infer_rows(&[3.0, 1.0, 0.0, 1.0], 2), &[5.5, -0.5]);
+    /// ```
+    pub fn infer_rows(&mut self, inputs: &[f32], rows: usize) -> &[f32] {
+        let width = self.shared.input_width;
+        assert!(
+            Some(inputs.len()) == rows.checked_mul(width),
+            "infer_rows: expected {rows} rows of width {width}, got {} values",
+            inputs.len()
+        );
+        self.run_rows(inputs, rows, None)
     }
 
     /// Like [`infer_batch`](Self::infer_batch), and calls `observe(layer, output)` with the
@@ -719,23 +754,36 @@ impl InferenceModel {
             "{what}: expected inputs of shape [batch, {}], got {dims:?}",
             shared.input_width
         );
-        let rows = dims[0];
-        let need = rows * shared.max_width;
+        let (rows, width) = (dims[0], shared.output_width);
+        let out = self.run_rows(inputs.data(), rows, observe);
+        TensorView::from_slice(out, &[rows, width])
+            .expect("the output buffer holds batch × output_width values")
+    }
+
+    /// Runs `rows` rows of `inputs` (checked by the caller to hold `rows · input_width`
+    /// values) through the model and returns the `rows · output_width` outputs: one row on
+    /// the calling thread with the matvec, as [`infer`](Self::infer) runs it (the GEMM's
+    /// set-up costs more than a single row's work), more with the GEMM on
+    /// [`threads`](cavitation_core::kernels::threads) threads.
+    fn run_rows(&mut self, inputs: &[f32], rows: usize, observe: Option<Observer<'_>>) -> &[f32] {
+        let shared = &*self.shared;
+        let need = rows
+            .checked_mul(shared.max_width)
+            .expect("the batch's buffers fit in memory");
         for buf in &mut self.bufs {
             if buf.len() < need {
                 buf.resize(need, 0.0);
             }
         }
+        let one = rows == 1;
         let run = Run {
             level: kernels::level(),
-            threads: kernels::threads(),
+            threads: if one { 1 } else { kernels::threads() },
             rows,
-            batched: true,
+            batched: !one,
         };
-        let at = run.forward(shared, &self.masks, inputs.data(), &mut self.bufs, observe);
-        let out = &self.bufs[at][..rows * shared.output_width];
-        TensorView::from_slice(out, &[rows, shared.output_width])
-            .expect("the output buffer holds batch × output_width values")
+        let at = run.forward(shared, &self.masks, inputs, &mut self.bufs, observe);
+        &self.bufs[at][..rows * shared.output_width]
     }
 }
 
@@ -1532,6 +1580,54 @@ pub(crate) mod tests {
                 assert_within(got.data(), &want[at.clone()], &bound[at], &what);
             }
         }
+    }
+
+    /// A one-row `infer_batch` (and `infer_batch_observed`, whose last observed output is the
+    /// returned one) gives `infer`'s output bit for bit, and `infer_rows` gives
+    /// `infer_batch`'s outputs bit for bit for 1, 2, 7 and 128 rows.
+    #[test]
+    fn one_row_batches_and_plain_rows_match() {
+        let mut params = ParamStore::new();
+        let net = network(&mut params, 5);
+        let x = inputs(128, 64, 6);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        for r in 0..20 {
+            let row = &x[r * 64..(r + 1) * 64];
+            let want = model.infer(row).to_vec();
+            let view = TensorView::from_slice(row, &[1, 64]).unwrap();
+            assert_same(
+                model.infer_batch(view).data(),
+                &want,
+                &format!("row {r}, batch"),
+            );
+            let mut last = Vec::new();
+            let got = model
+                .infer_batch_observed(view, &mut |_, out| last = out.data().to_vec())
+                .data()
+                .to_vec();
+            assert_same(&got, &want, &format!("row {r}, observed"));
+            assert_same(&last, &want, &format!("row {r}, last observed"));
+        }
+        for rows in [1usize, 2, 7, 128] {
+            let slice = &x[..rows * 64];
+            let view = TensorView::from_slice(slice, &[rows, 64]).unwrap();
+            let want = model.infer_batch(view).data().to_vec();
+            assert_same(
+                model.infer_rows(slice, rows),
+                &want,
+                &format!("{rows} rows"),
+            );
+        }
+    }
+
+    /// `infer_rows` refuses inputs whose length is not rows × the input width.
+    #[test]
+    #[should_panic(expected = "infer_rows: expected 2 rows of width 64, got 127 values")]
+    fn infer_rows_checks_the_length() {
+        let mut params = ParamStore::new();
+        let net = network(&mut params, 5);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        model.infer_rows(&[0.0; 127], 2);
     }
 
     /// Masks on a `Linear` and on a ReLU set the off neurons to exactly 0, as the tape does,
