@@ -279,7 +279,9 @@ pub struct ShrinkConfig {
     /// neuron's output is final ([`LayerActivity::mean`]). For a neuron whose output is the
     /// same on every row the fold is exact: the network's outputs do not change, within
     /// rounding. The fold changes the parameters, so it is in the step's checkpoint and in
-    /// the network the run keeps. Off by default.
+    /// the network the run keeps. It costs one extra pass over the training rows per step
+    /// for each listed layer after the first that loses neurons at that step, to measure its
+    /// means anew. Off by default.
     pub fold_means: bool,
     /// The step between levels, in basis points, up to `fine_from_bp`. Default 1,000.
     pub step_bp: u32,
@@ -862,17 +864,22 @@ impl Run<'_, '_> {
                 let next = linear_after_run(self.model, linear)
                     .expect("check_layout found a Linear after each run");
                 let (inputs, weight, bias) = (next.inputs(), next.weight(), next.bias());
-                let w = self.params.value(weight).data().to_vec();
+                let increments: Vec<f64> = self
+                    .params
+                    .value(weight)
+                    .data()
+                    .chunks_exact(inputs)
+                    .map(|row| {
+                        removed
+                            .iter()
+                            .filter(|&&j| mean[j] != 0.0)
+                            .map(|&j| f64::from(row[j]) * mean[j])
+                            .sum()
+                    })
+                    .collect();
                 let b = self.params.value_mut(bias).data_mut();
-                for (i, b) in b.iter_mut().enumerate() {
-                    let row = &w[i * inputs..(i + 1) * inputs];
-                    let mut sum = f64::from(*b);
-                    for &j in &removed {
-                        if mean[j] != 0.0 {
-                            sum += f64::from(row[j]) * mean[j];
-                        }
-                    }
-                    *b = sum as f32;
+                for (b, increment) in b.iter_mut().zip(increments) {
+                    *b = (f64::from(*b) + increment) as f32;
                 }
                 changed = true;
             }
