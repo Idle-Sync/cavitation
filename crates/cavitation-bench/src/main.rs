@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|inspect|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|activation|shrink|inspect|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -32,6 +32,13 @@
 //!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
 //!   only; its ticks are taken as 1/100 s (`USER_HZ` = 100, as on x86 and Arm Linux).
 //!   `small --child` is the child's side: one run at the current thread count.
+//! - `activation` times `tanh` and the sigmoid over 64 and 4,096 values: the plain scalar
+//!   loop on std's `f32::tanh` and `f32::exp`, then the kernels at every level this CPU
+//!   runs, in 301 interleaved rounds, and prints the median nanoseconds per value and each
+//!   kernel's speed-up over the scalar loop. It then times one input through the `small`
+//!   run's widths (4 → 32 → 32 → 1) with tanh and with ReLU through `InferenceModel::infer`
+//!   at the current level (20,000 warm-up calls each, then 301 interleaved rounds of 1,000
+//!   calls), and prints both medians and their ratio.
 //! - `shrink` trains the digits network (64 → 256 → 128 → 10, the digits known result's
 //!   recipe) on the first 1,149 training digits and shrinks it twice with the last 288 as
 //!   the validation set: once ranking by outgoing-weight norm with `dead_first` off and
@@ -79,7 +86,7 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|inspect|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|activation|shrink|inspect|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
     \x20 digits  [--python PATH] [--numpy-best]\n\
@@ -88,6 +95,7 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
+    \x20 activation\n\
     \x20 shrink\n\
     \x20 inspect [--rounds N]\n\
     \x20 info";
@@ -108,6 +116,7 @@ fn main() -> ExitCode {
         "gemm" => gemm(rest),
         "subnormal" => subnormal(rest),
         "small" => small(rest),
+        "activation" => activation(rest),
         "inspect" => inspect(rest),
         "shrink" => {
             if rest.is_empty() {
@@ -524,6 +533,52 @@ fn subnormal(args: &[String]) -> Result<(), String> {
             None => println!("  steps 901+ over steps 1-700: needs at least 1,000 steps"),
         }
     }
+    Ok(())
+}
+
+/// Runs the `activation` benchmark: the kernel timings, then the controller pair.
+fn activation(args: &[String]) -> Result<(), String> {
+    if let Some(other) = args.first() {
+        return Err(format!("unknown argument `{other}`"));
+    }
+    use cavitation_core::kernels::{Level, supported};
+    // Accelerate's activations are NEON's, so it is not timed separately.
+    let levels: Vec<Level> = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon]
+        .into_iter()
+        .filter(|&l| supported(l))
+        .collect();
+    println!(
+        "activation: {}, kernel {}, {} interleaved rounds",
+        machine::detect().cpu_model,
+        level(),
+        runs::ACTIVATION_ROUNDS
+    );
+    let cases = runs::activation_cases(&levels);
+    for n in runs::ACTIVATION_LENGTHS {
+        let times = runs::time_activations(&cases, n);
+        println!("{n} values: median ns per value (speed-up over the scalar loop)");
+        let mut base = times[0];
+        for (case, t) in cases.iter().zip(&times) {
+            if case.name.ends_with("scalar std") {
+                base = *t;
+            }
+            println!("  {:<22} {:>8.2}  ({:.1}x)", case.name, t, base / t);
+        }
+    }
+    let mut models = runs::activation_controllers()?;
+    let input = [0.1f32, -0.2, 0.05, 0.3];
+    let lat = runs::time_infer(&mut models, &input);
+    let (tanh, relu) = (
+        runs::median(&lat.per_call[0]) * 1e9,
+        runs::median(&lat.per_call[1]) * 1e9,
+    );
+    let net = runs::SMALL_NET.map(|w| w.to_string()).join(" → ");
+    println!(
+        "controller {net}, one input through infer at kernel {}: tanh {tanh:.0} ns, \
+         relu {relu:.0} ns, tanh over relu {:.2}",
+        level(),
+        tanh / relu
+    );
     Ok(())
 }
 

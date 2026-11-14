@@ -203,6 +203,32 @@ pub trait Real:
     /// assert_eq!(c, [11.0]);
     /// ```
     fn gemm(alpha: Self, a: MatRef<Self>, b: MatRef<Self>, beta: Self, c: MatMut<Self>);
+
+    /// Replaces every value with its hyperbolic tangent: through
+    /// [`kernels::activation::tanh_f32`](crate::kernels::activation::tanh_f32) for f32 (the
+    /// current kernel level, within 3 ulp of the correctly rounded result), and
+    /// [`Real::tanh`] on each value for f64.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f64, 1.0];
+    /// f64::tanh_in_place(&mut v);
+    /// assert_eq!(v, [0.0, 1.0f64.tanh()]);
+    /// ```
+    fn tanh_in_place(values: &mut [Self]);
+
+    /// Replaces every value with its logistic sigmoid `1 / (1 + e^-x)`: through
+    /// [`kernels::activation::sigmoid_f32`](crate::kernels::activation::sigmoid_f32) for f32
+    /// (the current kernel level, within 3 ulp of the correctly rounded result), and for f64
+    /// as `1 / (1 + e^-x)` for `x >= 0` and `e^x / (1 + e^x)` below, so it never overflows.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f32, -1000.0, 1000.0];
+    /// f32::sigmoid_in_place(&mut v);
+    /// assert_eq!(v, [0.5, 0.0, 1.0]);
+    /// ```
+    fn sigmoid_in_place(values: &mut [Self]);
 }
 
 #[cfg(test)]
@@ -213,7 +239,7 @@ thread_local! {
 
 /// Implements `Real` for a primitive float type by forwarding to its inherent methods.
 macro_rules! impl_real {
-    ($t:ident, $erf:path, $gemm:path) => {
+    ($t:ident, $erf:path, $gemm:path, $tanh:path, $sigmoid:path) => {
         impl Real for $t {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
@@ -266,12 +292,44 @@ macro_rules! impl_real {
                 GEMM_CALLS.with(|n| n.set(n.get() + 1));
                 $gemm(alpha, a, b, beta, c);
             }
+            fn tanh_in_place(values: &mut [Self]) {
+                $tanh(values);
+            }
+            fn sigmoid_in_place(values: &mut [Self]) {
+                $sigmoid(values);
+            }
         }
     };
 }
 
-impl_real!(f32, crate::ops::erf_f32, crate::kernels::gemm::gemm_f32);
-impl_real!(f64, crate::ops::erf_f64, crate::kernels::reference::gemm);
+impl_real!(
+    f32,
+    crate::ops::erf_f32,
+    crate::kernels::gemm::gemm_f32,
+    crate::kernels::activation::tanh_f32,
+    crate::kernels::activation::sigmoid_f32
+);
+impl_real!(
+    f64,
+    crate::ops::erf_f64,
+    crate::kernels::reference::gemm,
+    tanh_each,
+    sigmoid_each
+);
+
+/// [`Real::tanh`] on each value: the f64 `tanh_in_place`.
+fn tanh_each(values: &mut [f64]) {
+    for v in values {
+        *v = v.tanh();
+    }
+}
+
+/// The overflow-free sigmoid on each value: the f64 `sigmoid_in_place`.
+fn sigmoid_each(values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::sigmoid_value(*v);
+    }
+}
 
 /// Tests for `Real`.
 #[cfg(test)]

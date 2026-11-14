@@ -79,6 +79,8 @@ The activations that take a parameter default to PyTorch's values, so `LeakyRelu
 
 `Prelu` names its slopes `weight`, as PyTorch does, so a PyTorch `state_dict` with PReLU slopes loads into it.
 
+The formulas match; the last bits of a value need not. In f32, `Tanh` and `Sigmoid` run SIMD kernels whose results are within 3 ulp of the correctly rounded value, a relative error of at most about 3.6e-7. PyTorch's CPU kernels make their own approximations, so a transferred network's outputs agree to rounding, not bit for bit.
+
 ## Where Cavitation differs on purpose
 
 **Masks act on a neuron's final output.** PyTorch has no neuron mask; you would multiply an output by a 0/1 tensor, or write a hook. In Cavitation a neuron mask, set with `Sequential::set_neuron_mask` or `set_neuron`, replaces the neuron's output with exactly 0 and passes no gradient through it. It selects instead of multiplying, so an infinite output gives 0 rather than NaN. The mask is not placed on the `Linear` itself but at `Sequential::neuron_layer`, after the activations that follow it.
