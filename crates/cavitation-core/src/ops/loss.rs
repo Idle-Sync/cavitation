@@ -463,8 +463,8 @@ impl<T: Real> Tape<'_, T> {
     /// where neither logarithm was clamped. Where one was clamped, its term is constant and
     /// contributes 0, so only the other term's derivative remains (`-t / p` or
     /// `(1 - t) / (1 - p)`); this never divides by zero. This differs from PyTorch, which
-    /// divides by `max(p (1 - p), 1e-12)` and so gives a large finite gradient there. For `target` the gradient is
-    /// `ln(1 - p) - ln p` with the clamped logarithms.
+    /// divides by `max(p (1 - p), 1e-12)` and so gives a large finite gradient there. For `target`
+    /// the gradient is `ln(1 - p) - ln p` with the clamped logarithms.
     ///
     /// # Panics
     ///

@@ -26,17 +26,22 @@ jobs:
       CAVITATION_KERNEL: ${{ matrix.kernel }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # dtolnay/rust-toolchain has no release tags: this pins a commit of its `stable` branch.
+      # To update, take the newest commit of that branch from its GitHub page and pin it here.
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.kernel }}
       - name: Test
-        run: cargo test --workspace --release --no-fail-fast
+        run: cargo test --workspace --release --all-features --no-fail-fast
       - name: Examples
         run: |
           cargo run --release --example linear_regression -p cavitation
           cargo run --release --example logistic_regression -p cavitation
           cargo run --release --example from_pytorch -p cavitation
+      - name: Shrink example
+        if: matrix.kernel == 'reference'
+        run: cargo run --release --example shrink_digits -p cavitation
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
@@ -60,7 +65,7 @@ jobs:
         with:
           key: ${{ matrix.kernel }}
       - name: Test
-        run: cargo test --workspace --release --no-fail-fast
+        run: cargo test --workspace --release --all-features --no-fail-fast
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
@@ -87,7 +92,7 @@ jobs:
         with:
           key: ${{ matrix.kernel }}
       - name: Test
-        run: cargo test --workspace --release --no-fail-fast
+        run: cargo test --workspace --release --all-features --no-fail-fast
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
@@ -109,13 +114,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --workspace --no-deps --all-features
       - name: Doc tests
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --doc --all-features
       - name: Inspector page script
         run: |
           awk '/^<script>$/{f=1;next} /^<\/script>$/{f=0} f' crates/cavitation-inspect/assets/inspector.html > "$RUNNER_TEMP/inspector.js"

@@ -215,7 +215,9 @@ impl Evaluator {
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng, Tensor};
-    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, NeuronMask, Relu, Sequential, Targets};
+    /// use cavitation_nn::{
+    ///     Dataset, Evaluator, Linear, Loss, NeuronMask, Relu, Sequential, Targets,
+    /// };
     /// let mut params = ParamStore::new();
     /// let mut rng = Rng::seed(0);
     /// let net = Sequential::new()
@@ -226,7 +228,8 @@ impl Evaluator {
     ///     x: Tensor::from_vec(vec![1.0f32, -1.0, 0.5, 2.0], &[2, 2]).unwrap(),
     ///     targets: Targets::Values(Tensor::zeros(&[2, 1])),
     /// };
-    /// let mut evaluator = Evaluator::with_neuron_masks(&net, &params, Loss::Mse, 2, &[0]).unwrap();
+    /// let mut evaluator =
+    ///     Evaluator::with_neuron_masks(&net, &params, Loss::Mse, 2, &[0]).unwrap();
     /// evaluator.set_neuron_mask(0, &NeuronMask::all_off(4)).unwrap();
     /// // With every hidden neuron off the output is the last bias, the same for each row.
     /// let off = evaluator.evaluate(&data).unwrap();
@@ -474,9 +477,9 @@ impl Evaluator {
     /// for each output, `1 - Σ(y - ŷ)² / Σ(y - ȳ)²` in `f64` over every row, then the mean
     /// over the outputs; an output whose targets do not vary scores 1 when it is predicted
     /// exactly and 0 otherwise. With one row every output has zero variance, so R² is 1 or
-    /// 0, where scikit-learn returns NaN. R² is computed on the model's outputs as they are, so for a
-    /// loss on raw scores (such as [`Loss::BinaryCrossEntropyWithLogits`]) it compares
-    /// scores with targets.
+    /// 0, where scikit-learn returns NaN. R² is computed on the model's outputs as they are, so for
+    /// a loss on raw scores (such as [`Loss::BinaryCrossEntropyWithLogits`]) it compares scores
+    /// with targets.
     ///
     /// # Errors
     ///
@@ -497,7 +500,10 @@ impl Evaluator {
     /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
-    /// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0, 1, 0, 1]) };
+    /// let data = Dataset {
+    ///     x: Tensor::zeros(&[4, 2]),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 1]),
+    /// };
     /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 3).unwrap();
     /// let e = evaluator.evaluate(&data).unwrap();
     /// // Zero inputs and a zero bias give equal scores: every row predicts class 0, and the
@@ -588,7 +594,10 @@ impl Evaluator {
     /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
-    /// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0, 1, 0, 1]) };
+    /// let data = Dataset {
+    ///     x: Tensor::zeros(&[4, 2]),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 1]),
+    /// };
     /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 3).unwrap();
     /// let mut wrong = Vec::new();
     /// evaluator.misclassified(&data, &mut wrong).unwrap();
