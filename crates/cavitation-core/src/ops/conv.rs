@@ -146,19 +146,19 @@ pub(super) fn backward<T: Real>(
     if ctx.takes_grad(weight) {
         let count = groups(batch);
         let mut parts = ctx.scratch(count * cout * kl);
-        conv2d_backward(
-            &geom,
-            batch,
-            xv,
-            wv,
-            out_grad,
-            None,
-            Some(&mut parts),
-            &mut scratch,
-            threads,
-            &gemm::<T>,
-        );
         if let Some(slot) = ctx.slot(weight) {
+            conv2d_backward(
+                &geom,
+                batch,
+                xv,
+                wv,
+                out_grad,
+                None,
+                Some(&mut parts),
+                &mut scratch,
+                threads,
+                &gemm::<T>,
+            );
             slot.update_with(|buf, beta| {
                 for (i, d) in buf.iter_mut().enumerate() {
                     let mut acc = parts[i];
@@ -549,6 +549,33 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// An empty batch gives an empty output and zero gradients for the weight and bias,
+    /// even when the pooled buffers hold old values from a step with images.
+    #[test]
+    fn conv2d_empty_batch_gives_zero_gradients() {
+        let g = Conv2dGeom::with_options(2, 3, (4, 4), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+        let mut store = ParamStore::<f64>::new_generic();
+        let w = store.add(Tensor::from_vec(values(g.weight_len(), 1), &[3, 2, 3, 3]).unwrap());
+        let b = store.add(Tensor::from_vec(values(3, 2), &[3]).unwrap());
+        let mut graph = Graph::new_generic();
+        for batch in [4, 0] {
+            let x =
+                Tensor::from_vec(values(batch * g.in_width(), 3), &[batch, g.in_width()]).unwrap();
+            let mut tape = graph.tape(&store.values);
+            let (xv, wv, bv) = (tape.input(x.view()), tape.param(w), tape.param(b));
+            let y = tape.conv2d(xv, wv, Some(bv), g);
+            assert_eq!(tape.shape(y).dims(), &[batch, g.out_width()]);
+            let loss = tape.sum(y);
+            tape.backward(loss, &mut store.grads);
+            drop(tape);
+            if batch == 0 {
+                assert!(store.grad(w).data().iter().all(|&v| v == 0.0));
+                assert!(store.grad(b).data().iter().all(|&v| v == 0.0));
+            }
+            store.zero_grad();
         }
     }
 

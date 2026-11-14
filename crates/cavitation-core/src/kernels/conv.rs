@@ -609,6 +609,11 @@ pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]
 /// on the thread pool, so a batch of `n` images is `min(n, CONV_GROUPS)` groups whatever the
 /// thread count, and every result (the weight gradient is a sum of one partial per group,
 /// added in group order) is the same for any thread count.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{CONV_GROUPS, groups};
+/// assert_eq!(groups(1000), CONV_GROUPS);
+/// ```
 pub const CONV_GROUPS: usize = 16;
 
 /// How many column-matrix values one group aims to hold at once (2 MB in f32): a group
@@ -616,6 +621,15 @@ pub const CONV_GROUPS: usize = 16;
 /// GEMM is wide enough for the packed kernels while each thread's columns stay near its
 /// cache. An image whose own columns are more than this is taken alone. The chunk size
 /// depends on the geometry and the batch alone, never on the thread count.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{COLUMN_BUDGET, Conv2dGeom, images_per_chunk};
+/// // A 1-channel 8 x 8 image with a 3 x 3 kernel is 9 · 36 column values: far below the
+/// // budget, so a whole group of 8 images is one chunk.
+/// let geom = Conv2dGeom::new(1, 4, (8, 8), (3, 3)).unwrap();
+/// assert!(9 * 36 * 8 <= COLUMN_BUDGET);
+/// assert_eq!(images_per_chunk(&geom, 128), 8);
+/// ```
 pub const COLUMN_BUDGET: usize = 1 << 19;
 
 /// The number of groups a batch of `batch` images is cut into: `min(batch, CONV_GROUPS)`,
@@ -636,8 +650,8 @@ fn group_range(g: usize, count: usize, batch: usize) -> (usize, usize) {
     (start, end - start)
 }
 
-/// The number of images a group of `batch` takes per GEMM for `geom`: at most the largest
-/// group's size.
+/// The number of images each group of a batch of `batch` images takes per GEMM for `geom`:
+/// as many as fit in [`COLUMN_BUDGET`], at least 1 and at most the largest group's size.
 ///
 /// ```
 /// use cavitation_core::kernels::conv::{COLUMN_BUDGET, Conv2dGeom, images_per_chunk};
@@ -677,12 +691,19 @@ pub fn conv2d_scratch(geom: &Conv2dGeom, batch: usize, threads: usize) -> usize 
     (c + p) * workers(batch, threads)
 }
 
-/// The threads that take part for `batch` images: never more than the groups, nor than the
-/// pool's maximum.
+/// The threads whose tasks take part for `batch` images: one per group up to `threads`
+/// when there are at least as many groups as threads, else one, so that each group's GEMM
+/// runs on every thread instead (a small batch would otherwise leave threads idle). Never
+/// more than the pool's maximum.
 fn workers(batch: usize, threads: usize) -> usize {
-    threads
-        .clamp(1, groups(batch))
-        .min(super::pool::MAX_THREADS)
+    if groups(batch) < threads {
+        // Fewer groups than threads: one task at a time, each GEMM on every thread.
+        1
+    } else {
+        threads
+            .clamp(1, groups(batch))
+            .min(super::pool::MAX_THREADS)
+    }
 }
 
 /// A pointer that tasks on several threads may hold at once, each using its own part.
@@ -706,7 +727,17 @@ impl<T> Parts<T> {
     }
 }
 
-/// The GEMM a convolution runs: `c = a · b + beta · c` (`beta` 0 or 1).
+/// The GEMM a convolution runs: `c = a · b + beta · c` (`beta` 0 or 1). Any closure of that
+/// shape that may be shared between threads is one.
+///
+/// ```
+/// use cavitation_core::kernels::conv::ConvGemm;
+/// use cavitation_core::kernels::{MatMut, MatRef, reference};
+/// fn takes(_: &impl ConvGemm<f64>) {}
+/// takes(&|a: MatRef<f64>, b: MatRef<f64>, beta: f64, c: MatMut<f64>| {
+///     reference::gemm(1.0, a, b, beta, c)
+/// });
+/// ```
 pub trait ConvGemm<T>: Fn(MatRef<'_, T>, MatRef<'_, T>, T, MatMut<'_, T>) + Sync {}
 
 impl<T, F: Fn(MatRef<'_, T>, MatRef<'_, T>, T, MatMut<'_, T>) + Sync> ConvGemm<T> for F {}
@@ -910,6 +941,10 @@ pub fn conv2d_backward<T: Real>(
         if let Some(parts) = &dws {
             // SAFETY: group `t.index` alone writes part `t.index`.
             let dw = unsafe { parts.slice(t.index * cout * kl, cout * kl) };
+            if len == 0 {
+                // An empty batch: its one group adds nothing.
+                dw.fill(T::ZERO);
+            }
             if geom.is_pointwise() {
                 for (n, (image, g)) in x.chunks_exact(in_w).zip(dy.chunks_exact(out_w)).enumerate()
                 {
