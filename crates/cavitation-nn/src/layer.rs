@@ -2,10 +2,11 @@
 
 use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
-use crate::{Activation, InferenceLayer, Linear, Prelu};
+use crate::{Activation, Conv2d, InferenceLayer, Linear, Prelu};
 
 /// Keeps the layer downcasts closed: only this crate can name `Token`, so only this crate's
-/// `Linear` and `Prelu` can override [`Layer::linear_form`] and [`Layer::prelu_form`].
+/// `Linear`, `Prelu` and `Conv2d` can override [`Layer::linear_form`],
+/// [`Layer::prelu_form`] and [`Layer::conv2d_form`].
 pub(crate) mod private {
     /// The argument of the sealed [`Layer`](super::Layer) hooks; only this crate can make one.
     #[derive(Clone, Copy, Debug)]
@@ -177,6 +178,13 @@ pub trait Layer<T: Real>: Send + Sync {
         None
     }
 
+    /// This layer as a [`Conv2d`], if it is one: the sealed hook behind `as_conv2d` on
+    /// `dyn Layer`, closed to other crates as [`linear_form`](Self::linear_form) is.
+    #[doc(hidden)]
+    fn conv2d_form(&self, _: private::Token) -> Option<&Conv2d> {
+        None
+    }
+
     /// The width of input the layer requires, if it requires one. [`Sequential`](crate::Sequential)
     /// checks it against the width of the previous layer's output. The default is `None`
     /// (the layer accepts any width, or checks it itself).
@@ -300,6 +308,23 @@ macro_rules! downcasts {
             /// ```
             pub fn as_linear(&self) -> Option<&Linear> {
                 self.linear_form(private::Token(()))
+            }
+
+            /// This layer as a [`Conv2d`], if it is one. Only the crate's own `Conv2d`
+            /// answers `Some`. It works on `dyn Layer<T>` and on the same object with
+            /// `+ Send`, `+ Sync` or both.
+            ///
+            /// ```
+            /// use cavitation_core::{Conv2dGeom, ParamStore, Rng};
+            /// use cavitation_nn::{Conv2d, Layer, Relu};
+            /// let geom = Conv2dGeom::new(1, 2, (4, 4), (3, 3)).unwrap();
+            /// let conv = Conv2d::new(&mut ParamStore::new(), geom, &mut Rng::seed(0));
+            /// let layers: [&dyn Layer<f32>; 2] = [&conv, &Relu];
+            /// assert_eq!(layers[0].as_conv2d().unwrap().geom(), geom);
+            /// assert!(layers[1].as_conv2d().is_none());
+            /// ```
+            pub fn as_conv2d(&self) -> Option<&Conv2d> {
+                self.conv2d_form(private::Token(()))
             }
 
             /// This layer as a [`Prelu`], if it is one. Only the crate's own `Prelu`

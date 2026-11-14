@@ -468,6 +468,16 @@ impl InferenceModel {
                         bias.copy_from_slice(values.get(id).data());
                     }
                 }
+                Op::Layer(InferenceLayer::Conv2d { weight, bias, .. }) => {
+                    let conv = model
+                        .layer(step.layer)
+                        .as_conv2d()
+                        .expect("checked by fits_in_place");
+                    weight.copy_from_slice(values.get(conv.weight()).data());
+                    if let (Some(bias), Some(id)) = (bias.as_mut(), conv.bias()) {
+                        bias.copy_from_slice(values.get(id).data());
+                    }
+                }
                 Op::Layer(InferenceLayer::Prelu(slopes)) => {
                     let prelu = model
                         .layer(step.layer)
@@ -1118,10 +1128,24 @@ impl Compiled {
                 InferenceLayer::Prelu(slopes) => layer
                     .as_prelu()
                     .is_some_and(|prelu| values.get(prelu.weight()).data().len() == slopes.len()),
+                InferenceLayer::Conv2d { geom, bias, .. } => {
+                    layer.as_conv2d().is_some_and(|conv| {
+                        conv.geom() == *geom
+                            && values.get(conv.weight()).data().len() == geom.weight_len()
+                            && match (bias, conv.bias()) {
+                                (Some(_), Some(id)) => {
+                                    values.get(id).data().len() == geom.out_channels()
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            }
+                    })
+                }
                 InferenceLayer::Mask(_) => false,
                 other => {
                     layer.as_linear().is_none()
                         && layer.as_prelu().is_none()
+                        && layer.as_conv2d().is_none()
                         && layer.inference(values).as_ref() == Some(other)
                 }
             };

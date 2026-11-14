@@ -263,6 +263,11 @@ mod tests {
             (2, 1, (5, 4), (2, 3), (2, 2), (1, 1), (1, 1)),
             (1, 1, (3, 3), (3, 3), (1, 1), (1, 1), (1, 1)),
             (2, 3, (3, 3), (3, 3), (1, 1), (0, 0), (1, 1)),
+            // Padding past the kernel: the first and last output rows and columns are pure
+            // bias.
+            (1, 2, (3, 3), (2, 2), (1, 1), (3, 2), (1, 1)),
+            // Stride and dilation above 1 on the same axis.
+            (2, 2, (9, 8), (3, 2), (2, 2), (1, 1), (2, 3)),
             // 288 · 1,024 column values per image: 7 images per chunk, so the 9 images of a
             // `conv2d_matches_direct_loops` batch span two chunks, the second short.
             (32, 2, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)),
@@ -540,6 +545,57 @@ mod tests {
             );
             check(&grad(w), &dw, &mw, batch * oh * ow, "weight gradient");
             check(&grad(b), &db, &mb, batch * oh * ow, "bias gradient");
+        }
+    }
+
+    /// A convolution's gradients add to what other uses already put there: with the input
+    /// also summed and the weight used by two convolutions, the gradients are the sums of
+    /// each use's, on a chunked geometry and a 1 × 1 one.
+    #[test]
+    fn conv2d_gradients_accumulate() {
+        for g in [
+            Conv2dGeom::with_options(2, 3, (5, 4), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap(),
+            Conv2dGeom::new(2, 3, (5, 4), (1, 1)).unwrap(),
+        ] {
+            let batch = 2;
+            let (kh, kw) = g.kernel();
+            let mut store = ParamStore::<f64>::new_generic();
+            let xi = store.add(
+                Tensor::from_vec(values(batch * g.in_width(), 1), &[batch, g.in_width()]).unwrap(),
+            );
+            let w =
+                store.add(Tensor::from_vec(values(g.weight_len(), 2), &[3, 2, kh, kw]).unwrap());
+            let b = store.add(Tensor::from_vec(values(3, 3), &[3]).unwrap());
+            let grads = |store: &mut ParamStore<f64>, twice: bool| {
+                let mut graph = Graph::new_generic();
+                let mut tape = graph.tape(&store.values);
+                let (xv, wv, bv) = (tape.param(xi), tape.param(w), tape.param(b));
+                let y = tape.conv2d(xv, wv, Some(bv), g);
+                let mut loss = tape.sum(y);
+                if twice {
+                    let y2 = tape.conv2d(xv, wv, Some(bv), g);
+                    let s2 = tape.sum(y2);
+                    let sx = tape.sum(xv);
+                    let t = tape.add(s2, sx);
+                    loss = tape.add(loss, t);
+                }
+                tape.backward(loss, &mut store.grads);
+                drop(tape);
+                let out = [xi, w, b].map(|id| store.grad(id).data().to_vec());
+                store.zero_grad();
+                out
+            };
+            let once = grads(&mut store, false);
+            let both = grads(&mut store, true);
+            for (k, (one, two)) in once.iter().zip(&both).enumerate() {
+                for (i, (a, c)) in one.iter().zip(two).enumerate() {
+                    let want = 2.0 * a + if k == 0 { 1.0 } else { 0.0 };
+                    assert!(
+                        (c - want).abs() < 1e-12,
+                        "{g:?} gradient {k}[{i}]: {c} against {want}"
+                    );
+                }
+            }
         }
     }
 

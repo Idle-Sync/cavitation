@@ -192,6 +192,11 @@ impl<T: Real> Layer<T> for Conv2d {
         Some(self.geom.in_width())
     }
 
+    /// The layer itself.
+    fn conv2d_form(&self, _: crate::layer::private::Token) -> Option<&Conv2d> {
+        Some(self)
+    }
+
     /// [`InferenceLayer::Conv2d`], with the weight and the bias copied as they are.
     ///
     /// # Panics
@@ -332,5 +337,35 @@ mod tests {
                 assert_eq!(model.infer(row), &want[r * width..][..width], "row {r}");
             }
         }
+    }
+
+    /// After the weights change, `refresh_in_place` copies a conv network's new weights and
+    /// biases into the compiled model without recompiling, giving the bits of a fresh
+    /// compile.
+    #[test]
+    fn conv_refresh_in_place_matches_compile() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(2);
+        let c1 = Conv2d::new(&mut params, geom(), &mut rng);
+        let g2 = Conv2dGeom::new(3, 2, (6, 5), (1, 1)).unwrap();
+        let c2 = Conv2d::with_init(&mut params, g2, Init::TorchDefault, None, &mut rng);
+        let net = Sequential::new().push(c1).push(Relu).push(c2);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        for id in [c1_weight(&net), net.layer(2).as_conv2d().unwrap().weight()] {
+            for v in params.value_mut(id).data_mut() {
+                *v *= -1.5;
+            }
+        }
+        assert!(model.refresh_in_place(&net, &params));
+        let mut fresh = InferenceModel::compile(&net, &params).unwrap();
+        let x: Vec<f32> = (0..geom().in_width())
+            .map(|i| (i as f32 * 0.37).sin())
+            .collect();
+        assert_eq!(model.infer(&x), fresh.infer(&x));
+    }
+
+    /// The first layer's weight id.
+    fn c1_weight(net: &Sequential) -> ParamId {
+        net.layer(0).as_conv2d().unwrap().weight()
     }
 }

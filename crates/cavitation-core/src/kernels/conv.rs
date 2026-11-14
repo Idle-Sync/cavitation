@@ -234,6 +234,16 @@ impl Conv2dGeom {
             self.out_channels
                 .checked_mul(rows.unwrap_or(0))
                 .and_then(|v| v.checked_mul(cols.unwrap_or(0))),
+            // The weight, and one image's column matrix.
+            in_channels
+                .checked_mul(kernel.0)
+                .and_then(|v| v.checked_mul(kernel.1))
+                .and_then(|v| v.checked_mul(out_channels)),
+            in_channels
+                .checked_mul(kernel.0)
+                .and_then(|v| v.checked_mul(kernel.1))
+                .and_then(|v| v.checked_mul(rows.unwrap_or(0)))
+                .and_then(|v| v.checked_mul(cols.unwrap_or(0))),
         ];
         if sizes.iter().any(Option::is_none) {
             return fail(format!("the sizes overflow: {self:?}"));
@@ -595,11 +605,12 @@ pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]
     }
 }
 
-/// The most column-matrix values [`conv2d_forward`] and the tape's backward pass hold at
-/// once: images are taken in chunks of `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so
-/// each GEMM is wide enough to use the packed kernels well while the columns stay in a few
-/// megabytes. The chunk size depends on the geometry alone, never on the thread count, so
-/// results do too.
+/// How many column-matrix values [`conv2d_forward`] and the tape's backward pass aim to hold
+/// at once (8 MB in f32): images are taken in chunks of
+/// `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so each GEMM is wide enough to use the
+/// packed kernels well. An image whose own columns are more than this is taken alone, so the
+/// buffer holds `max(COLUMN_BUDGET, one image's columns)` values. The chunk size depends on
+/// the geometry and the batch alone, never on the thread count, so results do too.
 pub const COLUMN_BUDGET: usize = 1 << 21;
 
 /// The number of images [`conv2d_forward`] takes per GEMM for `geom`, at most `batch`.

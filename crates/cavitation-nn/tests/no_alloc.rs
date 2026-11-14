@@ -1306,6 +1306,52 @@ fn fit_validation_steady_state() -> usize {
     FIT_AFTER_EPOCH_2.load(Ordering::Relaxed) + control.after
 }
 
+/// `fit` with a validation set on a small CNN (the `conv_training_and_inference` network)
+/// for 6 epochs on 1,000 rows, the other 437 validating: from the third epoch on, nothing is
+/// allocated, the compiled model's convolutions included (each epoch's refresh copies the
+/// new weights in place).
+fn fit_validation_cnn_steady_state() -> usize {
+    let (train, validation) = synthetic_centred_1437().split_at(1000);
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(2);
+    let g1 = Conv2dGeom::with_options(1, 8, (8, 8), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+    let g2 = Conv2dGeom::new(8, 4, (8, 8), (1, 1)).unwrap();
+    let net = Sequential::new()
+        .push(Conv2d::new(&mut params, g1, &mut rng))
+        .push(Relu)
+        .push(Conv2d::new(&mut params, g2, &mut rng))
+        .push(Relu)
+        .push(Linear::new(&mut params, g2.out_width(), 10, &mut rng));
+    static AT_2: AtomicUsize = AtomicUsize::new(0);
+    static AFTER: AtomicUsize = AtomicUsize::new(0);
+    let config = cavitation_nn::FitConfig {
+        epochs: 6,
+        batch: 128,
+        // Some ReLU outputs next to the padding stay at 0 for whole epochs, and each
+        // epoch's dead-neuron report lists them in a fresh vector: an end-of-epoch report,
+        // not part of a training step or the validation, so it is left out here.
+        health: Health {
+            dead_relu: false,
+            ..Health::quiet()
+        },
+        validation: Some(validation),
+        on_epoch: Some(Box::new(|report, _, _| {
+            assert!(report.validation.is_some());
+            if report.epoch == 2 {
+                AT_2.store(allocations(), Ordering::Relaxed);
+            } else if report.epoch > 2 {
+                AFTER.store(
+                    allocations() - AT_2.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+        })),
+        ..cavitation_nn::FitConfig::default()
+    };
+    cavitation_nn::fit(&net, &mut params, &train, config).unwrap();
+    AFTER.load(Ordering::Relaxed)
+}
+
 /// Trains the 50k network with its ReLUs written as an activation of your own, so that its
 /// validation runs on the tape, for 6 epochs on 1,000 of the centred rows at batch 128
 /// with the other 437 as the validation set: every epoch's refresh copies the parameter
@@ -1345,7 +1391,7 @@ fn fit_validation_tape_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 27] = [
+    let scenarios: [Scenario; 28] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1384,6 +1430,10 @@ fn main() -> ExitCode {
         ),
         ("profiled_step_reuses_buffers", profiled_step_reuses_buffers),
         ("fit_validation_steady_state", fit_validation_steady_state),
+        (
+            "fit_validation_cnn_steady_state",
+            fit_validation_cnn_steady_state,
+        ),
         (
             "fit_validation_tape_steady_state",
             fit_validation_tape_steady_state,
