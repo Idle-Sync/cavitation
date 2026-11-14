@@ -272,7 +272,7 @@ The guide is in `book/`. Its first chapter, "Backprop by hand", works through th
 mdbook serve book   # then open http://localhost:3000
 ```
 
-Status: in development. v0.1.0 is tagged in the repository; nothing is published on crates.io yet.
+Status: in development. v0.2.0 is the latest tag in the repository; nothing is published on crates.io yet.
 
 ## Licence
 
