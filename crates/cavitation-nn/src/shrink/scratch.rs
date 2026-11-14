@@ -126,7 +126,8 @@ impl fmt::Debug for FoundSize {
 /// parameters. Any masked network [`compact`](super::compact()) accepts will do. The fresh
 /// network is `compact`'s rebuild of `model` with every parameter started again: each
 /// `Linear` gets new weights and biases as [`FromScratch::weights`] and
-/// [`FromScratch::biases`] say, drawn in layer order from `Rng::seed(scratch.seed)`, each
+/// [`FromScratch::biases`] say (a `Linear` without a bias gets none), drawn in layer order
+/// from `Rng::seed(scratch.seed)`, each
 /// `Prelu` gets new slopes of 0.25 ([`Prelu::new`]), and the layers without parameters are
 /// shared with `model`. The fresh network is then trained on `train` with
 /// [`fit`](crate::fit) and `scratch.fit`, and both networks are measured on `eval` with
@@ -218,7 +219,8 @@ pub fn train_found_size(
 }
 
 /// `layout` (with its values in `values`) rebuilt in a new store with new starting values:
-/// each `Linear` as `scratch` says, drawn in layer order from one generator, each `Prelu`
+/// each `Linear` as `scratch` says (without a bias if it had none), drawn in layer order
+/// from one generator, each `Prelu`
 /// with as many slopes as before, all 0.25, and every other layer shared. `layout` comes
 /// from `compact`, so it has no other layer with parameters.
 fn reinitialised(
@@ -232,14 +234,20 @@ fn reinitialised(
     for i in 0..layout.len() {
         let layer = layout.layer(i);
         if let Some(linear) = layer.as_linear() {
-            out = out.push(Linear::with_init(
-                &mut store,
-                linear.inputs(),
-                linear.outputs(),
-                scratch.weights,
-                scratch.biases,
-                &mut rng,
-            ));
+            let (inputs, outputs) = (linear.inputs(), linear.outputs());
+            out = out.push(match linear.bias() {
+                Some(_) => Linear::with_init(
+                    &mut store,
+                    inputs,
+                    outputs,
+                    scratch.weights,
+                    scratch.biases,
+                    &mut rng,
+                ),
+                None => {
+                    Linear::without_bias(&mut store, inputs, outputs, scratch.weights, &mut rng)
+                }
+            });
         } else if let Some(prelu) = layer.as_prelu() {
             let slopes = values.value(prelu.weight()).data().len();
             out = out.push(Prelu::new(&mut store, slopes));
@@ -298,7 +306,13 @@ mod tests {
                 store.value(got.weight()).data(),
                 want_store.value(want.weight()).data()
             );
-            assert!(store.value(got.bias()).data().iter().all(|&b| b == 0.0));
+            assert!(
+                store
+                    .value(got.bias().unwrap())
+                    .data()
+                    .iter()
+                    .all(|&b| b == 0.0)
+            );
         }
         let prelu = fresh.layer(1).as_prelu().unwrap();
         assert_eq!(store.value(prelu.weight()).data(), &[0.25; 5]);

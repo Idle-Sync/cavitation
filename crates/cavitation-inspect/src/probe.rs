@@ -149,9 +149,10 @@ pub struct NeuronValues {
     on: bool,
     /// Its incoming weights, the `Linear`'s weight row.
     weights: Vec<f32>,
-    /// Its bias.
-    bias: f32,
-    /// `bias + Σ weight · x` for the probed row, summed in `f64`.
+    /// Its bias, `None` without a `Linear` or when the `Linear` has no bias.
+    bias: Option<f32>,
+    /// `bias + Σ weight · x` for the probed row (`Σ weight · x` without a bias), summed in
+    /// `f64`.
     pre_activation: f32,
     /// The Euclidean norm of its column in the next `Linear`'s weight.
     outgoing_norm: Option<f32>,
@@ -209,17 +210,18 @@ impl NeuronValues {
         &self.weights
     }
 
-    /// The neuron's bias; `None` without a `Linear`.
+    /// The neuron's bias; `None` without a `Linear`, or when its `Linear` has no bias.
     ///
     /// ```
     /// assert!(cavitation_inspect::probe::NeuronValues::default().bias().is_none());
     /// ```
     pub fn bias(&self) -> Option<f32> {
-        self.linear.map(|_| self.bias)
+        self.bias
     }
 
-    /// `bias + Σ weight · x` for the probed row, summed in `f64` from the weights, so it is
-    /// the pre-activation before any mask; `None` without a `Linear`.
+    /// `bias + Σ weight · x` for the probed row (`Σ weight · x` when the `Linear` has no
+    /// bias), summed in `f64` from the weights, so it is the pre-activation before any mask;
+    /// `None` without a `Linear`.
     ///
     /// ```
     /// assert!(cavitation_inspect::probe::NeuronValues::default().pre_activation().is_none());
@@ -629,7 +631,7 @@ impl Probe {
         n.weights.clear();
         n.top_len = 0;
         n.outgoing_norm = None;
-        n.bias = 0.0;
+        n.bias = None;
         n.pre_activation = 0.0;
         let Some(at) = linear else {
             n.on = model.mask(layer).is_none_or(|m| m.is_on(neuron));
@@ -640,13 +642,13 @@ impl Probe {
         let inputs = lin.inputs();
         let weights = &params.value(lin.weight()).data()[neuron * inputs..(neuron + 1) * inputs];
         n.weights.extend_from_slice(weights);
-        n.bias = params.value(lin.bias()).data()[neuron];
+        n.bias = lin.bias().map(|id| params.value(id).data()[neuron]);
         let x: &[f32] = if at == 0 {
             &self.input
         } else {
             &self.layers[at - 1].a
         };
-        let mut sum = f64::from(n.bias);
+        let mut sum = n.bias.map_or(0.0, f64::from);
         for (i, (&w, &v)) in weights.iter().zip(x).enumerate() {
             let product = w * v;
             sum += f64::from(w) * f64::from(v);
@@ -783,5 +785,51 @@ mod tests {
             top[..3].iter().map(|c| c.input).collect::<Vec<_>>(),
             [1, 2, 0]
         );
+    }
+
+    /// A neuron of a `Linear` without a bias reports no bias, and its pre-activation is
+    /// `Σ weight · x` alone, the tape's value.
+    #[test]
+    fn neuron_without_a_bias() {
+        use cavitation_core::{Rng, Tensor};
+        use cavitation_nn::{Dataset, Init, Linear, Loss, Tanh, Targets};
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(4);
+        let net = Sequential::new()
+            .push(Linear::without_bias(
+                &mut params,
+                3,
+                4,
+                Init::XavierUniform,
+                &mut rng,
+            ))
+            .push(Tanh)
+            .push(Linear::new(&mut params, 4, 2, &mut rng));
+        let data = Dataset {
+            x: Tensor::from_vec(vec![1.0f32, -2.0, 0.5], &[1, 3]).unwrap(),
+            targets: Targets::Classes(vec![1]),
+        };
+        let mut probe = Probe::new();
+        probe
+            .run(&net, &params, &data, 0, Loss::CrossEntropy)
+            .unwrap();
+        let z = probe.layers()[1].z().unwrap()[2];
+        let n = probe.neuron(&net, &params, 1, 2).unwrap();
+        assert_eq!(n.linear(), Some(0));
+        assert_eq!(n.bias(), None);
+        let w = params.value(net.linear(0).unwrap().weight()).data()[6..9].to_vec();
+        let want = f64::from(w[0]) - 2.0 * f64::from(w[1]) + 0.5 * f64::from(w[2]);
+        let got = n.pre_activation().unwrap();
+        assert_eq!(got, want as f32);
+        assert!((got - z).abs() < 1e-6, "{got} against the tape's {z}");
+        let mut w = crate::json::JsonWriter::new();
+        crate::wire::neuron(&mut w, 0, &probe, probe.last_neuron());
+        assert!(
+            w.as_str().contains(r#""bias":null,"has_bias":false"#),
+            "{}",
+            w.as_str()
+        );
+        // The output layer has a bias.
+        assert!(probe.neuron(&net, &params, 2, 0).unwrap().bias().is_some());
     }
 }

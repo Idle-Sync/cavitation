@@ -466,7 +466,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use cavitation_core::{Error, Graph, KeyErrors, ParamStore, Rng, Tensor};
-    use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+    use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize_to_file};
     use serde_json::Value;
 
     use super::{LoadOptions, load, load_lenient, load_with, save};
@@ -640,6 +640,72 @@ mod tests {
         load(&path, &net2, &mut params2).unwrap();
         assert_eq!(bits(&net, &params), bits(&net2, &params2));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `Linear(4, 8, bias=False), ReLU, Linear(8, 3)` with random weights: the first layer
+    /// has no bias.
+    fn mlp_without_first_bias(seed: u64) -> (Sequential<f32>, ParamStore<f32>) {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(seed);
+        let net = Sequential::new()
+            .push(Linear::without_bias(
+                &mut params,
+                4,
+                8,
+                crate::Init::XavierUniform,
+                &mut rng,
+            ))
+            .push(Relu)
+            .push(Linear::new(&mut params, 8, 3, &mut rng));
+        (net, params)
+    }
+
+    /// A network with a `Linear` without a bias saves only that layer's weight, under
+    /// `0.weight`, and loads back into a differently initialised copy bit for bit.
+    #[test]
+    fn save_load_roundtrip_without_bias() {
+        let (net, params) = mlp_without_first_bias(1);
+        let path = temp_path("roundtrip-no-bias");
+        save(&path, &net, &params).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let file = SafeTensors::deserialize(&bytes).unwrap();
+        let mut keys: Vec<String> = file.names().into_iter().map(String::from).collect();
+        keys.sort();
+        assert_eq!(keys, ["0.weight", "2.bias", "2.weight"]);
+        let (net2, mut params2) = mlp_without_first_bias(2);
+        assert_ne!(bits(&net, &params), bits(&net2, &params2));
+        load(&path, &net2, &mut params2).unwrap();
+        assert_eq!(bits(&net, &params), bits(&net2, &params2));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file whose first layer has a bias does not load strictly into a model whose first
+    /// layer has none (`0.bias` is unexpected), and `load_lenient` skips that key; a file
+    /// without it does not load into a model that needs it (`0.bias` is missing).
+    #[test]
+    fn bias_and_no_bias_do_not_mix() {
+        let with = temp_path("with-bias");
+        write_entries(&with, &good_entries());
+        let (bare, mut bare_params) = mlp_without_first_bias(1);
+        let err = load(&with, &bare, &mut bare_params).unwrap_err();
+        let keys = keys_of(&err);
+        assert_eq!(keys.unexpected, ["0.bias"]);
+        assert!(keys.missing.is_empty() && keys.wrong_shape.is_empty());
+        assert_eq!(
+            load_lenient(&with, &bare, &mut bare_params).unwrap(),
+            ["0.bias"]
+        );
+        std::fs::remove_file(&with).unwrap();
+
+        let without = temp_path("without-bias");
+        let mut entries = good_entries();
+        entries.remove(1);
+        write_entries(&without, &entries);
+        let (net, mut params) = mlp(1);
+        let err = load(&without, &net, &mut params).unwrap_err();
+        assert_eq!(keys_of(&err).missing, ["0.bias"]);
+        load(&without, &bare, &mut bare_params).unwrap();
+        std::fs::remove_file(&without).unwrap();
     }
 
     /// The key problems of a load error, failing the test for any other error.
@@ -1242,7 +1308,20 @@ mod tests {
     /// from its position `k` (counting through the parameters in order) to
     /// `(k * 7919 mod 199) * 0.01 - 1` in f32, so its values come from neither initialiser.
     fn rust_fixture_model() -> (Sequential<f32>, ParamStore<f32>) {
-        let (net, mut params) = mlp(0);
+        fixture_values(mlp(0))
+    }
+
+    /// The model behind `from-rust-no-bias.safetensors`: `Linear(4, 8, bias=False), ReLU,
+    /// Linear(8, 3)` with its parameters set as [`rust_fixture_model`] sets them.
+    fn rust_fixture_model_without_bias() -> (Sequential<f32>, ParamStore<f32>) {
+        fixture_values(mlp_without_first_bias(0))
+    }
+
+    /// `net` with every parameter in `params` set from its position `k` (counting through
+    /// the parameters in order) to `(k * 7919 mod 199) * 0.01 - 1` in f32.
+    fn fixture_values(
+        (net, mut params): (Sequential<f32>, ParamStore<f32>),
+    ) -> (Sequential<f32>, ParamStore<f32>) {
         let mut k = 0u32;
         for (_, id) in net.parameter_names() {
             for v in params.value_mut(id).data_mut() {
@@ -1267,10 +1346,30 @@ mod tests {
     /// the PyTorch check after that.
     #[test]
     fn save_writes_the_file_pytorch_was_checked_against() {
-        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
         let (net, params) = rust_fixture_model();
-        let path = temp_path("from-rust");
-        save(&path, &net, &params).unwrap();
+        check_rust_file("from-rust", &net, &params);
+    }
+
+    /// The same for a network whose first `Linear` has no bias: `save` writes
+    /// `from-rust-no-bias.safetensors` byte for byte, with only `0.weight` for that layer,
+    /// and `make_fixtures.py --check-rust-save` loads it strictly into PyTorch's
+    /// `Linear(4, 8, bias=False), ReLU, Linear(8, 3)`.
+    #[test]
+    fn save_writes_the_bias_free_file_pytorch_was_checked_against() {
+        let (net, params) = rust_fixture_model_without_bias();
+        let names: Vec<String> = net.parameter_names().into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["0.weight", "2.weight", "2.bias"]);
+        check_rust_file("from-rust-no-bias", &net, &params);
+    }
+
+    /// Checks that `save` writes `tests/fixtures/state-dict/{stem}.safetensors` for `net`
+    /// byte for byte and that `{stem}-io.json` holds its parameter values; with
+    /// `CAVITATION_WRITE_FIXTURES` set, writes both files instead (the JSON with the inputs
+    /// of `mlp-io.json` and the network's outputs on them).
+    fn check_rust_file(stem: &str, net: &Sequential<f32>, params: &ParamStore<f32>) {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+        let path = temp_path(stem);
+        save(&path, net, params).unwrap();
         let written = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         let names = net.parameter_names();
@@ -1307,21 +1406,20 @@ mod tests {
                 "input": tensor_json(&[rows, 4], &input),
                 "output": tensor_json(&[rows, 3], &output),
             });
-            std::fs::write(dir.join("from-rust.safetensors"), &written).unwrap();
-            std::fs::write(dir.join("from-rust-io.json"), format!("{body}\n")).unwrap();
+            std::fs::write(dir.join(format!("{stem}.safetensors")), &written).unwrap();
+            std::fs::write(dir.join(format!("{stem}-io.json")), format!("{body}\n")).unwrap();
             return;
         }
 
-        let committed = std::fs::read(dir.join("from-rust.safetensors")).unwrap();
+        let committed = std::fs::read(dir.join(format!("{stem}.safetensors"))).unwrap();
         assert!(
             written == committed,
-            "save no longer writes tests/fixtures/state-dict/from-rust.safetensors; if the \
-             change is meant, rewrite it with CAVITATION_WRITE_FIXTURES=1 and rerun \
-             make_fixtures.py --check-rust-save"
+            "save no longer writes tests/fixtures/state-dict/{stem}.safetensors; if the change \
+             is meant, rewrite it with CAVITATION_WRITE_FIXTURES=1 and rerun make_fixtures.py \
+             --check-rust-save"
         );
-        let io: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("from-rust-io.json")).unwrap())
-                .unwrap();
+        let text = std::fs::read_to_string(dir.join(format!("{stem}-io.json"))).unwrap();
+        let io: Value = serde_json::from_str(&text).unwrap();
         for (name, id) in &names {
             let stored: Vec<u32> = io["params"][name.as_str()]["data"]
                 .as_array()

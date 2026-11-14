@@ -93,7 +93,7 @@ enum Reload {
 /// let mut params = ParamStore::new();
 /// let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
 /// params.value_mut(layer.weight()).data_mut()[0] = 2.0;
-/// params.value_mut(layer.bias()).data_mut()[0] = 1.0;
+/// params.value_mut(layer.bias().unwrap()).data_mut()[0] = 1.0;
 /// let net = Sequential::new().push(layer);
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0], &[3, 1]).unwrap(),
@@ -233,7 +233,7 @@ impl Evaluator {
     /// evaluator.set_neuron_mask(0, &NeuronMask::all_off(4)).unwrap();
     /// // With every hidden neuron off the output is the last bias, the same for each row.
     /// let off = evaluator.evaluate(&data).unwrap();
-    /// let bias = params.value(net.linear(2).unwrap().bias()).data()[0] as f64;
+    /// let bias = params.value(net.linear(2).unwrap().bias().unwrap()).data()[0] as f64;
     /// assert!((off.loss - bias * bias).abs() < 1e-6);
     /// ```
     pub fn with_neuron_masks(
@@ -319,7 +319,7 @@ impl Evaluator {
     /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
     /// let mut params = ParamStore::new();
     /// let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-    /// let (w, b) = (layer.weight(), layer.bias());
+    /// let (w, b) = (layer.weight(), layer.bias().unwrap());
     /// let net = Sequential::new().push(layer);
     /// let data = Dataset {
     ///     x: Tensor::from_vec(vec![1.0f32, 2.0], &[2, 1]).unwrap(),

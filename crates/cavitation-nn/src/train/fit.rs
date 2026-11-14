@@ -2867,7 +2867,7 @@ mod tests {
         };
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let net = Sequential::new().push(layer);
         let distances = Arc::new(Mutex::new(vec![1.0f64]));
         let sink = Arc::clone(&distances);
@@ -3319,7 +3319,7 @@ mod tests {
         };
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let mut net = Sequential::new().push(layer);
         let config = FitConfig {
             epochs: 4,
@@ -3520,7 +3520,10 @@ mod tests {
             let mut params = ParamStore::new();
             let mut rng = Rng::seed(22);
             let first = Linear::new(&mut params, 4, 16, &mut rng);
-            params.value_mut(first.bias()).data_mut().fill(-100.0);
+            params
+                .value_mut(first.bias().unwrap())
+                .data_mut()
+                .fill(-100.0);
             let mut net = Sequential::new()
                 .push(first)
                 .push(crate::Relu)
@@ -3743,7 +3746,7 @@ mod tests {
         };
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let mut net = Sequential::new().push(layer);
         let config = FitConfig {
             epochs: 2,

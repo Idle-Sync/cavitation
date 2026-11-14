@@ -281,7 +281,8 @@ pub struct ShrinkConfig {
     /// rounding. The fold changes the parameters, so it is in the step's checkpoint and in
     /// the network the run keeps. It costs one extra pass over the training rows per step
     /// for each listed layer after the first that loses neurons at that step, to measure its
-    /// means anew. Off by default.
+    /// means anew. The fold needs a bias to fold into, so with it on, [`shrink`] refuses a
+    /// listed layer whose next `Linear` has none. Off by default.
     pub fold_means: bool,
     /// The step between levels, in basis points, up to `fine_from_bp`. Default 1,000.
     pub step_bp: u32,
@@ -568,8 +569,9 @@ pub struct ShrinkReport {
 /// [`ShrinkConfig::criterion`] is `None` for value targets, or an `AccuracyDrop` is given
 /// for value targets, or the criterion's number is NaN; if `step_bp` or `fine_step_bp` is
 /// 0, `max_removed_bp` is 0 or above 10,000, `patience` is `Some(0)` or the retraining
-/// batch is 0; if a listed layer's neuron mask does not have its width; and as
-/// [`evaluate`] does for the validation set. Returns [`Error::Unsupported`] if a listed
+/// batch is 0; if a listed layer's neuron mask does not have its width; if
+/// [`fold_means`](ShrinkConfig::fold_means) is on and the `Linear` after a listed layer has
+/// no bias to fold into; and as [`evaluate`] does for the validation set. Returns [`Error::Unsupported`] if a listed
 /// `Linear`, or a layer between it and the layer that holds its neurons, carries a mask
 /// set with [`Sequential::set_mask`] (clear it and mask by `Linear` instead), and if the
 /// layer after a listed `Linear`'s neurons is not a `Linear` (a `Softmax` or a `Glu`, say),
@@ -649,6 +651,9 @@ pub(crate) fn run(
     let linears = hidden_linears(model, &config.linears)?;
     check_masks(model, &linears)?;
     let mut warnings = check_layout(model, &linears)?;
+    if config.fold_means {
+        check_fold_biases(model, &linears)?;
+    }
     let criterion = criterion(config.criterion, &train.targets)?;
     check_numbers(&config)?;
     let levels = levels(
@@ -863,7 +868,10 @@ impl Run<'_, '_> {
                 };
                 let next = linear_after_run(self.model, linear)
                     .expect("check_layout found a Linear after each run");
-                let (inputs, weight, bias) = (next.inputs(), next.weight(), next.bias());
+                let bias = next
+                    .bias()
+                    .expect("check_fold_biases found a bias after each run");
+                let (inputs, weight) = (next.inputs(), next.weight());
                 let increments: Vec<f64> = self
                     .params
                     .value(weight)
@@ -1170,6 +1178,24 @@ fn check_layout(model: &Sequential, linears: &[usize]) -> Result<Vec<ShrinkWarni
         });
     }
     Ok(warnings)
+}
+
+/// Refuses, with `InvalidData`, a listed `Linear` whose next `Linear` has no bias, which
+/// [`ShrinkConfig::fold_means`] would have to fold the removed neurons' means into. Runs
+/// after `check_layout`, which found a `Linear` after each listed run.
+fn check_fold_biases(model: &Sequential, linears: &[usize]) -> Result<(), Error> {
+    for &linear in linears {
+        let next_at = model.neuron_layer(linear) + 1;
+        let next = linear_after_run(model, linear).expect("check_layout found a Linear");
+        if next.bias().is_none() {
+            return Err(Error::InvalidData(format!(
+                "shrink: fold_means folds the means of the linear layer {linear}'s removed \
+                 neurons into the bias of the linear layer {next_at}, which has no bias; turn \
+                 fold_means off, or give that layer a bias"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The criterion to use: the one given (its number checked), or `AccuracyDrop` of 1 point

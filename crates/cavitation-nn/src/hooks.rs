@@ -508,7 +508,7 @@ mod tests {
             .data_mut()
             .copy_from_slice(&[0.5, -0.25, 0.75, 1.0]);
         params
-            .value_mut(linear.bias())
+            .value_mut(linear.bias().unwrap())
             .data_mut()
             .copy_from_slice(&[0.1, -0.2]);
         let net = Sequential::new_generic().push(linear).push(Tanh);

@@ -1080,7 +1080,7 @@ impl LogisticModel {
     /// };
     /// let mut params = ParamStore::new();
     /// let net = model.to_sequential(&mut params);
-    /// assert_eq!(params.value(net.linear(0).unwrap().bias()).data(), &[0.5]);
+    /// assert_eq!(params.value(net.linear(0).unwrap().bias().unwrap()).data(), &[0.5]);
     /// ```
     pub fn to_sequential(&self, params: &mut ParamStore) -> Sequential {
         self.dims("to_sequential");
