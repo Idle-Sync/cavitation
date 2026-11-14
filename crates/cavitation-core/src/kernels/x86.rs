@@ -5,21 +5,21 @@
 
 use std::arch::x86_64::{
     __m128, __m256, _CMP_GE_OQ, _CMP_LE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, _mm_add_epi32, _mm_add_ps,
-    _mm_and_ps, _mm_andnot_ps, _mm_blendv_ps, _mm_castsi128_ps, _mm_cmpge_ps, _mm_cmple_ps,
-    _mm_cmplt_ps, _mm_cmpunord_ps, _mm_cvttps_epi32, _mm_div_ps, _mm_floor_ps, _mm_load_ps,
-    _mm_loadu_ps, _mm_max_ps, _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps, _mm_or_ps, _mm_set1_epi32,
-    _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_slli_epi32, _mm_srai_epi32, _mm_storeu_ps,
-    _mm_sub_epi32, _mm_sub_ps, _mm_unpackhi_ps, _mm_unpacklo_ps, _mm256_add_epi32, _mm256_add_ps,
-    _mm256_and_ps, _mm256_andnot_ps, _mm256_blendv_ps, _mm256_broadcast_ss, _mm256_castsi256_ps,
-    _mm256_cmp_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_floor_ps, _mm256_fmadd_ps,
-    _mm256_fnmadd_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_mul_ps, _mm256_or_ps,
-    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_slli_epi32, _mm256_srai_epi32,
-    _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps,
+    _mm_and_ps, _mm_andnot_ps, _mm_blendv_ps, _mm_castsi128_ps, _mm_cmpge_ps, _mm_cmpgt_ps,
+    _mm_cmple_ps, _mm_cmplt_ps, _mm_cmpunord_ps, _mm_cvttps_epi32, _mm_div_ps, _mm_floor_ps,
+    _mm_load_ps, _mm_loadu_ps, _mm_max_ps, _mm_min_ps, _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps,
+    _mm_or_ps, _mm_set1_epi32, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_slli_epi32,
+    _mm_srai_epi32, _mm_storeu_ps, _mm_sub_epi32, _mm_sub_ps, _mm_unpackhi_ps, _mm_unpacklo_ps,
+    _mm256_add_epi32, _mm256_add_ps, _mm256_and_ps, _mm256_andnot_ps, _mm256_blendv_ps,
+    _mm256_broadcast_ss, _mm256_castsi256_ps, _mm256_cmp_ps, _mm256_cvttps_epi32, _mm256_div_ps,
+    _mm256_floor_ps, _mm256_fmadd_ps, _mm256_fnmadd_ps, _mm256_loadu_ps, _mm256_max_ps,
+    _mm256_mul_ps, _mm256_or_ps, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps,
+    _mm256_slli_epi32, _mm256_srai_epi32, _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps,
 };
 
 use super::MatRef;
 use super::activation::{
-    EXP_MIN, EXP_P, Func, LN2_HI, LN2_LO, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
+    EXP_MIN, EXP_P, EXPM1_MIN, Func, LN2_HI, LN2_LO, LOG_P, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
 };
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
 use super::matvec::Job;
@@ -637,6 +637,98 @@ fn exp_neg_sse(y: __m128) -> __m128 {
     let s1 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n1, bias)));
     let s2 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n2, bias)));
     _mm_mul_ps(_mm_mul_ps(p, s1), s2)
+}
+
+/// `e^y − 1` in each lane for `y <= 0`, as the reference's `expm1_neg` computes it (NaN
+/// lanes give a meaningless value, which the callers replace).
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn expm1_neg_sse(y: __m128) -> __m128 {
+    let low = _mm_cmplt_ps(y, _mm_set1_ps(EXPM1_MIN));
+    let y = _mm_max_ps(y, _mm_set1_ps(EXPM1_MIN));
+    let n = _mm_floor_ps(_mm_add_ps(
+        _mm_mul_ps(y, _mm_set1_ps(LOG2E)),
+        _mm_set1_ps(0.5),
+    ));
+    let r = _mm_sub_ps(y, _mm_mul_ps(n, _mm_set1_ps(LN2_HI)));
+    let r = _mm_sub_ps(r, _mm_mul_ps(n, _mm_set1_ps(LN2_LO)));
+    let mut p = _mm_set1_ps(EXP_P[0]);
+    for &c in &EXP_P[1..] {
+        p = _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c));
+    }
+    let q = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(p, r), r), r);
+    // `n` is a whole number in [-25, 0], so the truncating conversion is exact and `2^n`
+    // a normal power of two.
+    let n = _mm_cvttps_epi32(n);
+    let s = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n, _mm_set1_epi32(127))));
+    let v = _mm_add_ps(_mm_mul_ps(q, s), _mm_sub_ps(s, _mm_set1_ps(1.0)));
+    _mm_blendv_ps(v, _mm_set1_ps(-1.0), low)
+}
+
+/// `ln(1 + t)` in each lane for `t` in `[0, 1]`, as the reference's `log1p_unit` computes
+/// it.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn log1p_unit_sse(t: __m128) -> __m128 {
+    let one = _mm_set1_ps(1.0);
+    let m = _mm_add_ps(one, t);
+    let c = _mm_sub_ps(t, _mm_sub_ps(m, one));
+    let big = _mm_cmpgt_ps(m, _mm_set1_ps(std::f32::consts::SQRT_2));
+    let f = _mm_blendv_ps(m, _mm_mul_ps(m, _mm_set1_ps(0.5)), big);
+    let k = _mm_and_ps(big, one);
+    let x = _mm_sub_ps(f, one);
+    let z = _mm_mul_ps(x, x);
+    let mut p = _mm_set1_ps(LOG_P[0]);
+    for &cc in &LOG_P[1..] {
+        p = _mm_add_ps(_mm_mul_ps(p, x), _mm_set1_ps(cc));
+    }
+    let y = _mm_mul_ps(_mm_mul_ps(x, z), p);
+    let y = _mm_add_ps(y, _mm_mul_ps(k, _mm_set1_ps(LN2_LO)));
+    let y = _mm_sub_ps(y, _mm_mul_ps(_mm_set1_ps(0.5), z));
+    let r = _mm_add_ps(x, y);
+    let r = _mm_add_ps(r, _mm_mul_ps(k, _mm_set1_ps(LN2_HI)));
+    _mm_add_ps(r, _mm_div_ps(c, m))
+}
+
+/// Softplus in each lane, as the reference's `softplus_one` computes it.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn softplus_sse(x: __m128) -> __m128 {
+    let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
+    let l = log1p_unit_sse(exp_neg_sse(_mm_or_ps(x, sign)));
+    let m = _mm_and_ps(x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
+    let r = _mm_add_ps(m, l);
+    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+}
+
+/// ELU with `alpha` in each lane, as the reference's `elu_one` computes it.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn elu_sse(alpha: __m128, x: __m128) -> __m128 {
+    let neg = _mm_mul_ps(alpha, expm1_neg_sse(_mm_min_ps(x, _mm_setzero_ps())));
+    let r = _mm_blendv_ps(neg, x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
+    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+}
+
+/// The SSE4.2 softplus over `values`, in place.
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2.
+#[target_feature(enable = "sse4.2")]
+pub(super) unsafe fn softplus_sse_slice(values: &mut [f32]) {
+    sse_lanes(values, |v| softplus_sse(v));
+}
+
+/// The SSE4.2 ELU with `alpha` over `values`, in place.
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2.
+#[target_feature(enable = "sse4.2")]
+pub(super) unsafe fn elu_sse_slice(alpha: f32, values: &mut [f32]) {
+    let a = _mm_set1_ps(alpha);
+    sse_lanes(values, |v| elu_sse(a, v));
 }
 
 /// `tanh` in each lane, as the reference's `tanh_one` computes it.
