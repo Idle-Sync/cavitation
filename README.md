@@ -266,7 +266,15 @@ This runs the gradient checks, the PyTorch fixture comparisons on every kernel l
 
 ## Guide
 
-The guide is in `book/`. Its first chapter, "Backprop by hand", works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks. The second, "Shrinking a network", finds how many neurons the digits network can do without and removes them. The third, "Regression, exactly and by gradient", fits linear and logistic regression both ways and shows why the two meet. Build it with [mdBook](https://rust-lang.github.io/mdBook/):
+The guide is in `book/`, in five chapters:
+
+- "Backprop by hand" works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks.
+- "Shrinking a network" finds how many neurons the digits network can do without and removes them.
+- "Watching a network train" runs the inspector on the digits network, reads each panel of the page, and measures what watching costs.
+- "Regression, exactly and by gradient" fits linear and logistic regression both ways and shows why the two meet.
+- "Coming from PyTorch" lists what matches PyTorch, so a model moved between the two gives the same outputs, and where a PyTorch habit gives a different answer or none.
+
+Build it with [mdBook](https://rust-lang.github.io/mdBook/):
 
 ```sh
 mdbook serve book   # then open http://localhost:3000
