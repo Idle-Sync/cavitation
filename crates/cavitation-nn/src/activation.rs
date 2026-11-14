@@ -185,6 +185,14 @@ fn softplus<T: Real>(x: T, beta: T, threshold: T) -> T {
     }
 }
 
+/// `f` applied to the one value `x` as a slice of one: the in-place [`Real`] forms, whose
+/// f32 kernels give a value the same bits wherever it falls in a slice.
+fn one<T: Real>(x: T, f: impl Fn(&mut [T])) -> T {
+    let mut v = [x];
+    f(&mut v);
+    v[0]
+}
+
 /// The derivative of an upper-and-lower clamp whose slope inside `(lo, hi)` is `inside`:
 /// 0 at and beyond the bounds, NaN for NaN.
 fn clamp_derivative<T: Real>(x: T, lo: T, hi: T, inside: T) -> T {
@@ -261,35 +269,18 @@ impl ActivationKind {
                 T::gelu_tanh_in_place(&mut v);
                 v[0]
             }
-            ActivationKind::Elu(alpha) => {
-                if x > T::ZERO {
-                    x
-                } else {
-                    c(alpha) * x.exp_m1()
-                }
-            }
-            // `scale · (alpha · (eˣ - 1))`, grouped as the tape's SELU computes it.
-            ActivationKind::Selu => {
-                if x > T::ZERO {
-                    c(SELU_SCALE) * x
-                } else {
-                    c(SELU_SCALE) * (c(SELU_ALPHA) * x.exp_m1())
-                }
-            }
-            ActivationKind::Celu(alpha) => {
-                if x > T::ZERO {
-                    x
-                } else {
-                    c(alpha) * (x / c(alpha)).exp_m1()
-                }
-            }
+            ActivationKind::Elu(alpha) => one(x, |v| T::elu_in_place(v, c(alpha))),
+            ActivationKind::Selu => one(x, T::selu_in_place),
+            ActivationKind::Celu(alpha) => one(x, |v| T::celu_in_place(v, c(alpha))),
             ActivationKind::Silu => {
                 let mut v = [x];
                 T::silu_in_place(&mut v);
                 v[0]
             }
-            ActivationKind::Mish => x * softplus(x, T::ONE, c(MISH_THRESHOLD)).tanh(),
-            ActivationKind::Softplus { beta, threshold } => softplus(x, c(beta), c(threshold)),
+            ActivationKind::Mish => one(x, T::mish_in_place),
+            ActivationKind::Softplus { beta, threshold } => {
+                one(x, |v| T::softplus_in_place(v, c(beta), c(threshold)))
+            }
             ActivationKind::Softsign => x / (T::ONE + x.abs()),
             ActivationKind::Hardtanh { min, max } => {
                 let (lo, hi) = (c(min), c(max));
@@ -329,7 +320,7 @@ impl ActivationKind {
                     x * (x + three) / c(6.0)
                 }
             }
-            ActivationKind::LogSigmoid => x.min(T::ZERO) - (-x.abs()).exp().ln_1p(),
+            ActivationKind::LogSigmoid => one(x, T::log_sigmoid_in_place),
         }
     }
 

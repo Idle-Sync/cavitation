@@ -15,7 +15,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use cavitation_core::kernels::activation::{
-    gelu_tanh_f32_with, sigmoid_f32_with, silu_f32_with, tanh_f32_with,
+    celu_f32_with, elu_f32_with, gelu_tanh_f32_with, log_sigmoid_f32_with, mish_f32_with,
+    selu_f32_with, sigmoid_f32_with, silu_f32_with, softplus_beta_f32_with, tanh_f32_with,
 };
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
@@ -1409,6 +1410,18 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         InferenceLayer::Activation(ActivationKind::Silu) => silu_f32_with(level, data),
         InferenceLayer::Activation(ActivationKind::Gelu(GeluApprox::Tanh)) => {
             gelu_tanh_f32_with(level, data)
+        }
+        InferenceLayer::Activation(ActivationKind::Softplus { beta, threshold }) => {
+            softplus_beta_f32_with(level, *beta as f32, *threshold as f32, data)
+        }
+        InferenceLayer::Activation(ActivationKind::LogSigmoid) => log_sigmoid_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Mish) => mish_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Elu(alpha)) => {
+            elu_f32_with(level, *alpha as f32, data)
+        }
+        InferenceLayer::Activation(ActivationKind::Selu) => selu_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Celu(alpha)) => {
+            celu_f32_with(level, *alpha as f32, data)
         }
         InferenceLayer::Activation(kind) => {
             for v in data.iter_mut() {

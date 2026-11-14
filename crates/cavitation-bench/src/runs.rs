@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cavitation_core::kernels::activation::{
-    gelu_tanh_f32_with, sigmoid_f32_with, silu_f32_with, tanh_f32_with,
+    celu_f32_with, elu_f32_with, gelu_tanh_f32_with, log_sigmoid_f32_with, mish_f32_with,
+    selu_f32_with, sigmoid_f32_with, silu_f32_with, softplus_beta_f32_with, tanh_f32_with,
 };
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
@@ -1369,11 +1370,12 @@ pub struct ActivationCase {
     pub run: SliceFn,
 }
 
-/// The `activation` run's cases: `tanh`, the sigmoid, SiLU and the tanh form of GELU, each
-/// as the plain scalar loop the library ran before the SIMD kernels (std's `f32::tanh`; the
-/// overflow-free `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`; `x` times
-/// that sigmoid; GELU's formula with std's `f32::tanh`), then through the kernels at every
-/// level in `levels`.
+/// The `activation` run's cases: `tanh`, the sigmoid, SiLU, the tanh form of GELU,
+/// softplus, log-sigmoid, Mish, ELU, SELU and CELU, each as the plain scalar loop the
+/// library ran before the SIMD kernels (std's `f32::tanh`; the overflow-free
+/// `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`; `x` times that sigmoid;
+/// GELU's formula with std's `f32::tanh`; std's `ln_1p`, `exp` and `exp_m1` for the rest),
+/// then through the kernels at every level in `levels`.
 pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
     let mut cases = vec![ActivationCase {
         name: "tanh scalar std".to_string(),
@@ -1443,7 +1445,83 @@ pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
             run: Box::new(move |v: &mut [f32]| gelu_tanh_f32_with(level, v)),
         });
     }
+    push_family(&mut cases, "softplus", levels, softplus_std, |l, v| {
+        softplus_beta_f32_with(l, 1.0, 20.0, v)
+    });
+    push_family(
+        &mut cases,
+        "log-sigmoid",
+        levels,
+        |x| x.min(0.0) - (-x.abs()).exp().ln_1p(),
+        log_sigmoid_f32_with,
+    );
+    push_family(
+        &mut cases,
+        "mish",
+        levels,
+        |x| x * softplus_std(x).tanh(),
+        mish_f32_with,
+    );
+    push_family(
+        &mut cases,
+        "elu",
+        levels,
+        |x| if x > 0.0 { x } else { x.exp_m1() },
+        |l, v| elu_f32_with(l, 1.0, v),
+    );
+    push_family(
+        &mut cases,
+        "selu",
+        levels,
+        |x| {
+            let (scale, alpha) = (1.050_701f32, 1.673_263_2f32);
+            if x > 0.0 {
+                scale * x
+            } else {
+                scale * (alpha * x.exp_m1())
+            }
+        },
+        selu_f32_with,
+    );
+    push_family(
+        &mut cases,
+        "celu",
+        levels,
+        |x| if x > 0.0 { x } else { 1.5 * (x / 1.5).exp_m1() },
+        |l, v| celu_f32_with(l, 1.5, v),
+    );
     cases
+}
+
+/// Softplus at `beta` 1 and threshold 20 as the scalar loop computed it before the SIMD
+/// kernels: `x` above 20, std's `ln_1p(exp(x))` at or below.
+fn softplus_std(x: f32) -> f32 {
+    if x > 20.0 { x } else { x.exp().ln_1p() }
+}
+
+/// Adds the cases for one activation: `"<name> scalar std"`, the scalar loop over `scalar`,
+/// then `"<name> <level>"` through `kernel` at every level in `levels`.
+fn push_family(
+    cases: &mut Vec<ActivationCase>,
+    name: &str,
+    levels: &[Level],
+    scalar: fn(f32) -> f32,
+    kernel: fn(Level, &mut [f32]),
+) {
+    cases.push(ActivationCase {
+        name: format!("{name} scalar std"),
+        run: Box::new(move |v: &mut [f32]| {
+            for x in v {
+                *x = scalar(*x);
+            }
+        }),
+    });
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("{name} {level}"),
+            run: Box::new(move |v: &mut [f32]| kernel(level, v)),
+        });
+    }
 }
 
 /// Times every case on `n` values spread evenly over [-4, 4) (each call first copies them

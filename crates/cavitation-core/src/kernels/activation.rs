@@ -34,6 +34,10 @@
 //! (Accelerate's are NEON's) fuse multiply-adds, so their stated bounds are one ulp more
 //! (3 and 2), tested on the sweep.
 //!
+//! Log-sigmoid (`−softplus(−x)`), softplus at any `beta` and threshold, Mish
+//! (`x · tanh(softplus(x))`, a block of 64 values at a time through the softplus and tanh
+//! kernels), SELU and CELU are built on these two; each function's docs give its bound.
+//!
 //! # Examples
 //!
 //! ```
@@ -88,6 +92,10 @@ pub(super) const TANH_Q: [f32; 5] = [
 pub(super) const SIGN: u32 = 0x8000_0000;
 /// Below this `y`, `e^y − 1` rounds to −1 in f32 (`e^y < 2⁻²⁵`).
 pub(super) const EXPM1_MIN: f32 = -17.5;
+/// Below this magnitude, `e^y − 1` correctly rounded to f32 is `y` itself (`y²/2` is under
+/// half an ulp of `y`), so ELU is `alpha · x` there. Taking that branch keeps the sign of
+/// `−0`, which the exponential's polynomial loses (`−0 + 0` is `+0`).
+pub(super) const EXPM1_TINY: f32 = 2.980_232_2e-8; // 2⁻²⁵
 /// The coefficients of `P` in `ln f ≈ x − x²/2 + x³·P(x)`, `x = f − 1`, `f ∈ [√½, √2)`,
 /// highest degree first (Cephes `logf`).
 pub(super) const LOG_P: [f32; 9] = [
@@ -189,10 +197,13 @@ pub(super) fn softplus_one(x: f32) -> f32 {
 }
 
 /// ELU with `alpha` as the kernels compute it, one element at a time: `x` above 0, `alpha`
-/// times [`expm1_neg`]`(x)` at or below, NaN for NaN. The reference twin of the SIMD ELU.
+/// times [`expm1_neg`]`(x)` at or below (`alpha · x` below [`EXPM1_TINY`] in size, which
+/// keeps `−0`), NaN for NaN. The reference twin of the SIMD ELU.
 pub(super) fn elu_one(alpha: f32, x: f32) -> f32 {
     if x.is_nan() || x > 0.0 {
         x
+    } else if x.abs() < EXPM1_TINY {
+        alpha * x
     } else {
         alpha * expm1_neg(x)
     }
@@ -594,6 +605,288 @@ pub fn gelu_tanh_f32_with(level: Level, values: &mut [f32]) {
     }
 }
 
+/// Replaces every value `x` with softplus at the given `beta` and `threshold`, as
+/// [`Tape::softplus`](crate::Tape::softplus) defines it: `x` itself where `z = beta · x`
+/// is above `threshold`, and `ln(1 + e^z) / beta` at or below, with `ln(1 + e^z)` from
+/// [`softplus_f32`] on the kernel for the current [`level`](super::level). For `beta` 1,
+/// `z` is `x` and the division is exact, so the result is within [`softplus_f32`]'s bound;
+/// for other `beta` it is within that bound of `ln(1 + e^z) / beta` for the rounded `z`,
+/// plus the division's rounding. NaN stays NaN; a value's result depends only on the value,
+/// `beta`, `threshold` and the level. It allocates nothing.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::softplus_beta_f32;
+/// let mut v = [30.0f32, 0.0];
+/// softplus_beta_f32(1.0, 20.0, &mut v);
+/// assert_eq!(v[0], 30.0); // above the threshold: x itself
+/// assert!((v[1] - std::f32::consts::LN_2).abs() <= f32::EPSILON);
+/// ```
+pub fn softplus_beta_f32(beta: f32, threshold: f32, values: &mut [f32]) {
+    softplus_beta_f32_with(super::level(), beta, threshold, values);
+}
+
+/// [`softplus_beta_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::softplus_beta_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [1.0f32];
+/// softplus_beta_f32_with(Level::Reference, 2.0, 20.0, &mut v);
+/// assert!((v[0] - 1.063_464_3).abs() <= 4.0 * f32::EPSILON);
+/// ```
+pub fn softplus_beta_f32_with(level: Level, beta: f32, threshold: f32, values: &mut [f32]) {
+    let (mut z, mut sp) = ([0.0f32; BLOCK], [0.0f32; BLOCK]);
+    for block in values.chunks_mut(BLOCK) {
+        let (z, sp) = (&mut z[..block.len()], &mut sp[..block.len()]);
+        for (z, &x) in z.iter_mut().zip(block.iter()) {
+            *z = beta * x;
+        }
+        sp.copy_from_slice(z);
+        softplus_f32_with(level, sp);
+        for ((x, &z), &s) in block.iter_mut().zip(z.iter()).zip(sp.iter()) {
+            *x = if z > threshold { *x } else { s / beta };
+        }
+    }
+}
+
+/// Replaces every value `x` with log-sigmoid, `ln σ(x)`, computed as `−softplus(−x)` with
+/// [`softplus_f32`] on the kernel for the current [`level`](super::level): the same
+/// operations as `min(x, 0) − ln(1 + e^(−|x|))`, so nothing overflows and the result is
+/// within [`softplus_f32`]'s bound. NaN stays NaN; a value's result depends only on the
+/// value and the level. It allocates nothing.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::log_sigmoid_f32;
+/// let mut v = [-1000.0f32, 1000.0, 0.0];
+/// log_sigmoid_f32(&mut v);
+/// assert_eq!(&v[..2], &[-1000.0, 0.0]);
+/// assert!((v[2] + std::f32::consts::LN_2).abs() <= f32::EPSILON);
+/// ```
+pub fn log_sigmoid_f32(values: &mut [f32]) {
+    log_sigmoid_f32_with(super::level(), values);
+}
+
+/// [`log_sigmoid_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::log_sigmoid_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [1.0f32];
+/// log_sigmoid_f32_with(Level::Reference, &mut v);
+/// assert!((v[0] + 0.313_261_7).abs() <= 2.0 * f32::EPSILON);
+/// ```
+pub fn log_sigmoid_f32_with(level: Level, values: &mut [f32]) {
+    for v in values.iter_mut() {
+        *v = -*v;
+    }
+    softplus_f32_with(level, values);
+    for v in values.iter_mut() {
+        *v = -*v;
+    }
+}
+
+/// Replaces every value `x` with Mish, `x · tanh(softplus(x))`, with softplus at the
+/// tape's threshold of 20 ([`softplus_beta_f32`] with `beta` 1) and the tanh of
+/// [`tanh_f32`], both on the kernel for the current [`level`](super::level). Each kernel's
+/// relative error passes through the next one undiminished at worst (the tanh's relative
+/// condition number is at most 1), so the result is within the sum of the two bounds in
+/// relative terms plus the product's rounding: 13 ulp of the correctly rounded Mish while
+/// softplus is a normal `f32` (`x` above about −87.3), and within `6 · 2⁻¹⁴⁹ · |x|` plus
+/// 1 ulp below. The worst over a sweep of one f32 in 1,009 is 4 ulp at every level. A value's result depends only on the value and the level. It allocates
+/// nothing.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::mish_f32;
+/// let mut v = [0.0f32, 100.0, 1.0];
+/// mish_f32(&mut v);
+/// assert_eq!(&v[..2], &[0.0, 100.0]);
+/// assert!((v[2] - 0.865_098_4).abs() <= 16.0 * f32::EPSILON);
+/// ```
+pub fn mish_f32(values: &mut [f32]) {
+    mish_f32_with(super::level(), values);
+}
+
+/// [`mish_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::mish_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [-1.0f32];
+/// mish_f32_with(Level::Reference, &mut v);
+/// assert!((v[0] + 0.303_401_4).abs() <= 16.0 * f32::EPSILON);
+/// ```
+pub fn mish_f32_with(level: Level, values: &mut [f32]) {
+    let mut t = [0.0f32; BLOCK];
+    for block in values.chunks_mut(BLOCK) {
+        let t = &mut t[..block.len()];
+        t.copy_from_slice(block);
+        softplus_beta_f32_with(level, 1.0, MISH_THRESHOLD, t);
+        tanh_f32_with(level, t);
+        for (x, &t) in block.iter_mut().zip(t.iter()) {
+            *x *= t;
+        }
+    }
+}
+
+/// The softplus threshold inside Mish, as the tape's Mish uses it.
+const MISH_THRESHOLD: f32 = 20.0;
+
+/// Replaces every value `x` with SELU, `scale · elu(x, alpha)` with PyTorch's constants,
+/// the ELU from [`elu_f32`] on the kernel for the current [`level`](super::level) and then
+/// multiplied by `scale`, rounded once: within 3 ulp of the correctly rounded SELU at the
+/// reference and SSE4.2 levels and 4 at the fused levels (the worst over a sweep of one f32
+/// in 1,009 is 2 at every level). NaN stays NaN; a value's result depends only on the value
+/// and the level.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::selu_f32;
+/// let mut v = [0.0f32, 1.0, -100.0];
+/// selu_f32(&mut v);
+/// assert_eq!(v[0], 0.0);
+/// assert_eq!(v[1], 1.050_701);
+/// assert!((v[2] + 1.758_099_3).abs() <= 2.0 * f32::EPSILON);
+/// ```
+pub fn selu_f32(values: &mut [f32]) {
+    selu_f32_with(super::level(), values);
+}
+
+/// [`selu_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::selu_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [-1.0f32];
+/// selu_f32_with(Level::Reference, &mut v);
+/// assert!((v[0] + 1.111_330_7).abs() <= 4.0 * f32::EPSILON);
+/// ```
+pub fn selu_f32_with(level: Level, values: &mut [f32]) {
+    let (scale, alpha) = (crate::ops::SELU_SCALE as f32, crate::ops::SELU_ALPHA as f32);
+    elu_f32_with(level, alpha, values);
+    for v in values.iter_mut() {
+        *v *= scale;
+    }
+}
+
+/// Replaces every value `x` with CELU, `x` above 0 and `alpha · (e^(x/alpha) − 1)` at or
+/// below, with `e^(x/alpha) − 1` from [`elu_f32`]'s `e^y − 1` on the kernel for the current
+/// [`level`](super::level). For a positive `alpha`, `x / alpha` is rounded once and
+/// `e^y − 1` has a relative condition number of at most 1 for `y ≤ 0`, so the result is
+/// within 3 ulp of the correctly rounded CELU at the reference and SSE4.2 levels and 4 at
+/// the fused levels (the worst over a sweep of one f32 in 1,009 is 2). A negative `alpha` puts `x / alpha` above 0,
+/// outside the kernel's `e^y − 1`, so it takes std's `exp_m1` one value at a time instead.
+/// NaN stays NaN; a value's result depends only on the value, `alpha` and the level.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::celu_f32;
+/// let mut v = [2.0f32, -1.0];
+/// celu_f32(2.0, &mut v);
+/// assert_eq!(v[0], 2.0);
+/// assert!((v[1] + 0.786_938_7).abs() <= 4.0 * f32::EPSILON);
+/// ```
+pub fn celu_f32(alpha: f32, values: &mut [f32]) {
+    celu_f32_with(super::level(), alpha, values);
+}
+
+/// [`celu_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::celu_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [-1.0f32];
+/// celu_f32_with(Level::Reference, 1.0, &mut v);
+/// assert!((v[0] + 0.632_120_56).abs() <= 2.0 * f32::EPSILON);
+/// ```
+pub fn celu_f32_with(level: Level, alpha: f32, values: &mut [f32]) {
+    if alpha.is_nan() || alpha <= 0.0 {
+        assert!(
+            supported(level),
+            "activation kernel: {}",
+            super::cannot_run(level)
+        );
+        for v in values.iter_mut() {
+            if *v <= 0.0 || v.is_nan() {
+                *v = alpha * (*v / alpha).exp_m1();
+            }
+        }
+        return;
+    }
+    // At or below 0, `x / alpha` is at or below 0 and the kernel gives
+    // `alpha · (e^(x/alpha) − 1)`; above 0 it would give `x / alpha`, so `x` is kept there.
+    let mut y = [0.0f32; BLOCK];
+    for block in values.chunks_mut(BLOCK) {
+        let y = &mut y[..block.len()];
+        for (y, &x) in y.iter_mut().zip(block.iter()) {
+            *y = x / alpha;
+        }
+        elu_f32_with(level, alpha, y);
+        for (x, &e) in block.iter_mut().zip(y.iter()) {
+            if *x <= 0.0 || x.is_nan() {
+                *x = e;
+            }
+        }
+    }
+}
+
 /// Runs `func` over `values` with the kernel for `level`.
 ///
 /// # Panics
@@ -848,6 +1141,181 @@ mod tests {
             let fused = u64::from(level != Level::Reference && level != Level::Sse42);
             assert!(s_max.0 <= 2 + fused && e_max.0 <= 1 + fused, "{level}");
         }
+    }
+
+    /// ELU keeps the sign of a zero at every level (`alpha · (e^±0 − 1)` is `alpha · ±0`),
+    /// and is `alpha · x` for an input below `EXPM1_TINY` in size; SELU and CELU follow.
+    #[test]
+    fn elu_family_keeps_signed_zero() {
+        for level in levels() {
+            let mut v = [-0.0f32, 0.0, -1e-30, -1e-40];
+            elu_f32_with(level, 2.0, &mut v);
+            assert!(
+                v[0] == 0.0 && v[0].is_sign_negative(),
+                "{level}: elu(-0) is {}",
+                v[0]
+            );
+            assert!(
+                v[1] == 0.0 && v[1].is_sign_positive(),
+                "{level}: elu(+0) is {}",
+                v[1]
+            );
+            assert_eq!(v[2], -2e-30, "{level}");
+            assert_eq!(v[3], 2.0 * -1e-40, "{level}");
+            let mut v = [-0.0f32, 0.0];
+            selu_f32_with(level, &mut v);
+            assert!(
+                v[0].is_sign_negative() && v[1].is_sign_positive(),
+                "{level}: selu"
+            );
+            let mut v = [-0.0f32, 0.0];
+            celu_f32_with(level, 1.5, &mut v);
+            assert!(
+                v[0].is_sign_negative() && v[1].is_sign_positive(),
+                "{level}: celu"
+            );
+        }
+    }
+
+    /// Log-sigmoid, softplus at another `beta`, Mish, SELU and CELU against `f64` over the
+    /// sweep and the edge values at every level, within the bounds their docs state; NaN
+    /// exactly where the `f64` formula gives NaN.
+    #[test]
+    fn composite_activations_within_their_bounds() {
+        let mut xs = sweep(1009);
+        xs.extend(edges());
+        xs.push(f32::NAN);
+        for level in levels() {
+            let fused = u64::from(level != Level::Reference && level != Level::Sse42);
+            let (l, lx) = worst_of(
+                &xs,
+                |v| log_sigmoid_f32_with(level, v),
+                |x| -softplus_exact(-x),
+            );
+            assert!(
+                l <= 2 + fused,
+                "{level}: log_sigmoid is {l} ulp off at {lx:e}"
+            );
+            // `beta` 2: against the exact softplus of the rounded `z = 2x` (exact here), over 2.
+            let (s, sx) = worst_of(
+                &xs,
+                |v| softplus_beta_f32_with(level, 2.0, 20.0, v),
+                |x| {
+                    let z = 2.0 * x;
+                    if z > 20.0 {
+                        x
+                    } else {
+                        (softplus_exact64(z) / 2.0) as f32
+                    }
+                },
+            );
+            assert!(
+                s <= 2 + fused,
+                "{level}: softplus(beta 2) is {s} ulp off at {sx:e}"
+            );
+            let (e, ex) = worst_of(
+                &xs,
+                |v| selu_f32_with(level, v),
+                |x| {
+                    let (scale, alpha) = (crate::ops::SELU_SCALE, crate::ops::SELU_ALPHA);
+                    let w = f64::from(x);
+                    (if w > 0.0 {
+                        scale * w
+                    } else {
+                        scale * alpha * w.exp_m1()
+                    }) as f32
+                },
+            );
+            assert!(e <= 3 + fused, "{level}: selu is {e} ulp off at {ex:e}");
+            let (c, cx) = worst_of(
+                &xs,
+                |v| celu_f32_with(level, 2.5, v),
+                |x| {
+                    let w = f64::from(x);
+                    (if w > 0.0 { w } else { 2.5 * (w / 2.5).exp_m1() }) as f32
+                },
+            );
+            assert!(c <= 3 + fused, "{level}: celu is {c} ulp off at {cx:e}");
+            let mut mish = xs.clone();
+            mish_f32_with(level, &mut mish);
+            let mut m_worst = (0, 0.0f32);
+            for (&x, &got) in xs.iter().zip(&mish) {
+                let w = f64::from(x);
+                let sp = if w > 20.0 {
+                    w
+                } else {
+                    w.max(0.0) + (-w.abs()).exp().ln_1p()
+                };
+                let want = w * sp.tanh();
+                assert_eq!(
+                    got.is_nan(),
+                    want.is_nan(),
+                    "{level}: mish({x:e}) is {got:e}"
+                );
+                if want.is_nan() {
+                    continue;
+                }
+                if sp < f64::from(f32::MIN_POSITIVE) {
+                    let ulp = (want as f32).abs().next_up() - (want as f32).abs();
+                    let limit = 6.0 * 2f64.powi(-149) * w.abs() + f64::from(ulp);
+                    let err = (f64::from(got) - want).abs();
+                    assert!(
+                        err <= limit,
+                        "{level}: mish({x:e}) is {got:e}, want {want:e}"
+                    );
+                } else {
+                    let u = ulps(got, want as f32);
+                    if u > m_worst.0 {
+                        m_worst = (u, x);
+                    }
+                }
+            }
+            println!(
+                "{level}: log_sigmoid {l} at {lx:e}, softplus2 {s} at {sx:e}, selu {e} at {ex:e}, celu {c} at {cx:e}, mish {} at {:e}",
+                m_worst.0, m_worst.1
+            );
+            assert!(
+                m_worst.0 <= 13,
+                "{level}: mish is {} ulp off at {:e}",
+                m_worst.0,
+                m_worst.1
+            );
+        }
+    }
+
+    /// Softplus in f64 for an f32 input, before rounding.
+    fn softplus_exact64(x: f32) -> f64 {
+        let x = f64::from(x);
+        x.max(0.0) + (-x.abs()).exp().ln_1p()
+    }
+
+    /// CELU with a negative `alpha` takes the scalar formula, and every composite gives a
+    /// value the same bits wherever it falls in the slice (150 values: two blocks and a part).
+    #[test]
+    fn composite_activations_do_not_depend_on_the_block() {
+        let xs: Vec<f32> = (0..150).map(|i| -30.0 + 0.4 * i as f32).collect();
+        let fs: [fn(Level, &mut [f32]); 6] = [
+            log_sigmoid_f32_with,
+            mish_f32_with,
+            selu_f32_with,
+            |l, v| softplus_beta_f32_with(l, 0.5, 3.0, v),
+            |l, v| celu_f32_with(l, 1.5, v),
+            |l, v| celu_f32_with(l, -1.5, v),
+        ];
+        for level in levels() {
+            for f in fs {
+                let mut all = xs.clone();
+                f(level, &mut all);
+                for (i, &x) in xs.iter().enumerate() {
+                    let mut one = [x];
+                    f(level, &mut one);
+                    assert_eq!(one[0].to_bits(), all[i].to_bits(), "{level}: {x}");
+                }
+            }
+        }
+        let mut v = [-1.0f32, 2.0];
+        celu_f32_with(Level::Reference, -1.5, &mut v);
+        assert_eq!(v, [-1.5 * (-1.0f32 / -1.5).exp_m1(), 2.0]);
     }
 
     /// SiLU is within 7 ulp of the correctly rounded result (where the sigmoid is subnormal,
