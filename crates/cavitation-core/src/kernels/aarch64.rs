@@ -1,17 +1,17 @@
 //! aarch64 microkernels: the NEON GEMM tile (8 by 12, fused multiply-add by vector lane) and
-//! the NEON inference matvec kernel, and the NEON `tanh` and sigmoid kernel.
+//! the NEON inference matvec kernel, and the NEON `tanh`, sigmoid, softplus and ELU kernels.
 
 use std::arch::aarch64::{
     float32x4_t, vabsq_f32, vaddq_f32, vaddq_s32, vandq_u32, vbslq_f32, vceqq_f32, vcgeq_f32,
-    vcleq_f32, vcltq_f32, vcvtq_s32_f32, vdivq_f32, vdupq_n_f32, vdupq_n_s32, vdupq_n_u32,
-    vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vmulq_f32, vnegq_f32, vorrq_u32,
-    vreinterpretq_f32_s32, vreinterpretq_f32_u32, vreinterpretq_u32_f32, vrndmq_f32, vshlq_n_s32,
-    vshrq_n_s32, vst1q_f32, vsubq_f32, vsubq_s32,
+    vcgtq_f32, vcleq_f32, vcltq_f32, vcvtq_s32_f32, vdivq_f32, vdupq_n_f32, vdupq_n_s32,
+    vdupq_n_u32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vmulq_f32,
+    vnegq_f32, vorrq_u32, vreinterpretq_f32_s32, vreinterpretq_f32_u32, vreinterpretq_u32_f32,
+    vrndmq_f32, vshlq_n_s32, vshrq_n_s32, vst1q_f32, vsubq_f32, vsubq_s32,
 };
 
 use super::MatRef;
 use super::activation::{
-    EXP_MIN, EXP_P, Func, LN2_HI, LN2_LO, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
+    EXP_MIN, EXP_P, EXPM1_MIN, Func, LN2_HI, LN2_LO, LOG_P, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
 };
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
 use super::matvec::Job;
@@ -283,6 +283,115 @@ fn exp_neg_neon(y: float32x4_t) -> float32x4_t {
     let s1 = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n1, bias)));
     let s2 = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n2, bias)));
     vmulq_f32(vmulq_f32(p, s1), s2)
+}
+
+/// `e^y − 1` in each lane for `y <= 0`, the reference's `expm1_neg` with fused
+/// multiply-adds (NaN lanes give a meaningless value, which the callers replace).
+#[inline]
+#[target_feature(enable = "neon")]
+fn expm1_neg_neon(y: float32x4_t) -> float32x4_t {
+    let low = vcltq_f32(y, vdupq_n_f32(EXPM1_MIN));
+    let y = vmaxq_f32(y, vdupq_n_f32(EXPM1_MIN));
+    let n = vrndmq_f32(vfmaq_f32(vdupq_n_f32(0.5), y, vdupq_n_f32(LOG2E)));
+    let r = vfmsq_f32(y, n, vdupq_n_f32(LN2_HI));
+    let r = vfmsq_f32(r, n, vdupq_n_f32(LN2_LO));
+    let mut p = vdupq_n_f32(EXP_P[0]);
+    for &c in &EXP_P[1..] {
+        p = vfmaq_f32(vdupq_n_f32(c), p, r);
+    }
+    let q = vfmaq_f32(r, vmulq_f32(p, r), r);
+    // `n` is a whole number in [-25, 0] (or NaN, which converts to 0), so the conversion is
+    // exact and `2^n` a normal power of two.
+    let n = vcvtq_s32_f32(n);
+    let s = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(n, vdupq_n_s32(127))));
+    let v = vfmaq_f32(vsubq_f32(s, vdupq_n_f32(1.0)), q, s);
+    vbslq_f32(low, vdupq_n_f32(-1.0), v)
+}
+
+/// `ln(1 + t)` in each lane for `t` in `[0, 1]`, the reference's `log1p_unit` with fused
+/// multiply-adds in the polynomial; `1 + t` and its rounding error stay separate
+/// operations, as the correction needs.
+#[inline]
+#[target_feature(enable = "neon")]
+fn log1p_unit_neon(t: float32x4_t) -> float32x4_t {
+    let one = vdupq_n_f32(1.0);
+    let m = vaddq_f32(one, t);
+    let c = vsubq_f32(t, vsubq_f32(m, one));
+    let big = vcgtq_f32(m, vdupq_n_f32(std::f32::consts::SQRT_2));
+    let f = vbslq_f32(big, vmulq_f32(m, vdupq_n_f32(0.5)), m);
+    let k = vreinterpretq_f32_u32(vandq_u32(big, vreinterpretq_u32_f32(one)));
+    let x = vsubq_f32(f, one);
+    let z = vmulq_f32(x, x);
+    let mut p = vdupq_n_f32(LOG_P[0]);
+    for &cc in &LOG_P[1..] {
+        p = vfmaq_f32(vdupq_n_f32(cc), p, x);
+    }
+    let y = vmulq_f32(vmulq_f32(x, z), p);
+    let y = vfmaq_f32(y, k, vdupq_n_f32(LN2_LO));
+    let y = vfmsq_f32(y, vdupq_n_f32(0.5), z);
+    let r = vaddq_f32(x, y);
+    let r = vfmaq_f32(r, k, vdupq_n_f32(LN2_HI));
+    vaddq_f32(r, vdivq_f32(c, m))
+}
+
+/// Softplus in each lane, the reference's `softplus_one` with fused multiply-adds.
+#[inline]
+#[target_feature(enable = "neon")]
+fn softplus_neon(x: float32x4_t) -> float32x4_t {
+    let zero = vdupq_n_f32(0.0);
+    let l = log1p_unit_neon(exp_neg_neon(vnegq_f32(vabsq_f32(x))));
+    let m = vbslq_f32(vcgtq_f32(x, zero), x, zero);
+    let r = vaddq_f32(m, l);
+    // `x == x` is false only in NaN lanes, which keep `x`.
+    vbslq_f32(vceqq_f32(x, x), r, x)
+}
+
+/// ELU with `alpha` in each lane, the reference's `elu_one` with fused multiply-adds.
+#[inline]
+#[target_feature(enable = "neon")]
+fn elu_neon(alpha: float32x4_t, x: float32x4_t) -> float32x4_t {
+    let zero = vdupq_n_f32(0.0);
+    let neg = vmulq_f32(alpha, expm1_neg_neon(vminq_f32(x, zero)));
+    let r = vbslq_f32(vcgtq_f32(x, zero), x, neg);
+    vbslq_f32(vceqq_f32(x, x), r, x)
+}
+
+/// Runs `lanes` over `values` four at a time, the tail through a zero-padded vector.
+#[inline]
+#[target_feature(enable = "neon")]
+fn neon_lanes(values: &mut [f32], lanes: impl Fn(float32x4_t) -> float32x4_t) {
+    let (chunks, tail, mut pad) = split::<4>(values);
+    for c in chunks {
+        // SAFETY: `c` holds 4 floats; `vld1q_f32` and `vst1q_f32` need only f32 alignment.
+        unsafe { vst1q_f32(c.as_mut_ptr(), lanes(vld1q_f32(c.as_ptr()))) };
+    }
+    if !tail.is_empty() {
+        // SAFETY: `pad` holds 4 floats, as above.
+        unsafe { vst1q_f32(pad.as_mut_ptr(), lanes(vld1q_f32(pad.as_ptr()))) };
+        let n = tail.len();
+        tail.copy_from_slice(&pad[..n]);
+    }
+}
+
+/// The NEON softplus over `values`, in place.
+///
+/// # Safety
+///
+/// The CPU must support NEON.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn softplus_neon_slice(values: &mut [f32]) {
+    neon_lanes(values, |v| softplus_neon(v));
+}
+
+/// The NEON ELU with `alpha` over `values`, in place.
+///
+/// # Safety
+///
+/// The CPU must support NEON.
+#[target_feature(enable = "neon")]
+pub(super) unsafe fn elu_neon_slice(alpha: f32, values: &mut [f32]) {
+    let a = vdupq_n_f32(alpha);
+    neon_lanes(values, |v| elu_neon(a, v));
 }
 
 /// `tanh` in each lane, the reference's `tanh_one` with fused multiply-adds.
