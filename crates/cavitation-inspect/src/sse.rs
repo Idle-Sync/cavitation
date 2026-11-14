@@ -274,6 +274,13 @@ impl Hub {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Holds the hub's lock until the returned guard is dropped, so a test can make every
+    /// `try_lock` publish of the training side be refused.
+    #[cfg(test)]
+    pub(crate) fn hold_lock(&self) -> impl Drop + '_ {
+        self.lock()
+    }
+
     /// Takes the lock only if it is free now.
     fn try_lock(&self) -> Option<MutexGuard<'_, State>> {
         match self.state.try_lock() {

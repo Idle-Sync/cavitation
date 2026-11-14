@@ -44,6 +44,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - Explore mode: `Inspector::explore` serves a trained network to the page, which can switch neurons, rank a hidden layer's neurons by ablation, and shrink the network level by level, with `Cancel` ending a run after the step in progress.
 - The neuron panel shows a neuron of a `Linear` without a bias with no bias and its sum as `Σ w·x`; the `neuron` event has a new field, `has_bias`, and `bias` is `null` for such a neuron.
 - `sse::Hub`, `json::JsonWriter` (NaN and infinity as `null`, `<`, `>`, `&`, U+2028 and U+2029 escaped), `commands`, `probe::Probe` and `wire` (every event's fields) are public for programs that build their own view.
+- A snapshot (`stats`, `probe`, `neuron`, `profile`) is no longer sent ahead of an event that is still waiting for the hub: while a `status`, `epoch` or `model` event that the hub's lock refused waits, no snapshot is taken, so a page sees a paused run's `paused` status before its paused `stats`. A `profile` the hub's lock refused is asked for again on the next step instead of being lost. In explore mode, commands sent before a ranking or a shrink run starts are read before its first neuron or level, so a cancel sent early always stops the run at its first stopping point.
 
 ### Layers, training and inference (`cavitation-nn`)
 
