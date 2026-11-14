@@ -231,14 +231,21 @@ impl<T, C, const M: usize> std::fmt::Debug for Parts<T, C, M> {
 unsafe impl<T: Send, C: Send, const M: usize> Send for Parts<T, C, M> {}
 
 /// A shared reference that tasks on several threads may use: the parts of a step and the
-/// chunk statistics' slots.
+/// chunk statistics' slots, the only two things it is `Sync` for.
 struct ForTasks<P>(P);
 
-// SAFETY: `run_parts` uses it only to read parts that do not change during the call and to
-// form references to disjoint buffer chunks and statistics slots, one task per chunk,
-// while the buffers are borrowed for the step; sending those to another thread is sound
-// when `T: Send`.
-unsafe impl<P> Sync for ForTasks<P> {}
+// SAFETY: `run_parts` shares the parts list only to read parts that do not change during
+// the call and to form references to disjoint chunks, one task per chunk, while the
+// buffers are borrowed for the step: each task takes its chunks of the buffers as
+// `&mut [T]` on another thread (`T: Send`), reads its chunk of the gradient as `&[T]`
+// while other tasks read theirs (`T: Sync`), and reads the parts' constants by reference
+// (`C: Sync`).
+unsafe impl<T: Send + Sync, C: Sync, const M: usize> Sync for ForTasks<&[Part<T, C, M>]> {}
+
+// SAFETY: `run_parts` shares the statistics pointer only to write slot `t.index` from the
+// task that `pool::run` gave chunk `t.index`, so no two tasks touch the same slot, and the
+// slots outlive the call; `ChunkStats` is plain data.
+unsafe impl Sync for ForTasks<*mut ChunkStats> {}
 
 /// The update of one chunk: the parameter's constants and the chunk's parts of its `M`
 /// mutable buffers and of its gradient in, the chunk's statistics out.
@@ -754,16 +761,14 @@ impl<T: Real> Sgd<T> {
                 let grads = grad.as_ref().map(|g| g.data());
                 self.plain.push(id, [value.data_mut()], grads, ());
             }
-            let list = &mut self.plain;
-            if wd == 0.0 {
-                run_parts(threads, list, parts, stats, &|_, [v], g| {
-                    sgd_chunk::<T, false>(lr, wd, v, g)
-                });
-            } else {
-                run_parts(threads, list, parts, stats, &|_, [v], g| {
+            let decay = wd != 0.0;
+            run_parts(threads, &mut self.plain, parts, stats, &|_, [v], g| {
+                if decay {
                     sgd_chunk::<T, true>(lr, wd, v, g)
-                });
-            }
+                } else {
+                    sgd_chunk::<T, false>(lr, wd, v, g)
+                }
+            });
             return;
         }
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
@@ -774,24 +779,20 @@ impl<T: Real> Sgd<T> {
             self.with_momentum
                 .push(id, [value.data_mut(), buffer], grads, first);
         }
-        let list = &mut self.with_momentum;
-        if wd == 0.0 {
-            run_parts(threads, list, parts, stats, &|&first, [v, b], g| {
-                if first {
-                    sgd_momentum_chunk::<T, false, true>(lr, mu, wd, v, b, g)
-                } else {
-                    sgd_momentum_chunk::<T, false, false>(lr, mu, wd, v, b, g)
-                }
-            });
-        } else {
-            run_parts(threads, list, parts, stats, &|&first, [v, b], g| {
-                if first {
-                    sgd_momentum_chunk::<T, true, true>(lr, mu, wd, v, b, g)
-                } else {
-                    sgd_momentum_chunk::<T, true, false>(lr, mu, wd, v, b, g)
-                }
-            });
-        }
+        let decay = wd != 0.0;
+        // Each chunk picks the loop made for its case, so no element tests the settings.
+        run_parts(
+            threads,
+            &mut self.with_momentum,
+            parts,
+            stats,
+            &|&first, [v, b], g| match (decay, first) {
+                (false, false) => sgd_momentum_chunk::<T, false, false>(lr, mu, wd, v, b, g),
+                (false, true) => sgd_momentum_chunk::<T, false, true>(lr, mu, wd, v, b, g),
+                (true, false) => sgd_momentum_chunk::<T, true, false>(lr, mu, wd, v, b, g),
+                (true, true) => sgd_momentum_chunk::<T, true, true>(lr, mu, wd, v, b, g),
+            },
+        );
     }
 }
 
