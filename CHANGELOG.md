@@ -11,6 +11,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Tensors and autograd (`cavitation-core`)
 
+- `Tensor::into_vec` gives up a tensor and returns its elements without copying them, so a tensor can grow in place through `from_vec`.
 - When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
 - `kernels::Level::ALL` lists every kernel level, in the order of their numbers, supported on this CPU or not (a slice, so a later level can be added without changing its type).
 - `Tape::glu`, `softmax` and `log_softmax` on an input whose last axis has width 0, and `softmax_cross_entropy` and `nll` with no classes, now mark a parameter's gradient current in the backward pass, as every other operation does; it was left stale.
@@ -18,6 +19,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Layers, training and inference (`cavitation-nn`)
 
 - `Init::Normal { std }`: normal starting values with mean 0 and the given standard deviation, whatever the fans (PyTorch's `normal_(0, std)`, for recipes that say `std = 0.02`). A negative or non-finite deviation panics.
+- `Dataset::extend` appends another data set's rows and targets after the existing ones without copying those, so collecting data in rounds costs time in proportion to the rows added. It panics, leaving the data unchanged, when the feature counts, the target kinds or the output counts differ.
 - `save` records the model's layer kinds (`linear,relu,linear`) under `cavitation.layers` in the file's `__metadata__`, and `load` (and `load_with` with `strict` and no `rename`) returns `Error::Format` listing both when a file records other kinds: GELU-trained weights no longer load silently into a ReLU network (where the digits test set scored 339 of 360 instead of 345). Files without the record, PyTorch's among them, load as before; PyTorch ignores the metadata.
 - `load`, `load_lenient` and `load_with` read `F16`, `BF16` and `F64` safetensors files as well as `F32` ones: half precision widens to `F32` exactly (subnormals, infinities and NaN payloads included), and `F64` rounds to the nearest `F32`, as PyTorch's `.float()` does, with a finite value beyond the `F32` range refused as `Error::Format` naming its key. Checked bit for bit against state dicts written by PyTorch in each type. `save` still writes `F32`.
 - `StepLog`, a `StepControl` for `fit_controlled` that keeps one `StepRecord` per training step: its number, epoch, loss, rows and wall-clock seconds, and with `StepLog::with_update_times` the optimiser's update time from the step's profile (every step after the first recorded one is then profiled). `reserve` sizes its list once. A run without it is unchanged. Both are in the `cavitation` prelude.
