@@ -74,6 +74,7 @@ mod layer;
 mod linear;
 mod mask;
 mod optim;
+mod pooling;
 mod sequential;
 pub mod shrink;
 #[cfg(test)]
@@ -96,6 +97,7 @@ pub use layer::Layer;
 pub use linear::Linear;
 pub use mask::NeuronMask;
 pub use optim::{Adagrad, Adam, AdamW, GradStats, Optimizer, RmsProp, Sgd};
+pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 pub use sequential::{Sequential, Trace};
 pub use train::{
     Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,

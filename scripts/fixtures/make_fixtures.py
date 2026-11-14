@@ -639,6 +639,68 @@ def make_conv():
         add_case(f"conv2d-{name}", "conv2d", params, inputs, conv)
 
 
+def make_pool():
+    """max_pool2d, avg_pool2d and adaptive_avg_pool2d on images flattened to rows.
+
+    Max pooling's inputs are a shuffled ramp, so no window holds a tie and the gradient is
+    unambiguous. Built after every other case, so its draws shift none of their inputs.
+    """
+    def ramp(batch, c, h, w):
+        n = batch * c * h * w
+        values = torch.linspace(-2.0, 2.0, n)[torch.randperm(n)]
+        return values.reshape(batch, c * h * w)
+
+    max_cases = [
+        # name, batch, channels, (h, w), kernel, stride, padding, dilation, ceil_mode
+        ("2x2", 2, 3, (6, 6), (2, 2), (2, 2), (0, 0), (1, 1), False),
+        ("3x3-s2-p1", 2, 2, (7, 7), (3, 3), (2, 2), (1, 1), (1, 1), False),
+        ("3x3-s2-p1-ceil", 2, 2, (6, 6), (3, 3), (2, 2), (1, 1), (1, 1), True),
+        ("2x2-p1-ceil-dropped", 1, 2, (5, 5), (2, 2), (2, 2), (1, 1), (1, 1), True),
+        ("dilated", 1, 2, (9, 9), (3, 3), (1, 1), (0, 0), (2, 2), False),
+        ("non-square", 2, 2, (5, 8), (2, 3), (1, 2), (1, 1), (1, 1), False),
+        ("dilated-padded-ceil", 1, 2, (8, 7), (3, 3), (2, 2), (1, 1), (2, 2), True),
+    ]
+    for name, batch, c, (h, w), k, st, pd, dl, ceil in max_cases:
+        def pool(x, shape=(batch, c, h, w), k=k, st=st, pd=pd, dl=dl, ceil=ceil):
+            y = F.max_pool2d(x.reshape(shape), k, st, pd, dl, ceil_mode=ceil)
+            return y.reshape(shape[0], -1)
+
+        params = {"channels": c, "input": [h, w], "kernel": list(k), "stride": list(st),
+                  "padding": list(pd), "dilation": list(dl), "ceil_mode": ceil}
+        add_case(f"max-pool2d-{name}", "max_pool2d", params, [ramp(batch, c, h, w)], pool)
+    avg_cases = [
+        # name, batch, channels, (h, w), kernel, stride, padding, ceil, count_include_pad, divisor
+        ("2x2", 2, 3, (6, 6), (2, 2), (2, 2), (0, 0), False, True, None),
+        ("3x3-s2-p1", 2, 2, (7, 7), (3, 3), (2, 2), (1, 1), False, True, None),
+        ("3x3-s2-p1-exclude", 2, 2, (7, 7), (3, 3), (2, 2), (1, 1), False, False, None),
+        ("ceil-include", 1, 2, (6, 6), (3, 3), (2, 2), (1, 1), True, True, None),
+        ("ceil-overhang", 1, 1, (1, 6), (1, 3), (1, 2), (0, 0), True, True, None),
+        ("divisor", 2, 2, (5, 5), (2, 2), (1, 1), (1, 0), False, True, 3),
+        ("ceil-exclude", 1, 2, (6, 6), (3, 3), (2, 2), (1, 1), True, False, None),
+    ]
+    for name, batch, c, (h, w), k, st, pd, ceil, include, divisor in avg_cases:
+        def pool(x, shape=(batch, c, h, w), k=k, st=st, pd=pd, ceil=ceil, include=include, divisor=divisor):
+            y = F.avg_pool2d(x.reshape(shape), k, st, pd, ceil_mode=ceil, count_include_pad=include,
+                             divisor_override=divisor)
+            return y.reshape(shape[0], -1)
+
+        params = {"channels": c, "input": [h, w], "kernel": list(k), "stride": list(st),
+                  "padding": list(pd), "ceil_mode": ceil, "count_include_pad": include, "divisor": divisor}
+        add_case(f"avg-pool2d-{name}", "avg_pool2d", params, [rnd(batch, c * h * w)], pool)
+    for name, batch, c, (h, w), (oh, ow) in [
+        ("global", 2, 4, (5, 6), (1, 1)),
+        ("7-to-3", 2, 2, (7, 7), (3, 3)),
+        ("5x8-to-2x3", 1, 3, (5, 8), (2, 3)),
+        ("same", 1, 2, (4, 4), (4, 4)),
+        ("2-to-3", 1, 2, (2, 2), (3, 3)),
+    ]:
+        def pool(x, shape=(batch, c, h, w), out=(oh, ow)):
+            return F.adaptive_avg_pool2d(x.reshape(shape), out).reshape(shape[0], -1)
+
+        params = {"channels": c, "input": [h, w], "output": [oh, ow]}
+        add_case(f"adaptive-avg-pool2d-{name}", "adaptive_avg_pool2d", params, [rnd(batch, c * h * w)], pool)
+
+
 def write_state_dict(crates_dir):
     """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` and its outputs for five inputs."""
     out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
@@ -858,6 +920,7 @@ def main():
     make_select()
     make_dropout()
     make_conv()
+    make_pool()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):

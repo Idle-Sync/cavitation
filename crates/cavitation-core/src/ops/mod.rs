@@ -14,6 +14,7 @@ mod erf;
 mod glu;
 mod loss;
 mod matmul;
+mod pooling;
 mod reduce;
 #[cfg(test)]
 mod wrong;
@@ -52,6 +53,15 @@ pub(crate) enum Op<T: Real> {
     /// 2-D convolution: the images, the weight, the bias if any, and where the geometry's
     /// twelve numbers start in the graph's label buffer.
     Conv2d(Var, Var, Option<Var>, usize),
+    /// 2-D max pooling: the images, and where the geometry's numbers start in the
+    /// label buffer, each output's winner after them.
+    MaxPool2d(Var, usize),
+    /// 2-D average pooling: the images, and where the geometry's numbers start in the
+    /// label buffer, the divisor settings after them.
+    AvgPool2d(Var, usize),
+    /// 2-D adaptive average pooling: the images, and where the channels, input size and
+    /// output size start in the label buffer.
+    AdaptiveAvgPool2d(Var, usize),
     /// Matrix product `a · bᵀ` of `[m, k]` and `[n, k]`.
     MatMulNt(Var, Var),
     /// The input where the condition (broadcast to the input's shape) is non-zero, 0
@@ -157,6 +167,9 @@ impl<T: Real> Op<T> {
             Op::Mul(a, b) => elementwise::binary_backward(Kind::Mul, a, b, out_grad, ctx),
             Op::MatMul(a, b) => matmul::backward(false, a, b, out_grad, ctx),
             Op::Conv2d(x, w, b, start) => conv::backward(x, w, b, start, out_grad, ctx),
+            Op::MaxPool2d(x, start) => pooling::max_backward(x, start, out_grad, ctx),
+            Op::AvgPool2d(x, start) => pooling::avg_backward(x, start, out_grad, ctx),
+            Op::AdaptiveAvgPool2d(x, start) => pooling::adaptive_backward(x, start, out_grad, ctx),
             Op::MatMulNt(a, b) => matmul::backward(true, a, b, out_grad, ctx),
             Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
             Op::KeepWhere(x, keep) => elementwise::keep_where_backward(x, keep, out_grad, ctx),

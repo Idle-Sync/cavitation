@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_backward_reference, conv2d_reference};
+use cavitation_core::kernels::pooling::Pool2dGeom;
 use cavitation_core::kernels::{Level, detected, level, set_level, supported};
 use cavitation_core::{Gate, GeluApprox, Graph, ParamStore, Reduction, Tape, Tensor, Var};
 use serde_json::Value;
@@ -202,6 +203,17 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
             tape.dropout_with_mask(v[0], &keep, num(p, "p"))
         }
         "matmul" => tape.matmul(v[0], v[1]),
+        "max_pool2d" => tape.max_pool2d(v[0], pool_geom(f)),
+        "avg_pool2d" => tape.avg_pool2d(
+            v[0],
+            pool_geom(f),
+            p["count_include_pad"] == true,
+            p["divisor"].as_u64().map(|d| d as usize),
+        ),
+        "adaptive_avg_pool2d" => {
+            let (input, output) = (pair(p, "input"), pair(p, "output"));
+            tape.adaptive_avg_pool2d(v[0], num(p, "channels") as usize, input, output)
+        }
         "conv2d" => {
             let bias = (v.len() == 3).then(|| v[2]);
             tape.conv2d(v[0], v[1], bias, conv_geom(f))
@@ -394,6 +406,37 @@ fn matmul_bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         }
     }
     (gemm(k, out), vec![gemm(n, da), gemm(m, db)])
+}
+
+/// The pair recorded under `key`.
+fn pair(p: &Value, key: &str) -> (usize, usize) {
+    let v = p[key]
+        .as_array()
+        .unwrap_or_else(|| panic!("`{key}` is a pair"));
+    (
+        v[0].as_u64().unwrap() as usize,
+        v[1].as_u64().unwrap() as usize,
+    )
+}
+
+/// The geometry a pooling fixture records (dilation 1 when it records none).
+fn pool_geom(f: &Fixture) -> Pool2dGeom {
+    let p = &f.params;
+    let dilation = if p["dilation"].is_array() {
+        pair(p, "dilation")
+    } else {
+        (1, 1)
+    };
+    Pool2dGeom::with_options(
+        num(p, "channels") as usize,
+        pair(p, "input"),
+        pair(p, "kernel"),
+        pair(p, "stride"),
+        pair(p, "padding"),
+        dilation,
+        p["ceil_mode"] == true,
+    )
+    .expect("the fixture's geometry is valid")
 }
 
 /// The geometry a `conv2d` fixture records: channels, image and kernel sizes, stride,
@@ -726,11 +769,30 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         )
     };
     match f.op.as_str() {
-        "scale" | "relu" | "leaky_relu" | "tanh" | "sigmoid" | "gelu" | "elu" | "selu" | "celu"
-        | "silu" | "mish" | "softplus" | "softsign" | "hardtanh" | "relu6" | "hardsigmoid"
-        | "hardswish" | "log_sigmoid" | "glu" | "keep_where" | "dropout_with_mask" => {
-            all_elementwise()
-        }
+        "scale"
+        | "relu"
+        | "leaky_relu"
+        | "tanh"
+        | "sigmoid"
+        | "gelu"
+        | "elu"
+        | "selu"
+        | "celu"
+        | "silu"
+        | "mish"
+        | "softplus"
+        | "softsign"
+        | "hardtanh"
+        | "relu6"
+        | "hardsigmoid"
+        | "hardswish"
+        | "log_sigmoid"
+        | "glu"
+        | "keep_where"
+        | "dropout_with_mask"
+        | "max_pool2d"
+        | "avg_pool2d"
+        | "adaptive_avg_pool2d" => all_elementwise(),
         "prelu" => {
             // The slope's gradient sums over every position of its channel.
             let (x, slope) = (&f.inputs[0], &f.inputs[1]);
@@ -836,6 +898,8 @@ const DROPOUT: &[&str] = &["dropout_with_mask"];
 const MATMUL: &[&str] = &["matmul", "matmul_nt"];
 /// 2-D convolution.
 const CONV: &[&str] = &["conv2d"];
+/// 2-D pooling.
+const POOL: &[&str] = &["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
 /// The reductions.
 const REDUCTIONS: &[&str] = &["sum", "mean", "sum_axis", "mean_axis"];
 /// The activations, `prelu` and `glu`.
@@ -967,6 +1031,10 @@ comparison_tests! {
     /// `conv2d` with stride, padding, dilation, non-square images and kernels, 1 × 1 kernels
     /// and no bias matches PyTorch's float64 result within the GEMM bound.
     conv2d_matches_torch => CONV,
+    /// `max_pool2d`, `avg_pool2d` and `adaptive_avg_pool2d` with stride, padding, dilation,
+    /// `ceil_mode` (a dropped last window and an overhanging one), excluded padding, a
+    /// divisor override and overlapping adaptive windows match PyTorch.
+    pooling_matches_torch => POOL,
     /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
     reductions_match_torch => REDUCTIONS,
     /// Every activation, `prelu` and `glu` match PyTorch.

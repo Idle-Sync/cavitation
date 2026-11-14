@@ -980,6 +980,24 @@ impl<T: Real> Tape<'_, T> {
         start
     }
 
+    /// The elements of `v`, and `len` zeros appended to the graph's label buffer with where
+    /// they start: for an operation that reads its input while it writes what its backward
+    /// pass needs into the labels (max pooling's winners, say).
+    pub(crate) fn data_and_label_space(
+        &mut self,
+        v: Var,
+        len: usize,
+    ) -> (&[T], usize, &mut [usize]) {
+        let start = self.graph.labels.len();
+        self.graph.labels.resize(start + len, 0);
+        let values = Values {
+            tape: self.id,
+            nodes: &self.graph.nodes,
+            params: self.params,
+        };
+        (values.get(v), start, &mut self.graph.labels[start..])
+    }
+
     /// Appends a node and returns its variable.
     pub(crate) fn push(&mut self, op: Op<T>, shape: Shape, value: Vec<T>) -> Var {
         debug_assert!(matches!(op, Op::Param(_)) || value.len() == shape.len());

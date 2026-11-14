@@ -21,6 +21,7 @@ use cavitation_core::kernels::activation::{
 use cavitation_core::kernels::conv::{conv2d_forward, conv2d_scratch};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
+use cavitation_core::kernels::pooling::{Pool2dGeom, adaptive_avg_pool2d, avg_pool2d, max_pool2d};
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
 use cavitation_core::{
     Conv2dGeom, Error, Gate, GeluApprox, ParamStore, Real, TensorView, log_softmax_row, softmax_row,
@@ -77,6 +78,26 @@ pub enum InferenceLayer {
         weight: Vec<f32>,
         /// The bias, `out` values, or `None`.
         bias: Option<Vec<f32>>,
+    },
+    /// 2-D max pooling of this shape.
+    MaxPool2d(Pool2dGeom),
+    /// 2-D average pooling of this shape.
+    AvgPool2d {
+        /// The pooling's shape; never dilated.
+        geom: Pool2dGeom,
+        /// Whether the padding counts towards the divisor.
+        count_include_pad: bool,
+        /// The divisor used in place of the window's size, if any.
+        divisor_override: Option<usize>,
+    },
+    /// 2-D adaptive average pooling of `channels` planes of `input` to `output`.
+    AdaptiveAvgPool2d {
+        /// Channels of each image.
+        channels: usize,
+        /// Height and width of each input image.
+        input: (usize, usize),
+        /// Height and width of each output image.
+        output: (usize, usize),
     },
 }
 
@@ -992,6 +1013,38 @@ impl Compiled {
                     );
                     width
                 }
+                InferenceLayer::MaxPool2d(geom) => geom.out_width(),
+                InferenceLayer::AvgPool2d {
+                    geom,
+                    divisor_override,
+                    ..
+                } => {
+                    assert!(
+                        geom.dilation() == (1, 1) && *divisor_override != Some(0),
+                        "InferenceModel::compile: layer {i} ({name}) is an average pooling with \
+                         dilation {:?} and divisor {divisor_override:?}; it takes no dilation \
+                         and a divisor of at least 1",
+                        geom.dilation()
+                    );
+                    geom.out_width()
+                }
+                InferenceLayer::AdaptiveAvgPool2d {
+                    channels,
+                    input,
+                    output,
+                } => {
+                    let out = channels
+                        .checked_mul(output.0)
+                        .and_then(|v| v.checked_mul(output.1))
+                        .filter(|_| input.0 > 0 && input.1 > 0 && output.0 > 0 && output.1 > 0);
+                    out.unwrap_or_else(|| {
+                        panic!(
+                            "InferenceModel::compile: layer {i} ({name}) pools {channels} \
+                             channels of {input:?} to {output:?}: every size must be at \
+                             least 1 and the output must fit in memory"
+                        )
+                    })
+                }
                 InferenceLayer::Conv2d { geom, weight, bias } => {
                     let biases = bias.as_ref().map_or(geom.out_channels(), Vec::len);
                     assert!(
@@ -1216,6 +1269,25 @@ impl Compiled {
     }
 }
 
+/// Runs one pooling step on `rows` images from `src` into `dst`, with the loops the tape
+/// runs.
+fn pool(form: &InferenceLayer, rows: usize, src: &[f32], dst: &mut [f32]) {
+    match form {
+        InferenceLayer::MaxPool2d(geom) => max_pool2d(geom, rows, src, dst, None),
+        InferenceLayer::AvgPool2d {
+            geom,
+            count_include_pad,
+            divisor_override,
+        } => avg_pool2d(geom, rows, src, *count_include_pad, *divisor_override, dst),
+        InferenceLayer::AdaptiveAvgPool2d {
+            channels,
+            input,
+            output,
+        } => adaptive_avg_pool2d(rows, *channels, *input, *output, src, dst),
+        _ => unreachable!("only pooling forms reach `pool`"),
+    }
+}
+
 /// The scratch every `Conv2d` step of `steps` fits in for `rows` images on `threads`
 /// threads.
 fn conv_scratch_len(steps: &[Step], rows: usize, threads: usize) -> usize {
@@ -1239,6 +1311,12 @@ fn declared_width(form: &InferenceLayer) -> Option<usize> {
         InferenceLayer::Prelu(slopes) if slopes.len() > 1 => Some(slopes.len()),
         InferenceLayer::Mask(keep) => Some(keep.len()),
         InferenceLayer::Conv2d { geom, .. } => Some(geom.in_width()),
+        InferenceLayer::MaxPool2d(geom) | InferenceLayer::AvgPool2d { geom, .. } => {
+            Some(geom.in_width())
+        }
+        InferenceLayer::AdaptiveAvgPool2d {
+            channels, input, ..
+        } => Some(channels * input.0 * input.1),
         _ => None,
     }
 }
@@ -1352,6 +1430,19 @@ impl Run {
                         &mut dst[..n_out],
                         cols,
                     );
+                    cur = Some(to);
+                }
+                InferenceLayer::MaxPool2d(_)
+                | InferenceLayer::AvgPool2d { .. }
+                | InferenceLayer::AdaptiveAvgPool2d { .. } => {
+                    let to = cur.map_or(0, |c| 1 - c);
+                    let [b0, b1] = bufs;
+                    let (src, dst): (&[f32], &mut [f32]) = match cur {
+                        None => (input, if to == 0 { b0 } else { b1 }),
+                        Some(0) => (b0, b1),
+                        Some(_) => (b1, b0),
+                    };
+                    pool(form, rows, &src[..n_in], &mut dst[..n_out]);
                     cur = Some(to);
                 }
                 InferenceLayer::Softmax | InferenceLayer::LogSoftmax => {
@@ -1570,6 +1661,9 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         InferenceLayer::Linear { .. }
         | InferenceLayer::Glu(_)
         | InferenceLayer::Conv2d { .. }
+        | InferenceLayer::MaxPool2d(_)
+        | InferenceLayer::AvgPool2d { .. }
+        | InferenceLayer::AdaptiveAvgPool2d { .. }
         | InferenceLayer::Softmax
         | InferenceLayer::LogSoftmax => {
             unreachable!("Linear, Conv2d, Glu, Softmax and LogSoftmax steps run on their own")
