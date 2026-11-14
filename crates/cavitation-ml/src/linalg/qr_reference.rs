@@ -286,8 +286,8 @@ fn column_norm(f: &[f64], cols: usize, j: usize, rows: std::ops::Range<usize>) -
     f64::sqrt(s) * scale
 }
 
-/// The reference least-squares solution: [`Qr::new`], [`Qr::dependent_column`] and
-/// [`Qr::solve`] of this module, with the errors of the shipped [`super::lstsq`].
+/// The reference least-squares solution: [`Qr::new`] and [`Qr::solve`] of this module
+/// (which refuses dependent columns), with the errors of the shipped [`super::lstsq`].
 ///
 /// # Errors
 ///
@@ -305,9 +305,5 @@ fn column_norm(f: &[f64], cols: usize, j: usize, rows: std::ops::Range<usize>) -
 /// assert!((x.data()[0] - 2.0).abs() < 1e-15);
 /// ```
 pub fn lstsq(a: TensorView<'_, f64>, b: TensorView<'_, f64>) -> Result<Tensor<f64>, Error> {
-    let qr = Qr::new(a)?;
-    if let Some(j) = qr.dependent_column() {
-        return Err(dependent_error(j));
-    }
-    qr.solve(b)
+    Qr::new(a)?.solve(b)
 }
