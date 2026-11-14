@@ -1335,7 +1335,7 @@ fn trained(params: &mut ParamStore) -> (Sequential, Dataset) {
 
 /// A config that validates on `validation`, retrains one epoch per step and keeps every
 /// checkpoint; the rest as the defaults.
-fn quick(validation: Dataset) -> ShrinkConfig {
+fn quick(validation: Dataset) -> ShrinkConfig<'static> {
     ShrinkConfig {
         validation: Some(Validation::Given(validation)),
         retrain: RetrainConfig {
@@ -1409,7 +1409,7 @@ fn dead_pair(params: &mut ParamStore) -> (Sequential, Dataset) {
 }
 
 /// One level of 2,000 basis points on the dead pair's network.
-fn one_level(validation: Dataset, dead_first: bool) -> ShrinkConfig {
+fn one_level(validation: Dataset, dead_first: bool) -> ShrinkConfig<'static> {
     ShrinkConfig {
         step_bp: 2000,
         max_removed_bp: 2000,
@@ -1502,12 +1502,11 @@ fn patience_two_ends_after_two_misses() {
 fn on_step_stop_keeps_best() {
     let mut params = ParamStore::new();
     let mut net = hidden_network(&mut params, 4, 16);
-    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let log = seen.clone();
+    let mut seen = Vec::new();
     let config = ShrinkConfig {
         criterion: Some(ALWAYS),
-        on_step: Some(Box::new(move |step: &ShrinkStep| {
-            log.borrow_mut().push(step.removed_bp);
+        on_step: Some(Box::new(|step: &ShrinkStep| {
+            seen.push(step.removed_bp);
             if step.removed_bp == 3000 {
                 Flow::Stop
             } else {
@@ -1517,10 +1516,58 @@ fn on_step_stop_keeps_best() {
         ..quick(clusters(30, 4, 6))
     };
     let report = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap();
-    assert_eq!(*seen.borrow(), [1000, 2000, 3000]);
+    assert_eq!(seen, [1000, 2000, 3000]);
     assert_eq!(report.steps.len(), 3);
     assert_eq!(report.chosen, Some(2));
     assert_eq!(net.neuron_mask(0).unwrap().count_on(), 12);
+}
+
+/// A `ShrinkConfig` whose callbacks borrow local lists runs on a scoped thread, and the
+/// lists hold every step afterwards; one with owned callbacks moves into a spawned thread.
+#[test]
+fn shrink_config_crosses_threads() {
+    let mut on_steps = Vec::new();
+    let mut rankings = 0usize;
+    let report = std::thread::scope(|s| {
+        let config = ShrinkConfig {
+            criterion: Some(ALWAYS),
+            max_removed_bp: 3000,
+            ranking: Ranking::Custom(Box::new(|ctx| {
+                rankings += 1;
+                ctx.on.iter().map(|&j| j as f64).collect()
+            })),
+            on_step: Some(Box::new(|step: &ShrinkStep| {
+                on_steps.push(step.removed_bp);
+                Flow::Continue
+            })),
+            ..quick(clusters(30, 4, 6))
+        };
+        s.spawn(move || {
+            let mut params = ParamStore::new();
+            let mut net = hidden_network(&mut params, 4, 16);
+            shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap()
+        })
+        .join()
+        .unwrap()
+    });
+    assert_eq!(on_steps, [1000, 2000, 3000]);
+    assert_eq!(rankings, 3);
+    assert_eq!(report.steps.len(), 3);
+
+    let owned = ShrinkConfig {
+        criterion: Some(ALWAYS),
+        max_removed_bp: 1000,
+        on_step: Some(Box::new(|_: &ShrinkStep| Flow::Continue)),
+        ..quick(clusters(30, 4, 6))
+    };
+    let report = std::thread::spawn(move || {
+        let mut params = ParamStore::new();
+        let mut net = hidden_network(&mut params, 4, 16);
+        shrink(&mut net, &mut params, &clusters(48, 4, 7), owned).unwrap()
+    })
+    .join()
+    .unwrap();
+    assert_eq!(report.steps.len(), 1);
 }
 
 /// The default config has no validation set: `InvalidData` naming `validation`, and the
@@ -1875,12 +1922,11 @@ fn carve_retrains_on_the_rest() {
     let mut net = hidden_network(&mut params, 4, 8);
     let (start_net, start) = (net.clone(), params.clone());
     let train = clusters(100, 4, 7);
-    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-    let log = seen.clone();
+    let mut seen = Vec::new();
     let config = ShrinkConfig {
         validation: Some(Validation::Carve { share: 0.26 }),
-        ranking: Ranking::Custom(Box::new(move |ctx| {
-            log.borrow_mut().push(ctx.activity.clone());
+        ranking: Ranking::Custom(Box::new(|ctx| {
+            seen.push(ctx.activity.clone());
             ctx.on.iter().map(|&j| j as f64).collect()
         })),
         step_bp: 2000,
@@ -1890,7 +1936,7 @@ fn carve_retrains_on_the_rest() {
     let report = shrink(&mut net, &mut params, &train, config).unwrap();
     let rest = train.subset(0..74);
     let want = activity(&start_net, &start, &rest, &[0], 256).unwrap();
-    assert_eq!(*seen.borrow(), want);
+    assert_eq!(seen, want);
     let (masks, store) = report.steps[0].checkpoint.as_ref().unwrap();
     let (mut by_hand, mut values) = (start_net.clone(), start.clone());
     by_hand.set_neuron_mask(0, masks[0].1.clone());
@@ -2035,22 +2081,21 @@ fn zero_epochs_leave_the_parameters() {
 fn counted_shrink(
     net: &mut Sequential,
     params: &mut ParamStore,
-    ranking: Ranking,
+    ranking: Ranking<'_>,
 ) -> (Result<cavitation_nn::shrink::ShrinkReport, Error>, usize) {
-    let steps = std::rc::Rc::new(std::cell::Cell::new(0));
-    let count = steps.clone();
+    let mut steps = 0;
     let config = ShrinkConfig {
         ranking,
         criterion: Some(ALWAYS),
         max_removed_bp: 3000,
-        on_step: Some(Box::new(move |_: &ShrinkStep| {
-            count.set(count.get() + 1);
+        on_step: Some(Box::new(|_: &ShrinkStep| {
+            steps += 1;
             Flow::Continue
         })),
         ..quick(clusters(30, 4, 6))
     };
     let result = shrink(net, params, &clusters(48, 4, 7), config);
-    (result, steps.get())
+    (result, steps)
 }
 
 /// Neurons that reach a `Softmax` or a `Glu` before the next `Linear` are not removed by a
@@ -2251,7 +2296,11 @@ fn constant_pair(params: &mut ParamStore) -> Sequential {
 
 /// One step of 2,000 bp with no retraining that removes exactly `neurons[k]` from the
 /// `k`-th hidden `Linear` (layers 0 and 2), with `fold_means` as given.
-fn remove_exactly(neurons: [usize; 2], fold_means: bool, validation: Dataset) -> ShrinkConfig {
+fn remove_exactly(
+    neurons: [usize; 2],
+    fold_means: bool,
+    validation: Dataset,
+) -> ShrinkConfig<'static> {
     ShrinkConfig {
         step_bp: 2000,
         max_removed_bp: 2000,
@@ -2532,7 +2581,7 @@ fn assert_same_outputs(
 
 /// A config of one hidden layer's worth of levels, 1,000 bp apart up to `max_bp`, with no
 /// retraining, every level run, the fold on, and scores from `score` (lowest removed first).
-fn fold_levels(max_bp: u32, dead_first: bool, score: fn(usize) -> f64) -> ShrinkConfig {
+fn fold_levels(max_bp: u32, dead_first: bool, score: fn(usize) -> f64) -> ShrinkConfig<'static> {
     ShrinkConfig {
         step_bp: 1000,
         max_removed_bp: max_bp,
