@@ -304,9 +304,12 @@ pub enum Warning {
     },
     /// Neurons of a ReLU or ReLU6 layer that output exactly 0 for every sample of the epoch.
     /// Neurons turned off by a [`NeuronMask`](crate::NeuronMask), on the activation layer or
-    /// on the layer before it, are not counted. Sent to the sink every epoch; without a sink,
-    /// printed when the layer's share of dead neurons passes 25%, 50% or 90% for the first
-    /// time. "Dead" is measured per epoch and on the data the epoch ran over: a neuron that is
+    /// on the layer before it, are not counted. After a `Conv2d` or `BatchNorm2d` (with only
+    /// element-wise layers between), each value of the row is one position of one channel,
+    /// and a position counts only when its whole channel output 0 everywhere: a live channel
+    /// is often 0 at the positions that see flat input, such as an image's blank border.
+    /// Sent to the sink every epoch; without a sink, printed when the layer's share of dead
+    /// neurons passes 25%, 50% or 90% for the first time. "Dead" is measured per epoch and on the data the epoch ran over: a neuron that is
     /// silent on every training row of one epoch can fire in a later epoch, once the layers
     /// before it change, or on rows it was not counted on.
     DeadNeurons {
@@ -532,8 +535,8 @@ impl fmt::Display for Warning {
                 }
                 f.write_str(
                     "]; try a lower learning rate, a leaky activation such as LeakyRelu, or a \
-                     positive bias initialisation on the Linear before it (one built with \
-                     Linear::without_bias has no bias: build it with a bias first)",
+                     positive bias initialisation on the Linear or Conv2d before it (one built \
+                     without a bias has none: build it with a bias first)",
                 )
             }
         }
@@ -661,6 +664,33 @@ struct ReluLayer {
     offset: usize,
     /// Its output width.
     width: usize,
+    /// Values per channel when it follows a convolution or batch norm (its output is
+    /// channels of images), else 1: a position then counts as dead only when every position
+    /// of its channel is.
+    spatial: usize,
+}
+
+/// Values per channel of the output of layer `relu` when an image layer comes before it
+/// through element-wise layers only: a `Conv2d`'s output channels or a `BatchNorm2d`'s
+/// channels dividing `width`. `None` for a dense layer.
+fn channel_size(model: &Sequential, relu: usize, width: usize) -> Option<usize> {
+    let mut j = relu;
+    while j > 0 {
+        j -= 1;
+        let layer = model.layer(j);
+        let channels = if let Some(conv) = layer.as_conv2d() {
+            conv.geom().out_channels()
+        } else if let Some(bn) = layer.as_batch_norm2d() {
+            bn.channels()
+        } else if layer.is_elementwise() {
+            continue;
+        } else {
+            return None;
+        };
+        return (channels > 0 && width.is_multiple_of(channels) && width > channels)
+            .then(|| width / channels);
+    }
+    None
 }
 
 /// Runs the [`Health`] checks during training. [`Trainer`](crate::Trainer) and
@@ -1100,6 +1130,7 @@ impl<'s> HealthMonitor<'s> {
                 layer: i,
                 offset,
                 width,
+                spatial: channel_size(model, i, width).unwrap_or(1),
             };
             if self.relu_layers.get(k) != Some(&entry) {
                 self.relu_layers.truncate(k);
@@ -1400,12 +1431,23 @@ impl<'s> HealthMonitor<'s> {
                     layer,
                     offset,
                     width,
+                    spatial,
                 } = self.relu_layers[k];
                 let alive = &self.alive[offset..offset + width];
                 if alive.iter().all(|&a| a) {
                     continue;
                 }
-                let neurons = (0..width).filter(|&j| !alive[j]).collect();
+                // After an image layer a position of a live channel that saw only flat
+                // input is not dead: only the positions of channels dead everywhere count.
+                let mut neurons = Vec::new();
+                for start in (0..width).step_by(spatial) {
+                    if alive[start..start + spatial].iter().all(|&a| !a) {
+                        neurons.extend(start..start + spatial);
+                    }
+                }
+                if neurons.is_empty() {
+                    continue;
+                }
                 self.emit(Warning::DeadNeurons {
                     epoch,
                     layer,
@@ -1755,6 +1797,70 @@ mod tests {
                 "masked {masked:?}"
             );
         }
+    }
+
+    /// After a 1 × 1 convolution to two channels on 4 × 4 images, channel 0 copies the
+    /// input, which is 0 on the border and positive in the centre, and channel 1 is about
+    /// −100 everywhere. The ReLU's border positions of channel 0 output 0 all epoch, but the
+    /// channel is alive, so only channel 1's 16 positions (16 to 31) are reported dead.
+    #[test]
+    fn dead_relu_after_conv_counts_channels() {
+        use crate::{Conv2d, Flatten};
+        use cavitation_core::Conv2dGeom;
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(3);
+        let conv = Conv2d::new(
+            &mut params,
+            Conv2dGeom::new(1, 2, (4, 4), (1, 1)).unwrap(),
+            &mut rng,
+        );
+        params
+            .value_mut(conv.weight())
+            .data_mut()
+            .copy_from_slice(&[1.0, 0.0]);
+        params
+            .value_mut(conv.bias().unwrap())
+            .data_mut()
+            .copy_from_slice(&[0.0, -100.0]);
+        let net = Sequential::new()
+            .push(conv)
+            .push(Relu)
+            .push(Flatten)
+            .push(Linear::new(&mut params, 32, 1, &mut rng));
+        let mut x = vec![0.0f32; 8 * 16];
+        for (k, v) in x.iter_mut().enumerate() {
+            let (r, c) = ((k % 16) / 4, k % 4);
+            if (1..3).contains(&r) && (1..3).contains(&c) {
+                *v = 1.0 + (k / 16) as f32;
+            }
+        }
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[8, 16]).unwrap(),
+            targets: Targets::Values(Tensor::full(&[8, 1], 0.5f32)),
+        };
+        let (seen, sink) = collecting_sink();
+        let config = FitConfig {
+            epochs: 1,
+            batch: 4,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 1e-3,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            health: health(OnNonFinite::Stop, sink),
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(
+            dead_reports(&seen),
+            [Warning::DeadNeurons {
+                epoch: 1,
+                layer: 1,
+                width: 32,
+                neurons: (16..32).collect()
+            }]
+        );
     }
 
     /// On 2 → 4 → ReLU → Sigmoid → 1 with the first bias at −100 (every ReLU neuron dead),
@@ -2640,8 +2746,8 @@ mod tests {
                  gradient reached it, which points at dead ReLUs or a saturated output",
                 "epoch 1: 2 of 4 (50%) neurons of layer 1 output 0 for every sample (dead ReLU): \
                  [0, 3]; try a lower learning rate, a leaky activation such as LeakyRelu, or a \
-                 positive bias initialisation on the Linear before it (one built with \
-                 Linear::without_bias has no bias: build it with a bias first)",
+                 positive bias initialisation on the Linear or Conv2d before it (one built \
+                 without a bias has none: build it with a bias first)",
             ]
         );
     }
