@@ -3905,6 +3905,51 @@ mod tests {
         assert_eq!(evaluation_bits(&last), evaluation_bits(&manual));
     }
 
+    /// The validation measures the run's loss, not the default cross-entropy: with
+    /// `Loss::Nll` on class targets, after a `LogSoftmax` and on raw scores, each epoch's
+    /// validation is bit for bit `evaluate` with `Loss::Nll`. On raw scores cross-entropy
+    /// gives a different loss, so an evaluator built with the wrong loss fails here. (After a
+    /// `LogSoftmax` cross-entropy equals NLL in exact arithmetic, as log-softmax of
+    /// log-probabilities gives them back, which is why the raw-score case is there.)
+    #[test]
+    fn validation_uses_the_runs_class_loss() {
+        let data = synthetic_classes(64, 4, 2, 21);
+        let validation = validation_set();
+        for log_softmax in [true, false] {
+            let mut params = ParamStore::new();
+            let mut net = small_classifier(&mut params, 4, 2, 22);
+            if log_softmax {
+                net = net.push(crate::LogSoftmax);
+            }
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (record, held_out) = (Arc::clone(&seen), validation.clone());
+            let config = FitConfig {
+                loss: Loss::Nll,
+                validation: Some(validation.clone()),
+                on_epoch: Some(Box::new(move |report, model, params| {
+                    let nll = crate::evaluate(model, params, &held_out, Loss::Nll, 16).unwrap();
+                    let ce =
+                        crate::evaluate(model, params, &held_out, Loss::CrossEntropy, 16).unwrap();
+                    record.lock().unwrap().push((report.validation, nll, ce));
+                })),
+                ..control_config(3)
+            };
+            let history = fit(&net, &mut params, &data, config).unwrap();
+            assert_eq!(history.epochs.len(), 3);
+            for (recorded, nll, ce) in seen.lock().unwrap().iter() {
+                let recorded = recorded.expect("every epoch has a validation");
+                assert!(recorded.accuracy.is_some());
+                assert_eq!(evaluation_bits(&recorded), evaluation_bits(nll));
+                if !log_softmax {
+                    assert!(
+                        (recorded.loss - ce.loss).abs() > 1e-3,
+                        "{recorded:?} {ce:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Without a validation set (the default) no epoch has a validation.
     #[test]
     fn no_validation_by_default() {
