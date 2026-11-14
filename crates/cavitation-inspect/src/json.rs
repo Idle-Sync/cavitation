@@ -40,7 +40,23 @@ pub struct JsonWriter {
     open: Vec<bool>,
     /// Whether a key was just written, so the next value follows its colon with no comma.
     after_key: bool,
+    /// The scalar values (numbers, integers, booleans, `null`) written since the last clear.
+    values: usize,
+    /// The bytes those values took.
+    value_bytes: usize,
 }
+
+/// The most bytes one scalar value can take as [`JsonWriter`] writes it: 24, an `f64` such
+/// as `-1.3475090132806154e-197` (a sign, 17 significant digits, the point and a
+/// three-digit exponent). An `f32`, an integer (at most 20), a boolean or `null` is shorter.
+///
+/// ```
+/// use cavitation_inspect::json::{JsonWriter, MAX_VALUE_LEN};
+/// let mut w = JsonWriter::new();
+/// w.number(-1.3475090132806154e-197);
+/// assert_eq!(w.as_str().len(), MAX_VALUE_LEN);
+/// ```
+pub const MAX_VALUE_LEN: usize = 24;
 
 impl JsonWriter {
     /// An empty writer.
@@ -65,6 +81,62 @@ impl JsonWriter {
         self.buf.clear();
         self.open.clear();
         self.after_key = false;
+        self.values = 0;
+        self.value_bytes = 0;
+    }
+
+    /// The longest text a document of the same shape as the one written since the last
+    /// clear can take: the same keys, strings, objects and arrays, with every scalar value
+    /// (number, integer, boolean or `null`) as long as [`MAX_VALUE_LEN`].
+    ///
+    /// ```
+    /// let mut w = cavitation_inspect::json::JsonWriter::new();
+    /// w.begin_array().number(0.5).bool(true).end_array();
+    /// assert_eq!(w.as_str(), "[0.5,true]");
+    /// // "[", ",", "]" and two values of at most 24 bytes each.
+    /// assert_eq!(w.shape_bound(), 3 + 2 * 24);
+    /// ```
+    pub fn shape_bound(&self) -> usize {
+        self.buf.len() - self.value_bytes + self.values * MAX_VALUE_LEN
+    }
+
+    /// Makes the buffer's capacity at least [`shape_bound`](Self::shape_bound), so that
+    /// writing a document of the same shape again, whatever its values, never grows it.
+    ///
+    /// ```
+    /// let mut w = cavitation_inspect::json::JsonWriter::new();
+    /// w.begin_array().number(1.0).end_array();
+    /// w.reserve_for_shape();
+    /// let room = w.capacity();
+    /// w.clear();
+    /// w.begin_array().number(-1.3475090132806154e-197).end_array();
+    /// assert_eq!(w.capacity(), room);
+    /// ```
+    pub fn reserve_for_shape(&mut self) {
+        let bound = self.shape_bound();
+        self.buf.reserve(bound.saturating_sub(self.buf.len()));
+    }
+
+    /// The bytes the buffer can hold before it has to grow.
+    ///
+    /// ```
+    /// let mut w = cavitation_inspect::json::JsonWriter::new();
+    /// w.null();
+    /// assert!(w.capacity() >= 4);
+    /// ```
+    pub fn capacity(&self) -> usize {
+        self.buf.capacity()
+    }
+
+    /// Writes one scalar value with `write`, after the separator, and counts it and its
+    /// bytes for [`shape_bound`](Self::shape_bound).
+    fn scalar(&mut self, write: impl FnOnce(&mut String)) -> &mut Self {
+        self.separate();
+        let start = self.buf.len();
+        write(&mut self.buf);
+        self.values += 1;
+        self.value_bytes += self.buf.len() - start;
+        self
     }
 
     /// The text written so far.
@@ -203,15 +275,15 @@ impl JsonWriter {
     /// assert_eq!(w.as_str(), "[0.25,1e-7,null]");
     /// ```
     pub fn number(&mut self, x: f64) -> &mut Self {
-        self.separate();
-        if x.is_finite() {
-            // `{:?}` gives the shortest round-trip form, in exponent notation when very
-            // large or small, which is valid JSON either way.
-            let _ = write!(self.buf, "{x:?}");
-        } else {
-            self.buf.push_str("null");
-        }
-        self
+        self.scalar(|buf| {
+            if x.is_finite() {
+                // `{:?}` gives the shortest round-trip form, in exponent notation when very
+                // large or small, which is valid JSON either way.
+                let _ = write!(buf, "{x:?}");
+            } else {
+                buf.push_str("null");
+            }
+        })
     }
 
     /// Writes an `f32` number, or `null` when it is NaN or infinite, in the shortest text
@@ -223,13 +295,13 @@ impl JsonWriter {
     /// assert_eq!(w.as_str(), "0.1");
     /// ```
     pub fn f32(&mut self, x: f32) -> &mut Self {
-        self.separate();
-        if x.is_finite() {
-            let _ = write!(self.buf, "{x:?}");
-        } else {
-            self.buf.push_str("null");
-        }
-        self
+        self.scalar(|buf| {
+            if x.is_finite() {
+                let _ = write!(buf, "{x:?}");
+            } else {
+                buf.push_str("null");
+            }
+        })
     }
 
     /// Writes an array of `f32` numbers, each as [`f32`](Self::f32) writes it.
@@ -255,9 +327,9 @@ impl JsonWriter {
     /// assert_eq!(w.as_str(), "42");
     /// ```
     pub fn uint(&mut self, x: u64) -> &mut Self {
-        self.separate();
-        let _ = write!(self.buf, "{x}");
-        self
+        self.scalar(|buf| {
+            let _ = write!(buf, "{x}");
+        })
     }
 
     /// Writes a signed integer.
@@ -268,9 +340,9 @@ impl JsonWriter {
     /// assert_eq!(w.as_str(), "-42");
     /// ```
     pub fn int(&mut self, x: i64) -> &mut Self {
-        self.separate();
-        let _ = write!(self.buf, "{x}");
-        self
+        self.scalar(|buf| {
+            let _ = write!(buf, "{x}");
+        })
     }
 
     /// Writes `true` or `false`.
@@ -281,9 +353,7 @@ impl JsonWriter {
     /// assert_eq!(w.as_str(), "true");
     /// ```
     pub fn bool(&mut self, x: bool) -> &mut Self {
-        self.separate();
-        self.buf.push_str(if x { "true" } else { "false" });
-        self
+        self.scalar(|buf| buf.push_str(if x { "true" } else { "false" }))
     }
 
     /// Writes `null`.
@@ -294,8 +364,6 @@ impl JsonWriter {
     /// assert_eq!(w.as_str(), "null");
     /// ```
     pub fn null(&mut self) -> &mut Self {
-        self.separate();
-        self.buf.push_str("null");
-        self
+        self.scalar(|buf| buf.push_str("null"))
     }
 }

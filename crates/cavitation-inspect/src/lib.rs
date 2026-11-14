@@ -78,4 +78,4 @@ pub mod wire;
 
 pub use explore::ExploreConfig;
 pub use server::{Inspector, InspectorConfig};
-pub use snapshot::fit;
+pub use snapshot::{EVALUATION_FACTOR, fit};

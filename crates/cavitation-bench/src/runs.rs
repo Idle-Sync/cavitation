@@ -1,22 +1,25 @@
 //! Timed runs: the matrix products of one training step, each timed on its own, the
-//! training and inference runs that are compared with the numpy baseline, and the parts of
-//! the `shrink` run.
+//! training and inference runs that are compared with the numpy baseline, the parts of the
+//! `shrink` run, and the runs of the `inspect` benchmark.
 
 use std::cell::{Cell, RefCell};
 use std::hint::black_box;
+use std::io::{Read, Write};
+use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
 use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_datasets::{cifar10, digits, mnist};
+use cavitation_inspect::{Inspector, InspectorConfig};
 use cavitation_nn::shrink::{ShrinkConfig, ShrinkStep, Validation, shrink};
 use cavitation_nn::{
-    Adam, Batch, Batcher, Dataset, Evaluation, FitConfig, Health, InferenceModel, Init, Linear,
-    Loss, LrSchedule, Optimizer, OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets, Trainer,
-    Warning, WarningKind, accuracy, fit,
+    Adam, Batch, Batcher, Dataset, Evaluation, FitConfig, Health, History, InferenceModel, Init,
+    Linear, Loss, LrSchedule, Optimizer, OptimizerConfig, Relu, Sequential, Sgd, Tanh, Targets,
+    Trainer, Warning, WarningKind, accuracy, fit,
 };
 
 use crate::numpy;
@@ -700,6 +703,21 @@ mod tests {
         );
     }
 
+    /// The off/off spread is the typical distance of a round from 1, so a noisy run whose
+    /// ratios straddle 1 is not met, as a median of the ratios would make it.
+    #[test]
+    fn aa_spread_measures_noise() {
+        // The nine off/off ratios of a run on a busy machine.
+        let busy = [
+            1.2324, 1.6936, 0.6832, 0.9811, 0.9599, 0.8331, 1.0346, 1.0018, 1.0437,
+        ];
+        assert!((median(&busy) - 1.0).abs() < 0.01);
+        assert!((aa_spread(&busy) - 0.0437).abs() < 1e-9);
+        assert!(aa_spread(&busy) > 0.01);
+        let quiet = [1.003, 0.998, 1.001, 0.996, 1.004, 0.999, 1.002, 0.997];
+        assert!(aa_spread(&quiet) <= 0.01);
+    }
+
     /// The 1M network's eight products do 4,799,488 FLOPs per sample (6 × weights minus the
     /// first layer's input gradient), and the digits network's 269,824.
     #[test]
@@ -1096,4 +1114,230 @@ pub fn elements(net: &Sequential, params: &ParamStore) -> usize {
         .iter()
         .map(|(_, id)| params.value(*id).data().len())
         .sum()
+}
+
+/// The ways the `inspect` run trains, in the order of its first round.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InspectMode {
+    /// `cavitation_nn::fit`, no inspector: the baseline.
+    Off,
+    /// The baseline again, for the A/A pair.
+    OffAgain,
+    /// `cavitation_inspect::fit` with one client reading `/events` on its own thread.
+    Reading,
+    /// `cavitation_inspect::fit` with one client connected to `/events` and never reading.
+    Connected,
+}
+
+impl InspectMode {
+    /// The four modes in the order of the first round; round `r` starts at mode `r` mod 4.
+    pub const ALL: [InspectMode; 4] = [
+        InspectMode::Off,
+        InspectMode::OffAgain,
+        InspectMode::Reading,
+        InspectMode::Connected,
+    ];
+
+    /// The mode's name in the report.
+    pub fn name(self) -> &'static str {
+        match self {
+            InspectMode::Off => "off",
+            InspectMode::OffAgain => "off again",
+            InspectMode::Reading => "on, reading",
+            InspectMode::Connected => "on, not reading",
+        }
+    }
+
+    /// Whether the run trains under the inspector.
+    pub fn inspected(self) -> bool {
+        matches!(self, InspectMode::Reading | InspectMode::Connected)
+    }
+}
+
+/// Timed epochs in each run of the `inspect` benchmark: the `digits` benchmark's 100.
+pub const INSPECT_EPOCHS: usize = 100;
+
+/// Rounds of the `inspect` benchmark: each runs the four modes once. A multiple of 4, so
+/// that every mode runs first, second, third and last equally often.
+pub const INSPECT_ROUNDS: usize = 8;
+
+/// The off/off spread of the `inspect` benchmark: the median, over the rounds, of
+/// `|1 − ratio|`, where each ratio is one round's off time over its off-again time. Two
+/// identical runs give 1 on a quiet machine, so this is how far a typical round strays from
+/// 1: the noise a mode's ratio carries too. It is not `|1 − median(ratio)|`, which stays near
+/// 0 whenever the noise is symmetric, however large it is.
+pub fn aa_spread(ratios: &[f64]) -> f64 {
+    let deviations: Vec<f64> = ratios.iter().map(|r| (1.0 - r).abs()).collect();
+    median(&deviations)
+}
+
+/// The least time the `inspect` benchmark trains, untimed, before its rounds: past the
+/// package power-limit window of a low-power CPU (the N5105 runs at 15 W for 27.98 s, then
+/// at 10 W), so that every round runs at the same power limit.
+pub const INSPECT_WARMUP: Duration = Duration::from_secs(30);
+
+/// The digits the `inspect` benchmark trains on and probes.
+pub struct InspectData {
+    /// The 1,437 training digits.
+    pub train: Dataset,
+    /// The 360 test digits: the inspector's probe set.
+    pub test: Dataset,
+}
+
+/// Loads the digits for the `inspect` benchmark.
+///
+/// # Errors
+///
+/// Returns a message if the digits cannot be loaded.
+pub fn inspect_data() -> Result<InspectData, String> {
+    let (train, test) = digits::load().map_err(|e| e.to_string())?;
+    Ok(InspectData { train, test })
+}
+
+/// What one run of the `inspect` benchmark measured.
+#[derive(Clone, Copy, Debug)]
+pub struct InspectRun {
+    /// Wall-clock seconds of the `fit` call.
+    pub seconds: f64,
+    /// Snapshots the inspector captured during the run (0 without an inspector).
+    pub snapshots: u64,
+    /// Clients connected when training ended (0 without an inspector).
+    pub clients_at_end: usize,
+    /// The bits of the last epoch's mean loss, the same in every mode.
+    pub loss_bits: u64,
+}
+
+/// The digits benchmark's training: SGD at 0.01, batch 128, the rows in order, the health
+/// checks on with no output, cross-entropy.
+fn inspect_fit_config(epochs: usize) -> FitConfig {
+    FitConfig {
+        epochs,
+        batch: 128,
+        optimizer: OptimizerConfig::Sgd {
+            lr: 0.01,
+            momentum: 0.0,
+            weight_decay: 0.0,
+        },
+        loss: Loss::CrossEntropy,
+        shuffle_seed: None,
+        schedule: LrSchedule::Constant,
+        health: Health::quiet(),
+        on_epoch: None,
+        validation: None,
+    }
+}
+
+/// The client side of an inspected run: a reader thread, or a connection that never reads.
+enum InspectClient {
+    /// A thread reading the event stream until the server closes it.
+    Reading(TcpStream, std::thread::JoinHandle<()>),
+    /// A connection that asked for the event stream and reads nothing.
+    Connected(TcpStream),
+}
+
+/// Opens `/events` on the inspector at `url` (`http://<address>/?token=<token>`).
+///
+/// # Errors
+///
+/// Returns a message if the connection or the request fails.
+fn open_events(url: &str) -> Result<TcpStream, String> {
+    let rest = url.strip_prefix("http://").ok_or("the inspector's URL")?;
+    let address = &rest[..rest.find('/').ok_or("the inspector's URL")?];
+    let token = &url[url.find("token=").ok_or("the inspector's token")? + 6..];
+    let mut stream = TcpStream::connect(address).map_err(|e| format!("{address}: {e}"))?;
+    let request = format!("GET /events?token={token} HTTP/1.1\r\nHost: {address}\r\n\r\n");
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("{address}: {e}"))?;
+    Ok(stream)
+}
+
+/// Trains the 50k network (He normal weights from seed 1) on the training digits for
+/// `epochs` epochs in `mode`, and times the `fit` call. Under the inspector the 360 test
+/// digits are the probe set (8×8 images), with the default `eval_rows` and `snapshot_hz`; the
+/// client connects, and the hub has registered it, before the clock starts.
+///
+/// # Errors
+///
+/// Returns a message if the inspector cannot start, the client cannot connect within 5 s,
+/// or training fails.
+pub fn inspect_once(
+    mode: InspectMode,
+    data: &InspectData,
+    epochs: usize,
+) -> Result<InspectRun, String> {
+    let mut params = ParamStore::new();
+    let mut net = build_net(&mut params, &DIGITS_NET);
+    let config = inspect_fit_config(epochs);
+    if !mode.inspected() {
+        let start = Instant::now();
+        let history = fit(&net, &mut params, &data.train, config).map_err(|e| e.to_string())?;
+        let seconds = start.elapsed().as_secs_f64();
+        return Ok(InspectRun {
+            seconds,
+            snapshots: 0,
+            clients_at_end: 0,
+            loss_bits: last_loss_bits(&history),
+        });
+    }
+    let mut inspector = Inspector::start(InspectorConfig {
+        address: "127.0.0.1:0".parse().expect("a socket address"),
+        probe: Some(data.test.clone()),
+        input_image: Some((8, 8)),
+        title: "digits benchmark".to_string(),
+        ..InspectorConfig::default()
+    })
+    .map_err(|e| e.to_string())?;
+    let stream = open_events(&inspector.url())?;
+    let client = match mode {
+        InspectMode::Reading => {
+            let mut reader = stream.try_clone().map_err(|e| e.to_string())?;
+            let thread = std::thread::spawn(move || {
+                let mut buffer = vec![0u8; 1 << 16];
+                while matches!(reader.read(&mut buffer), Ok(n) if n > 0) {}
+            });
+            InspectClient::Reading(stream, thread)
+        }
+        _ => InspectClient::Connected(stream),
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while inspector.clients() == 0 {
+        if Instant::now() > deadline {
+            return Err("the client did not connect within 5 s".to_string());
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let before = inspector.snapshots_taken();
+    let start = Instant::now();
+    let history =
+        cavitation_inspect::fit(&mut net, &mut params, &data.train, config, &mut inspector)
+            .map_err(|e| e.to_string())?;
+    let seconds = start.elapsed().as_secs_f64();
+    let run = InspectRun {
+        seconds,
+        snapshots: inspector.snapshots_taken() - before,
+        clients_at_end: inspector.clients(),
+        loss_bits: last_loss_bits(&history),
+    };
+    // Closing the client first lets the inspector's drop finish without waiting for it.
+    match client {
+        InspectClient::Reading(stream, thread) => {
+            drop(inspector);
+            let _ = stream.shutdown(Shutdown::Both);
+            let _ = thread.join();
+        }
+        InspectClient::Connected(stream) => {
+            let _ = stream.shutdown(Shutdown::Both);
+            drop(inspector);
+        }
+    }
+    Ok(run)
+}
+
+/// The bits of the last epoch's mean loss in `history`.
+fn last_loss_bits(history: &History) -> u64 {
+    history
+        .epochs
+        .last()
+        .map_or(0, |report| report.mean_loss.to_bits())
 }
