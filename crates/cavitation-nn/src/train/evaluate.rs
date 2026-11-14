@@ -68,11 +68,12 @@ pub(crate) struct Prefix {
 /// What [`Evaluator::reload`] did, for the tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reload {
-    /// The compiled model took the new values in place.
+    /// The new values were copied in place: into the compiled model, or into the tape's
+    /// parameter values.
     InPlace,
     /// The model was compiled afresh.
     Recompiled,
-    /// The model runs on the tape.
+    /// The model runs on the tape, with a new copy of the model and its values.
     Tape,
 }
 
@@ -310,10 +311,11 @@ impl Evaluator {
     ///
     /// When `model` has the very layers the evaluator was last made or refreshed with (the
     /// model itself, or a clone of it, with only parameter values and mask values changed
-    /// since, as during [`fit`](crate::fit)), the model compiles, no clone shares its
-    /// weights and no mask was added or removed, `refresh` copies the new values in place
-    /// and allocates nothing. Otherwise it allocates: it builds the new weights before
-    /// copying them in, and on the tape it copies the parameter values afresh.
+    /// since, as during [`fit`](crate::fit)) and no mask was added or removed, `refresh`
+    /// copies the new values in place and allocates nothing: into the compiled model when
+    /// the model compiles and no clone shares its weights, and into the tape's parameter
+    /// values, whose buffers it reuses, when it does not compile. Otherwise it allocates:
+    /// it builds the new weights before copying them in, or a new copy of the model.
     ///
     /// # Errors
     ///
@@ -421,12 +423,13 @@ impl Evaluator {
 
     /// The work of [`refresh`](Self::refresh) without allocating, when `model` has the same
     /// layers as the evaluator's copy and the masks sit where they did: copies the new
-    /// weights into the compiled model and each of `model`'s mask values into the compiled
+    /// weights into the compiled model (or the tape's parameter values) and each of `model`'s mask values into the compiled
     /// model and the copy, as [`reload`](Self::reload) would. A mask added by
     /// [`with_neuron_masks`](Self::with_neuron_masks) on a `Linear` that `model` does not
     /// mask keeps its values. Returns `false`, changing nothing, when it cannot: the layers
-    /// differ, a mask was added, removed or changed width, the model runs on the tape, or
-    /// the compiled model refuses ([`InferenceModel::refresh_in_place`]).
+    /// differ, a mask was added, removed or changed width, or the compiled model refuses
+    /// ([`InferenceModel::refresh_in_place`]). On the tape it copies the parameter values
+    /// into the evaluator's own, reusing their buffers.
     fn reload_in_place(&mut self, model: &Sequential, params: &ParamStore) -> bool {
         if !self.model.same_layers(model) {
             return false;
@@ -441,11 +444,15 @@ impl Evaluator {
                 _ => return false,
             }
         }
-        let Engine::Compiled(compiled) = &mut self.engine else {
-            return false;
-        };
-        if !compiled.refresh_in_place(model, params) {
-            return false;
+        match &mut self.engine {
+            Engine::Compiled(compiled) => {
+                if !compiled.refresh_in_place(model, params) {
+                    return false;
+                }
+            }
+            // The copy's own layers run on the tape with these values; `clone_from` reuses
+            // the buffers, which have the same parameters' shapes after the first refresh.
+            Engine::Tape(values) => values.clone_from(&params.values),
         }
         for i in 0..model.len() {
             if let Some(mask) = model.mask(i) {
@@ -1390,7 +1397,8 @@ mod tests {
             want(&own, &params, &off)
         );
         params.value_mut(w).data_mut()[1] -= 0.5;
-        assert_eq!(evaluator.reload(&own, &params).unwrap(), Reload::Tape);
+        // The same layers again: the tape's values are copied in place.
+        assert_eq!(evaluator.reload(&own, &params).unwrap(), Reload::InPlace);
         assert_eq!(
             evaluator.evaluate(&data).unwrap(),
             want(&own, &params, &off)
