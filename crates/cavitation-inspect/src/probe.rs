@@ -732,6 +732,7 @@ fn insert_top(top: &mut [Contribution; TOP_INPUTS], len: &mut usize, c: Contribu
     *len = (*len + 1).min(TOP_INPUTS);
 }
 
+/// Tests of the probe: the values it fills for each layer and for the chosen neuron.
 #[cfg(test)]
 mod tests {
     use super::*;

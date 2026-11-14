@@ -43,8 +43,8 @@ const fn contains(haystack: &str, needle: &str) -> bool {
     false
 }
 
-// The page holds both places the export writes into, whatever its line endings: checked at
-// compile time, so `document` cannot fail on the built-in page.
+/// The page holds both places the export writes into, whatever its line endings: checked at
+/// compile time, so `document` cannot fail on the built-in page.
 const _: () = assert!(
     contains(PAGE, META_AFTER) && contains(PAGE, SNAPSHOT_MARKER),
     "the inspector page must hold its charset element and its snapshot marker"
@@ -85,6 +85,7 @@ fn fill(page: &str, snapshot: &str) -> String {
     out
 }
 
+/// Tests of the export: where it writes, its escaping and its policy.
 #[cfg(test)]
 mod tests {
     use super::*;
