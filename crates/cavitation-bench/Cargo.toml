@@ -15,4 +15,6 @@ workspace = true
 [dependencies]
 cavitation-core = { path = "../cavitation-core" }
 cavitation-datasets = { path = "../cavitation-datasets" }
+# The inspector, whose cost the `inspect` run measures.
+cavitation-inspect = { path = "../cavitation-inspect" }
 cavitation-nn = { path = "../cavitation-nn" }
