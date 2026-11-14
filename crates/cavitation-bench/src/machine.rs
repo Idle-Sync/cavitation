@@ -55,14 +55,50 @@ fn sysctl(key: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Describes this machine: `/proc/cpuinfo` on Linux, `sysctl` on macOS. Falls back to an
-/// unknown model and the core count the standard library reports.
+/// The processor name in the output of
+/// `reg query HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0 /v ProcessorNameString`
+/// (Windows): the text after `REG_SZ` on the `ProcessorNameString` line, trimmed. Returns
+/// `None` if there is no such line or the name is empty.
+pub fn parse_reg_processor_name(text: &str) -> Option<String> {
+    text.lines()
+        .filter(|line| line.trim_start().starts_with("ProcessorNameString"))
+        .find_map(|line| line.split_once("REG_SZ"))
+        .map(|(_, name)| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+}
+
+/// Runs `program` with `args` and returns its standard output, if the command works.
+fn run(program: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(program).args(args).output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Describes this machine: `/proc/cpuinfo` on Linux, `sysctl` on macOS, the registry's
+/// processor name (through `reg query`) on Windows. Falls back to an unknown model and the
+/// core count the standard library reports.
 pub fn detect() -> MachineInfo {
     let found = if cfg!(target_os = "macos") {
         parse_sysctl(
             &sysctl("machdep.cpu.brand_string").unwrap_or_default(),
             &sysctl("hw.ncpu").unwrap_or_default(),
         )
+    } else if cfg!(windows) {
+        run(
+            "reg",
+            &[
+                "query",
+                r"HKLM\HARDWARE\DESCRIPTION\System\CentralProcessor\0",
+                "/v",
+                "ProcessorNameString",
+            ],
+        )
+        .and_then(|text| parse_reg_processor_name(&text))
+        .map(|cpu_model| MachineInfo {
+            cpu_model,
+            logical_cores: std::thread::available_parallelism().map_or(1, usize::from),
+        })
     } else {
         std::fs::read_to_string("/proc/cpuinfo")
             .ok()
@@ -86,16 +122,45 @@ pub fn parse_load_average(text: &str) -> Option<String> {
     (values.len() == 3 && values.iter().all(|v| v.parse::<f64>().is_ok())).then(|| values.join(" "))
 }
 
-/// The load average now: `/proc/loadavg` on Linux, `sysctl -n vm.loadavg` on macOS; `unknown`
-/// where neither can be read.
+/// The CPU busy percentage in the output of
+/// `powershell -NoProfile -Command (Get-CimInstance Win32_Processor).LoadPercentage`: the
+/// whole numbers it prints (one per processor package), averaged and written as `busy N%`.
+/// Returns `None` if it prints no number.
+pub fn parse_load_percentage(text: &str) -> Option<String> {
+    let values: Vec<f64> = text
+        .split_whitespace()
+        .filter_map(|word| word.parse::<f64>().ok())
+        .collect();
+    (!values.is_empty()).then(|| {
+        format!(
+            "busy {:.0}%",
+            values.iter().sum::<f64>() / values.len() as f64
+        )
+    })
+}
+
+/// The load now: the load averages from `/proc/loadavg` on Linux and `sysctl -n vm.loadavg`
+/// on macOS; on Windows, which has no load average, the CPU busy percentage over the last
+/// moment (`Win32_Processor.LoadPercentage`); `unknown` where none can be read.
 pub fn load_average() -> String {
-    let text = if cfg!(target_os = "macos") {
-        sysctl("vm.loadavg")
+    let found = if cfg!(target_os = "macos") {
+        sysctl("vm.loadavg").and_then(|t| parse_load_average(&t))
+    } else if cfg!(windows) {
+        run(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "(Get-CimInstance Win32_Processor).LoadPercentage",
+            ],
+        )
+        .and_then(|t| parse_load_percentage(&t))
     } else {
-        std::fs::read_to_string("/proc/loadavg").ok()
+        std::fs::read_to_string("/proc/loadavg")
+            .ok()
+            .and_then(|t| parse_load_average(&t))
     };
-    text.and_then(|t| parse_load_average(&t))
-        .unwrap_or_else(|| "unknown".to_string())
+    found.unwrap_or_else(|| "unknown".to_string())
 }
 
 /// The version line of the compiler on `PATH` (`rustc --version`), or `unknown`.
@@ -164,6 +229,38 @@ mod tests {
         assert_eq!(info.logical_cores, 10);
         assert!(parse_sysctl("Apple M4", "ten").is_none());
         assert!(parse_sysctl("", "10").is_none());
+    }
+
+    /// The processor name comes from the `ProcessorNameString` line of `reg query`'s output,
+    /// spaces in the name kept; output without that line, or with an empty name, gives `None`.
+    #[test]
+    fn registry_processor_name_parses() {
+        let out = "\r\nHKEY_LOCAL_MACHINE\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0\r\n    \
+                   ProcessorNameString    REG_SZ    13th Gen Intel(R) Core(TM) i5-1335U\r\n\r\n";
+        assert_eq!(
+            parse_reg_processor_name(out),
+            Some("13th Gen Intel(R) Core(TM) i5-1335U".to_string())
+        );
+        assert_eq!(parse_reg_processor_name("ERROR: not found"), None);
+        assert_eq!(
+            parse_reg_processor_name("    ProcessorNameString    REG_SZ    \r\n"),
+            None
+        );
+    }
+
+    /// The Windows load is the mean of the busy percentages printed, one per package; no
+    /// number gives `None`.
+    #[test]
+    fn load_percentage_parses() {
+        assert_eq!(
+            parse_load_percentage("37\r\n"),
+            Some("busy 37%".to_string())
+        );
+        assert_eq!(
+            parse_load_percentage("20\r\n42\r\n"),
+            Some("busy 31%".to_string())
+        );
+        assert_eq!(parse_load_percentage(""), None);
     }
 
     /// Both load-average formats give the three numbers.
