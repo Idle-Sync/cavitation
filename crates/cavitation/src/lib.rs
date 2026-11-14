@@ -62,9 +62,10 @@
 //! let mut optimizer = Sgd::new(0.5);
 //! let mut graph = Graph::new();
 //! let mut last = f32::INFINITY;
-//! for _ in 0..1000 {
-//!     // The tape reads `params.values`; `backward` writes `params.grads`.
-//!     let mut tape = graph.tape(&params.values);
+//! for step in 1..=1000 {
+//!     // A training tape (seed 0, this step's number) reads `params.values`; `backward`
+//!     // writes `params.grads`.
+//!     let mut tape = graph.training_tape(&params.values, 0, step);
 //!     let input = tape.input(x.view());
 //!     let target = tape.input(y.view());
 //!     let out = net.forward(&mut tape, input);

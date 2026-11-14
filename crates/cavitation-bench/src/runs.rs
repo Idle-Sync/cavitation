@@ -1203,6 +1203,7 @@ fn inspect_fit_config(epochs: usize) -> FitConfig<'static> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: None,
+        dropout_seed: 0,
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,

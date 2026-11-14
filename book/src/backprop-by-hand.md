@@ -97,7 +97,7 @@ Every gradient has the shape of the value it belongs to. The weight gradients ad
 
 Each epoch is one step on the full batch:
 
-1. `graph.tape(&params.values)` opens a tape. Each operation recorded on it computes its value straight away and remembers what its backward pass needs. The `Graph` keeps the buffers between steps, so after the first steps recording allocates nothing.
+1. `graph.training_tape(&params.values, 0, step)` opens a tape for a training step (the seed and the step's number seed any random draws, such as dropout's; this network makes none). Each operation recorded on it computes its value straight away and remembers what its backward pass needs. The `Graph` keeps the buffers between steps, so after the first steps recording allocates nothing.
 2. `tape.input` records the batch, `net.forward_traced` records the four layers (the trace keeps each layer's input and output for the hooks and health checks), and `tape.mse` records the loss.
 3. `tape.backward(loss, &mut params.grads)` walks the tape from the loss back to the start, applying the rules of the previous section, and writes ∂L/∂W and ∂L/∂b for every parameter into `params.grads`.
 4. The monitor checks that the loss and the gradients are finite and warns about gradients that explode or vanish.

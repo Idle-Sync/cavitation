@@ -995,6 +995,7 @@ impl Run<'_, '_, '_> {
             optimizer: r.optimizer,
             loss: r.loss,
             shuffle_seed: r.shuffle_seed,
+            dropout_seed: 0,
             schedule: LrSchedule::Constant,
             health: Health::quiet(),
             on_epoch: None,

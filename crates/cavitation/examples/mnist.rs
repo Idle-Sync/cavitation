@@ -73,6 +73,7 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        dropout_seed: 0,
         // The rate starts at 1e-3 and falls along a cosine towards 0 over the 10 epochs.
         schedule: LrSchedule::Cosine { min_lr: 0.0 },
         health,

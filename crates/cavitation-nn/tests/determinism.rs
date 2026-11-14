@@ -60,6 +60,7 @@ fn train() -> Vec<u32> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(5),
+        dropout_seed: 0,
         schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: None,

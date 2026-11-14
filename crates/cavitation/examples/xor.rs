@@ -58,7 +58,7 @@ fn main() -> Result<(), Error> {
     // alive, then drops the tape so the optimiser can update the parameters.
     for epoch in 1..=2000 {
         let step = epoch as u64;
-        let mut tape = graph.tape(&params.values);
+        let mut tape = graph.training_tape(&params.values, 0, step);
         let input = tape.input(x.view());
         let target = tape.input(y.view());
         let out = net.forward_traced(&mut tape, input, &mut trace);

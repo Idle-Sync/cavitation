@@ -119,6 +119,7 @@ fn mnist_known_result() {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        dropout_seed: 0,
         schedule: LrSchedule::Cosine { min_lr: 0.0 },
         health,
         on_epoch: Some(Box::new(

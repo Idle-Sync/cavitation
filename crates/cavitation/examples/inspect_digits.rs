@@ -187,6 +187,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             weight_decay: 0.0,
         },
         shuffle_seed: Some(7),
+        dropout_seed: 0,
         health: Health::quiet(),
         ..FitConfig::default()
     };
