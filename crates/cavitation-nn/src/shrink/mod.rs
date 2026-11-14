@@ -36,9 +36,33 @@ pub use prune::{
 };
 pub use scratch::{FoundSize, FromScratch, train_found_size};
 
-use cavitation_core::Real;
+use cavitation_core::{Error, Real};
 
 use crate::Sequential;
+
+/// The names of the built-in image layers that have no downcast: the three poolings.
+const POOL_NAMES: [&str; 3] = ["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
+
+/// [`Error::Unsupported`] from `tool` if `model` has an image layer (`Conv2d`,
+/// `BatchNorm2d`, or a pooling layer, found by its name), naming the first one: the tools
+/// here remove neurons of `Linear` layers, and a neuron of an image row is one value of
+/// one channel, which they cannot remove on its own.
+pub(crate) fn refuse_image_layers<T: Real>(model: &Sequential<T>, tool: &str) -> Result<(), Error> {
+    for i in 0..model.len() {
+        let layer = model.layer(i);
+        let name = layer.name();
+        if layer.as_conv2d().is_some()
+            || layer.as_batch_norm2d().is_some()
+            || POOL_NAMES.contains(&name)
+        {
+            return Err(Error::Unsupported(format!(
+                "{tool}: layer {i} is an image layer ({name}); the shrink tools remove \
+                 neurons of Linear layers in dense networks and do not shrink image models"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// Which neurons of the `Linear` at layer `linear` are on: a neuron is off when any mask in
 /// its run (the `Linear` itself and the element-wise layers after it, up to

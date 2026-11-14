@@ -56,6 +56,8 @@ use crate::{Layer, Linear, Prelu, Sequential};
 ///
 /// [`Error::Unsupported`], naming the layer and what to do instead, for:
 ///
+/// - an image layer (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or
+///   `AdaptiveAvgPool2d`): compaction works on the neurons of dense networks;
 /// - a mask with no `Linear` after it, so that its neurons are the model's outputs;
 /// - a mask whose off neurons pass an element-wise layer with `f(0) ≠ 0` on the way to the
 ///   next `Linear` (a mask on a `Linear` or a `Tanh` followed by a `Sigmoid`, say), so that
@@ -112,6 +114,7 @@ pub fn compact<T: Real>(
     model: &Sequential<T>,
     params: &ParamStore<T>,
 ) -> Result<(Sequential<T>, ParamStore<T>), Error> {
+    super::refuse_image_layers(model, "compact")?;
     check_parameters(model)?;
     let owners = run_owners(model);
     let masks = placed_masks(model, &owners)?;
