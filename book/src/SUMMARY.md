@@ -8,3 +8,4 @@
 - [Shrinking a network](shrinking.md)
 - [Watching a network train](inspector.md)
 - [Regression, exactly and by gradient](regression.md)
+- [Coming from PyTorch](from-pytorch.md)

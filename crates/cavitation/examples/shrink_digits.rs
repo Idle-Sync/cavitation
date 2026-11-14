@@ -2,8 +2,8 @@
 //! it with `shrink` on the rest, compacts the result into a smaller dense network and saves
 //! it. With `--ablate` it first switches neurons off one at a time and reports what each
 //! costs; with `--lottery` it also retrains the found size twice from the start: once from
-//! the kept neurons' initial weights, once from new random weights, each for as many epochs
-//! as the pruned network trained in all.
+//! the kept neurons' initial weights, once from new random weights with `train_found_size`,
+//! each for as many epochs as the pruned network trained in all.
 //!
 //! The guide's chapter "Shrinking a network" walks through this file; the `ANCHOR`
 //! comments mark the parts it includes.
@@ -11,7 +11,9 @@
 //! Run it with `cargo run --release --example shrink_digits -p cavitation`, adding
 //! `-- --ablate`, `-- --lottery` or both for the extra parts.
 
-use cavitation::cavitation_nn::shrink::{ShrinkConfig, Validation, ablate, compact, shrink};
+use cavitation::cavitation_nn::shrink::{
+    FromScratch, ShrinkConfig, Validation, ablate, compact, shrink, train_found_size,
+};
 use cavitation::prelude::*;
 
 /// The known-result network for the digits: He uniform weights, zero biases, `Rng::seed(seed)`,
@@ -36,15 +38,10 @@ fn network(params: &mut ParamStore, hidden: [usize; 2], seed: u64) -> Sequential
         .push(he(hidden[1], 10))
 }
 
-/// The known result's training for `epochs` epochs (20 in the known result): Adam at 0.002,
+/// The known result's recipe for `epochs` epochs (20 in the known result): Adam at 0.002,
 /// batch 32, shuffle seed 7.
-fn train(
-    net: &Sequential,
-    params: &mut ParamStore,
-    data: &Dataset,
-    epochs: usize,
-) -> Result<(), Error> {
-    let config = FitConfig {
+fn recipe(epochs: usize) -> FitConfig {
+    FitConfig {
         epochs,
         batch: 32,
         optimizer: OptimizerConfig::Adam {
@@ -54,8 +51,17 @@ fn train(
         shuffle_seed: Some(7),
         health: Health::quiet(),
         ..FitConfig::default()
-    };
-    fit(net, params, data, config).map(|_| ())
+    }
+}
+
+/// Trains `net` on `data` with the known result's recipe for `epochs` epochs.
+fn train(
+    net: &Sequential,
+    params: &mut ParamStore,
+    data: &Dataset,
+    epochs: usize,
+) -> Result<(), Error> {
+    fit(net, params, data, recipe(epochs)).map(|_| ())
 }
 
 /// Switches off the neurons of both hidden layers, first one by hand and then every one in
@@ -172,15 +178,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ticket_acc * 100.0
         );
         // ANCHOR_END: lottery
-        // The same size from new random weights.
-        let mut fresh_params = ParamStore::new();
-        let fresh = network(&mut fresh_params, [kept[0], kept[1]], 1);
-        train(&fresh, &mut fresh_params, &train_rows, epochs)?;
-        let fresh_acc = accuracy(&fresh, &fresh_params, &test, 128);
+        // The same size from new random weights, as `network` starts them: He uniform
+        // weights, zero biases, seed 1.
+        // ANCHOR: scratch
+        let scratch = FromScratch {
+            weights: Init::HeUniform,
+            biases: Init::Zeros,
+            seed: 1,
+            fit: recipe(epochs),
+        };
+        let found = train_found_size(&net, &params, &train_rows, &test, scratch)?;
+        let fresh_acc = found.scratch.accuracy.unwrap_or(f64::NAN);
         println!(
             "same size, new random weights: test {:.2}%",
             fresh_acc * 100.0
         );
+        // ANCHOR_END: scratch
     }
     Ok(())
 }
