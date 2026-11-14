@@ -1258,7 +1258,9 @@ mod tests {
 
     /// A slope that is neither [1] nor [C] panics naming both shapes.
     #[test]
-    #[should_panic(expected = "prelu")]
+    #[should_panic(
+        expected = "prelu: slope shape [2] does not fit x shape [2, 3]; expected [1] or [3]"
+    )]
     fn prelu_bad_slope_shape_panics() {
         let store = ParamStore::<f64>::new_generic();
         let mut graph = Graph::<f64>::new_generic();

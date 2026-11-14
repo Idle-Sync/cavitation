@@ -323,17 +323,15 @@ mod tests {
         a.to_bits().abs_diff(b.to_bits())
     }
 
-    /// Across every branch, the f32 port stays within 2 ulp of the f64 port rounded to f32.
+    /// Across every branch, the f32 port stays within 2 ulp of the f64 port rounded to f32,
+    /// with no absolute allowance (the sweep's largest distance measured 1 ulp).
     #[test]
     fn erf_f32_matches_f64_across_branches() {
         let mut x = -7.0f32;
         while x < 7.0 {
             let want = erf_f64(x as f64) as f32;
             let got = erf_f32(x);
-            assert!(
-                ulps(got, want) <= 4 || (got - want).abs() < 1e-7,
-                "{x}: {got} vs {want}"
-            );
+            assert!(ulps(got, want) <= 2, "{x}: {got} vs {want}");
             x += 0.0137;
         }
     }

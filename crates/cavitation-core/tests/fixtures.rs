@@ -796,26 +796,6 @@ const LOSSES: &[&str] = &[
     "kl_div",
 ];
 
-/// Every operation list a comparison test checks.
-const OP_GROUPS: &[&[&str]] = &[
-    ARITHMETIC,
-    SELECT,
-    MATMUL,
-    REDUCTIONS,
-    ACTIVATIONS,
-    SOFTMAX,
-    LOSSES,
-];
-
-/// Every level, in the order of their numbers.
-const ALL_LEVELS: [Level; 5] = [
-    Level::Reference,
-    Level::Sse42,
-    Level::Avx2Fma,
-    Level::Neon,
-    Level::Accelerate,
-];
-
 /// Serialises the tests that change the process-wide kernel level.
 static LEVEL_LOCK: Mutex<()> = Mutex::new(());
 
@@ -831,7 +811,7 @@ impl Drop for RestoreLevel {
 
 /// Every level this CPU can run, in the order of `Level`'s numbers.
 fn supported_levels() -> Vec<Level> {
-    ALL_LEVELS
+    Level::ALL
         .iter()
         .copied()
         .filter(|&l| supported(l))
@@ -840,7 +820,7 @@ fn supported_levels() -> Vec<Level> {
 
 /// The levels this CPU cannot run.
 fn skipped_levels() -> Vec<Level> {
-    ALL_LEVELS
+    Level::ALL
         .iter()
         .copied()
         .filter(|&l| !supported(l))
@@ -875,47 +855,41 @@ fn check_ops(ops: &[&str]) {
     });
 }
 
-/// `add`, `sub`, `mul` and `scale`, with broadcasting, match PyTorch.
-#[test]
-fn arithmetic_matches_torch() {
-    check_ops(ARITHMETIC);
+/// Declares one comparison test per operation group, each running [`check_ops`] on its
+/// group, and `OP_GROUPS`, the list [`every_fixture_op_is_checked`] reads, from the same
+/// table: a group in the list always has its test.
+macro_rules! comparison_tests {
+    ($( $(#[doc = $doc:literal])* $name:ident => $ops:ident, )*) => {
+        $(
+            $(#[doc = $doc])*
+            #[test]
+            fn $name() {
+                check_ops($ops);
+            }
+        )*
+
+        /// Every operation list a comparison test checks, from the table that declares the
+        /// tests.
+        const OP_GROUPS: &[&[&str]] = &[$($ops),*];
+    };
 }
 
-/// `keep_where` matches `torch.where(keep != 0, x, 0)`, including its zero gradient for
-/// `keep`.
-#[test]
-fn keep_where_matches_torch() {
-    check_ops(SELECT);
-}
-
-/// `matmul` and `matmul_nt` match PyTorch's float64 result within the GEMM bound.
-#[test]
-fn matmul_matches_torch() {
-    check_ops(MATMUL);
-}
-
-/// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
-#[test]
-fn reductions_match_torch() {
-    check_ops(REDUCTIONS);
-}
-
-/// Every activation, `prelu` and `glu` match PyTorch.
-#[test]
-fn activations_match_torch() {
-    check_ops(ACTIVATIONS);
-}
-
-/// `softmax` and `log_softmax` match PyTorch's float64 result.
-#[test]
-fn softmax_matches_torch() {
-    check_ops(SOFTMAX);
-}
-
-/// Every loss, under every reduction, matches PyTorch's float64 result.
-#[test]
-fn losses_match_torch() {
-    check_ops(LOSSES);
+comparison_tests! {
+    /// `add`, `sub`, `mul` and `scale`, with broadcasting, match PyTorch.
+    arithmetic_matches_torch => ARITHMETIC,
+    /// `keep_where` matches `torch.where(keep != 0, x, 0)`, including its zero gradient for
+    /// `keep`.
+    keep_where_matches_torch => SELECT,
+    /// `matmul` and `matmul_nt` match PyTorch's float64 result within the GEMM bound.
+    matmul_matches_torch => MATMUL,
+    /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
+    reductions_match_torch => REDUCTIONS,
+    /// Every activation, `prelu` and `glu` match PyTorch.
+    activations_match_torch => ACTIVATIONS,
+    /// `softmax` and `log_softmax` match PyTorch's float64 result.
+    softmax_matches_torch => SOFTMAX,
+    /// Every loss, under every reduction, matches PyTorch's float64 result.
+    losses_match_torch => LOSSES,
 }
 
 /// Every fixture file's operation is covered by one of the comparison tests.
@@ -933,7 +907,8 @@ fn every_fixture_op_is_checked() {
     );
 }
 
-/// Prints the levels the comparisons ran on and the ones this CPU cannot run, and checks
+/// Prints the levels the comparisons ran on and the ones this CPU cannot run (both from the
+/// library's [`Level::ALL`], so a new level is run wherever it is supported), and checks
 /// that the reference level and the level the library chose by default are among them.
 #[test]
 fn levels_covered() {
@@ -961,7 +936,6 @@ fn levels_covered() {
         "the detected level {} is among the levels run",
         detected()
     );
-    assert_eq!(run.len() + skipped.len(), ALL_LEVELS.len());
 }
 
 /// Every loss has a fixture for each of the four reductions.

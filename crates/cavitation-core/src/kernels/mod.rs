@@ -78,8 +78,15 @@ pub enum Level {
 }
 
 impl Level {
-    /// Every level, in the order of their numbers.
-    const ALL: [Level; 5] = [
+    /// Every level, in the order of their numbers, supported on this CPU or not. A later
+    /// version may add levels, so the list may grow.
+    ///
+    /// ```
+    /// use cavitation_core::kernels::{Level, supported};
+    /// assert_eq!(Level::ALL[0], Level::Reference);
+    /// assert!(Level::ALL.iter().any(|&l| supported(l)));
+    /// ```
+    pub const ALL: &'static [Level] = &[
         Level::Reference,
         Level::Sse42,
         Level::Avx2Fma,
@@ -130,7 +137,8 @@ impl fmt::Display for Level {
 /// ```
 pub fn parse_level(s: &str) -> Result<Level, String> {
     Level::ALL
-        .into_iter()
+        .iter()
+        .copied()
         .find(|l| l.to_string() == s)
         .ok_or_else(|| {
             format!(
