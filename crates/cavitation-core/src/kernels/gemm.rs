@@ -661,6 +661,9 @@ unsafe fn packed<K: Kernel>(
     };
     let (m, n, k) = (a.rows(), b.cols(), a.cols());
     let (mr, nr) = (K::MR, K::NR);
+    // The thread count asked for, before the plan lowers it for a small product: the
+    // packing buffers are reserved for it.
+    let asked = threads.min(super::pool::MAX_THREADS);
     let plan = Plan::new::<K>(m, n, k, threads);
     let Plan {
         threads,
@@ -673,13 +676,22 @@ unsafe fn packed<K: Kernel>(
     // The one raw pointer to C, taken from the `MatMut` borrowed for the whole call.
     let c_ptr = Shared(c.data.as_mut_ptr());
     SCRATCH.with_borrow_mut(|scratch| {
-        // Sizes depend only on the shape and the thread count, so a warmed-up caller never
-        // grows them again. `full` and `last` bound the tasks and rows of every block, and
-        // no compute task runs on a worker numbered `slots` or above.
+        // `full` and `last` bound the tasks and rows of every block, and no compute task runs
+        // on a worker numbered `slots` or above. The buffers are reserved for the largest
+        // block the kernel ever packs (`KC` by `NC` of `B`; `MC` by `KC` of `A` for each
+        // slot of the thread count asked for), not just this call's, so a thread that meets
+        // a larger product later (a convolution group's GEMM can run on any worker) never
+        // grows them: only its first call at a thread count allocates.
         let slots = launch(threads, full.tasks().max(last.tasks()));
         let a_slot = (full.m_panels.max(last.m_panels) * mr * kc * K::A_REP).div_ceil(16);
-        reserve(&mut scratch.b, (kc * nc).div_ceil(16));
-        reserve(&mut scratch.a, slots * a_slot);
+        let a_most = (K::MC.div_ceil(mr) * mr * K::KC * K::A_REP)
+            .div_ceil(16)
+            .max(a_slot);
+        reserve(
+            &mut scratch.b,
+            (K::KC * K::NC).div_ceil(16).max((kc * nc).div_ceil(16)),
+        );
+        reserve(&mut scratch.a, asked.max(slots) * a_most);
         let b_buf = Shared(scratch.b.as_mut_ptr().cast::<f32>());
         let a_buf = Shared(scratch.a.as_mut_ptr().cast::<f32>());
         for j0 in (0..n).step_by(nc) {

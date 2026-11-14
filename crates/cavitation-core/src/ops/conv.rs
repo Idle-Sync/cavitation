@@ -1,31 +1,20 @@
 //! 2-D convolution on the tape: `conv2d`, with its backward pass.
 //!
-//! Images are taken in chunks of a few megabytes of columns ([`images_per_chunk`]): each
-//! chunk's column matrix ([`im2col`]) is multiplied by the weight with the GEMM of the
-//! current kernel level (`Real::gemm`), and nothing is kept between the forward and the
-//! backward pass, which builds each chunk's columns again. A 1 × 1 kernel with stride 1 and
-//! no padding multiplies each image itself.
+//! The batch is cut into groups of images ([`groups`]) run in parallel; each group copies
+//! its images' windows into column matrices and multiplies them by the weight with the GEMM
+//! of the current kernel level (`Real::gemm`), by [`conv2d_forward`] and
+//! [`conv2d_backward`]. Nothing is kept between the forward and the backward pass, which
+//! builds the columns again. A 1 × 1 kernel with stride 1 and no padding multiplies each
+//! image itself.
 
 use crate::graph::{BackwardCtx, Var};
-use crate::kernels::conv::{
-    Conv2dGeom, col2im, conv2d_forward, conv2d_scratch, im2col, images_per_chunk,
-};
-use crate::kernels::{MatMut, MatRef};
+use crate::kernels::conv::{Conv2dGeom, conv2d_backward, conv2d_forward, conv2d_scratch, groups};
+use crate::kernels::{self, MatMut, MatRef};
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
 
 /// The operation's name, used in panic messages.
 const NAME: &str = "conv2d";
-
-/// A row-major `rows` by `cols` view of `data`.
-fn mat<T: Real>(data: &[T], rows: usize, cols: usize) -> MatRef<'_, T> {
-    MatRef::new(data, rows, cols, cols, 1).expect("buffer holds rows * cols elements")
-}
-
-/// A writable row-major `rows` by `cols` view of `data`.
-fn mat_mut<T: Real>(data: &mut [T], rows: usize, cols: usize) -> MatMut<'_, T> {
-    MatMut::new(data, rows, cols, cols, 1).expect("buffer holds rows * cols elements")
-}
 
 /// The batch size of a `conv2d` input of shape `sx`, after checking the input, weight and
 /// bias shapes against `geom`.
@@ -62,10 +51,12 @@ impl<T: Real> Tape<'_, T> {
     /// `[out]`. The result is `[batch, out_channels · out_height · out_width]`, each row one
     /// output image in the same order.
     ///
-    /// The windows of a chunk of images are copied into a column matrix and multiplied by
-    /// the weight with the GEMM of the current kernel level; the gradients are GEMMs too,
-    /// chunk by chunk in order (the chunk size depends on the geometry alone), so they are
-    /// the same for any thread count. An input that takes no
+    /// The batch is cut into groups of images that run in parallel on the thread pool; each
+    /// group copies its images' windows into column matrices and multiplies them by the
+    /// weight with the GEMM of the current kernel level. The gradients are GEMMs too, group
+    /// by group, and the weight gradient adds one partial per group in group order (the
+    /// groups depend on the batch alone), so every result is the same for any thread
+    /// count. An input that takes no
     /// gradient costs no input-gradient work.
     ///
     /// # Panics
@@ -91,10 +82,9 @@ impl<T: Real> Tape<'_, T> {
     pub fn conv2d(&mut self, x: Var, weight: Var, bias: Option<Var>, geom: Conv2dGeom) -> Var {
         let sb = bias.map(|b| self.shape(b));
         let batch = check_shapes(&geom, &self.shape(x), &self.shape(weight), sb.as_ref());
+        let threads = kernels::threads();
         let mut out = self.take_buffer(batch * geom.out_width());
-        let (cols_len, prod_len) = scratch_lens(&geom, batch);
-        let mut cols = self.take_buffer(cols_len);
-        let mut prod = self.take_buffer(prod_len);
+        let mut scratch = self.take_buffer(conv2d_scratch(&geom, batch, threads));
         let bv = bias.map(|b| self.data(b));
         conv2d_forward(
             &geom,
@@ -103,34 +93,25 @@ impl<T: Real> Tape<'_, T> {
             self.data(weight),
             bv,
             &mut out,
-            &mut cols,
-            &mut prod,
-            // beta = 0 writes every value; the pooled buffers' old contents are unused.
-            |a, b, c| T::gemm(T::ONE, a, b, T::ZERO, c),
+            &mut scratch,
+            threads,
+            &gemm::<T>,
         );
-        self.give_buffer(cols);
-        self.give_buffer(prod);
+        self.give_buffer(scratch);
         let start = self.push_labels(&geom.to_words());
         let so = Shape::new(&[batch, geom.out_width()]);
         self.push(Op::Conv2d(x, weight, bias, start), so, out)
     }
 }
 
-/// The scratch `conv2d` takes for `batch` images: [`conv2d_scratch`]'s lengths, or none for
-/// a 1 × 1 kernel with stride 1 and no padding, which multiplies the images themselves.
-fn scratch_lens(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
-    if geom.is_pointwise() {
-        (0, 0)
-    } else {
-        conv2d_scratch(geom, batch)
-    }
+/// `c = a · b + beta · c` with the current level's GEMM.
+fn gemm<T: Real>(a: MatRef<'_, T>, b: MatRef<'_, T>, beta: T, c: MatMut<'_, T>) {
+    T::gemm(T::ONE, a, b, beta, c);
 }
 
-/// Backward of `conv2d`, chunk by chunk of images as the forward pass takes them
-/// ([`images_per_chunk`]), in order: `db` sums the output gradient; `dW += dY' · colsᵀ` and
-/// `dX = col2im(Wᵀ · dY')`, with `cols` the chunk's column matrix built again and `dY'` the
-/// chunk's output gradient gathered to `[out, images · windows]`. A 1 × 1 kernel with stride
-/// 1 and no padding works on each image directly.
+/// Backward of `conv2d`: `db` sums the output gradient; the input gradient and one partial
+/// weight gradient per group come from [`conv2d_backward`], and the partials are added up in
+/// group order, so every gradient is the same for any thread count.
 pub(super) fn backward<T: Real>(
     x: Var,
     weight: Var,
@@ -143,7 +124,7 @@ pub(super) fn backward<T: Real>(
     let batch = ctx.shape(x).dims()[0];
     let (oh, ow) = geom.out_size();
     let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
-    let (in_w, out_w) = (geom.in_width(), geom.out_width());
+    let out_w = geom.out_width();
     let (xv, wv) = (ctx.value(x), ctx.value(weight));
     if let Some(b) = bias
         && let Some(slot) = ctx.slot(b)
@@ -160,85 +141,56 @@ pub(super) fn backward<T: Real>(
             }
         });
     }
-    let pointwise = geom.is_pointwise();
-    let per = images_per_chunk(&geom, batch);
-    let (cols_len, prod_len) = scratch_lens(&geom, batch);
-    let mut cols = ctx.scratch(cols_len);
-    let mut dyp = ctx.scratch(prod_len);
-    // Gathers images `n0..n0 + nb` of the output gradient to `[out, nb · windows]`.
-    let gather = |dyp: &mut [T], n0: usize, nb: usize| {
-        let cols_n = nb * windows;
-        for k in 0..nb {
-            let image = &out_grad[(n0 + k) * out_w..][..out_w];
-            for (o, plane) in image.chunks_exact(windows).enumerate() {
-                dyp[o * cols_n + k * windows..][..windows].copy_from_slice(plane);
-            }
-        }
-    };
-    if ctx.takes_grad(weight)
-        && let Some(slot) = ctx.slot(weight)
-    {
-        slot.update_with(|buf, beta| {
-            if pointwise {
-                for n in 0..batch {
-                    let cm = mat(&xv[n * in_w..][..in_w], kl, windows);
-                    let dy = mat(&out_grad[n * out_w..][..out_w], cout, windows);
-                    let beta = if n == 0 { beta } else { T::ONE };
-                    T::gemm(T::ONE, dy, cm.transpose(), beta, mat_mut(buf, cout, kl));
+    let threads = kernels::threads();
+    let mut scratch = ctx.scratch(conv2d_scratch(&geom, batch, threads));
+    if ctx.takes_grad(weight) {
+        let count = groups(batch);
+        let mut parts = ctx.scratch(count * cout * kl);
+        conv2d_backward(
+            &geom,
+            batch,
+            xv,
+            wv,
+            out_grad,
+            None,
+            Some(&mut parts),
+            &mut scratch,
+            threads,
+            &gemm::<T>,
+        );
+        if let Some(slot) = ctx.slot(weight) {
+            slot.update_with(|buf, beta| {
+                for (i, d) in buf.iter_mut().enumerate() {
+                    let mut acc = parts[i];
+                    for g in 1..count {
+                        acc += parts[g * cout * kl + i];
+                    }
+                    *d = if beta == T::ZERO { acc } else { *d + acc };
                 }
-                return;
-            }
-            let mut n0 = 0;
-            while n0 < batch {
-                let nb = per.min(batch - n0);
-                let cols_n = nb * windows;
-                im2col(
-                    &geom,
-                    nb,
-                    &xv[n0 * in_w..][..nb * in_w],
-                    &mut cols[..kl * cols_n],
-                );
-                gather(&mut dyp, n0, nb);
-                let dy = mat(&dyp[..cout * cols_n], cout, cols_n);
-                let cm = mat(&cols[..kl * cols_n], kl, cols_n);
-                let beta = if n0 == 0 { beta } else { T::ONE };
-                T::gemm(T::ONE, dy, cm.transpose(), beta, mat_mut(buf, cout, kl));
-                n0 += nb;
-            }
-        });
+            });
+        }
+        ctx.release(parts);
     }
     if ctx.takes_grad(x)
         && let Some(slot) = ctx.slot(x)
     {
-        let wt = mat(wv, cout, kl).transpose();
         slot.update_with(|buf, beta| {
-            if pointwise {
-                for n in 0..batch {
-                    let dy = mat(&out_grad[n * out_w..][..out_w], cout, windows);
-                    let dx = &mut buf[n * in_w..][..in_w];
-                    T::gemm(T::ONE, wt, dy, beta, mat_mut(dx, kl, windows));
-                }
-                return;
-            }
-            let mut n0 = 0;
-            while n0 < batch {
-                let nb = per.min(batch - n0);
-                let cols_n = nb * windows;
-                gather(&mut dyp, n0, nb);
-                let dy = mat(&dyp[..cout * cols_n], cout, cols_n);
-                let dcols = &mut cols[..kl * cols_n];
-                T::gemm(T::ONE, wt, dy, T::ZERO, mat_mut(dcols, kl, cols_n));
-                let dx = &mut buf[n0 * in_w..][..nb * in_w];
-                if beta == T::ZERO {
-                    dx.fill(T::ZERO);
-                }
-                col2im(&geom, nb, dcols, dx);
-                n0 += nb;
-            }
+            let add = beta != T::ZERO;
+            conv2d_backward(
+                &geom,
+                batch,
+                xv,
+                wv,
+                out_grad,
+                Some((buf, add)),
+                None,
+                &mut scratch,
+                threads,
+                &gemm::<T>,
+            );
         });
     }
-    ctx.release(cols);
-    ctx.release(dyp);
+    ctx.release(scratch);
 }
 
 /// Tests for the convolution operation: against the direct loops, the 1 × 1 path, the
@@ -375,15 +327,16 @@ mod tests {
     }
 
     /// An input that takes no gradient costs no input-gradient GEMM: the backward pass of a
-    /// 1 × 1 convolution of a tape input over 3 images runs 3 GEMMs (the weight gradient's),
-    /// against 6 when the input is a parameter.
+    /// 1 × 1 convolution of a tape input runs 1 GEMM (the weight gradient's), against 2 when
+    /// the input is a parameter. One image makes one group, which runs on the calling
+    /// thread, where the GEMM count is kept.
     #[test]
     fn conv2d_skips_the_input_gradient_of_an_input() {
         let g = Conv2dGeom::new(2, 3, (4, 4), (1, 1)).unwrap();
         let calls = |input_is_param: bool| {
             let mut store = ParamStore::new();
             let w = store.add(Tensor::full(&[3, 2, 1, 1], 0.5f32));
-            let x = Tensor::full(&[3, g.in_width()], 1.0f32);
+            let x = Tensor::full(&[1, g.in_width()], 1.0f32);
             let xp = store.add(x.clone());
             let mut graph = Graph::new();
             let mut tape = graph.tape(&store.values);
@@ -399,8 +352,8 @@ mod tests {
             tape.backward(loss, &mut store.grads);
             GEMM_CALLS.with(|n| n.get())
         };
-        assert_eq!(calls(false), 3);
-        assert_eq!(calls(true), 6);
+        assert_eq!(calls(false), 1);
+        assert_eq!(calls(true), 2);
     }
 
     /// Pooled buffers holding old values do not leak into the results: three steps on one

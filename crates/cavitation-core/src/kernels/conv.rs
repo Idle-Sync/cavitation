@@ -605,51 +605,122 @@ pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]
     }
 }
 
-/// How many column-matrix values [`conv2d_forward`] and the tape's backward pass aim to hold
-/// at once (8 MB in f32): images are taken in chunks of
-/// `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so each GEMM is wide enough to use the
-/// packed kernels well. An image whose own columns are more than this is taken alone, so the
-/// buffer holds `max(COLUMN_BUDGET, one image's columns)` values. The chunk size depends on
-/// the geometry and the batch alone, never on the thread count, so results do too.
-pub const COLUMN_BUDGET: usize = 1 << 21;
+/// The most groups a batch is cut into: groups of consecutive images run as separate tasks
+/// on the thread pool, so a batch of `n` images is `min(n, CONV_GROUPS)` groups whatever the
+/// thread count, and every result (the weight gradient is a sum of one partial per group,
+/// added in group order) is the same for any thread count.
+pub const CONV_GROUPS: usize = 16;
 
-/// The number of images [`conv2d_forward`] takes per GEMM for `geom`, at most `batch`.
+/// How many column-matrix values one group aims to hold at once (2 MB in f32): a group
+/// takes its images in chunks of `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so each
+/// GEMM is wide enough for the packed kernels while each thread's columns stay near its
+/// cache. An image whose own columns are more than this is taken alone. The chunk size
+/// depends on the geometry and the batch alone, never on the thread count.
+pub const COLUMN_BUDGET: usize = 1 << 19;
+
+/// The number of groups a batch of `batch` images is cut into: `min(batch, CONV_GROUPS)`,
+/// at least 1.
+///
+/// ```
+/// use cavitation_core::kernels::conv::groups;
+/// assert_eq!((groups(1), groups(9), groups(128)), (1, 9, 16));
+/// ```
+pub fn groups(batch: usize) -> usize {
+    batch.clamp(1, CONV_GROUPS)
+}
+
+/// Group `g` of `count` over `batch` images: its first image and its number of images, the
+/// images split as evenly as they go.
+fn group_range(g: usize, count: usize, batch: usize) -> (usize, usize) {
+    let (start, end) = (g * batch / count, (g + 1) * batch / count);
+    (start, end - start)
+}
+
+/// The number of images a group of `batch` takes per GEMM for `geom`: at most the largest
+/// group's size.
 ///
 /// ```
 /// use cavitation_core::kernels::conv::{COLUMN_BUDGET, Conv2dGeom, images_per_chunk};
-/// let geom = Conv2dGeom::with_options(32, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
-/// assert_eq!(images_per_chunk(&geom, 128), COLUMN_BUDGET / (288 * 1024));
-/// assert_eq!(images_per_chunk(&geom, 3), 3);
+/// let geom = Conv2dGeom::with_options(8, 8, (8, 8), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// // 128 images in 16 groups of 8; 72 · 64 column values per image.
+/// assert_eq!(images_per_chunk(&geom, 128), 8.min(COLUMN_BUDGET / (72 * 64)));
 /// ```
 pub fn images_per_chunk(geom: &Conv2dGeom, batch: usize) -> usize {
     let (oh, ow) = geom.out_size();
     let per_image = geom.kernel_len() * oh * ow;
-    (COLUMN_BUDGET / per_image).clamp(1, batch.max(1))
+    let largest = batch.div_ceil(groups(batch)).max(1);
+    (COLUMN_BUDGET / per_image).clamp(1, largest)
 }
 
-/// The scratch [`conv2d_forward`] needs for `batch` images of `geom`: the column matrix's
-/// length and the product's, for one chunk of images.
+/// One worker's scratch for `batch` images of `geom`: a column matrix and a product of one
+/// chunk ([`images_per_chunk`]), none for a 1 × 1 kernel with stride 1 and no padding.
+fn worker_scratch(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
+    if geom.is_pointwise() {
+        return (0, 0);
+    }
+    let (oh, ow) = geom.out_size();
+    let windows = images_per_chunk(geom, batch) * oh * ow;
+    (geom.kernel_len() * windows, geom.out_channels() * windows)
+}
+
+/// The scratch [`conv2d_forward`] and [`conv2d_backward`] need for `batch` images of
+/// `geom` on `threads` threads: one column matrix and one product per thread that takes
+/// part.
 ///
 /// ```
 /// use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_scratch};
 /// let geom = Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap();
-/// assert_eq!(conv2d_scratch(&geom, 1), (4 * 4, 2 * 4));
+/// assert_eq!(conv2d_scratch(&geom, 1, 4), 4 * 4 + 2 * 4);
 /// ```
-pub fn conv2d_scratch(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
-    let (oh, ow) = geom.out_size();
-    let images = images_per_chunk(geom, batch);
-    let windows = images * oh * ow;
-    (geom.kernel_len() * windows, geom.out_channels() * windows)
+pub fn conv2d_scratch(geom: &Conv2dGeom, batch: usize, threads: usize) -> usize {
+    let (c, p) = worker_scratch(geom, batch);
+    (c + p) * workers(batch, threads)
 }
 
+/// The threads that take part for `batch` images: never more than the groups, nor than the
+/// pool's maximum.
+fn workers(batch: usize, threads: usize) -> usize {
+    threads
+        .clamp(1, groups(batch))
+        .min(super::pool::MAX_THREADS)
+}
+
+/// A pointer that tasks on several threads may hold at once, each using its own part.
+struct Parts<T>(*mut T);
+
+// SAFETY: `Parts` is only used by the functions below, each task of which touches a
+// disjoint part (its group's images, its worker's scratch) of a buffer borrowed mutably for
+// the whole call.
+unsafe impl<T: Send> Sync for Parts<T> {}
+
+impl<T> Parts<T> {
+    /// `len` elements from `start`.
+    ///
+    /// # Safety
+    ///
+    /// `start + len` is inside the buffer, and no other live slice overlaps this one.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
+        // SAFETY: as the caller promises.
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(start), len) }
+    }
+}
+
+/// The GEMM a convolution runs: `c = a · b + beta · c` (`beta` 0 or 1).
+pub trait ConvGemm<T>: Fn(MatRef<'_, T>, MatRef<'_, T>, T, MatMut<'_, T>) + Sync {}
+
+impl<T, F: Fn(MatRef<'_, T>, MatRef<'_, T>, T, MatMut<'_, T>) + Sync> ConvGemm<T> for F {}
+
 /// The convolution of `batch` images `x` by `weight` (`[out, kernel_len]` row-major, the
-/// `[out, in, kh, kw]` weight's own layout), plus `bias`, into `out`, with `gemm(a, b, c)`
-/// computing `c = a · b`: chunk by chunk of [`images_per_chunk`] images, the chunk's
-/// column matrix in `cols` times the weight into `prod` (`[out, images · windows]`), then
-/// each value moved to its output image with the bias added. A 1 × 1 kernel with stride 1
-/// and no padding multiplies each image itself instead. The tape and `InferenceModel` both
-/// run this, so they agree bit for bit; `cols` and `prod` hold at least
-/// [`conv2d_scratch`]'s lengths.
+/// `[out, in, kh, kw]` weight's own layout), plus `bias`, into `out`, with `gemm` computing
+/// the products. The batch is cut into [`groups`] of consecutive images, run as tasks on up
+/// to `threads` threads; each group takes its images [`images_per_chunk`] at a time, copies
+/// their windows into its thread's column matrix, multiplies it by the weight into its
+/// product (`[out, images · windows]`) and moves each value to its output image, adding
+/// the bias. A 1 × 1 kernel with stride 1 and no padding multiplies each image itself. Each
+/// output depends on its own image alone, so the result is the same for any thread count;
+/// the tape and `InferenceModel` both run this, so they agree bit for bit. `scratch` holds
+/// at least [`conv2d_scratch`] values.
 ///
 /// # Panics
 ///
@@ -660,10 +731,12 @@ pub fn conv2d_scratch(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
 /// use cavitation_core::kernels::{MatMut, MatRef, reference};
 /// let geom = Conv2dGeom::new(1, 1, (3, 3), (2, 2)).unwrap();
 /// let x: Vec<f64> = (1..=9).map(f64::from).collect();
-/// let (c, p) = conv2d_scratch(&geom, 1);
-/// let (mut cols, mut prod, mut out) = (vec![0.0; c], vec![0.0; p], vec![0.0; 4]);
-/// let gemm = |a: MatRef<f64>, b: MatRef<f64>, c: MatMut<f64>| reference::gemm(1.0, a, b, 0.0, c);
-/// conv2d_forward(&geom, 1, &x, &[1.0; 4], Some(&[0.5]), &mut out, &mut cols, &mut prod, gemm);
+/// let mut scratch = vec![0.0; conv2d_scratch(&geom, 1, 1)];
+/// let mut out = vec![0.0; 4];
+/// let gemm = |a: MatRef<f64>, b: MatRef<f64>, beta: f64, c: MatMut<f64>| {
+///     reference::gemm(1.0, a, b, beta, c)
+/// };
+/// conv2d_forward(&geom, 1, &x, &[1.0; 4], Some(&[0.5]), &mut out, &mut scratch, 1, &gemm);
 /// assert_eq!(out, [12.5, 16.5, 24.5, 28.5]);
 /// ```
 #[allow(clippy::too_many_arguments)]
@@ -674,9 +747,9 @@ pub fn conv2d_forward<T: Real>(
     weight: &[T],
     bias: Option<&[T]>,
     out: &mut [T],
-    cols: &mut [T],
-    prod: &mut [T],
-    mut gemm: impl FnMut(MatRef<'_, T>, MatRef<'_, T>, MatMut<'_, T>),
+    scratch: &mut [T],
+    threads: usize,
+    gemm: &impl ConvGemm<T>,
 ) {
     let (oh, ow) = geom.out_size();
     let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
@@ -684,49 +757,256 @@ pub fn conv2d_forward<T: Real>(
     check_len("the input", x.len(), batch * in_w);
     check_len("the weight", weight.len(), geom.weight_len());
     check_len("the output", out.len(), batch * out_w);
-    let wm = MatRef::new(weight, cout, kl, kl, 1).expect("checked length");
-    if geom.is_pointwise() {
-        for (image, y) in x.chunks_exact(in_w).zip(out.chunks_exact_mut(out_w)) {
-            let rhs = MatRef::new(image, kl, windows, windows, 1).expect("checked length");
-            gemm(
-                wm,
-                rhs,
-                MatMut::new(y, cout, windows, windows, 1).expect("checked length"),
-            );
-        }
-    } else {
-        let per = images_per_chunk(geom, batch);
-        let mut n0 = 0;
-        while n0 < batch {
-            let nb = per.min(batch - n0);
-            let cols_n = nb * windows;
-            let cm = &mut cols[..kl * cols_n];
-            im2col(geom, nb, &x[n0 * in_w..][..nb * in_w], cm);
-            let pm = &mut prod[..cout * cols_n];
-            gemm(
-                wm,
-                MatRef::new(&*cm, kl, cols_n, cols_n, 1).expect("checked length"),
-                MatMut::new(pm, cout, cols_n, cols_n, 1).expect("checked length"),
-            );
-            for (k, y) in out[n0 * out_w..][..nb * out_w]
-                .chunks_exact_mut(out_w)
-                .enumerate()
-            {
-                for (o, plane) in y.chunks_exact_mut(windows).enumerate() {
-                    plane.copy_from_slice(&pm[o * cols_n + k * windows..][..windows]);
-                }
-            }
-            n0 += nb;
-        }
-    }
     if let Some(b) = bias {
         check_len("the bias", b.len(), cout);
-        for image in out.chunks_exact_mut(out_w) {
-            for (plane, &bo) in image.chunks_exact_mut(windows).zip(b) {
-                for v in plane {
-                    *v += bo;
+    }
+    let (cols_len, prod_len) = worker_scratch(geom, batch);
+    let workers = workers(batch, threads);
+    assert!(
+        scratch.len() >= (cols_len + prod_len) * workers,
+        "conv2d: the scratch holds {} values, expected at least {}",
+        scratch.len(),
+        (cols_len + prod_len) * workers
+    );
+    let count = groups(batch);
+    let per = images_per_chunk(geom, batch);
+    let wm = MatRef::new(weight, cout, kl, kl, 1).expect("checked length");
+    let (outs, scratches) = (Parts(out.as_mut_ptr()), Parts(scratch.as_mut_ptr()));
+    super::pool::run(workers, count, &|t| {
+        let (first, len) = group_range(t.index, count, batch);
+        // SAFETY: groups cover disjoint images, so their outputs are disjoint parts of
+        // `out`; each worker runs one task at a time, so its scratch part is its own.
+        let (out, own) = unsafe {
+            (
+                outs.slice(first * out_w, len * out_w),
+                scratches.slice(t.worker * (cols_len + prod_len), cols_len + prod_len),
+            )
+        };
+        let (cols, prod) = own.split_at_mut(cols_len);
+        let x = &x[first * in_w..][..len * in_w];
+        if geom.is_pointwise() {
+            for (image, y) in x.chunks_exact(in_w).zip(out.chunks_exact_mut(out_w)) {
+                let rhs = MatRef::new(image, kl, windows, windows, 1).expect("checked length");
+                let y = MatMut::new(y, cout, windows, windows, 1).expect("checked length");
+                gemm(wm, rhs, T::ZERO, y);
+            }
+        } else {
+            let mut n0 = 0;
+            while n0 < len {
+                let nb = per.min(len - n0);
+                let cols_n = nb * windows;
+                let cm = &mut cols[..kl * cols_n];
+                im2col(geom, nb, &x[n0 * in_w..][..nb * in_w], cm);
+                let pm = &mut prod[..cout * cols_n];
+                gemm(
+                    wm,
+                    MatRef::new(&*cm, kl, cols_n, cols_n, 1).expect("checked length"),
+                    T::ZERO,
+                    MatMut::new(pm, cout, cols_n, cols_n, 1).expect("checked length"),
+                );
+                for (k, y) in out[n0 * out_w..][..nb * out_w]
+                    .chunks_exact_mut(out_w)
+                    .enumerate()
+                {
+                    for (o, plane) in y.chunks_exact_mut(windows).enumerate() {
+                        plane.copy_from_slice(&pm[o * cols_n + k * windows..][..windows]);
+                    }
+                }
+                n0 += nb;
+            }
+        }
+        if let Some(b) = bias {
+            for image in out.chunks_exact_mut(out_w) {
+                for (plane, &bo) in image.chunks_exact_mut(windows).zip(b) {
+                    for v in plane {
+                        *v += bo;
+                    }
                 }
             }
+        }
+    });
+}
+
+/// The input and weight gradients of [`conv2d_forward`] for the output gradient `dy`, group
+/// by group as the forward pass cuts the batch, on up to `threads` threads:
+///
+/// - `dx`, if given, receives the input gradient, `col2im(Wᵀ · dY')` per chunk, added to
+///   what is there when its flag is `true` and written over it when `false`;
+/// - `dw_parts`, if given, receives one partial weight gradient per group
+///   (`groups(batch) · out · kernel_len` values), each `Σ dY' · colsᵀ` over the group's
+///   chunks in order, for the caller to add up in group order.
+///
+/// `dY'` is a chunk's output gradient gathered to `[out, images · windows]`. Every result
+/// depends on its group alone, so it is the same for any thread count. `scratch` holds at
+/// least [`conv2d_scratch`] values.
+///
+/// # Panics
+///
+/// Panics if any slice is too short or has the wrong length, naming it.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_backward, conv2d_scratch};
+/// use cavitation_core::kernels::{MatMut, MatRef, reference};
+/// let geom = Conv2dGeom::new(1, 1, (1, 3), (1, 2)).unwrap();
+/// let mut scratch = vec![0.0; conv2d_scratch(&geom, 1, 1)];
+/// let (mut dx, mut dw) = (vec![0.0f64; 3], vec![0.0; 2]);
+/// let gemm = |a: MatRef<f64>, b: MatRef<f64>, beta: f64, c: MatMut<f64>| {
+///     reference::gemm(1.0, a, b, beta, c)
+/// };
+/// conv2d_backward(&geom, 1, &[1.0, 2.0, 3.0], &[1.0, 1.0], &[1.0, 1.0],
+///     Some((&mut dx, false)), Some(&mut dw), &mut scratch, 1, &gemm);
+/// assert_eq!((dx, dw), (vec![1.0, 2.0, 1.0], vec![3.0, 5.0]));
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_backward<T: Real>(
+    geom: &Conv2dGeom,
+    batch: usize,
+    x: &[T],
+    weight: &[T],
+    dy: &[T],
+    dx: Option<(&mut [T], bool)>,
+    dw_parts: Option<&mut [T]>,
+    scratch: &mut [T],
+    threads: usize,
+    gemm: &impl ConvGemm<T>,
+) {
+    let (oh, ow) = geom.out_size();
+    let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
+    let (in_w, out_w) = (geom.in_width(), geom.out_width());
+    let count = groups(batch);
+    check_len("the input", x.len(), batch * in_w);
+    check_len("the weight", weight.len(), geom.weight_len());
+    check_len("the output gradient", dy.len(), batch * out_w);
+    let (cols_len, prod_len) = worker_scratch(geom, batch);
+    let workers = workers(batch, threads);
+    assert!(
+        scratch.len() >= (cols_len + prod_len) * workers,
+        "conv2d: the scratch holds {} values, expected at least {}",
+        scratch.len(),
+        (cols_len + prod_len) * workers
+    );
+    let add = dx.as_ref().is_some_and(|d| d.1);
+    let dxs = dx.map(|(d, _)| {
+        check_len("the input gradient", d.len(), batch * in_w);
+        Parts(d.as_mut_ptr())
+    });
+    let dws = dw_parts.map(|d| {
+        check_len("the weight gradient's parts", d.len(), count * cout * kl);
+        Parts(d.as_mut_ptr())
+    });
+    let per = images_per_chunk(geom, batch);
+    let wm = MatRef::new(weight, cout, kl, kl, 1).expect("checked length");
+    let scratches = Parts(scratch.as_mut_ptr());
+    super::pool::run(workers, count, &|t| {
+        let (first, len) = group_range(t.index, count, batch);
+        // SAFETY: each worker runs one task at a time, so its scratch part is its own.
+        let own = unsafe { scratches.slice(t.worker * (cols_len + prod_len), cols_len + prod_len) };
+        let (cols, dyp) = own.split_at_mut(cols_len);
+        let x = &x[first * in_w..][..len * in_w];
+        let dy = &dy[first * out_w..][..len * out_w];
+        if let Some(parts) = &dws {
+            // SAFETY: group `t.index` alone writes part `t.index`.
+            let dw = unsafe { parts.slice(t.index * cout * kl, cout * kl) };
+            if geom.is_pointwise() {
+                for (n, (image, g)) in x.chunks_exact(in_w).zip(dy.chunks_exact(out_w)).enumerate()
+                {
+                    let cm = MatRef::new(image, kl, windows, windows, 1).expect("checked length");
+                    let gm = MatRef::new(g, cout, windows, windows, 1).expect("checked length");
+                    let beta = if n == 0 { T::ZERO } else { T::ONE };
+                    gemm(
+                        gm,
+                        cm.transpose(),
+                        beta,
+                        MatMut::new(&mut *dw, cout, kl, kl, 1).expect("checked length"),
+                    );
+                }
+            } else {
+                let mut n0 = 0;
+                while n0 < len {
+                    let nb = per.min(len - n0);
+                    let cols_n = nb * windows;
+                    im2col(
+                        geom,
+                        nb,
+                        &x[n0 * in_w..][..nb * in_w],
+                        &mut cols[..kl * cols_n],
+                    );
+                    gather(
+                        &dy[n0 * out_w..][..nb * out_w],
+                        windows,
+                        cout,
+                        &mut dyp[..cout * cols_n],
+                    );
+                    let gm = MatRef::new(&dyp[..cout * cols_n], cout, cols_n, cols_n, 1)
+                        .expect("checked length");
+                    let cm = MatRef::new(&cols[..kl * cols_n], kl, cols_n, cols_n, 1)
+                        .expect("checked length");
+                    let beta = if n0 == 0 { T::ZERO } else { T::ONE };
+                    gemm(
+                        gm,
+                        cm.transpose(),
+                        beta,
+                        MatMut::new(&mut *dw, cout, kl, kl, 1).expect("checked length"),
+                    );
+                    n0 += nb;
+                }
+            }
+        }
+        if let Some(parts) = &dxs {
+            // SAFETY: groups cover disjoint images, so their input gradients are disjoint.
+            let dx = unsafe { parts.slice(first * in_w, len * in_w) };
+            let wt = wm.transpose();
+            let beta = if add { T::ONE } else { T::ZERO };
+            if geom.is_pointwise() {
+                for (g, d) in dy.chunks_exact(out_w).zip(dx.chunks_exact_mut(in_w)) {
+                    let gm = MatRef::new(g, cout, windows, windows, 1).expect("checked length");
+                    gemm(
+                        wt,
+                        gm,
+                        beta,
+                        MatMut::new(d, kl, windows, windows, 1).expect("checked length"),
+                    );
+                }
+            } else {
+                if !add {
+                    dx.fill(T::ZERO);
+                }
+                let mut n0 = 0;
+                while n0 < len {
+                    let nb = per.min(len - n0);
+                    let cols_n = nb * windows;
+                    gather(
+                        &dy[n0 * out_w..][..nb * out_w],
+                        windows,
+                        cout,
+                        &mut dyp[..cout * cols_n],
+                    );
+                    let gm = MatRef::new(&dyp[..cout * cols_n], cout, cols_n, cols_n, 1)
+                        .expect("checked length");
+                    let dcols = &mut cols[..kl * cols_n];
+                    gemm(
+                        wt,
+                        gm,
+                        T::ZERO,
+                        MatMut::new(&mut *dcols, kl, cols_n, cols_n, 1).expect("checked length"),
+                    );
+                    col2im(geom, nb, dcols, &mut dx[n0 * in_w..][..nb * in_w]);
+                    n0 += nb;
+                }
+            }
+        }
+    });
+}
+
+/// Gathers the output gradient of `dy.len() / (out · windows)` consecutive images, each
+/// `[out, windows]`, into `dst` as `[out, images · windows]`: channel `o` of every image
+/// side by side, image after image.
+fn gather<T: Real>(dy: &[T], windows: usize, cout: usize, dst: &mut [T]) {
+    let images = dy.len() / (cout * windows);
+    let cols_n = images * windows;
+    for (k, image) in dy.chunks_exact(cout * windows).enumerate() {
+        for (o, plane) in image.chunks_exact(windows).enumerate() {
+            dst[o * cols_n + k * windows..][..windows].copy_from_slice(plane);
         }
     }
 }
