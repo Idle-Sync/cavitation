@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Breaking changes
+
+- `Health`, `HealthMonitor`, `Trainer`, `FitConfig`, `shrink::FromScratch` and `cavitation_ml::GradientConfig` take a lifetime parameter, and `Health::sink` and `FitConfig::on_epoch` are `Box<dyn FnMut(..) + Send + 's>`. The callbacks can borrow local state (a sink can push onto a `Vec` the caller reads after the run, without `Rc<RefCell<..>>`), and a `FitConfig` or a `Trainer` can be moved to another thread. A callback that captures something that is not `Send` (an `Rc`, a `Cell`) no longer compiles; borrow the value instead, or use `Arc` and an atomic or a `Mutex`. Code that names one of these types where a lifetime cannot be elided, such as a function with no reference arguments returning `FitConfig`, writes `FitConfig<'static>`; `TrainerHandle` and every `StepControl` are unchanged.
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `shrink::ablate` (and `ablate_with`, `ablate_controlled`) runs the layers before each swept `Linear` once, keeping that `Linear`'s input for every row, and then only the layers from the `Linear` on for each of its neurons; the results are bit-identical. Sweeping the second hidden `Linear` of a 64 → 256 → 256 → 10 network over 1,000 rows: 2.67–2.78 s before, 2.22 s after (one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`). The gain grows with the share of the work before the swept layer; the first `Linear`'s input is the data, so its sweep is unchanged. The kept input takes `rows × width` values for the swept layer's input width.

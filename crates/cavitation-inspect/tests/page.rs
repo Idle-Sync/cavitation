@@ -104,7 +104,7 @@ fn small_data() -> Dataset {
 }
 
 /// Three epochs of Adam at 1e-2, batch 16, quiet health checks.
-fn fit_config() -> FitConfig {
+fn fit_config() -> FitConfig<'static> {
     FitConfig {
         epochs: 3,
         batch: 16,

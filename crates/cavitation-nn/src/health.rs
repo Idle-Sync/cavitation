@@ -556,7 +556,7 @@ impl fmt::Display for Warning {
 /// };
 /// assert_eq!(health.grad_norm_high, 1e3);
 /// ```
-pub struct Health {
+pub struct Health<'s> {
     /// What to do when the loss or a gradient is NaN or infinite.
     pub on_non_finite: OnNonFinite,
     /// A gradient norm above this sends [`Warning::Exploding`].
@@ -573,10 +573,10 @@ pub struct Health {
     /// `cavitation: warning:`, with the bounded printing described on [`Health`].
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
-    pub sink: Option<Box<dyn FnMut(&Warning)>>,
+    pub sink: Option<Box<dyn FnMut(&Warning) + Send + 's>>,
 }
 
-impl Health {
+impl<'s> Health<'s> {
     /// Every check on and `Stop` on non-finite values, but no output: the warnings go to a
     /// sink that drops them. A step that meets a NaN or infinity still returns
     /// [`Error::NonFinite`].
@@ -587,7 +587,7 @@ impl Health {
     /// assert_eq!(health.on_non_finite, OnNonFinite::Stop);
     /// assert!(health.dead_relu && health.sink.is_some());
     /// ```
-    pub fn quiet() -> Health {
+    pub fn quiet() -> Health<'s> {
         Health {
             sink: Some(Box::new(|_: &Warning| {})),
             ..Health::default()
@@ -595,10 +595,10 @@ impl Health {
     }
 }
 
-impl Default for Health {
+impl<'s> Default for Health<'s> {
     /// Stop on non-finite values, norm bounds 1e3 and 1e-7, dead ReLU checks on, warnings
     /// printed to standard error.
-    fn default() -> Health {
+    fn default() -> Health<'s> {
         Health {
             on_non_finite: OnNonFinite::Stop,
             grad_norm_high: 1e3,
@@ -609,7 +609,7 @@ impl Default for Health {
     }
 }
 
-impl fmt::Debug for Health {
+impl fmt::Debug for Health<'_> {
     /// Writes every setting; the sink shows only whether there is one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Health")
@@ -724,9 +724,9 @@ struct ReluLayer {
 ///      feature 0"
 /// );
 /// ```
-pub struct HealthMonitor {
+pub struct HealthMonitor<'s> {
     /// The checks and the sink.
-    health: Health,
+    health: Health<'s>,
     /// Whether the non-finite loss warning was sent this epoch.
     loss_warned: bool,
     /// Whether the clamped-logarithm warning was sent this epoch.
@@ -769,7 +769,7 @@ pub struct HealthMonitor {
     trained_this_epoch: bool,
 }
 
-impl HealthMonitor {
+impl<'s> HealthMonitor<'s> {
     /// A monitor running the checks of `health`.
     ///
     /// ```
@@ -777,7 +777,7 @@ impl HealthMonitor {
     /// let mut monitor = HealthMonitor::new(Health::default());
     /// assert!(monitor.end_epoch(1).is_ok());
     /// ```
-    pub fn new(health: Health) -> HealthMonitor {
+    pub fn new(health: Health<'s>) -> HealthMonitor<'s> {
         HealthMonitor {
             health,
             loss_warned: false,
@@ -809,7 +809,7 @@ impl HealthMonitor {
     /// let mut monitor = HealthMonitor::new(Health::default()).with_loss(Loss::Nll);
     /// assert!(monitor.end_epoch(1).is_ok());
     /// ```
-    pub fn with_loss(mut self, loss: Loss) -> HealthMonitor {
+    pub fn with_loss(mut self, loss: Loss) -> HealthMonitor<'s> {
         self.non_negative = loss.non_negative();
         self
     }
@@ -1273,8 +1273,6 @@ impl HealthMonitor {
     /// Panics if a parameter in `names` was not in the optimiser's last step.
     ///
     /// ```
-    /// use std::cell::Cell;
-    /// use std::rc::Rc;
     /// use cavitation_core::{ParamStore, Rng};
     /// use cavitation_nn::{Health, HealthMonitor, Linear, Optimizer, Sequential, Sgd, Warning};
     /// let mut params = ParamStore::new();
@@ -1282,19 +1280,19 @@ impl HealthMonitor {
     /// let mut optimizer = Sgd::new(0.1);
     /// // No backward pass: nothing moves, and every gradient counts as 0 in the statistics.
     /// optimizer.step(&mut params);
-    /// // The sink is `'static`, so it shares the count through an `Rc`.
-    /// let vanishing = Rc::new(Cell::new(0));
-    /// let count = Rc::clone(&vanishing);
+    /// // The sink borrows a local count; it is read once the monitor is gone.
+    /// let mut vanishing = 0;
     /// let mut monitor = HealthMonitor::new(Health {
-    ///     sink: Some(Box::new(move |w: &Warning| {
+    ///     sink: Some(Box::new(|w: &Warning| {
     ///         if let Warning::Vanishing { .. } = w {
-    ///             count.set(count.get() + 1);
+    ///             vanishing += 1;
     ///         }
     ///     })),
     ///     ..Health::default()
     /// });
     /// monitor.after_update(1, optimizer.last_stats(), &net.parameter_names()).unwrap();
-    /// assert_eq!(vanishing.get(), 2);
+    /// drop(monitor);
+    /// assert_eq!(vanishing, 2);
     /// ```
     pub fn after_update(
         &mut self,
@@ -1433,8 +1431,7 @@ impl HealthMonitor {
 mod tests {
     //! Tests for the health checks, through `fit`, `Trainer` and the manual loop.
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::{
@@ -1444,18 +1441,18 @@ mod tests {
     use cavitation_core::{Error, Graph, ParamStore, Reduction, Rng, Tensor, TensorView};
 
     /// The list a collecting sink writes to.
-    type Seen = Rc<RefCell<Vec<Warning>>>;
+    type Seen = Arc<Mutex<Vec<Warning>>>;
 
     /// A warning sink, as [`Health::sink`] holds it.
-    type Sink = Box<dyn FnMut(&Warning)>;
+    type Sink = Box<dyn FnMut(&Warning) + Send>;
 
     /// A sink that keeps a copy of every warning it receives, and the list it keeps them in.
     fn collecting_sink() -> (Seen, Sink) {
-        let seen = Rc::new(RefCell::new(Vec::new()));
-        let sink = Rc::clone(&seen);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
         (
             seen,
-            Box::new(move |w: &Warning| sink.borrow_mut().push(w.clone())),
+            Box::new(move |w: &Warning| sink.lock().unwrap().push(w.clone())),
         )
     }
 
@@ -1481,7 +1478,7 @@ mod tests {
     }
 
     /// The default checks with `on_non_finite` and the given sink.
-    fn health(on_non_finite: OnNonFinite, sink: Sink) -> Health {
+    fn health(on_non_finite: OnNonFinite, sink: Sink) -> Health<'static> {
         Health {
             on_non_finite,
             sink: Some(sink),
@@ -1589,7 +1586,7 @@ mod tests {
             trainer.end_epoch(epoch).unwrap();
         }
         assert_eq!(trainer.steps(), 4);
-        let seen = seen.borrow();
+        let seen = seen.lock().unwrap();
         assert_eq!(
             seen[0],
             Warning::NonFinite {
@@ -1645,7 +1642,8 @@ mod tests {
         };
         fit(&net, &mut params, &data, config).unwrap();
         let exploding: Vec<(u64, f64)> = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter_map(|w| match w {
                 Warning::Exploding { step, layer, norm } if layer == "0.weight" => {
@@ -1702,7 +1700,8 @@ mod tests {
 
     /// The `DeadNeurons` warnings in `seen`.
     fn dead_reports(seen: &Seen) -> Vec<Warning> {
-        seen.borrow()
+        seen.lock()
+            .unwrap()
             .iter()
             .filter(|w| matches!(w, Warning::DeadNeurons { .. }))
             .cloned()
@@ -1975,7 +1974,8 @@ mod tests {
         let (seen, sink) = collecting_sink();
         fit_exploding(health(OnNonFinite::Stop, sink), 3);
         let steps: Vec<u64> = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter_map(|w| match w {
                 Warning::Exploding { step, layer, .. } if layer == "0.weight" => Some(*step),
@@ -1991,7 +1991,8 @@ mod tests {
         let (seen, sink) = collecting_sink();
         fit_exploding(health(OnNonFinite::Stop, sink), 1);
         let names: Vec<String> = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter_map(|w| match w {
                 Warning::Exploding { layer, .. } => Some(layer.clone()),
@@ -2316,7 +2317,7 @@ mod tests {
             .unwrap_err();
         assert!(is_non_finite(&err, 5, "0.bias"), "{err:?}");
         assert_eq!(
-            *seen.borrow(),
+            *seen.lock().unwrap(),
             [Warning::NonFinite {
                 step: 5,
                 location: "0.bias".to_string(),
@@ -2358,7 +2359,8 @@ mod tests {
         let history = fit(&net, &mut params, &data, config).unwrap();
         assert_eq!(history.epochs.len(), 2);
         let clamped: Vec<Warning> = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter(|w| matches!(w, Warning::ClampedLogs { .. }))
             .cloned()
@@ -2393,7 +2395,7 @@ mod tests {
         assert_eq!(parameter_bits(&net, &params), before);
         assert_eq!(trainer.steps(), 1);
         assert_eq!(
-            *seen.borrow(),
+            *seen.lock().unwrap(),
             [Warning::NonFinite {
                 step: 1,
                 location: "loss".to_string(),
@@ -2442,7 +2444,8 @@ mod tests {
         let last = history.epochs.last().unwrap().mean_loss;
         assert!(last < 1e-8, "{last}");
         let vanishing: Vec<Warning> = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter(|w| matches!(w, Warning::Vanishing { .. }))
             .cloned()
@@ -2479,7 +2482,7 @@ mod tests {
         monitor
             .after_update(2, optimizer.last_stats(), &names)
             .unwrap();
-        let seen = seen.borrow();
+        let seen = seen.lock().unwrap();
         let vanishing = seen
             .iter()
             .filter(|w| matches!(w, Warning::Vanishing { .. }))
@@ -2510,7 +2513,11 @@ mod tests {
         monitor
             .after_update(2, optimizer.last_stats(), &names)
             .unwrap();
-        assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "{:?}",
+            seen.lock().unwrap()
+        );
     }
 
     /// A negative first loss (possible with `kl_div` on inputs that are not log-probabilities)
@@ -2537,11 +2544,12 @@ mod tests {
             .after_update(2, optimizer.last_stats(), &names)
             .unwrap();
         assert!(
-            seen.borrow()
+            seen.lock()
+                .unwrap()
                 .iter()
                 .any(|w| matches!(w, Warning::Vanishing { .. })),
             "{:?}",
-            seen.borrow()
+            seen.lock().unwrap()
         );
     }
 
@@ -2636,7 +2644,7 @@ mod tests {
             target: false,
         };
         assert_eq!(
-            *seen.borrow(),
+            *seen.lock().unwrap(),
             [Warning::NonFinite {
                 step: 1,
                 location: "loss".to_string(),
@@ -2746,7 +2754,7 @@ mod tests {
         }
         assert_eq!(losses[0], 0.0);
         assert!(losses[1..].iter().all(|&l| l < 0.0), "{losses:?}");
-        let warnings = seen.borrow();
+        let warnings = seen.lock().unwrap();
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(
             matches!(warnings[0], Warning::NegativeLoss { step: 2, loss } if loss == losses[1])
@@ -2778,7 +2786,11 @@ mod tests {
             monitor
                 .after_backward(1, -1.0, &tape, &trace, &net, no_labels(&x))
                 .unwrap();
-            assert!(seen.borrow().is_empty(), "{:?}", seen.borrow());
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{:?}",
+                seen.lock().unwrap()
+            );
         }
     }
 
@@ -2903,10 +2915,10 @@ mod tests {
     /// the parameter bits and the trainer.
     fn train_ranges(
         optimizer: Box<dyn Optimizer<f32>>,
-        health: Health,
+        health: Health<'static>,
         data: &Dataset,
         ranges: &[std::ops::Range<usize>],
-    ) -> (Vec<u32>, Trainer) {
+    ) -> (Vec<u32>, Trainer<'static>) {
         let mut params = ParamStore::new();
         let net = classifier(&mut params);
         let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 32);
@@ -2947,7 +2959,8 @@ mod tests {
             assert!(skipped.iter().all(|&b| f32::from_bits(b).is_finite()));
             assert_eq!((trainer.steps(), trainer.skipped_steps()), (9, 3));
             let loss_steps: Vec<u64> = seen
-                .borrow()
+                .lock()
+                .unwrap()
                 .iter()
                 .filter_map(|w| match w {
                     Warning::NonFinite { step, location, .. } if location == "loss" => Some(*step),
@@ -2956,11 +2969,12 @@ mod tests {
                 .collect();
             assert_eq!(loss_steps, [2, 5, 8]);
             assert!(
-                seen.borrow()
+                seen.lock()
+                    .unwrap()
                     .iter()
                     .all(|w| w.kind() != WarningKind::NonFinite || w.location() == Some("loss")),
                 "{:?}",
-                seen.borrow()
+                seen.lock().unwrap()
             );
         }
     }
@@ -3034,7 +3048,7 @@ mod tests {
 
     /// The `fit` configuration of the `Skip` comparison: 3 unshuffled epochs of Adam in
     /// batches of 4, mean squared error, `health`.
-    fn skip_fit_config(health: Health) -> FitConfig {
+    fn skip_fit_config(health: Health<'static>) -> FitConfig<'static> {
         FitConfig {
             epochs: 3,
             batch: 4,
@@ -3078,7 +3092,8 @@ mod tests {
             assert_eq!(a.mean_loss.to_bits(), b.mean_loss.to_bits());
         }
         let non_finite: Vec<(u64, String)> = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter_map(|w| match w {
                 Warning::NonFinite { step, location, .. } => Some((*step, location.clone())),
@@ -3211,11 +3226,12 @@ mod tests {
             .after_update(2, optimizer.last_stats(), &names)
             .unwrap();
         let vanishing = seen
-            .borrow()
+            .lock()
+            .unwrap()
             .iter()
             .filter(|w| matches!(w, Warning::Vanishing { .. }))
             .count();
-        assert_eq!(vanishing, 2, "{:?}", seen.borrow());
+        assert_eq!(vanishing, 2, "{:?}", seen.lock().unwrap());
     }
 
     /// A profile asked for before a skipped step carries over to the next step that trains.
@@ -3261,12 +3277,12 @@ mod tests {
             let mut monitor = HealthMonitor::new(health(policy, sink));
             assert!(monitor.before_update(1, f32::NAN, &params, &names));
             assert!(monitor.before_update(1, 0.5, &params, &names));
-            assert!(seen.borrow().is_empty());
+            assert!(seen.lock().unwrap().is_empty());
         }
         let (seen, sink) = collecting_sink();
         let mut monitor = HealthMonitor::new(health(OnNonFinite::Skip, sink));
         assert!(!monitor.before_update(1, f32::NAN, &params, &names));
-        assert!(seen.borrow().is_empty());
+        assert!(seen.lock().unwrap().is_empty());
         assert!(!monitor.before_update(2, 0.5, &params, &names));
         assert!(!monitor.before_update(3, 0.5, &params, &names));
         // Every step of epoch 1 was skipped.
@@ -3277,7 +3293,7 @@ mod tests {
             location: "0.bias".to_string(),
             input: None,
         };
-        assert_eq!(*seen.borrow(), [bias_warning(2), bias_warning(4)]);
+        assert_eq!(*seen.lock().unwrap(), [bias_warning(2), bias_warning(4)]);
         params.zero_grad();
         assert!(monitor.before_update(5, 0.5, &params, &names));
     }
@@ -3320,7 +3336,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            *seen.borrow(),
+            *seen.lock().unwrap(),
             [Warning::NonFinite {
                 step: 1,
                 location: "loss".to_string(),

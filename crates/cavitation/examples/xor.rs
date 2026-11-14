@@ -6,9 +6,6 @@
 //!
 //! Run it with `cargo run --release --example xor -p cavitation`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use cavitation::prelude::*;
 
 /// Prints the values of a tensor view as one short line, to three decimals.
@@ -47,12 +44,10 @@ fn main() -> Result<(), Error> {
     let mut optimizer = Sgd::new(0.5);
     // Health checks stay on. Warnings (for example a gradient norm outside the bounds) are
     // collected here and summarised at the end instead of printed in the middle of the run.
-    let warnings: Rc<RefCell<Vec<String>>> = Rc::default();
-    let sink = Rc::clone(&warnings);
+    // The sink borrows the list, which is read once the monitor is dropped.
+    let mut warnings: Vec<String> = Vec::new();
     let mut monitor = HealthMonitor::new(Health {
-        sink: Some(Box::new(move |w: &Warning| {
-            sink.borrow_mut().push(w.to_string())
-        })),
+        sink: Some(Box::new(|w: &Warning| warnings.push(w.to_string()))),
         ..Health::default()
     });
     let mut graph = Graph::new();
@@ -146,7 +141,7 @@ fn main() -> Result<(), Error> {
 
     println!("\nPredictions (targets 0, 1, 1, 0):");
     println!("  {}", row(tape.value(out).data()));
-    let warnings = warnings.borrow();
+    drop(monitor);
     match warnings.last() {
         Some(last) => println!("health: {} warnings; last: {last}", warnings.len()),
         None => println!("health: no warnings"),

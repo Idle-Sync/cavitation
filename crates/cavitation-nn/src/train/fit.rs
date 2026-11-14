@@ -245,7 +245,7 @@ impl Loss {
 /// };
 /// train().unwrap();
 /// ```
-pub struct Trainer {
+pub struct Trainer<'s> {
     /// The storage every step records on.
     graph: Graph<f32>,
     /// Each layer's input and output in the last step.
@@ -264,7 +264,7 @@ pub struct Trainer {
     /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip).
     skipped: u64,
     /// The health checks run on every step.
-    health: HealthMonitor,
+    health: HealthMonitor<'s>,
     /// The model's parameter names, for the health checks' messages.
     names: Vec<(String, ParamId)>,
     /// The step profile's state: asked for, last result and reused buffers.
@@ -274,7 +274,7 @@ pub struct Trainer {
     schedule_stopped: bool,
 }
 
-impl Trainer {
+impl<'s> Trainer<'s> {
     /// A trainer for `model` that minimises `loss` with `optimizer`, gathering batches of
     /// `batch` rows when it runs whole epochs for [`fit`].
     ///
@@ -295,7 +295,7 @@ impl Trainer {
         optimizer: impl Optimizer<f32> + 'static,
         loss: Loss,
         batch: usize,
-    ) -> Trainer {
+    ) -> Trainer<'s> {
         Trainer::with_boxed(model, Box::new(optimizer), loss, batch)
     }
 
@@ -305,7 +305,7 @@ impl Trainer {
         optimizer: Box<dyn Optimizer<f32>>,
         loss: Loss,
         batch: usize,
-    ) -> Trainer {
+    ) -> Trainer<'s> {
         assert!(batch > 0, "Trainer::new: the batch size must be at least 1");
         Trainer {
             graph: Graph::new(),
@@ -335,7 +335,7 @@ impl Trainer {
     /// trainer.set_health(Health { on_non_finite: OnNonFinite::Warn, ..Health::default() });
     /// assert!(trainer.end_epoch(1).is_ok());
     /// ```
-    pub fn set_health(&mut self, health: Health) {
+    pub fn set_health(&mut self, health: Health<'s>) {
         self.health = HealthMonitor::new(health).with_loss(self.loss);
     }
 
@@ -1043,8 +1043,46 @@ pub struct StepInfo {
 /// assert_eq!((handle.learning_rate(), handle.steps()), (0.05, 0));
 /// ```
 pub struct TrainerHandle<'a> {
-    /// The trainer the handle acts on.
-    trainer: &'a mut Trainer,
+    /// The trainer the handle acts on, behind the calls a handle allows, so the handle's
+    /// type does not carry the trainer's own lifetime.
+    trainer: &'a mut (dyn HandleTarget + 'a),
+}
+
+/// The calls a [`TrainerHandle`] passes on to its [`Trainer`].
+trait HandleTarget {
+    /// As [`Trainer::profile_next_step`].
+    fn profile_next_step(&mut self);
+    /// As [`Trainer::last_profile`].
+    fn last_profile(&self) -> Option<&StepProfile>;
+    /// As [`Trainer::override_learning_rate`].
+    fn override_learning_rate(&mut self, lr: f64);
+    /// As [`Trainer::learning_rate`].
+    fn learning_rate(&self) -> f64;
+    /// As [`Trainer::steps`].
+    fn steps(&self) -> u64;
+    /// As [`Trainer::skipped_steps`].
+    fn skipped_steps(&self) -> u64;
+}
+
+impl HandleTarget for Trainer<'_> {
+    fn profile_next_step(&mut self) {
+        Trainer::profile_next_step(self);
+    }
+    fn last_profile(&self) -> Option<&StepProfile> {
+        Trainer::last_profile(self)
+    }
+    fn override_learning_rate(&mut self, lr: f64) {
+        Trainer::override_learning_rate(self, lr);
+    }
+    fn learning_rate(&self) -> f64 {
+        Trainer::learning_rate(self)
+    }
+    fn steps(&self) -> u64 {
+        Trainer::steps(self)
+    }
+    fn skipped_steps(&self) -> u64 {
+        Trainer::skipped_steps(self)
+    }
 }
 
 impl<'a> TrainerHandle<'a> {
@@ -1059,7 +1097,7 @@ impl<'a> TrainerHandle<'a> {
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
     /// assert!(TrainerHandle::new(&mut trainer).last_profile().is_none());
     /// ```
-    pub fn new(trainer: &'a mut Trainer) -> TrainerHandle<'a> {
+    pub fn new(trainer: &'a mut Trainer<'_>) -> TrainerHandle<'a> {
         TrainerHandle { trainer }
     }
 
@@ -1477,7 +1515,7 @@ pub struct History {
 /// let config = FitConfig { epochs: 3, loss: Loss::Mse, ..FitConfig::default() };
 /// assert_eq!((config.epochs, config.batch), (3, 32));
 /// ```
-pub struct FitConfig {
+pub struct FitConfig<'s> {
     /// How many passes over the data.
     pub epochs: usize,
     /// The rows per step; the last batch of an epoch may be smaller.
@@ -1491,13 +1529,13 @@ pub struct FitConfig {
     /// How the learning rate changes from epoch to epoch, starting from the optimiser's.
     pub schedule: LrSchedule,
     /// The health checks run on every step and at the end of every epoch.
-    pub health: Health,
+    pub health: Health<'s>,
     /// Called as soon as each epoch ends with its report, the model and the parameters as
     /// they are after the epoch, so a held-out metric such as [`accuracy`] can be measured
     /// every epoch.
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
-    pub on_epoch: Option<Box<dyn FnMut(&EpochReport, &Sequential, &ParamStore) + 'static>>,
+    pub on_epoch: Option<Box<dyn FnMut(&EpochReport, &Sequential, &ParamStore) + Send + 's>>,
     /// A held-out set measured after every whole epoch, recorded in
     /// [`EpochReport::validation`] before `on_epoch` runs: the loss with
     /// [`loss`](Self::loss), and the accuracy (class targets) or R² (value targets), `batch`
@@ -1510,10 +1548,10 @@ pub struct FitConfig {
     pub validation: Option<Dataset>,
 }
 
-impl Default for FitConfig {
+impl Default for FitConfig<'_> {
     /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, the
     /// default health checks, no callback, no validation set.
-    fn default() -> FitConfig {
+    fn default() -> Self {
         FitConfig {
             epochs: 10,
             batch: 32,
@@ -1531,7 +1569,7 @@ impl Default for FitConfig {
     }
 }
 
-impl fmt::Debug for FitConfig {
+impl fmt::Debug for FitConfig<'_> {
     /// Writes every setting; the callback shows only whether there is one, and the
     /// validation set only its rows and features.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2087,7 +2125,7 @@ mod tests {
 
     use super::*;
     use crate::train::data::tests::classes_dataset;
-    use crate::{Glu, Layer, Linear, Sigmoid, Tanh};
+    use crate::{Glu, Layer, Linear, Sigmoid, Tanh, Warning};
     use cavitation_core::{Gate, ParamId, Rng, Tensor};
 
     /// `n` rows of `features` uniform values in `[-1, 1)` from `Rng::seed(seed)`, labelled
@@ -2514,7 +2552,7 @@ mod tests {
     }
 
     /// `fit` config for `loss` with two epochs.
-    fn config_for(loss: Loss) -> FitConfig {
+    fn config_for(loss: Loss) -> FitConfig<'static> {
         FitConfig {
             epochs: 2,
             batch: 2,
@@ -3130,7 +3168,7 @@ mod tests {
 
     /// The configuration of the control tests: `epochs` epochs at batch 16, Adam, shuffled,
     /// with quiet health checks.
-    fn control_config(epochs: usize) -> FitConfig {
+    fn control_config(epochs: usize) -> FitConfig<'static> {
         FitConfig {
             epochs,
             batch: 16,
@@ -3138,6 +3176,96 @@ mod tests {
             health: Health::quiet(),
             ..FitConfig::default()
         }
+    }
+
+    // A configuration, a trainer and their health checks can move to another thread.
+    const _: () = {
+        /// Requires `T: Send`.
+        const fn send<T: Send>() {}
+        send::<FitConfig<'static>>();
+        send::<Trainer<'static>>();
+        send::<Health<'static>>();
+    };
+
+    /// A `FitConfig` whose sink and epoch callback record where they run is built on this
+    /// thread, moved into `std::thread::spawn` with the data, model and parameters, and
+    /// trains there: both callbacks ran on the worker, not on this thread (the epoch
+    /// callback once per epoch, the sink on the steps, with a bound every gradient passes),
+    /// and the run gives the parameters of the same run on this thread, bit for bit.
+    #[test]
+    fn a_fit_config_moves_to_another_thread() {
+        type Seen = Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>;
+        let make = |epochs: Seen, warnings: Seen| FitConfig {
+            health: Health {
+                grad_norm_high: 0.0,
+                sink: Some(Box::new(move |_: &Warning| {
+                    warnings.lock().unwrap().push(std::thread::current().id());
+                })),
+                ..Health::default()
+            },
+            on_epoch: Some(Box::new(
+                move |_: &EpochReport, _: &Sequential, _: &ParamStore| {
+                    epochs.lock().unwrap().push(std::thread::current().id());
+                },
+            )),
+            ..control_config(3)
+        };
+        let (data, mut here, net_here) = control_setup();
+        fit(
+            &net_here,
+            &mut here,
+            &data,
+            make(Seen::default(), Seen::default()),
+        )
+        .unwrap();
+        let (epochs_seen, warned_on) = (Seen::default(), Seen::default());
+        let config = make(Arc::clone(&epochs_seen), Arc::clone(&warned_on));
+        let (data, params, net) = control_setup();
+        let there = std::thread::spawn(move || {
+            let mut params = params;
+            fit(&net, &mut params, &data, config).unwrap();
+            parameter_bits(&net, &params)
+        })
+        .join()
+        .unwrap();
+        let me = std::thread::current().id();
+        let (epochs, warned) = (epochs_seen.lock().unwrap(), warned_on.lock().unwrap());
+        assert_eq!(epochs.len(), 3);
+        assert!(!warned.is_empty());
+        assert!(epochs.iter().chain(warned.iter()).all(|&id| id != me));
+        assert_eq!(there, parameter_bits(&net_here, &here));
+    }
+
+    /// The sink and the epoch callback can borrow local state: they push onto lists owned
+    /// by the test, here from a scoped thread, and the lists are read once the run is over.
+    #[test]
+    fn callbacks_borrow_local_state() {
+        let (data, mut params, net) = control_setup();
+        let mut warnings: Vec<String> = Vec::new();
+        let mut losses: Vec<f64> = Vec::new();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let config = FitConfig {
+                    // A bound every gradient passes, so every step sends a warning.
+                    health: Health {
+                        grad_norm_high: 0.0,
+                        sink: Some(Box::new(|w: &Warning| warnings.push(w.to_string()))),
+                        ..Health::default()
+                    },
+                    on_epoch: Some(Box::new(
+                        |r: &EpochReport, _: &Sequential, _: &ParamStore| losses.push(r.mean_loss),
+                    )),
+                    ..control_config(2)
+                };
+                fit(&net, &mut params, &data, config).unwrap();
+            });
+        });
+        assert_eq!(losses.len(), 2);
+        assert!(!warnings.is_empty());
+        assert!(
+            warnings.iter().all(|w| w.contains("exploding")),
+            "{warnings:?}"
+        );
     }
 
     /// A control that changes nothing.

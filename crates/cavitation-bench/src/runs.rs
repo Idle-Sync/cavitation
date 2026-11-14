@@ -2,12 +2,12 @@
 //! training and inference runs that are compared with the numpy baseline, the parts of the
 //! `shrink` run, the runs of the `inspect` benchmark, and the `activation` timings.
 
-use std::cell::{Cell, RefCell};
 use std::hint::black_box;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
@@ -412,16 +412,20 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, HealthLog),
             weight_decay: 0.0,
         }
     };
-    let mut trainer = Trainer::new(&net, optimizer.build(), Loss::CrossEntropy, spec.batch);
     // The default checks, with the warnings recorded instead of printed to standard error:
     // the sink adds to a count (the first of each kind also keeps its place), and the
-    // summary is formatted after the timing.
-    let warnings = Rc::new(RefCell::new(HealthLog::default()));
-    let epoch_now = Rc::new(Cell::new(0usize));
-    let (log, now) = (Rc::clone(&warnings), Rc::clone(&epoch_now));
+    // summary is formatted after the timing. The sink borrows both, so they are made before
+    // the trainer.
+    let warnings = Mutex::new(HealthLog::default());
+    let epoch_now = AtomicUsize::new(0);
+    let mut trainer = Trainer::new(&net, optimizer.build(), Loss::CrossEntropy, spec.batch);
     trainer.set_health(Health {
-        sink: Some(Box::new(move |w: &Warning| {
-            log.borrow_mut().record(w, now.get());
+        sink: Some(Box::new(|w: &Warning| {
+            let epoch = epoch_now.load(Ordering::Relaxed);
+            warnings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(w, epoch);
         })),
         ..Health::default()
     });
@@ -441,7 +445,7 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, HealthLog),
     let count = spec.steps.unwrap_or(ranges.len());
     let mut seconds = Vec::with_capacity(spec.epochs);
     for epoch in 1..=spec.epochs {
-        epoch_now.set(epoch);
+        epoch_now.store(epoch, Ordering::Relaxed);
         let first = (epoch - 1) * count;
         let start = Instant::now();
         batcher.epoch();
@@ -456,7 +460,9 @@ fn train_ours(spec: &TrainSpec, data: &Dataset) -> Result<(Vec<f64>, HealthLog),
         trainer.end_epoch(epoch).map_err(|e| e.to_string())?;
         seconds.push(start.elapsed().as_secs_f64());
     }
-    Ok((seconds, warnings.take()))
+    drop(trainer);
+    let log = warnings.into_inner().unwrap_or_else(|e| e.into_inner());
+    Ok((seconds, log))
 }
 
 /// Loads the training data a run needs: MNIST's 60,000 images from `data/mnist/`,
@@ -1210,7 +1216,7 @@ pub struct InspectRun {
 
 /// The digits benchmark's training: SGD at 0.01, batch 128, the rows in order, the health
 /// checks on with no output, cross-entropy.
-fn inspect_fit_config(epochs: usize) -> FitConfig {
+fn inspect_fit_config(epochs: usize) -> FitConfig<'static> {
     FitConfig {
         epochs,
         batch: 128,
