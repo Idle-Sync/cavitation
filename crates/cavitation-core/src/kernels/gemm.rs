@@ -681,7 +681,9 @@ unsafe fn packed<K: Kernel>(
         // block the kernel ever packs (`KC` by `NC` of `B`; `MC` by `KC` of `A` for each
         // slot of the thread count asked for), not just this call's, so a thread that meets
         // a larger product later (a convolution group's GEMM can run on any worker) never
-        // grows them: only its first call at a thread count allocates.
+        // grows them: only its first call at a thread count allocates. (`nc` is rounded up
+        // to whole `NR` panels, so `NC` is too.) This costs each thread that runs a GEMM
+        // about 2 MB for `B` and, per slot, 98 KB (AVX2) to 393 KB (SSE4.2) for `A`.
         let slots = launch(threads, full.tasks().max(last.tasks()));
         let a_slot = (full.m_panels.max(last.m_panels) * mr * kc * K::A_REP).div_ceil(16);
         let a_most = (K::MC.div_ceil(mr) * mr * K::KC * K::A_REP)
@@ -689,7 +691,9 @@ unsafe fn packed<K: Kernel>(
             .max(a_slot);
         reserve(
             &mut scratch.b,
-            (K::KC * K::NC).div_ceil(16).max((kc * nc).div_ceil(16)),
+            (K::KC * K::NC.next_multiple_of(K::NR))
+                .div_ceil(16)
+                .max((kc * nc).div_ceil(16)),
         );
         reserve(&mut scratch.a, asked.max(slots) * a_most);
         let b_buf = Shared(scratch.b.as_mut_ptr().cast::<f32>());

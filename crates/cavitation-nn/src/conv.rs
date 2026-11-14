@@ -236,6 +236,7 @@ impl<T: Real> Layer<T> for Conv2d {
 mod tests {
     use super::*;
     use crate::{InferenceModel, Linear, Relu, Sequential};
+    use cavitation_core::kernels::Level;
     use cavitation_core::{Graph, gradcheck_params};
 
     /// A 2 → 3 channel 3 × 3 convolution with padding 1 on 6 × 5 images.
@@ -308,7 +309,10 @@ mod tests {
 
     /// Inference gives the tape's bits for one image and for a batch, through two
     /// convolutions (one 1 × 1) and their ReLUs, with and without a bias: both run the same
-    /// GEMMs on the same column matrices.
+    /// GEMMs on the same column matrices. At the Accelerate level one image is a product of
+    /// another shape than the tape's chunk, which Accelerate may round differently, so there
+    /// the single-image outputs are compared within `1e-5 · max(1, |tape|)` (the sums here
+    /// have at most 18 terms, and the GEMM bound is far tighter).
     #[test]
     fn conv_inference_matches_tape() {
         for with_bias in [true, false] {
@@ -333,8 +337,20 @@ mod tests {
             let mut model = InferenceModel::compile(&net, &params).unwrap();
             let width = g2.out_width();
             assert_eq!(model.infer_batch(x.view()).data(), want.as_slice());
+            let accelerate = cavitation_core::kernels::level() == Level::Accelerate;
             for (r, row) in x.data().chunks(geom().in_width()).enumerate() {
-                assert_eq!(model.infer(row), &want[r * width..][..width], "row {r}");
+                let got = model.infer(row).to_vec();
+                let want = &want[r * width..][..width];
+                if accelerate {
+                    for (g, w) in got.iter().zip(want) {
+                        assert!(
+                            (g - w).abs() <= 1e-5 * w.abs().max(1.0),
+                            "row {r}: {g} against {w}"
+                        );
+                    }
+                } else {
+                    assert_eq!(got, want, "row {r}");
+                }
             }
         }
     }
