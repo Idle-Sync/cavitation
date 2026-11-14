@@ -7,7 +7,8 @@
 //!   `digits` times epochs of the 50k network on the digits; `latency` times one input
 //!   through the 50k network. Each also runs `scripts/bench/numpy_mlp.py` with the same
 //!   network, batch, data and step counts, and prints cavitation against numpy with the
-//!   ratio. The results are also written to `target/bench/results.json`.
+//!   ratio. The results are also written to `bench/results.json` in the target folder
+//!   (`CARGO_TARGET_DIR` when it is set, else the workspace's `target`).
 //! - `cifar [--batch 32|128] [--steps N]` times 3 epochs of the 3072 → 1024 → 512 → 10
 //!   network (ReLU, cross-entropy, Adam lr 1e-3) on CIFAR-10's 50,000 training images, at
 //!   batch 128 and then 32 (or only the batch given), against the same numpy baseline. With
@@ -80,6 +81,7 @@ mod runs;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cavitation_core::kernels::{detected, level, threads};
 
@@ -99,6 +101,27 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 shrink\n\
     \x20 inspect [--rounds N]\n\
     \x20 info";
+
+/// Set once a command has read its arguments and begun to run: an error after that is a
+/// failure of the run (numpy's output not matching, say), not of the command line, so the
+/// usage text is not printed with it.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Marks the command as running; called once its arguments are read.
+fn running() {
+    RUNNING.store(true, Ordering::Relaxed);
+}
+
+/// What `main` prints for an error `e` of `command`: the usage text follows only an error
+/// raised before the command began to run (`running` false), which is about the command
+/// line.
+fn failure_message(command: &str, e: &str, running: bool) -> String {
+    if running {
+        format!("cavitation-bench {command}: {e}")
+    } else {
+        format!("cavitation-bench {command}: {e}\n{USAGE}")
+    }
+}
 
 /// Entry point of the benchmark runner.
 fn main() -> ExitCode {
@@ -130,7 +153,9 @@ fn main() -> ExitCode {
             if command == "all" {
                 info();
             }
-            for run in plan(command, &o)? {
+            let runs = plan(command, &o)?;
+            running();
+            for run in runs {
                 rows.push(execute(run, &o)?);
             }
             report(&rows, o.numpy_best)
@@ -140,8 +165,9 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("cavitation-bench {command}: {e}\n{USAGE}");
-            ExitCode::from(2)
+            let ran = RUNNING.load(Ordering::Relaxed);
+            eprintln!("{}", failure_message(command, &e, ran));
+            ExitCode::from(if ran { 1 } else { 2 })
         }
     }
 }
@@ -301,7 +327,8 @@ fn execute(run: Run, o: &Options) -> Result<Comparison, String> {
     }
 }
 
-/// Prints the table of cavitation against numpy and writes `target/bench/results.json`.
+/// Prints the table of cavitation against numpy and writes `results.json` (see
+/// [`results_dir`]).
 /// With `numpy_best`, numpy's column is its fastest setting and the default one is beside it.
 ///
 /// # Errors
@@ -388,7 +415,17 @@ fn json_list(values: &[f64]) -> String {
     format!("[{}]", items.join(", "))
 }
 
-/// Writes `target/bench/results.json` at the repository root.
+/// The folder `results.json` goes in: `bench` under `target_dir` (the value of
+/// `CARGO_TARGET_DIR`) when it is set and not empty, else under the workspace's `target`
+/// beside `manifest_dir` (this crate's folder).
+fn results_dir(target_dir: Option<std::ffi::OsString>, manifest_dir: &str) -> PathBuf {
+    match target_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join("bench"),
+        None => PathBuf::from(manifest_dir).join("../../target/bench"),
+    }
+}
+
+/// Writes `results.json` into [`results_dir`].
 ///
 /// # Errors
 ///
@@ -437,7 +474,10 @@ fn write_results(rows: &[Comparison], load: &str, numpy_best: bool) -> Result<()
         load,
         runs.join(",\n")
     );
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/bench");
+    let dir = results_dir(
+        std::env::var_os("CARGO_TARGET_DIR"),
+        env!("CARGO_MANIFEST_DIR"),
+    );
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let path = dir.join("results.json");
     std::fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -462,6 +502,7 @@ fn gemm(args: &[String]) -> Result<(), String> {
         }
     }
     let products = runs::shapes(&set)?;
+    running();
     let (level, threads) = (level(), threads());
     println!("gemm {set}: kernel {level}, {threads} threads, median of 31 samples");
     println!(
@@ -511,6 +552,7 @@ fn subnormal(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    running();
     println!(
         "subnormal: one parameter of {} elements, gradient 1e-3 on step 1 and 0 after, \
          kernel {}, {} threads",
@@ -541,6 +583,7 @@ fn activation(args: &[String]) -> Result<(), String> {
     if let Some(other) = args.first() {
         return Err(format!("unknown argument `{other}`"));
     }
+    running();
     use cavitation_core::kernels::{Level, supported};
     // Accelerate's activations are NEON's, so it is not timed separately.
     let levels: Vec<Level> = [Level::Reference, Level::Sse42, Level::Avx2Fma, Level::Neon]
@@ -597,6 +640,7 @@ fn small(args: &[String]) -> Result<(), String> {
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--child" => {
+                running();
                 let run = runs::small_once()?;
                 println!(
                     "wall {:e} cpu {:e} loss {:08x}",
@@ -615,6 +659,7 @@ fn small(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    running();
     let net = runs::SMALL_NET.map(|w| w.to_string()).join(" → ");
     println!(
         "small: {net} with tanh, MSE, Adam lr 1e-3, batch {}, {} rows, {} timed epochs, \
@@ -732,6 +777,7 @@ fn inspect(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
+    running();
     let whole = std::time::Instant::now();
     let cpu_start = machine::process_cpu_seconds();
     let machine = machine::detect();
@@ -999,6 +1045,7 @@ fn check_compaction(
 ///
 /// Returns a message if a step fails.
 fn shrink() -> Result<(), String> {
+    running();
     use cavitation_nn::shrink::{Ranking, ShrinkConfig};
     let machine = machine::detect();
     println!(
@@ -1126,6 +1173,38 @@ fn shrink() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `results.json` goes under `CARGO_TARGET_DIR` when it is set, and under the
+    /// workspace's `target` when it is unset or empty.
+    #[test]
+    fn results_follow_the_target_dir() {
+        let manifest = "/repo/crates/cavitation-bench";
+        assert_eq!(
+            results_dir(Some("/tmp/t".into()), manifest),
+            PathBuf::from("/tmp/t/bench")
+        );
+        assert_eq!(
+            results_dir(None, manifest),
+            PathBuf::from("/repo/crates/cavitation-bench/../../target/bench")
+        );
+        assert_eq!(
+            results_dir(Some("".into()), manifest),
+            results_dir(None, manifest)
+        );
+    }
+
+    /// The usage text follows a command-line error only, not a failure while running.
+    #[test]
+    fn usage_only_for_command_line_errors() {
+        let before = failure_message("gemm", "unknown argument `--x`", false);
+        assert!(before.starts_with("cavitation-bench gemm: unknown argument `--x`\n"));
+        assert!(before.ends_with(USAGE));
+        let during = failure_message("digits", "numpy's loss does not match", true);
+        assert_eq!(
+            during,
+            "cavitation-bench digits: numpy's loss does not match"
+        );
+    }
 
     /// The child's result line reads back into the numbers it was printed from.
     #[test]

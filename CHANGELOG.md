@@ -8,6 +8,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 - `shrink::ablate` (and `ablate_with`, `ablate_controlled`) runs the layers before each swept `Linear` once, keeping that `Linear`'s input for every row, and then only the layers from the `Linear` on for each of its neurons; the results are bit-identical. Sweeping the second hidden `Linear` of a 64 → 256 → 256 → 10 network over 1,000 rows: 2.67–2.78 s before, 2.22 s after (one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`). The gain grows with the share of the work before the swept layer; the first `Linear`'s input is the data, so its sweep is unchanged. The kept input takes `rows × width` values for the swept layer's input width.
 
+### Data, examples, guide and benchmark
+
+- `cavitation-bench` writes `results.json` under `CARGO_TARGET_DIR` (in its `bench` folder) when that is set, instead of always the workspace's `target/bench`; prints the usage text only for a command-line error, not after a failure while running (which now exits with status 1, not 2); and on aarch64 Linux, whose `/proc/cpuinfo` has no `model name`, names the CPU from its cores' `CPU implementer` and `CPU part` (`ARM Cortex-A76`, with the board's `Model` line when there is one) instead of `unknown`.
+
 ## v0.2.0 (2026-11-14)
 
 ### Breaking changes
