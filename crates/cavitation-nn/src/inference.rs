@@ -14,6 +14,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
@@ -1158,7 +1159,7 @@ impl Run {
                     if cur.is_none() {
                         bufs[c][..n_in].copy_from_slice(&input[..n_in]);
                     }
-                    element_wise(form, &mut bufs[c][..n_in], step.inputs);
+                    element_wise(self.level, form, &mut bufs[c][..n_in], step.inputs);
                     cur = Some(c);
                 }
             }
@@ -1246,10 +1247,11 @@ fn relu_value(v: f32) -> f32 {
     if v <= 0.0 { 0.0 } else { v }
 }
 
-/// The value of a gated linear unit's gate at `x`, as the tape computes it.
+/// The value of a gated linear unit's gate at `x`, as the tape computes it: its sigmoid gate
+/// is the scalar sigmoid, not the SIMD kernel of the `Sigmoid` layer.
 fn gate_value(gate: Gate, x: f32) -> f32 {
     let kind = match gate {
-        Gate::Sigmoid => ActivationKind::Sigmoid,
+        Gate::Sigmoid => return crate::activation::sigmoid(x),
         Gate::Gelu(approx) => ActivationKind::Gelu(approx),
         Gate::Relu => ActivationKind::Relu,
         Gate::Silu => ActivationKind::Silu,
@@ -1257,14 +1259,17 @@ fn gate_value(gate: Gate, x: f32) -> f32 {
     Activation::<f32>::f(&kind, x)
 }
 
-/// Applies a step that keeps the width to `data` in place, `width` values per row.
-fn element_wise(form: &InferenceLayer, data: &mut [f32], width: usize) {
+/// Applies a step that keeps the width to `data` in place, `width` values per row; `tanh`
+/// and the sigmoid run the SIMD kernels of `level`.
+fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: usize) {
     match form {
         InferenceLayer::Activation(ActivationKind::Relu) => {
             for v in data.iter_mut() {
                 *v = relu_value(*v);
             }
         }
+        InferenceLayer::Activation(ActivationKind::Tanh) => tanh_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Sigmoid) => sigmoid_f32_with(level, data),
         InferenceLayer::Activation(kind) => {
             for v in data.iter_mut() {
                 *v = Activation::<f32>::f(kind, *v);

@@ -143,8 +143,10 @@ pub enum ActivationKind {
     LogSigmoid,
 }
 
-/// `1 / (1 + e^-x)` without overflowing the exponential.
-fn sigmoid<T: Real>(x: T) -> T {
+/// `1 / (1 + e^-x)` without overflowing the exponential, one value at a time with std's
+/// `exp`: the scalar sigmoid that SiLU, the derivatives and the GLU gate use (the `Sigmoid`
+/// layer runs the SIMD kernels instead).
+pub(crate) fn sigmoid<T: Real>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
     } else {
@@ -239,8 +241,18 @@ impl ActivationKind {
                     c(slope) * x
                 }
             }
-            ActivationKind::Tanh => x.tanh(),
-            ActivationKind::Sigmoid => sigmoid(x),
+            // The kernels the tape and inference run, so the value here matches theirs bit
+            // for bit.
+            ActivationKind::Tanh => {
+                let mut v = [x];
+                T::tanh_in_place(&mut v);
+                v[0]
+            }
+            ActivationKind::Sigmoid => {
+                let mut v = [x];
+                T::sigmoid_in_place(&mut v);
+                v[0]
+            }
             ActivationKind::Gelu(GeluApprox::Exact) => {
                 half * x * (T::ONE + (x * c(FRAC_1_SQRT_2)).erf())
             }

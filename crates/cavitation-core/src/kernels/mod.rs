@@ -3,8 +3,9 @@
 //!
 //! The tape's matrix products and the optimisers run on these kernels; most programs never
 //! call them directly. [`MatRef`] and [`MatMut`] describe a matrix inside a slice by its
-//! strides, so a transposed or column-major matrix needs no copy. [`gemm`] and [`matvec`]
-//! hold the fast kernels, [`reference`](mod@reference) the plain loops they are tested against, and
+//! strides, so a transposed or column-major matrix needs no copy. [`gemm`], [`matvec`] and
+//! [`activation`] hold the fast kernels, [`reference`](mod@reference) the plain loops they are
+//! tested against, and
 //! [`pool`] the thread pool the threaded kernels share. [`level`] and [`threads`] report
 //! what the fast kernels use, and `CAVITATION_KERNEL` and `CAVITATION_THREADS` override them.
 //!
@@ -26,6 +27,7 @@
 mod aarch64;
 #[cfg(any(test, all(target_vendor = "apple", target_arch = "aarch64")))]
 mod accelerate;
+pub mod activation;
 pub mod gemm;
 pub mod matvec;
 pub mod pool;

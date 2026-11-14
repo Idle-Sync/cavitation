@@ -1,6 +1,6 @@
 //! Timed runs: the matrix products of one training step, each timed on its own, the
 //! training and inference runs that are compared with the numpy baseline, the parts of the
-//! `shrink` run, and the runs of the `inspect` benchmark.
+//! `shrink` run, the runs of the `inspect` benchmark, and the `activation` timings.
 
 use std::cell::{Cell, RefCell};
 use std::hint::black_box;
@@ -10,6 +10,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
 use cavitation_core::{ParamStore, Rng, Tensor};
@@ -1340,4 +1341,121 @@ fn last_loss_bits(history: &History) -> u64 {
         .epochs
         .last()
         .map_or(0, |report| report.mean_loss.to_bits())
+}
+
+/// The slice lengths the `activation` run times: one hidden layer of a small controller,
+/// and one batch of a wide layer.
+pub const ACTIVATION_LENGTHS: [usize; 2] = [64, 4096];
+
+/// Timed rounds of the `activation` run's kernel timings.
+pub const ACTIVATION_ROUNDS: usize = 301;
+
+/// An activation computed over a slice in place.
+pub type SliceFn = Box<dyn Fn(&mut [f32])>;
+
+/// One way to compute an activation over a slice in place, for the `activation` run.
+pub struct ActivationCase {
+    /// What it computes and how, for example `"tanh sse4.2"`.
+    pub name: String,
+    /// The computation.
+    pub run: SliceFn,
+}
+
+/// The `activation` run's cases: `tanh` and the sigmoid, each as the plain scalar loop the
+/// library ran before the SIMD kernels (std's `f32::tanh`; the overflow-free
+/// `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`), then through the kernels at
+/// every level in `levels`.
+pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
+    let mut cases = vec![ActivationCase {
+        name: "tanh scalar std".to_string(),
+        run: Box::new(|v: &mut [f32]| {
+            for x in v {
+                *x = x.tanh();
+            }
+        }),
+    }];
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("tanh {level}"),
+            run: Box::new(move |v: &mut [f32]| tanh_f32_with(level, v)),
+        });
+    }
+    cases.push(ActivationCase {
+        name: "sigmoid scalar std".to_string(),
+        run: Box::new(|v: &mut [f32]| {
+            for x in v {
+                *x = if *x >= 0.0 {
+                    1.0 / (1.0 + (-*x).exp())
+                } else {
+                    let e = x.exp();
+                    e / (1.0 + e)
+                };
+            }
+        }),
+    });
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("sigmoid {level}"),
+            run: Box::new(move |v: &mut [f32]| sigmoid_f32_with(level, v)),
+        });
+    }
+    cases
+}
+
+/// Times every case on `n` values spread evenly over [-4, 4) (each call first copies them
+/// into the working buffer, so every call sees the same inputs; the copy is included):
+/// [`ACTIVATION_ROUNDS`] rounds, each running every case, starting one case later each
+/// round, for enough calls to take about 20 µs. Returns, for each case, the median over
+/// rounds of nanoseconds per value.
+pub fn time_activations(cases: &[ActivationCase], n: usize) -> Vec<f64> {
+    let input: Vec<f32> = (0..n).map(|i| -4.0 + 8.0 * i as f32 / n as f32).collect();
+    let mut buf = input.clone();
+    let calls = (20_000 / n).max(1);
+    for case in cases {
+        for _ in 0..calls * 10 {
+            buf.copy_from_slice(&input);
+            (case.run)(black_box(&mut buf));
+        }
+    }
+    let k = cases.len();
+    let mut per_value = vec![Vec::with_capacity(ACTIVATION_ROUNDS); k];
+    for round in 0..ACTIVATION_ROUNDS {
+        for j in 0..k {
+            let c = (round + j) % k;
+            let start = Instant::now();
+            for _ in 0..calls {
+                buf.copy_from_slice(&input);
+                (cases[c].run)(black_box(&mut buf));
+            }
+            per_value[c].push(start.elapsed().as_secs_f64() * 1e9 / (calls * n) as f64);
+        }
+    }
+    per_value.iter().map(|t| median(t)).collect()
+}
+
+/// The `activation` run's controller pair: the `small` run's widths (4 → 32 → 32 → 1) with
+/// tanh, and the same with ReLU, Xavier uniform weights from seed 1 and zero biases,
+/// compiled for inference.
+pub fn activation_controllers() -> Result<Vec<InferenceModel>, String> {
+    let mut models = Vec::new();
+    for tanh in [true, false] {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(1);
+        let mut net = Sequential::new();
+        for (i, pair) in SMALL_NET.windows(2).enumerate() {
+            net = net.push(Linear::with_init(
+                &mut params,
+                pair[0],
+                pair[1],
+                Init::XavierUniform,
+                Init::Zeros,
+                &mut rng,
+            ));
+            if i + 2 < SMALL_NET.len() {
+                net = if tanh { net.push(Tanh) } else { net.push(Relu) };
+            }
+        }
+        models.push(InferenceModel::compile(&net, &params).map_err(|e| e.to_string())?);
+    }
+    Ok(models)
 }

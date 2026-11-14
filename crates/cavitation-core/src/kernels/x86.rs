@@ -1,16 +1,26 @@
 //! x86_64 microkernels: the SSE4.2 GEMM tile (6 by 8, multiply then add; SSE has no fused
 //! multiply-add) with its packing routines, the AVX2 tile (6 by 16, fused multiply-add), and
-//! the SSE4.2 and AVX2 inference matvec kernels.
+//! the SSE4.2 and AVX2 inference matvec kernels, and the SSE4.2 and AVX2 `tanh` and sigmoid
+//! kernels.
 
 use std::arch::x86_64::{
-    __m128, __m256, _CMP_LE_OQ, _mm_add_ps, _mm_andnot_ps, _mm_cmple_ps, _mm_load_ps, _mm_loadu_ps,
-    _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps,
-    _mm_storeu_ps, _mm_unpackhi_ps, _mm_unpacklo_ps, _mm256_add_ps, _mm256_andnot_ps,
-    _mm256_broadcast_ss, _mm256_cmp_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
-    _mm256_set1_ps, _mm256_setzero_ps, _mm256_storeu_ps,
+    __m128, __m256, _CMP_GE_OQ, _CMP_LE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, _mm_add_epi32, _mm_add_ps,
+    _mm_and_ps, _mm_andnot_ps, _mm_blendv_ps, _mm_castsi128_ps, _mm_cmpge_ps, _mm_cmple_ps,
+    _mm_cmplt_ps, _mm_cmpunord_ps, _mm_cvttps_epi32, _mm_div_ps, _mm_floor_ps, _mm_load_ps,
+    _mm_loadu_ps, _mm_max_ps, _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps, _mm_or_ps, _mm_set1_epi32,
+    _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_slli_epi32, _mm_srai_epi32, _mm_storeu_ps,
+    _mm_sub_epi32, _mm_sub_ps, _mm_unpackhi_ps, _mm_unpacklo_ps, _mm256_add_epi32, _mm256_add_ps,
+    _mm256_and_ps, _mm256_andnot_ps, _mm256_blendv_ps, _mm256_broadcast_ss, _mm256_castsi256_ps,
+    _mm256_cmp_ps, _mm256_cvttps_epi32, _mm256_div_ps, _mm256_floor_ps, _mm256_fmadd_ps,
+    _mm256_fnmadd_ps, _mm256_loadu_ps, _mm256_max_ps, _mm256_mul_ps, _mm256_or_ps,
+    _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps, _mm256_slli_epi32, _mm256_srai_epi32,
+    _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps,
 };
 
 use super::MatRef;
+use super::activation::{
+    EXP_MIN, EXP_P, Func, LN2_HI, LN2_LO, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
+};
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
 use super::matvec::Job;
 
@@ -557,4 +567,202 @@ unsafe fn avx2_rows<const R: usize, const FIRST: bool>(job: &Job, i0: usize, out
         // SAFETY: `o` holds 8 floats; the store is unaligned.
         unsafe { _mm256_storeu_ps(o.as_mut_ptr(), a) };
     }
+}
+
+/// The SSE4.2 `tanh` or sigmoid kernel over `values`, in place, four lanes at a time (the
+/// tail through a padded vector). It performs the reference twin's operations in the same
+/// order, one rounding each, so its results equal the reference's bit for bit.
+///
+/// # Safety
+///
+/// The CPU must support SSE4.2.
+#[target_feature(enable = "sse4.2")]
+pub(super) unsafe fn activation_sse(func: Func, values: &mut [f32]) {
+    match func {
+        Func::Tanh => sse_lanes(values, |v| tanh_sse(v)),
+        Func::Sigmoid => sse_lanes(values, |v| sigmoid_sse(v)),
+    }
+}
+
+/// Runs `lanes` over `values` four at a time, two vectors per step so that their long
+/// dependency chains overlap, the tail through a zero-padded vector.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn sse_lanes(values: &mut [f32], lanes: impl Fn(__m128) -> __m128) {
+    let (chunks, tail, mut pad) = split::<4>(values);
+    let (pairs, single) = chunks.as_chunks_mut::<2>();
+    for [c0, c1] in pairs {
+        let (v0, v1) = (lanes(load4(c0)), lanes(load4(c1)));
+        store4(c0, v0);
+        store4(c1, v1);
+    }
+    for c in single {
+        let v = lanes(load4(c));
+        store4(c, v);
+    }
+    if !tail.is_empty() {
+        let v = lanes(load4(&pad));
+        store4(&mut pad, v);
+        let n = tail.len();
+        tail.copy_from_slice(&pad[..n]);
+    }
+}
+
+/// `e^y` in each lane for `y <= 0`, as the reference's `exp_neg` computes it (NaN lanes
+/// give a meaningless value, which the callers replace).
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn exp_neg_sse(y: __m128) -> __m128 {
+    let y = _mm_max_ps(y, _mm_set1_ps(EXP_MIN));
+    let n = _mm_floor_ps(_mm_add_ps(
+        _mm_mul_ps(y, _mm_set1_ps(LOG2E)),
+        _mm_set1_ps(0.5),
+    ));
+    let r = _mm_sub_ps(y, _mm_mul_ps(n, _mm_set1_ps(LN2_HI)));
+    let r = _mm_sub_ps(r, _mm_mul_ps(n, _mm_set1_ps(LN2_LO)));
+    let mut p = _mm_set1_ps(EXP_P[0]);
+    for &c in &EXP_P[1..] {
+        p = _mm_add_ps(_mm_mul_ps(p, r), _mm_set1_ps(c));
+    }
+    let p = _mm_add_ps(
+        _mm_add_ps(_mm_mul_ps(_mm_mul_ps(p, r), r), r),
+        _mm_set1_ps(1.0),
+    );
+    // `n` is a whole number in [-150, 0], so the truncating conversion is exact; each half
+    // is in [-75, 0], a normal power of two.
+    let n = _mm_cvttps_epi32(n);
+    let n1 = _mm_srai_epi32::<1>(n);
+    let n2 = _mm_sub_epi32(n, n1);
+    let bias = _mm_set1_epi32(127);
+    let s1 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n1, bias)));
+    let s2 = _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(n2, bias)));
+    _mm_mul_ps(_mm_mul_ps(p, s1), s2)
+}
+
+/// `tanh` in each lane, as the reference's `tanh_one` computes it.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn tanh_sse(x: __m128) -> __m128 {
+    let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
+    let one = _mm_set1_ps(1.0);
+    let a = _mm_andnot_ps(sign, x);
+    let s = _mm_mul_ps(a, a);
+    let mut q = _mm_set1_ps(TANH_Q[0]);
+    for &c in &TANH_Q[1..] {
+        q = _mm_add_ps(_mm_mul_ps(q, s), _mm_set1_ps(c));
+    }
+    let small = _mm_add_ps(a, _mm_mul_ps(a, _mm_mul_ps(s, q)));
+    let e = exp_neg_sse(_mm_mul_ps(_mm_set1_ps(-2.0), a));
+    let big = _mm_div_ps(_mm_sub_ps(one, e), _mm_add_ps(one, e));
+    let r = _mm_blendv_ps(big, small, _mm_cmplt_ps(a, _mm_set1_ps(TANH_SMALL)));
+    let r = _mm_or_ps(r, _mm_and_ps(sign, x));
+    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+}
+
+/// The logistic sigmoid in each lane, as the reference's `sigmoid_one` computes it.
+#[inline]
+#[target_feature(enable = "sse4.2")]
+fn sigmoid_sse(x: __m128) -> __m128 {
+    let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
+    let one = _mm_set1_ps(1.0);
+    // `-|x|`: `x` with its sign bit set.
+    let e = exp_neg_sse(_mm_or_ps(x, sign));
+    let d = _mm_add_ps(one, e);
+    let r = _mm_blendv_ps(
+        _mm_div_ps(e, d),
+        _mm_div_ps(one, d),
+        _mm_cmpge_ps(x, _mm_setzero_ps()),
+    );
+    _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
+}
+
+/// The AVX2 `tanh` or sigmoid kernel over `values`, in place, eight lanes at a time (the
+/// tail through a padded vector), the reference's algorithm with fused multiply-adds.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and FMA.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn activation_avx2(func: Func, values: &mut [f32]) {
+    let lanes = |v: __m256| match func {
+        Func::Tanh => tanh_avx2(v),
+        Func::Sigmoid => sigmoid_avx2(v),
+    };
+    let (chunks, tail, mut pad) = split::<8>(values);
+    for c in chunks {
+        // SAFETY: `c` holds 8 floats; the load and store are unaligned.
+        unsafe { _mm256_storeu_ps(c.as_mut_ptr(), lanes(_mm256_loadu_ps(c.as_ptr()))) };
+    }
+    if !tail.is_empty() {
+        // SAFETY: `pad` holds 8 floats; the load and store are unaligned.
+        unsafe { _mm256_storeu_ps(pad.as_mut_ptr(), lanes(_mm256_loadu_ps(pad.as_ptr()))) };
+        let n = tail.len();
+        tail.copy_from_slice(&pad[..n]);
+    }
+}
+
+/// `e^y` in each lane for `y <= 0`, the reference's `exp_neg` with fused multiply-adds.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn exp_neg_avx2(y: __m256) -> __m256 {
+    let y = _mm256_max_ps(y, _mm256_set1_ps(EXP_MIN));
+    let n = _mm256_floor_ps(_mm256_fmadd_ps(
+        y,
+        _mm256_set1_ps(LOG2E),
+        _mm256_set1_ps(0.5),
+    ));
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_HI), y);
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_LO), r);
+    let mut p = _mm256_set1_ps(EXP_P[0]);
+    for &c in &EXP_P[1..] {
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(c));
+    }
+    let p = _mm256_add_ps(
+        _mm256_fmadd_ps(_mm256_mul_ps(p, r), r, r),
+        _mm256_set1_ps(1.0),
+    );
+    // As in the SSE4.2 kernel: `n` is whole and in [-150, 0].
+    let n = _mm256_cvttps_epi32(n);
+    let n1 = _mm256_srai_epi32::<1>(n);
+    let n2 = _mm256_sub_epi32(n, n1);
+    let bias = _mm256_set1_epi32(127);
+    let s1 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(n1, bias)));
+    let s2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(n2, bias)));
+    _mm256_mul_ps(_mm256_mul_ps(p, s1), s2)
+}
+
+/// `tanh` in each lane, the reference's `tanh_one` with fused multiply-adds.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn tanh_avx2(x: __m256) -> __m256 {
+    let sign = _mm256_castsi256_ps(_mm256_set1_epi32(SIGN as i32));
+    let one = _mm256_set1_ps(1.0);
+    let a = _mm256_andnot_ps(sign, x);
+    let s = _mm256_mul_ps(a, a);
+    let mut q = _mm256_set1_ps(TANH_Q[0]);
+    for &c in &TANH_Q[1..] {
+        q = _mm256_fmadd_ps(q, s, _mm256_set1_ps(c));
+    }
+    let small = _mm256_fmadd_ps(a, _mm256_mul_ps(s, q), a);
+    let e = exp_neg_avx2(_mm256_mul_ps(_mm256_set1_ps(-2.0), a));
+    let big = _mm256_div_ps(_mm256_sub_ps(one, e), _mm256_add_ps(one, e));
+    let is_small = _mm256_cmp_ps::<_CMP_LT_OQ>(a, _mm256_set1_ps(TANH_SMALL));
+    let r = _mm256_blendv_ps(big, small, is_small);
+    let r = _mm256_or_ps(r, _mm256_and_ps(sign, x));
+    _mm256_blendv_ps(r, x, _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x))
+}
+
+/// The logistic sigmoid in each lane, the reference's `sigmoid_one` with fused
+/// multiply-adds.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn sigmoid_avx2(x: __m256) -> __m256 {
+    let sign = _mm256_castsi256_ps(_mm256_set1_epi32(SIGN as i32));
+    let one = _mm256_set1_ps(1.0);
+    // `-|x|`: `x` with its sign bit set.
+    let e = exp_neg_avx2(_mm256_or_ps(x, sign));
+    let d = _mm256_add_ps(one, e);
+    let positive = _mm256_cmp_ps::<_CMP_GE_OQ>(x, _mm256_setzero_ps());
+    let r = _mm256_blendv_ps(_mm256_div_ps(e, d), _mm256_div_ps(one, d), positive);
+    _mm256_blendv_ps(r, x, _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x))
 }

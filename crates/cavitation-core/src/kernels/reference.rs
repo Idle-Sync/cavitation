@@ -1,7 +1,8 @@
 //! Plain reference GEMM and matvec: the simple loops that fast kernels are tested against.
 //!
 //! They are generic over [`Real`], so they also give the `f64` products the
-//! gradient checks use.
+//! gradient checks use. The f32 activation twins, [`tanh_f32`] and [`sigmoid_f32`], are the
+//! scalar form of the SIMD activation kernels.
 //!
 //! # Examples
 //!
@@ -170,6 +171,45 @@ pub(super) fn check_matvec_shapes<T: Real>(
             bias.len(),
             out.len()
         );
+    }
+}
+
+/// Replaces every value with its hyperbolic tangent, one element at a time, by the
+/// algorithm of [`activation`](super::activation) with one rounding per operation: the
+/// reference twin of the SIMD `tanh` kernels, within 2 ulp of the correctly rounded result
+/// for every finite f32.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::reference;
+/// let mut v = [0.0f32, 1.0];
+/// reference::tanh_f32(&mut v);
+/// assert_eq!(v[0], 0.0);
+/// assert!((v[1] - 0.761_594_2).abs() <= f32::EPSILON);
+/// ```
+pub fn tanh_f32(values: &mut [f32]) {
+    for v in values {
+        *v = super::activation::tanh_one(*v);
+    }
+}
+
+/// Replaces every value with its logistic sigmoid, one element at a time, by the algorithm
+/// of [`activation`](super::activation) with one rounding per operation: the reference twin
+/// of the SIMD sigmoid kernels, within 2 ulp of the correctly rounded result for every
+/// finite f32.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::reference;
+/// let mut v = [0.0f32, -1000.0];
+/// reference::sigmoid_f32(&mut v);
+/// assert_eq!(v, [0.5, 0.0]);
+/// ```
+pub fn sigmoid_f32(values: &mut [f32]) {
+    for v in values {
+        *v = super::activation::sigmoid_one(*v);
     }
 }
 

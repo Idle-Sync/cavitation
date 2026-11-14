@@ -39,7 +39,7 @@ const FRAC_1_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 
 /// `1 / (1 + e^-x)` for `x >= 0` and `e^x / (1 + e^x)` below, so the exponential never
 /// overflows.
-pub(super) fn sigmoid_value<T: Real>(x: T) -> T {
+pub(crate) fn sigmoid_value<T: Real>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
     } else {
@@ -281,7 +281,9 @@ impl<T: Real> Tape<'_, T> {
         })
     }
 
-    /// Records the hyperbolic tangent of every element.
+    /// Records the hyperbolic tangent of every element. In f32 it runs the SIMD kernel of
+    /// the current level, within 3 ulp of the correctly rounded result (see
+    /// [`kernels::activation`](crate::kernels::activation)).
     ///
     /// # Panics
     ///
@@ -298,12 +300,14 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0]);
     /// ```
     pub fn tanh(&mut self, x: Var) -> Var {
-        self.map(Op::Tanh(x), x, Real::tanh)
+        self.map_slice(Op::Tanh(x), x, T::tanh_in_place)
     }
 
     /// Records the logistic sigmoid `1 / (1 + e^-x)` of every element. It is computed as
     /// `1 / (1 + e^-x)` for `x >= 0` and `e^x / (1 + e^x)` below, so it never overflows:
-    /// large negative inputs give 0 and large positive inputs give 1.
+    /// large negative inputs give 0 and large positive inputs give 1. In f32 it runs the
+    /// SIMD kernel of the current level, within 3 ulp of the correctly rounded result (see
+    /// [`kernels::activation`](crate::kernels::activation)).
     ///
     /// # Panics
     ///
@@ -320,7 +324,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.5, 1.0]);
     /// ```
     pub fn sigmoid(&mut self, x: Var) -> Var {
-        self.map(Op::Sigmoid(x), x, sigmoid_value)
+        self.map_slice(Op::Sigmoid(x), x, T::sigmoid_in_place)
     }
 
     /// Records GELU of every element, in the exact form (with `erf`) or the tanh
@@ -661,6 +665,15 @@ impl<T: Real> Tape<'_, T> {
         }
         self.push(op, shape, out)
     }
+
+    /// Records `op`, whose value is `x` with `f` applied to the whole buffer in place.
+    fn map_slice(&mut self, op: Op<T>, x: Var, f: impl Fn(&mut [T])) -> Var {
+        let shape = self.shape(x);
+        let mut out = self.take_buffer(shape.len());
+        out.copy_from_slice(self.data(x));
+        f(&mut out);
+        self.push(op, shape, out)
+    }
 }
 
 /// Passes `out_grad[i] * derivative(i)` to `x`, where `derivative` gets the index of the
@@ -955,6 +968,43 @@ mod tests {
         let x = tape.input(x.view());
         let y = tape.sigmoid(x);
         assert_eq!(tape.value(y).data(), &[0.0, 0.5, 1.0, 0.0, 1.0]);
+    }
+
+    /// In f32, where `tanh` and `sigmoid` run the SIMD kernels, values and gradients agree
+    /// with the exact f64 functions and derivatives at the current kernel level (the process
+    /// setting is not changed, since other tests run beside this one), over inputs on both
+    /// sides of the switch between the kernel's two `tanh` formulas.
+    #[test]
+    fn f32_kernels_give_the_f64_values_and_gradients() {
+        let level = crate::kernels::level();
+        let xs: Vec<f32> = (-400..=400).map(|i| i as f32 * 0.0137).collect();
+        for tanh in [true, false] {
+            let mut store = ParamStore::new();
+            let p = store.add(Tensor::from_vec(xs.clone(), &[xs.len()]).unwrap());
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&store.values);
+            let v = tape.param(p);
+            let y = if tanh { tape.tanh(v) } else { tape.sigmoid(v) };
+            let loss = tape.sum(y);
+            let values = tape.value(y).data().to_vec();
+            tape.backward(loss, &mut store.grads);
+            drop(tape);
+            for ((&x, &got), &grad) in xs.iter().zip(&values).zip(store.grad(p).data()) {
+                let x = x as f64;
+                let (want, slope) = if tanh {
+                    let t = x.tanh();
+                    (t, 1.0 - t * t)
+                } else {
+                    let s = 1.0 / (1.0 + (-x).exp());
+                    (s, s * (1.0 - s))
+                };
+                assert!((got as f64 - want).abs() <= 4e-7, "{level} value at {x}");
+                assert!(
+                    (grad as f64 - slope).abs() <= 1e-6,
+                    "{level} gradient at {x}"
+                );
+            }
+        }
     }
 
     /// Exact GELU at 1 is Phi(1) = 0.8413447460685429.
