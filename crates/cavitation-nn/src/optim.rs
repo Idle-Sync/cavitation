@@ -231,14 +231,21 @@ impl<T, C, const M: usize> std::fmt::Debug for Parts<T, C, M> {
 unsafe impl<T: Send, C: Send, const M: usize> Send for Parts<T, C, M> {}
 
 /// A shared reference that tasks on several threads may use: the parts of a step and the
-/// chunk statistics' slots.
+/// chunk statistics' slots, the only two things it is `Sync` for.
 struct ForTasks<P>(P);
 
-// SAFETY: `run_parts` uses it only to read parts that do not change during the call and to
-// form references to disjoint buffer chunks and statistics slots, one task per chunk,
-// while the buffers are borrowed for the step; sending those to another thread is sound
-// when `T: Send`.
-unsafe impl<P> Sync for ForTasks<P> {}
+// SAFETY: `run_parts` shares the parts list only to read parts that do not change during
+// the call and to form references to disjoint chunks, one task per chunk, while the
+// buffers are borrowed for the step: each task takes its chunks of the buffers as
+// `&mut [T]` on another thread (`T: Send`), reads its chunk of the gradient as `&[T]`
+// while other tasks read theirs (`T: Sync`), and reads the parts' constants by reference
+// (`C: Sync`).
+unsafe impl<T: Send + Sync, C: Sync, const M: usize> Sync for ForTasks<&[Part<T, C, M>]> {}
+
+// SAFETY: `run_parts` shares the statistics pointer only to write slot `t.index` from the
+// task that `pool::run` gave chunk `t.index`, so no two tasks touch the same slot, and the
+// slots outlive the call; `ChunkStats` is plain data.
+unsafe impl Sync for ForTasks<*mut ChunkStats> {}
 
 /// The update of one chunk: the parameter's constants and the chunk's parts of its `M`
 /// mutable buffers and of its gradient in, the chunk's statistics out.
