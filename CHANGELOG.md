@@ -4,6 +4,11 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- `kernels::Level::ALL` lists every kernel level, in the order of their numbers, supported on this CPU or not (a slice, so a later level can be added without changing its type).
+- `Tape::glu`, `softmax` and `log_softmax` on an input whose last axis has width 0, and `softmax_cross_entropy` and `nll` with no classes, now mark a parameter's gradient current in the backward pass, as every other operation does; it was left stale.
+
 ## v0.2.0 (2026-11-14)
 
 ### Breaking changes
@@ -28,8 +33,6 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `ParamGrads::like` makes a second gradient set for a store, allocated on first use, so a second backward pass leaves `ParamStore::grads` untouched; `ParamGrads::zero_grad` clears it.
 - SIMD `tanh` and sigmoid for f32: `kernels::activation::tanh_f32` and `sigmoid_f32` (and `_with` variants that take a `Level`), with SSE4.2, AVX2 and NEON kernels and the scalar twins `kernels::reference::tanh_f32` and `sigmoid_f32`. Results are within 3 ulp of the correctly rounded value at every level (2 ulp at the reference and SSE4.2 levels, checked for every finite f32); the SSE4.2 kernel matches the reference bit for bit; a value's result does not depend on where it sits in the slice. `Tape::tanh` and `Tape::sigmoid` in f32 run them, as do the new `Real::tanh_in_place` and `Real::sigmoid_in_place` (`Real` is sealed, so adding methods breaks no code). f32 results change in the last bits; f64 is unchanged. On an Intel Celeron N5105 at SSE4.2, over 4,096 values, measured with `cavitation-bench activation` pinned to one core while the machine was busy (load average 5): tanh 7.3 ns per value against 29.7 ns for the scalar `f32::tanh` loop (4.1x), sigmoid 5.4 ns against 14.5 ns (2.7x).
 - The backward pass of `Tape::binary_cross_entropy` with both inputs taking a gradient computes each element's logarithms once instead of twice, with the same gradients bit for bit: 3.29 ms before, 2.43 after for 65,536 values (forward and backward, one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`, load average about 2.5). The other two-input losses, `kl_div` included, are unchanged: their two gradients share no costly work, and the one-pass form measured no faster for `kl_div`.
-- `kernels::Level::ALL` lists every kernel level, in the order of their numbers, supported on this CPU or not (a slice, so a later level can be added without changing its type).
-- `Tape::glu`, `softmax` and `log_softmax` on an input whose last axis has width 0, and `softmax_cross_entropy` and `nll` with no classes, now mark a parameter's gradient current in the backward pass, as every other operation does; it was left stale.
 
 ### Classic machine learning (`cavitation-ml`)
 
