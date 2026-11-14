@@ -396,18 +396,29 @@ fn grow(mut workers: MutexGuard<'static, Vec<&'static Worker>>, wanted: usize) -
     while workers.len() < wanted {
         // The call number before the next call: the worker's first job is the one after it.
         let last_call = POOL.call.load(Ordering::Relaxed);
-        let worker: &'static Worker = Box::leak(Box::new(Worker {
+        let raw = Box::into_raw(Box::new(Worker {
             id: workers.len() + 1,
             posted: AtomicUsize::new(last_call),
             parked: AtomicBool::new(false),
             thread: OnceLock::new(),
         }));
+        // SAFETY: `raw` is a live allocation that is never freed while the worker runs (a
+        // worker started below lives for the rest of the process); it is freed only when
+        // the spawn fails, after every reference made from it is gone.
+        let worker: &'static Worker = unsafe { &*raw };
         match spawn_worker(worker, last_call) {
             Ok(handle) => {
                 let _ = worker.thread.set(handle.thread().clone());
                 workers.push(worker);
             }
-            Err(_) => break,
+            Err(_) => {
+                // SAFETY: `raw` is the pointer `Box::into_raw` returned above. The only
+                // reference made from it went into the thread's closure, which a failed spawn
+                // drops without running, and it was never added to `workers`, so nothing
+                // refers to the allocation any more and the box can be freed.
+                drop(unsafe { Box::from_raw(raw) });
+                break;
+            }
         }
     }
     let len = workers.len().min(wanted);
@@ -716,7 +727,7 @@ mod tests {
     /// The pool cannot start any worker: `run`, and a `run` nested inside one of its
     /// tasks, still finish with every task run once on the calling thread. Runs
     /// `spawn_failure_child` in a fresh process (where no worker exists yet) and fails if it
-    /// fails or does not finish within 30 seconds.
+    /// fails, does not report exactly one test passed, or does not finish within 30 seconds.
     #[test]
     fn pool_spawn_failure_runs_inline() {
         let exe = std::env::current_exe().expect("the test binary's path");
@@ -727,15 +738,15 @@ mod tests {
                 "--test-threads=1",
                 "kernels::pool::tests::spawn_failure_child",
             ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .env(SPAWN_FAILURE_CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .expect("the test binary runs");
         let start = Instant::now();
         loop {
-            if let Some(status) = child.try_wait().expect("waiting for the child") {
-                assert!(status.success(), "the child failed: {status}");
-                return;
+            if child.try_wait().expect("waiting for the child").is_some() {
+                break;
             }
             if start.elapsed() > std::time::Duration::from_secs(30) {
                 let _ = child.kill();
@@ -744,13 +755,24 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let out = child.wait_with_output().expect("the child's output");
+        crate::test_child::assert_passed(&out);
     }
 
+    /// Set by `pool_spawn_failure_runs_inline` for its child; without it,
+    /// `spawn_failure_child` does nothing, so running the whole suite with
+    /// `--include-ignored` does not switch worker spawning off for every other test.
+    const SPAWN_FAILURE_CHILD: &str = "CAVITATION_TEST_SPAWN_FAILURE_CHILD";
+
     /// Helper for `pool_spawn_failure_runs_inline`; ignored by default and run in a child
-    /// process, since it disables worker spawning for the whole process.
+    /// process, since it disables worker spawning for the whole process. Does nothing unless
+    /// [`SPAWN_FAILURE_CHILD`] is set.
     #[test]
     #[ignore = "run in a child process by pool_spawn_failure_runs_inline"]
     fn spawn_failure_child() {
+        if std::env::var_os(SPAWN_FAILURE_CHILD).is_none() {
+            return;
+        }
         FAIL_SPAWN.store(true, Ordering::Relaxed);
         let outer_seen: Vec<AtomicUsize> = (0..4).map(|_| AtomicUsize::new(0)).collect();
         run(4, 4, &|outer: Task| {
