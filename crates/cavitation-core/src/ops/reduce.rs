@@ -293,7 +293,7 @@ mod tests {
     /// The mean of a tensor with no elements panics.
     #[test]
     #[should_panic(expected = "mean of empty")]
-    fn mean_of_empty_axis_panics() {
+    fn mean_of_an_empty_tensor_panics() {
         let store = ParamStore::new();
         let mut graph = Graph::new();
         let mut tape = graph.tape(&store.values);
