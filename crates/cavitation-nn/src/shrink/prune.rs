@@ -38,7 +38,7 @@ const FULL_BP: u32 = 10_000;
 /// assert!(matches!(ShrinkConfig::default().ranking, Ranking::OutNorm));
 /// ```
 #[non_exhaustive]
-pub enum Ranking {
+pub enum Ranking<'s> {
     /// The Euclidean norm of the neuron's outgoing weights: its column in the weight of the
     /// `Linear` that follows its layer. A neuron whose output the next layer barely uses
     /// goes first. This needs a `Linear` right after the neurons' run of element-wise
@@ -51,13 +51,13 @@ pub enum Ranking {
     Random(u64),
     /// Your own scores: the function gets a [`RankContext`] for one layer and returns one
     /// score for each entry of [`RankContext::on`], in that order. It is called only for
-    /// a layer that loses neurons at the step.
+    /// a layer that loses neurons at the step. It is `Send` and may borrow for `'s`.
     // The boxed callback is the plainest type for this variant; an alias would only hide it.
     #[allow(clippy::type_complexity)]
-    Custom(Box<dyn FnMut(&RankContext<'_>) -> Vec<f64>>),
+    Custom(Box<dyn FnMut(&RankContext<'_>) -> Vec<f64> + Send + 's>),
 }
 
-impl fmt::Debug for Ranking {
+impl fmt::Debug for Ranking<'_> {
     /// Writes the variant; a custom function shows only as `Custom(FnMut)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -239,6 +239,12 @@ impl Default for RetrainConfig {
 /// How [`shrink`] runs. Taken by value, because it can hold callbacks. Levels are in whole
 /// basis points of each layer's width: 1 bp is 0.01%, 10,000 bp the whole layer.
 ///
+/// The callbacks ([`on_step`](Self::on_step) and a [`Ranking::Custom`] function) are
+/// `Send` and may borrow for the lifetime `'s`, as [`FitConfig`](crate::FitConfig)'s are: an
+/// `on_step` can push each step onto a local `Vec` that the caller reads after the run, and
+/// a configuration can move to another thread (with owned callbacks, or borrowing ones
+/// inside [`std::thread::scope`]).
+///
 /// The default shrinks every hidden `Linear`, removes first the neurons whose output is 0
 /// on every training row (for a ReLU, those that never fire) and then the lowest
 /// out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
@@ -260,13 +266,13 @@ impl Default for RetrainConfig {
 /// assert!(config.criterion.is_none() && config.validation.is_none());
 /// assert!(!config.keep_checkpoints && config.on_step.is_none());
 /// ```
-pub struct ShrinkConfig {
+pub struct ShrinkConfig<'s> {
     /// The `Linear` layers to shrink, by layer index; empty (the default) shrinks every
     /// hidden `Linear` (each one with another `Linear` after it). A layer listed twice is
     /// shrunk once.
     pub linears: Vec<usize>,
     /// The order in which each layer's neurons are removed.
-    pub ranking: Ranking,
+    pub ranking: Ranking<'s>,
     /// Whether neurons whose output is 0 on every training row (for a ReLU, neurons that
     /// never fire) go before the ranking's order; removing them changes nothing. On by
     /// default.
@@ -312,15 +318,15 @@ pub struct ShrinkConfig {
     /// the best step so far.
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
-    pub on_step: Option<Box<dyn FnMut(&ShrinkStep) -> Flow>>,
+    pub on_step: Option<Box<dyn FnMut(&ShrinkStep) -> Flow + Send + 's>>,
 }
 
-impl Default for ShrinkConfig {
+impl Default for ShrinkConfig<'_> {
     /// Every hidden `Linear`, neurons whose output is 0 on every training row first and
     /// then out-norm, levels 1,000 to 7,000
     /// bp by 1,000 and on to 9,500 by 500, patience 2, the default criterion, no validation
     /// set, the default retraining, no checkpoints, no callback.
-    fn default() -> ShrinkConfig {
+    fn default() -> Self {
         ShrinkConfig {
             linears: Vec::new(),
             ranking: Ranking::OutNorm,
@@ -340,7 +346,7 @@ impl Default for ShrinkConfig {
     }
 }
 
-impl fmt::Debug for ShrinkConfig {
+impl fmt::Debug for ShrinkConfig<'_> {
     /// Writes every setting; the callback shows only whether there is one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShrinkConfig")
@@ -625,7 +631,7 @@ pub fn shrink(
     model: &mut Sequential,
     params: &mut ParamStore,
     train: &Dataset,
-    config: ShrinkConfig,
+    config: ShrinkConfig<'_>,
 ) -> Result<ShrinkReport, Error> {
     let loss = config.retrain.loss;
     let mut measure = |model: &Sequential, params: &ParamStore, data: &Dataset| {
@@ -644,7 +650,7 @@ pub(crate) fn run(
     model: &mut Sequential,
     params: &mut ParamStore,
     train: &Dataset,
-    mut config: ShrinkConfig,
+    mut config: ShrinkConfig<'_>,
     measure: &mut Measure<'_>,
 ) -> Result<ShrinkReport, Error> {
     let (train, validation) = split(train, config.validation.take())?;
@@ -740,7 +746,7 @@ struct Best {
 }
 
 /// The state of one [`run`]: the network being shrunk and everything each step reads.
-struct Run<'r, 'm> {
+struct Run<'r, 'm, 'c> {
     /// The network, masked step by step.
     model: &'r mut Sequential,
     /// Its parameters, retrained step by step.
@@ -756,12 +762,12 @@ struct Run<'r, 'm> {
     /// The unpruned network's measures on the validation set.
     baseline: Evaluation,
     /// The run's settings (the ranking and the callback are used mutably).
-    config: &'r mut ShrinkConfig,
+    config: &'r mut ShrinkConfig<'c>,
     /// The validation measurement.
     measure: &'r mut Measure<'m>,
 }
 
-impl Run<'_, '_> {
+impl Run<'_, '_, '_> {
     /// Runs the steps at `levels` until the last, `Flow::Stop` or the patience runs out,
     /// and returns them with the latest step that met the criterion.
     fn steps(&mut self, levels: &[u32]) -> Result<(Vec<ShrinkStep>, Option<Best>), Error> {
@@ -1227,7 +1233,7 @@ fn criterion(given: Option<Criterion>, targets: &Targets) -> Result<Criterion, E
 }
 
 /// Checks the levels, the patience and the retraining batch.
-fn check_numbers(config: &ShrinkConfig) -> Result<(), Error> {
+fn check_numbers(config: &ShrinkConfig<'_>) -> Result<(), Error> {
     let bad = |what: String| Err(Error::InvalidData(format!("shrink: {what}")));
     if config.step_bp == 0 || config.fine_step_bp == 0 {
         return bad(format!(
@@ -1488,12 +1494,11 @@ mod tests {
                 Some(script.next().expect("no more than 5 steps")),
             ))
         };
-        let ranked = std::rc::Rc::new(std::cell::Cell::new(0));
-        let count = ranked.clone();
+        let mut ranked = 0;
         let config = ShrinkConfig {
             validation: Some(Validation::Given(validation)),
-            ranking: Ranking::Custom(Box::new(move |ctx: &RankContext<'_>| {
-                count.set(count.get() + 1);
+            ranking: Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
+                ranked += 1;
                 ctx.on.iter().map(|&j| -(j as f64)).collect()
             })),
             dead_first: false,
@@ -1507,7 +1512,7 @@ mod tests {
         let report = run(&mut net, &mut params, &train, config, &mut measure).unwrap();
         // At 1,000 bp all 8 neurons stay (ceil(7.2) = 8), so nothing is ranked; steps 2
         // to 5 each rank once.
-        assert_eq!(ranked.get(), 4);
+        assert_eq!(ranked, 4);
         let met: Vec<bool> = report.steps.iter().map(|s| s.met).collect();
         assert_eq!(met, [true, false, true, false, false]);
         assert_eq!(report.chosen, Some(2));

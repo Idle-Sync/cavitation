@@ -1028,7 +1028,7 @@ fn trained(hidden: usize) -> (Sequential, ParamStore, Dataset) {
 /// A small shrink run: levels 1,000 bp to `max_bp` by 1,000, every level run (no
 /// patience), one retraining epoch per level, measured on 300 held-out rows, and a stop rule
 /// every level meets (100 accuracy points), so the kept level is the last one run.
-fn shrink_config(max_bp: u32) -> ShrinkConfig {
+fn shrink_config(max_bp: u32) -> ShrinkConfig<'static> {
     ShrinkConfig {
         max_removed_bp: max_bp,
         patience: None,
@@ -1044,12 +1044,13 @@ fn shrink_config(max_bp: u32) -> ShrinkConfig {
 
 /// An explore configuration with cross-entropy, these training rows, and a shrink factory
 /// for [`shrink_config`]`(max_bp)` when `max_bp` is given.
-fn explore_config(train: Option<Dataset>, max_bp: Option<u32>) -> ExploreConfig {
+fn explore_config(train: Option<Dataset>, max_bp: Option<u32>) -> ExploreConfig<'static> {
     ExploreConfig {
         loss: Loss::CrossEntropy,
         train,
-        shrink: max_bp
-            .map(|bp| Box::new(move || shrink_config(bp)) as Box<dyn FnMut() -> ShrinkConfig>),
+        shrink: max_bp.map(|bp| {
+            Box::new(move || shrink_config(bp)) as Box<dyn FnMut() -> ShrinkConfig<'static> + Send>
+        }),
     }
 }
 
