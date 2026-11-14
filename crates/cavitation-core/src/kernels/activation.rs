@@ -284,7 +284,11 @@ mod tests {
 
     /// The levels this CPU can run.
     fn levels() -> Vec<Level> {
-        Level::ALL.iter().copied().filter(|&l| supported(l)).collect()
+        Level::ALL
+            .iter()
+            .copied()
+            .filter(|&l| supported(l))
+            .collect()
     }
 
     /// The distance between two f32 in units in the last place, counting across zero (so
