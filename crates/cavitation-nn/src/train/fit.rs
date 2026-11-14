@@ -193,7 +193,8 @@ impl Loss {
 /// The same step written out by hand, the way to train with a loss [`Loss`] does not list:
 /// open a tape on the parameter values, add the batch as an input, run the model (traced,
 /// for the health checks), record the loss, run `backward` into the gradients, run the
-/// [`HealthMonitor`]'s tape checks, drop the tape, step the optimiser, run the monitor's
+/// [`HealthMonitor`]'s tape checks, drop the tape, ask the monitor whether to apply the update
+/// (it checks the gradients before they reach the parameters), step the optimiser, run the monitor's
 /// gradient checks on the optimiser's statistics and mark the gradients stale; at the end
 /// of each epoch, end the monitor's epoch. The tape borrows `params.values` while
 /// `backward` writes `params.grads`; borrowing the two fields separately is what lets this
@@ -230,8 +231,10 @@ impl Loss {
 ///         };
 ///         monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
 ///         drop(tape);
-///         optimizer.step(&mut params);
-///         monitor.after_update(step, optimizer.last_stats(), &names)?;
+///         if monitor.before_update(step, value, &params, &names)? {
+///             optimizer.step(&mut params);
+///             monitor.after_update(step, optimizer.last_stats(), &names)?;
+///         }
 ///         params.zero_grad();
 ///         monitor.end_epoch(epoch)?;
 ///     }
@@ -369,9 +372,9 @@ impl Trainer {
     /// parameter, and sends the matching [`Warning::NonFinite`] to the health sink. For a
     /// non-finite loss the error's `detail` names the first NaN or infinite value in the batch's
     /// inputs or value targets (with no dataset row, as `step` does not know one), or says that the
-    /// inputs were finite and the values overflowed. A NaN or infinite loss skips the optimiser
-    /// step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is
-    /// found after the update has applied it. The step is counted and the gradients are marked
+    /// inputs were finite and the values overflowed. A NaN or infinite loss, or a NaN or infinite
+    /// gradient with a finite loss, stops before the optimiser step, so the parameters and the
+    /// optimiser's state stay as they were. The step is counted and the gradients are marked
     /// stale either way. [`fit`] stops at this error. Under
     /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not, and the
     /// update is applied. Under [`OnNonFinite::Skip`](crate::OnNonFinite) the step returns its
@@ -527,7 +530,16 @@ impl Trainer {
                     .after_backward(step, value, &tape, &self.trace, model, inputs);
             (value, checked)
         };
-        let apply = checked.is_ok() && self.health.before_update(step, value, params, &self.names);
+        let apply = match checked {
+            Ok(()) => match self.health.before_update(step, value, params, &self.names) {
+                Ok(apply) => apply,
+                Err(err) => {
+                    checked = Err(err);
+                    false
+                }
+            },
+            Err(_) => false,
+        };
         if apply {
             let update_start = profiling.then(Instant::now);
             self.optimizer.step(params);
@@ -1663,8 +1675,9 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// with `config.health.on_non_finite` set to [`OnNonFinite::Stop`](crate::OnNonFinite) (the
 /// default), returns [`Error::NonFinite`] at the first step whose loss or gradient is NaN or
 /// infinite, naming the step and `"loss"` or the parameter (for example `"0.weight"`), after
-/// sending the matching warning to the health sink. A non-finite loss stops before the optimiser
-/// step; a non-finite gradient with a finite loss is found after the update applied it. With
+/// sending the matching warning to the health sink. A non-finite loss, or a non-finite gradient
+/// with a finite loss, stops before the optimiser step, so the parameters keep the values of the
+/// last good step. With
 /// [`OnNonFinite::Skip`](crate::OnNonFinite), such a step is left out instead and training
 /// continues (see [`EpochReport::rows`]).
 ///

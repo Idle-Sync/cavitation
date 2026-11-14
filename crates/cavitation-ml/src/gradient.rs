@@ -391,9 +391,10 @@ pub(crate) fn train(
                 let checked = monitor.after_backward(step, value, &tape, &trace, &model, inputs);
                 (value, checked)
             };
-            // `Ok(false)`: `OnNonFinite::Skip` left this step out.
+            // `Ok(false)`: `OnNonFinite::Skip` left this step out. Under `Stop`, a NaN or
+            // infinite gradient is an error here, before the update.
             let checked = checked.and_then(|()| {
-                if !monitor.before_update(step, value, &params, &names) {
+                if !monitor.before_update(step, value, &params, &names)? {
                     return Ok(false);
                 }
                 optimizer.step(&mut params);

@@ -7,7 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
-- `OnNonFinite` has a new variant, `Skip`. The enum is not `#[non_exhaustive]`, so a `match` on it outside `cavitation-nn` that lists every variant must add `Skip`.
+- `OnNonFinite` has a new variant, `Skip`, and is now `#[non_exhaustive]`: a `match` on it outside `cavitation-nn` needs a wildcard arm (which also covers later variants). Building a value, such as `OnNonFinite::Stop`, works as before.
 
 ### Workspace
 
@@ -43,8 +43,9 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `Standardizer`: each column's mean and population standard deviation, `transform` and `inverse_transform`, and `fold_into_input` and `fold_into_output`, which write the scaling into the first or last `Linear` so a trained network takes raw inputs or answers in the targets' units.
 - `shrink::ablate_controlled`: `ablate_with` whose callback returns a `Flow`, so a sweep can stop early.
 - `Loss::record` is public, so a tape of your own can record the training loss.
-- `OnNonFinite::Skip`: a step whose loss or gradient is NaN or infinite sends the warning and is left out, leaving the parameters and the optimiser's state (momentum, moments, Adam's step counts) as they were, and training continues; a run that skips a step ends with the parameters, bit for bit, of the run without that step's batch. It reads every gradient once more per step, before the update. A skipped step counts in `Trainer::steps` and in the new `Trainer::skipped_steps`, but not in `EpochReport::rows` or `mean_loss`, and `StepControl::after_step` does not run after it. A hand-written loop asks the new `HealthMonitor::before_update` whether to apply each update.
+- `OnNonFinite::Skip`: a step whose loss or gradient is NaN or infinite sends the warning and is left out, leaving the parameters and the optimiser's state (momentum, moments, Adam's step counts) as they were, and training continues; a run that skips a step ends with the parameters, bit for bit, of the run without that step's batch. It reads every gradient once more per step, before the update. A skipped step counts in `Trainer::steps` and in the new `Trainer::skipped_steps`, but not in `EpochReport::rows` or `mean_loss`, and `StepControl::after_step` does not run after it. A hand-written loop asks the new `HealthMonitor::before_update` whether to apply each update (`Ok(false)` to leave it out, an error under `Stop`).
 - The docs of `OnNonFinite::Warn` say what it does: the update is applied, so a NaN loss or gradient reaches the parameters and from the next step every parameter.
+- Fixed: under `OnNonFinite::Stop` (the default), a NaN or infinite gradient with a finite loss was applied to the parameters and the optimiser's state before `Error::NonFinite` came back. The step now stops before the optimiser runs, so the parameters keep the values of the last good step. This reads every gradient once more per step, before the update.
 
 ### Data, examples, guide and benchmark
 
