@@ -718,9 +718,12 @@ impl<T, F: Fn(MatRef<'_, T>, MatRef<'_, T>, T, MatMut<'_, T>) + Sync> ConvGemm<T
 /// their windows into its thread's column matrix, multiplies it by the weight into its
 /// product (`[out, images · windows]`) and moves each value to its output image, adding
 /// the bias. A 1 × 1 kernel with stride 1 and no padding multiplies each image itself. Each
-/// output depends on its own image alone, so the result is the same for any thread count;
-/// the tape and `InferenceModel` both run this, so they agree bit for bit. `scratch` holds
-/// at least [`conv2d_scratch`] values.
+/// output depends on its own image alone, so the result is the same for any thread count.
+/// The tape and `InferenceModel` both run this, so they agree bit for bit at every kernel
+/// level whose GEMM gives each value the same bits whatever the product's shape (the
+/// library's own kernels); at the Accelerate level, whose `sgemm` chooses its blocking from
+/// the shape, a group of another size can round differently, within the GEMM bound.
+/// `scratch` holds at least [`conv2d_scratch`] values.
 ///
 /// # Panics
 ///
