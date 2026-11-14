@@ -508,7 +508,7 @@ impl<T: Real> Sequential<T> {
     /// let layer = Linear::new(&mut params, 2, 3, &mut Rng::seed(0));
     /// let bias = layer.bias();
     /// let net = Sequential::new().push(layer);
-    /// assert_eq!(net.param("0.bias"), Some(bias));
+    /// assert_eq!(net.param("0.bias"), bias);
     /// assert_eq!(net.param("1.bias"), None);
     /// ```
     pub fn param(&self, name: &str) -> Option<ParamId> {
@@ -1015,7 +1015,7 @@ mod tests {
     fn param_by_name() {
         let mut params = ParamStore::new();
         let net = lrl(&mut params);
-        assert_eq!(net.param("2.bias"), Some(net.linear(2).unwrap().bias()));
+        assert_eq!(net.param("2.bias"), net.linear(2).unwrap().bias());
         assert_eq!(net.param("0.weight"), Some(net.linear(0).unwrap().weight()));
         for bad in [
             "7.weight", "x", "", ".", "1.weight", "2.scale", "02.bias", "+2.bias", "2",

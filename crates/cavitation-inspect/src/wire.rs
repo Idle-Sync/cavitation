@@ -110,8 +110,10 @@
 //! - `on` (boolean): whether it is switched on.
 //! - `a`, `z`, `df`, `grad_a`, `grad_z` (number or `null`): its values in the chosen layer,
 //!   as in `probe`.
-//! - `pre_activation` (number or `null`): `bias + Σ weight·x`, before any mask.
+//! - `pre_activation` (number or `null`): `bias + Σ weight·x` (`Σ weight·x` for a `Linear`
+//!   without a bias), before any mask.
 //! - `bias` (number or `null`).
+//! - `has_bias` (boolean): whether its `Linear` has a bias; `false` without a `Linear`.
 //! - `weights` (array of numbers): its incoming weights, one per input of its `Linear`.
 //! - `outgoing_norm` (number or `null`): the Euclidean norm of its weights in the next
 //!   `Linear`.
@@ -644,6 +646,7 @@ pub fn probe(w: &mut JsonWriter, step: u64, probe: &Probe, model: &Sequential) {
 /// let mut w = JsonWriter::new();
 /// wire::neuron(&mut w, 1, &probe, probe.last_neuron());
 /// assert!(w.as_str().contains(r#""layer":1,"neuron":0,"linear":0,"on":true"#));
+/// assert!(w.as_str().contains(r#""has_bias":true"#));
 /// # Ok::<(), cavitation_core::Error>(())
 /// ```
 pub fn neuron(w: &mut JsonWriter, step: u64, probe: &Probe, neuron: &NeuronValues) {
@@ -676,6 +679,7 @@ pub fn neuron(w: &mut JsonWriter, step: u64, probe: &Probe, neuron: &NeuronValue
     number_or_null(w, neuron.pre_activation().map(f64::from));
     w.key("bias");
     number_or_null(w, neuron.bias().map(f64::from));
+    w.key("has_bias").bool(neuron.bias().is_some());
     w.key("weights").f32s(neuron.weights()).key("outgoing_norm");
     number_or_null(w, neuron.outgoing_norm().map(f64::from));
     w.key("top_inputs").begin_array();

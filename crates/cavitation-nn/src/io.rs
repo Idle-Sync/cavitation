@@ -466,7 +466,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use cavitation_core::{Error, Graph, KeyErrors, ParamStore, Rng, Tensor};
-    use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
+    use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize_to_file};
     use serde_json::Value;
 
     use super::{LoadOptions, load, load_lenient, load_with, save};
@@ -640,6 +640,72 @@ mod tests {
         load(&path, &net2, &mut params2).unwrap();
         assert_eq!(bits(&net, &params), bits(&net2, &params2));
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// `Linear(4, 8, bias=False), ReLU, Linear(8, 3)` with random weights: the first layer
+    /// has no bias.
+    fn mlp_without_first_bias(seed: u64) -> (Sequential<f32>, ParamStore<f32>) {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(seed);
+        let net = Sequential::new()
+            .push(Linear::without_bias(
+                &mut params,
+                4,
+                8,
+                crate::Init::XavierUniform,
+                &mut rng,
+            ))
+            .push(Relu)
+            .push(Linear::new(&mut params, 8, 3, &mut rng));
+        (net, params)
+    }
+
+    /// A network with a `Linear` without a bias saves only that layer's weight, under
+    /// `0.weight`, and loads back into a differently initialised copy bit for bit.
+    #[test]
+    fn save_load_roundtrip_without_bias() {
+        let (net, params) = mlp_without_first_bias(1);
+        let path = temp_path("roundtrip-no-bias");
+        save(&path, &net, &params).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let file = SafeTensors::deserialize(&bytes).unwrap();
+        let mut keys: Vec<String> = file.names().into_iter().map(String::from).collect();
+        keys.sort();
+        assert_eq!(keys, ["0.weight", "2.bias", "2.weight"]);
+        let (net2, mut params2) = mlp_without_first_bias(2);
+        assert_ne!(bits(&net, &params), bits(&net2, &params2));
+        load(&path, &net2, &mut params2).unwrap();
+        assert_eq!(bits(&net, &params), bits(&net2, &params2));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file whose first layer has a bias does not load strictly into a model whose first
+    /// layer has none (`0.bias` is unexpected), and `load_lenient` skips that key; a file
+    /// without it does not load into a model that needs it (`0.bias` is missing).
+    #[test]
+    fn bias_and_no_bias_do_not_mix() {
+        let with = temp_path("with-bias");
+        write_entries(&with, &good_entries());
+        let (bare, mut bare_params) = mlp_without_first_bias(1);
+        let err = load(&with, &bare, &mut bare_params).unwrap_err();
+        let keys = keys_of(&err);
+        assert_eq!(keys.unexpected, ["0.bias"]);
+        assert!(keys.missing.is_empty() && keys.wrong_shape.is_empty());
+        assert_eq!(
+            load_lenient(&with, &bare, &mut bare_params).unwrap(),
+            ["0.bias"]
+        );
+        std::fs::remove_file(&with).unwrap();
+
+        let without = temp_path("without-bias");
+        let mut entries = good_entries();
+        entries.remove(1);
+        write_entries(&without, &entries);
+        let (net, mut params) = mlp(1);
+        let err = load(&without, &net, &mut params).unwrap_err();
+        assert_eq!(keys_of(&err).missing, ["0.bias"]);
+        load(&without, &bare, &mut bare_params).unwrap();
+        std::fs::remove_file(&without).unwrap();
     }
 
     /// The key problems of a load error, failing the test for any other error.

@@ -31,6 +31,44 @@ fn gradcheck_linear() {
     report.assert_passed();
 }
 
+/// A `Linear` without a bias has the right gradient for its input and weight, alone and
+/// inside a `Sequential` before a `Tanh` and a `Linear` that has a bias.
+#[test]
+fn gradcheck_linear_without_bias() {
+    let mut params = ParamStore::<f64>::new_generic();
+    let mut rng = Rng::seed(12);
+    let layer = Linear::without_bias(&mut params, 3, 5, Init::XavierNormal, &mut rng);
+    assert_eq!(params.len(), 1);
+    let data = (0..12).map(|i| ((i as f64) * 0.7).sin()).collect();
+    let x = Tensor::from_vec(data, &[4, 3]).unwrap();
+    gradcheck_params(&mut params, std::slice::from_ref(&x), |tape, v| {
+        layer.forward(tape, v[0])
+    })
+    .assert_passed();
+
+    let mut params = ParamStore::<f64>::new_generic();
+    let net = Sequential::new_generic()
+        .push(Linear::without_bias(
+            &mut params,
+            3,
+            4,
+            Init::XavierNormal,
+            &mut rng,
+        ))
+        .push(Tanh)
+        .push(Linear::with_init(
+            &mut params,
+            4,
+            2,
+            Init::XavierNormal,
+            Init::XavierUniform,
+            &mut rng,
+        ));
+    let names: Vec<String> = net.parameter_names().into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, ["0.weight", "2.weight", "2.bias"]);
+    gradcheck_params(&mut params, &[x], |tape, v| net.forward(tape, v[0])).assert_passed();
+}
+
 /// A user-defined layer: `y = alpha · tanh(x)` with one learnable `alpha`.
 struct ScaledTanh {
     /// The scale, shape `[1]`.

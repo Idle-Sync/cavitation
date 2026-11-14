@@ -16,6 +16,16 @@ The state-dict fixture goes under `crates/cavitation-nn/tests/fixtures/state-dic
 `safetensors.torch.save_file` as `mlp.safetensors`, and `mlp-io.json` with five inputs and the
 network's outputs in f32 and float64. `--only state-dict` writes just these two files.
 
+The bias-free fixture goes in the same folder: the `state_dict` of
+`nn.Sequential(Linear(4, 8, bias=False), ReLU(), Linear(8, 3))` (seed 0, so its keys are
+`0.weight`, `2.weight` and `2.bias`) saved as `mlp-no-bias.safetensors`, and
+`mlp-no-bias-io.json` with five inputs, an upstream gradient, the network's outputs and the
+gradients of `sum(output * upstream)` with respect to each parameter, in f32 and float64.
+Every hidden pre-activation is at least 1e-3 from ReLU's kink, so both sides take the same
+branch. After writing, the script loads the file back into a new network with
+`load_state_dict(strict=True)` and requires the same outputs. `--only no-bias` writes just
+these two files.
+
 `--check-rust-save [PATH]` writes nothing. It checks the other direction: that a file written by the
 library's `save` loads in PyTorch. The Rust test `save_writes_the_file_pytorch_was_checked_against`
 (in `crates/cavitation-nn/src/io.rs`) keeps `from-rust.safetensors` in the same folder equal,
@@ -56,6 +66,7 @@ read back the exact values.
 """
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -549,6 +560,64 @@ def write_state_dict(crates_dir):
     print(f"wrote the state-dict fixture to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
 
 
+def write_no_bias_network(crates_dir):
+    """Saves a seeded `Linear(4, 8, bias=False), ReLU(), Linear(8, 3)`, with its outputs and
+    parameter gradients for five inputs and an upstream gradient, then checks that the file
+    loads back strictly and gives the same outputs."""
+    out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
+    os.makedirs(out_dir, exist_ok=True)
+
+    def network():
+        return torch.nn.Sequential(
+            torch.nn.Linear(4, 8, bias=False), torch.nn.ReLU(), torch.nn.Linear(8, 3)
+        )
+
+    torch.manual_seed(0)
+    model = network()
+    x = rnd(5, 4)
+    upstream = rnd(5, 3)
+    keys = list(model.state_dict().keys())
+    check(keys == ["0.weight", "2.weight", "2.bias"], f"unexpected keys {keys}")
+    pre = x.double() @ model[0].weight.double().T
+    check(bool((pre.abs() >= 1e-3).all()), "a hidden pre-activation is within 1e-3 of ReLU's kink")
+
+    def run(dtype):
+        net = copy.deepcopy(model).to(dtype)
+        out = net(x.to(dtype))
+        (out * upstream.to(dtype)).sum().backward()
+        grads = {name: p.grad.detach() for name, p in net.named_parameters()}
+        return out.detach(), grads
+
+    out32, grads32 = run(torch.float32)
+    out64, grads64 = run(torch.float64)
+    path = os.path.join(out_dir, "mlp-no-bias.safetensors")
+    save_file(model.state_dict(), path)
+    body = {
+        "torch_version": TORCH_VERSION,
+        "keys": keys,
+        "input": tensor_json(x, F32_DIGITS),
+        "upstream": tensor_json(upstream, F32_DIGITS),
+        "output": tensor_json(out32, F32_DIGITS),
+        "grads": {k: tensor_json(grads32[k], F32_DIGITS) for k in keys},
+        "output_f64": tensor_json(out64, F64_DIGITS),
+        "grads_f64": {k: tensor_json(grads64[k], F64_DIGITS) for k in keys},
+    }
+    with open(os.path.join(out_dir, "mlp-no-bias-io.json"), "w") as f:
+        json.dump(body, f, separators=(",", ":"))
+        f.write("\n")
+
+    fresh = network()
+    fresh.load_state_dict(load_file(path), strict=True)
+    with torch.no_grad():
+        again = fresh(x)
+    check(torch.equal(again, out32), "the saved bias-free network gives other outputs")
+    print(
+        f"wrote the bias-free fixture to {out_dir} with torch {TORCH_VERSION}; it loads back "
+        f"with strict keys {keys} and gives the same outputs",
+        file=sys.stderr,
+    )
+
+
 def mlp_bound(model, x):
     """Per-output bound on the distance of an f32 forward pass of `model` (Linear, ReLU, Linear)
     on `x` from the float64 result: `2 * (k + 2) * 1.19e-7 * sum|terms|` for each layer, with
@@ -612,7 +681,9 @@ def main():
         help="the crates directory (default: crates, relative to the working directory; files go under "
         "cavitation-core/tests/fixtures/ops, and --check-rust-save reads under cavitation-nn/tests/fixtures)",
     )
-    parser.add_argument("--only", choices=["state-dict"], help="write only this fixture family")
+    parser.add_argument(
+        "--only", choices=["state-dict", "no-bias"], help="write only this fixture family"
+    )
     parser.add_argument(
         "--check-rust-save",
         nargs="?",
@@ -627,6 +698,9 @@ def main():
         return
     if args.only == "state-dict":
         write_state_dict(args.out)
+        return
+    if args.only == "no-bias":
+        write_no_bias_network(args.out)
         return
     make_arithmetic()
     make_matmul()
@@ -667,6 +741,7 @@ def main():
             f.write("\n")
     print(f"wrote {len(OPTIM_CASES)} fixtures to {optim_dir} with torch {TORCH_VERSION}", file=sys.stderr)
     write_state_dict(args.out)
+    write_no_bias_network(args.out)
 
 
 if __name__ == "__main__":

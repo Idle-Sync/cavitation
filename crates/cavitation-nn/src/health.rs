@@ -1619,7 +1619,7 @@ mod tests {
     fn exploding_gradient_warns_once_per_epoch() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
-        let (w, b) = (layer.weight(), layer.bias());
+        let (w, b) = (layer.weight(), layer.bias().unwrap());
         let net = Sequential::new().push(layer);
         let y = f64::from(params.value(w).data().iter().sum::<f32>() + params.value(b).data()[0]);
         // Mean squared error over a batch of 2 rows: each weight's gradient is 2 (y − 1e4).
@@ -1676,7 +1676,10 @@ mod tests {
     ) -> (Sequential, Dataset) {
         let mut rng = Rng::seed(3);
         let first = Linear::new(params, 2, 4, &mut rng);
-        params.value_mut(first.bias()).data_mut().fill(-100.0);
+        params
+            .value_mut(first.bias().unwrap())
+            .data_mut()
+            .fill(-100.0);
         let mut net = Sequential::new()
             .push(first)
             .push(Relu)
@@ -1748,7 +1751,10 @@ mod tests {
         let mut params = ParamStore::new();
         let mut rng = Rng::seed(3);
         let first = Linear::new(&mut params, 2, 4, &mut rng);
-        params.value_mut(first.bias()).data_mut().fill(-100.0);
+        params
+            .value_mut(first.bias().unwrap())
+            .data_mut()
+            .fill(-100.0);
         let mut net = Sequential::new()
             .push(first)
             .push(Relu)
@@ -1856,7 +1862,7 @@ mod tests {
     fn thresholds_loop() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 20, &mut Rng::seed(0));
-        let (w, b) = (layer.weight(), layer.bias());
+        let (w, b) = (layer.weight(), layer.bias().unwrap());
         params.value_mut(w).data_mut().fill(1.0);
         let net = Sequential::new().push(layer).push(Relu);
         let mut monitor = HealthMonitor::new(Health::default());
@@ -2297,7 +2303,7 @@ mod tests {
     fn non_finite_gradient_names_the_parameter() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let net = Sequential::new().push(layer);
         params.grads.accumulate(bias).0.data_mut()[0] = f32::INFINITY;
         let mut optimizer = Sgd::new(0.1);
@@ -2715,7 +2721,7 @@ mod tests {
     fn negative_loss_warns() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
-        for id in [layer.weight(), layer.bias()] {
+        for id in [layer.weight(), layer.bias().unwrap()] {
             params.value_mut(id).data_mut().fill(0.0);
         }
         let net = Sequential::new().push(layer);
@@ -2806,7 +2812,7 @@ mod tests {
     fn negative_loss_printing_child() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 2, &mut Rng::seed(0));
-        for id in [layer.weight(), layer.bias()] {
+        for id in [layer.weight(), layer.bias().unwrap()] {
             params.value_mut(id).data_mut().fill(0.0);
         }
         let net = Sequential::new().push(layer);
@@ -3173,7 +3179,7 @@ mod tests {
     fn skipped_step_sets_no_loss_baseline() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let net = Sequential::new().push(layer);
         let names = net.parameter_names();
         let (seen, sink) = collecting_sink();
@@ -3244,7 +3250,7 @@ mod tests {
     fn before_update_checks_only_under_skip() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
-        let (weight, bias) = (layer.weight(), layer.bias());
+        let (weight, bias) = (layer.weight(), layer.bias().unwrap());
         let names = Sequential::new().push(layer).parameter_names();
         params.grads.accumulate(weight).0.data_mut().fill(0.5);
         params.grads.accumulate(bias).0.data_mut()[0] = f32::NAN;

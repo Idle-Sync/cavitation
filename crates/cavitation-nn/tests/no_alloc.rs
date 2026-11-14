@@ -988,7 +988,7 @@ fn near_ties(net: &Sequential, params: &ParamStore, data: &Dataset) -> Vec<bool>
                     continue;
                 };
                 let w = params.value(linear.weight()).data();
-                let b = params.value(linear.bias()).data();
+                let b = params.value(linear.bias().unwrap()).data();
                 let k = h.len();
                 let (mut next, mut carried) = (Vec::new(), Vec::new());
                 for j in 0..linear.outputs() {

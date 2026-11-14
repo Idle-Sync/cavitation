@@ -16,7 +16,7 @@ use crate::{Layer, Linear, Prelu, Sequential};
 /// the off neurons still reach the next `Linear` as 0):
 ///
 /// - the `Linear` is rebuilt from the rows of its weight and bias for the neurons that are
-///   on;
+///   on (a `Linear` without a bias is rebuilt without one);
 /// - the next `Linear` is rebuilt from the matching columns of its weight;
 /// - a `Prelu` with one slope per neuron between them is rebuilt with [`Prelu::new`] and its
 ///   kept slopes copied.
@@ -390,7 +390,7 @@ fn zeros_through<T: Real>(layer: &dyn Layer<T>, params: &ParamStore<T>, width: u
 
 /// The `Linear` at layer `index` rebuilt in `store` from the rows `rows` (every row if
 /// `None`) and the columns `cols` (every column if `None`) of its weight in `params`, and
-/// the same rows of its bias.
+/// the same rows of its bias; a `Linear` without a bias is rebuilt without one.
 fn rebuild_linear<T: Real>(
     index: usize,
     linear: &Linear,
@@ -399,13 +399,19 @@ fn rebuild_linear<T: Real>(
     rows: Option<&[usize]>,
     cols: Option<&[usize]>,
 ) -> Result<Linear, Error> {
-    let (w, b) = (params.value(linear.weight()), params.value(linear.bias()));
+    let w = params.value(linear.weight());
+    let b = linear.bias().map(|id| params.value(id));
     let (outputs, inputs) = (linear.outputs(), linear.inputs());
-    if w.shape().dims() != [outputs, inputs] || b.shape().dims() != [outputs] {
+    if w.shape().dims() != [outputs, inputs] {
         return Err(Error::InvalidData(format!(
-            "compact: the linear layer {index} expects weight [{outputs}, {inputs}] and bias \
-             [{outputs}], the store holds {:?} and {:?}",
-            w.shape().dims(),
+            "compact: the linear layer {index} expects weight [{outputs}, {inputs}], the store \
+             holds {:?}",
+            w.shape().dims()
+        )));
+    }
+    if let Some(b) = b.filter(|b| b.shape().dims() != [outputs]) {
+        return Err(Error::InvalidData(format!(
+            "compact: the linear layer {index} expects bias [{outputs}], the store holds {:?}",
             b.shape().dims()
         )));
     }
@@ -425,15 +431,23 @@ fn rebuild_linear<T: Real>(
             &all_cols
         }
     };
-    let (w, b) = (w.data(), b.data());
+    let w = w.data();
     let mut weight = Vec::with_capacity(rows.len() * cols.len());
     for &r in rows {
         weight.extend(cols.iter().map(|&c| w[r * inputs + c]));
     }
-    let bias: Vec<T> = rows.iter().map(|&r| b[r]).collect();
     let weight = Tensor::from_vec(weight, &[rows.len(), cols.len()])?;
-    let bias = Tensor::from_vec(bias, &[rows.len()])?;
-    Linear::from_values(store, weight, bias)
+    let bias = match b {
+        Some(b) => {
+            let b = b.data();
+            Some(Tensor::from_vec(
+                rows.iter().map(|&r| b[r]).collect(),
+                &[rows.len()],
+            )?)
+        }
+        None => None,
+    };
+    Linear::from_parts(store, weight, bias)
 }
 
 /// The `Prelu` rebuilt in `store` with its slopes from `params`: only the slopes of the

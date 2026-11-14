@@ -321,7 +321,8 @@ pub(crate) fn train(
         setup.outputs,
         &mut Rng::seed(config.init_seed),
     );
-    let (weight, bias) = (linear.weight(), linear.bias());
+    let weight = linear.weight();
+    let bias = linear.bias().expect("Linear::new makes a bias");
     if let Some(start) = &setup.bias {
         params.value_mut(bias).data_mut().copy_from_slice(start);
     }
