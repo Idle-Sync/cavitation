@@ -623,6 +623,8 @@ def make_conv():
         ("no-bias", 2, 3, 4, (5, 5), (3, 3), (1, 1), (1, 1), (1, 1), False),
         ("lenet-c1", 2, 1, 6, (28, 28), (5, 5), (1, 1), (2, 2), (1, 1), True),
         ("full-kernel", 2, 2, 3, (3, 3), (3, 3), (1, 1), (0, 0), (1, 1), True),
+        ("pad-past-kernel", 2, 1, 2, (3, 3), (2, 2), (1, 1), (3, 2), (1, 1), True),
+        ("stride2-dilated2", 2, 2, 2, (9, 8), (3, 2), (2, 2), (1, 1), (2, 3), True),
     ]
     for name, batch, cin, cout, (h, w), kernel, stride, padding, dilation, bias in cases:
         x = rnd(batch, cin * h * w)
