@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|subnormal|small|activation|shrink|inspect|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -20,6 +20,15 @@
 //!   training step of the named network at the current kernel level and thread count
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
 //!   GFLOPS (`2·m·n·k` / time) and threads used, then the rate over all eight.
+//! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
+//!   [--ours-only]` train the v0.3 benchmark CNNs (LeNet-5's layout on MNIST, Adam lr 1e-3,
+//!   batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10 epochs) here and then
+//!   with `scripts/bench/torch_cnn.py` at the same thread count, from the same initial
+//!   weights and batch order, which the run writes to `bench/cnn/<name>-seed<seed>/` under
+//!   the target folder (see the `cnn` module). Each epoch's mean loss, test accuracy and
+//!   training time are printed for both, then the final accuracies and the median epoch
+//!   time after the first, with ours over PyTorch's; `result.json` in the same folder keeps
+//!   them. `--rows` trains on the first N training images only, for a quick run.
 //! - `subnormal [--steps N]` (default 2,000) times the optimiser update of one parameter of
 //!   1,068,810 elements whose gradient is 1e-3 on the first step and 0 after, for SGD,
 //!   SGD with momentum 0.9 and Adam (lr 1e-3), so their state decays through the subnormal
@@ -82,6 +91,7 @@
 //! and with one thread; each setting goes to the child as environment variables. The
 //! comparison quotes the fastest setting, with the default one beside it.
 
+mod cnn;
 mod machine;
 mod numpy;
 mod runs;
@@ -95,7 +105,7 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|subnormal|small|activation|shrink|inspect|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
     \x20 digits  [--python PATH] [--numpy-best]\n\
@@ -103,6 +113,8 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 conv    [--batch N]\n\
+    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only]\n\
+    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
@@ -146,6 +158,22 @@ fn main() -> ExitCode {
             .ok_or_else(|| "info takes no arguments".to_string()),
         "gemm" => gemm(rest),
         "conv" => conv(rest),
+        "mnist-cnn" | "cifar-cnn" => {
+            let net = if command == "mnist-cnn" {
+                cnn::MNIST
+            } else {
+                cnn::CIFAR
+            };
+            cnn::Options::parse(net, rest).and_then(|o| {
+                info();
+                running();
+                let root = results_dir(
+                    std::env::var_os("CARGO_TARGET_DIR"),
+                    env!("CARGO_MANIFEST_DIR"),
+                );
+                cnn::run(net, &o, &root)
+            })
+        }
         "subnormal" => subnormal(rest),
         "small" => small(rest),
         "activation" => activation(rest),
