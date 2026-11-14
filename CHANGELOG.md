@@ -6,6 +6,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Breaking changes
 
+- `Init` has a new variant, `Normal { std }`, so a `match` on `Init` outside `cavitation-nn` needs an arm for it.
 - `Health`, `HealthMonitor`, `Trainer`, `FitConfig`, `shrink::FromScratch` and `cavitation_ml::GradientConfig` take a lifetime parameter, and `Health::sink` and `FitConfig::on_epoch` are `Box<dyn FnMut(..) + Send + 's>`. The callbacks can borrow local state (a sink can push onto a `Vec` the caller reads after the run, without `Rc<RefCell<..>>`), and a `FitConfig` or a `Trainer` can be moved to another thread. A callback that captures something that is not `Send` (an `Rc`, a `Cell`) no longer compiles; borrow the value instead, or use `Arc` and an atomic or a `Mutex`. Code that names one of these types where a lifetime cannot be elided, such as a function with no reference arguments returning `FitConfig`, writes `FitConfig<'static>`; `TrainerHandle` and every `StepControl` are unchanged.
 
 ### Tensors and autograd (`cavitation-core`)
@@ -17,6 +18,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Layers, training and inference (`cavitation-nn`)
 
+- `Init::Normal { std }`: normal starting values with mean 0 and the given standard deviation, whatever the fans (PyTorch's `normal_(0, std)`, for recipes that say `std = 0.02`). A negative or non-finite deviation panics.
 - `Dataset::extend` appends another data set's rows and targets after the existing ones without copying those, so collecting data in rounds costs time in proportion to the rows added. It panics, leaving the data unchanged, when the feature counts, the target kinds or the output counts differ.
 - `save` records the model's layer kinds (`linear,relu,linear`) under `cavitation.layers` in the file's `__metadata__`, and `load` (and `load_with` with `strict` and no `rename`) returns `Error::Format` listing both when a file records other kinds: GELU-trained weights no longer load silently into a ReLU network (where the digits test set scored 339 of 360 instead of 345). Files without the record, PyTorch's among them, load as before; PyTorch ignores the metadata.
 - `load`, `load_lenient` and `load_with` read `F16`, `BF16` and `F64` safetensors files as well as `F32` ones: half precision widens to `F32` exactly (subnormals, infinities and NaN payloads included), and `F64` rounds to the nearest `F32`, as PyTorch's `.float()` does, with a finite value beyond the `F32` range refused as `Error::Format` naming its key. Checked bit for bit against state dicts written by PyTorch in each type. `save` still writes `F32`.
@@ -25,6 +27,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- `cavitation_datasets::mnist::load` reads each file's pixels and labels straight from the bytes read, instead of copying them into a second buffer first. The test that loads the real files is now ignored by default with its reason shown, rather than passing silently when the files are missing; run it with `cargo test --release -p cavitation-datasets -- --ignored mnist_real_files`, where missing files fail it with the download instructions.
 - `cavitation_datasets::mnist::load` returns `Error::Format` naming the file for images that are not 28 by 28. Before, a header of 0 images with huge row and column counts passed the length check and gave a data set of shape `[0, rows · cols]`, where the product could overflow.
 - `cavitation-bench` writes `results.json` under `CARGO_TARGET_DIR` (in its `bench` folder) when that is set, instead of always the workspace's `target/bench`; prints the usage text only for a command-line error, not after a failure while running (which now exits with status 1, not 2); and on aarch64 Linux, whose `/proc/cpuinfo` has no `model name`, names the CPU from its cores' `CPU implementer` and `CPU part` (`ARM Cortex-A76`, with the board's `Model` line when there is one) instead of `unknown`.
 - The README lists all five guide chapters, in the guide's order, and "Coming from PyTorch" explains where a neuron mask goes in one paragraph instead of two that overlapped.
