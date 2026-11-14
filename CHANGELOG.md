@@ -6,6 +6,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Breaking changes
 
+- `Init` has a new variant, `Normal { std }`, so a `match` on `Init` outside `cavitation-nn` needs an arm for it.
 - `Health`, `HealthMonitor`, `Trainer`, `FitConfig`, `shrink::FromScratch` and `cavitation_ml::GradientConfig` take a lifetime parameter, and `Health::sink` and `FitConfig::on_epoch` are `Box<dyn FnMut(..) + Send + 's>`. The callbacks can borrow local state (a sink can push onto a `Vec` the caller reads after the run, without `Rc<RefCell<..>>`), and a `FitConfig` or a `Trainer` can be moved to another thread. A callback that captures something that is not `Send` (an `Rc`, a `Cell`) no longer compiles; borrow the value instead, or use `Arc` and an atomic or a `Mutex`. Code that names one of these types where a lifetime cannot be elided, such as a function with no reference arguments returning `FitConfig`, writes `FitConfig<'static>`; `TrainerHandle` and every `StepControl` are unchanged.
 
 ### Tensors and autograd (`cavitation-core`)
@@ -16,6 +17,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Layers, training and inference (`cavitation-nn`)
 
+- `Init::Normal { std }`: normal starting values with mean 0 and the given standard deviation, whatever the fans (PyTorch's `normal_(0, std)`, for recipes that say `std = 0.02`). A negative or non-finite deviation panics.
 - `save` records the model's layer kinds (`linear,relu,linear`) under `cavitation.layers` in the file's `__metadata__`, and `load` (and `load_with` with `strict` and no `rename`) returns `Error::Format` listing both when a file records other kinds: GELU-trained weights no longer load silently into a ReLU network (where the digits test set scored 339 of 360 instead of 345). Files without the record, PyTorch's among them, load as before; PyTorch ignores the metadata.
 - `load`, `load_lenient` and `load_with` read `F16`, `BF16` and `F64` safetensors files as well as `F32` ones: half precision widens to `F32` exactly (subnormals, infinities and NaN payloads included), and `F64` rounds to the nearest `F32`, as PyTorch's `.float()` does, with a finite value beyond the `F32` range refused as `Error::Format` naming its key. Checked bit for bit against state dicts written by PyTorch in each type. `save` still writes `F32`.
 - `StepLog`, a `StepControl` for `fit_controlled` that keeps one `StepRecord` per training step: its number, epoch, loss, rows and wall-clock seconds, and with `StepLog::with_update_times` the optimiser's update time from the step's profile (every step after the first recorded one is then profiled). `reserve` sizes its list once. A run without it is unchanged. Both are in the `cavitation` prelude.
