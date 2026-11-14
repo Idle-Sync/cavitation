@@ -219,8 +219,16 @@ pub struct Comparison {
     pub detail: String,
     /// Seconds per epoch or per round, as cavitation measured them.
     pub ours: Vec<f64>,
-    /// Seconds per epoch or per round, as numpy measured them.
+    /// Seconds per epoch or per round, as numpy measured them at the setting compared
+    /// against: the fastest tried (see [`numpy_setting`](Self::numpy_setting)).
     pub numpy: Vec<f64>,
+    /// Seconds per epoch or per round of numpy at its default settings (the same run as
+    /// `numpy` when only the default was tried).
+    pub numpy_default: Vec<f64>,
+    /// The setting `numpy` was measured at: `default`, `1 thread`, `core Nehalem`, ...
+    pub numpy_setting: String,
+    /// Every numpy setting tried, in order, with its median seconds.
+    pub numpy_tried: Vec<(String, f64)>,
     /// The work in each timed sample: samples per epoch or steps per timed run (training),
     /// or calls per round (latency).
     pub work: f64,
@@ -228,8 +236,13 @@ pub struct Comparison {
     pub timing_note: String,
     /// The numpy version that ran the baseline.
     pub numpy_version: String,
-    /// The BLAS thread setting the baseline saw.
-    pub blas_threads: String,
+    /// The BLAS numpy ran on at the setting compared against (library, version, OpenBLAS
+    /// core, threads).
+    pub blas: String,
+    /// The BLAS numpy ran on at its default settings.
+    pub blas_default: String,
+    /// The health warnings numpy's own checks raised (training only).
+    pub numpy_warnings: Option<usize>,
     /// How to show a median: `s/epoch`, `samples/s`, `steps/s` or `us/call`.
     pub unit: Unit,
     /// The health warnings the run raised, by kind (see [`HealthLog::summary`]); empty for
@@ -329,9 +342,25 @@ impl Comparison {
         }
     }
 
-    /// How many times faster cavitation is: numpy's median time over ours.
+    /// How many times faster cavitation is: numpy's median time (at the setting compared
+    /// against) over ours.
     pub fn ratio(&self) -> f64 {
         median(&self.numpy) / median(&self.ours)
+    }
+
+    /// How many times faster cavitation is than numpy at its default settings.
+    pub fn default_ratio(&self) -> f64 {
+        median(&self.numpy_default) / median(&self.ours)
+    }
+
+    /// The numpy settings tried with their medians in this comparison's unit, for example
+    /// `default 12.31, 1 thread 9.80`.
+    pub fn tried_summary(&self) -> String {
+        self.numpy_tried
+            .iter()
+            .map(|(label, seconds)| format!("{label} {:.2}", self.value(*seconds)))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -447,13 +476,58 @@ fn net_arg(widths: &[usize]) -> String {
         .join(",")
 }
 
+/// What both sides of a training comparison time, in each step and at each epoch's end.
+pub const TRAIN_TIMED_STEPS: &str = "both sides time the same steps: the batch copy, the \
+     forward pass, the loss value with a finite check, dead-ReLU tracking, the backward pass, \
+     the update, each parameter's gradient norm against the health bounds, and the \
+     end-of-epoch report and reset";
+
+/// What both sides of the latency comparison time.
+pub const LATENCY_TIMED_STEPS: &str =
+    "both sides time back-to-back single-input forward passes, biases added";
+
+/// Builds a comparison from cavitation's times and numpy's runs.
+fn comparison(
+    name: String,
+    detail: String,
+    ours: Vec<f64>,
+    numpy: numpy::NumpyRuns,
+    timing_note: &str,
+    (work, unit): (f64, Unit),
+    health: String,
+) -> Comparison {
+    Comparison {
+        name,
+        detail,
+        ours,
+        numpy: numpy.best.samples,
+        numpy_default: numpy.default.samples,
+        numpy_setting: numpy.best_label,
+        numpy_tried: numpy.tried,
+        work,
+        timing_note: timing_note.to_string(),
+        numpy_version: numpy.best.numpy_version,
+        blas: numpy.best.blas,
+        blas_default: numpy.default.blas,
+        numpy_warnings: numpy.best.warnings,
+        unit,
+        health,
+    }
+}
+
 /// Runs a training comparison: cavitation first, then the numpy script with the same
-/// network, batch, data, optimiser, warm-up, epoch count and steps per timed sample.
+/// network, batch, data, optimiser, warm-up, epoch count and steps per timed sample, at
+/// numpy's default settings and, with `numpy_best`, at the others
+/// [`numpy::run_settings`] tries.
 ///
 /// # Errors
 ///
 /// Returns a message if either side fails.
-pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, String> {
+pub fn compare_training(
+    spec: &TrainSpec,
+    python: &str,
+    numpy_best: bool,
+) -> Result<Comparison, String> {
     let data = load_training_data(spec.data)?;
     let (ours, health) = train_ours(spec, &data)?;
     let rows = data.len();
@@ -482,15 +556,21 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
     if let Some(n) = spec.steps {
         args.extend(["--steps".to_string(), n.to_string()]);
     }
-    let theirs = numpy::run(python, &args)?;
-    theirs.check("train", steps, spec.epochs)?;
+    let theirs = numpy::run_settings(python, &args, numpy_best, |r| {
+        r.check("train", steps, spec.epochs)
+    })?;
     let timed = match spec.steps {
         Some(n) => format!("runs of {n} steps ({epoch_steps} steps per epoch)"),
         None => format!("epochs of {epoch_steps} steps"),
     };
-    Ok(Comparison {
-        name: spec.name.clone(),
-        detail: format!(
+    let work = if spec.unit == Unit::StepsPerSecond {
+        steps as f64
+    } else {
+        rows as f64
+    };
+    Ok(comparison(
+        spec.name.clone(),
+        format!(
             "{} network, batch {}, {}, {} untimed warm-up steps, \
              {} timed {timed}, Health::default() on ({} warnings counted)",
             net_arg(&spec.widths),
@@ -505,20 +585,11 @@ pub fn compare_training(spec: &TrainSpec, python: &str) -> Result<Comparison, St
             health.total()
         ),
         ours,
-        numpy: theirs.samples,
-        timing_note: "ours times the batch copy, the step with its loss value and health \
-                      checks, and end_epoch; numpy times the gradient step only"
-            .to_string(),
-        numpy_version: theirs.numpy_version,
-        blas_threads: theirs.blas_threads,
-        work: if spec.unit == Unit::StepsPerSecond {
-            steps as f64
-        } else {
-            rows as f64
-        },
-        unit: spec.unit,
-        health: health.summary(),
-    })
+        theirs,
+        TRAIN_TIMED_STEPS,
+        (work, spec.unit),
+        health.summary(),
+    ))
 }
 
 /// Calls in each timed round of the latency run.
@@ -551,12 +622,12 @@ fn latency_ours() -> Result<Vec<f64>, String> {
 }
 
 /// Runs the latency comparison: cavitation, then the numpy script with the same network,
-/// warm-up, rounds and calls.
+/// warm-up, rounds and calls, at the numpy settings [`compare_training`] uses.
 ///
 /// # Errors
 ///
 /// Returns a message if either side fails.
-pub fn compare_latency(python: &str) -> Result<Comparison, String> {
+pub fn compare_latency(python: &str, numpy_best: bool) -> Result<Comparison, String> {
     let ours = latency_ours()?;
     let args: Vec<String> = [
         "--mode",
@@ -572,24 +643,22 @@ pub fn compare_latency(python: &str) -> Result<Comparison, String> {
     ]
     .map(String::from)
     .to_vec();
-    let theirs = numpy::run(python, &args)?;
-    theirs.check("infer", LATENCY_CALLS, LATENCY_ROUNDS)?;
-    Ok(Comparison {
-        name: "latency".to_string(),
-        detail: format!(
+    let theirs = numpy::run_settings(python, &args, numpy_best, |r| {
+        r.check("infer", LATENCY_CALLS, LATENCY_ROUNDS)
+    })?;
+    Ok(comparison(
+        "latency".to_string(),
+        format!(
             "{} network, one input per call, {LATENCY_WARMUP} warm-up calls, \
              {LATENCY_ROUNDS} rounds of {LATENCY_CALLS} calls",
             net_arg(&DIGITS_NET)
         ),
         ours,
-        numpy: theirs.samples,
-        timing_note: "both time back-to-back single-input forward passes".to_string(),
-        numpy_version: theirs.numpy_version,
-        blas_threads: theirs.blas_threads,
-        work: LATENCY_CALLS as f64,
-        unit: Unit::MicrosPerCall,
-        health: String::new(),
-    })
+        theirs,
+        LATENCY_TIMED_STEPS,
+        (LATENCY_CALLS as f64, Unit::MicrosPerCall),
+        String::new(),
+    ))
 }
 
 /// Tests for the timed runs.
