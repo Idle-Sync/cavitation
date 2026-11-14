@@ -143,7 +143,8 @@ pub struct KeyErrors {
     pub unexpected: Vec<String>,
     /// Keys whose stored shape differs from the parameter's, as `(key, expected, found)`.
     pub wrong_shape: Vec<(String, Vec<usize>, Vec<usize>)>,
-    /// Keys stored with an element type other than `F32`, as `(key, found type)`.
+    /// Keys stored with an element type a load cannot read (anything but `F32`, `F16`,
+    /// `BF16` and `F64`), as `(key, found type)`.
     pub wrong_dtype: Vec<(String, String)>,
     /// When no key the model needs was found, the first five keys of the file (after any
     /// renaming), sorted, to show what it holds; empty otherwise.
@@ -200,7 +201,9 @@ impl fmt::Display for KeyErrors {
         let types: Vec<String> = self
             .wrong_dtype
             .iter()
-            .map(|(key, found)| format!("key `{key}` has element type {found}, expected F32"))
+            .map(|(key, found)| {
+                format!("key `{key}` has element type {found}, expected F32, F16, BF16 or F64")
+            })
             .collect();
         if !types.is_empty() {
             write_list(f, "wrong element types", &types)?;

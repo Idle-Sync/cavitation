@@ -574,6 +574,29 @@ def write_state_dict(crates_dir):
     print(f"wrote the state-dict fixture to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
 
 
+def write_dtype_files(crates_dir):
+    """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` state dict in F16, BF16 and F64,
+    for loading into F32 parameters, with the F32 values PyTorch's `.float()` gives for each
+    tensor (exact for F16 and BF16; for F64, the nearest F32). The F64 network is created in
+    float64, so its values are not F32 values and the rounding is exercised."""
+    out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
+    os.makedirs(out_dir, exist_ok=True)
+    body = {"torch_version": TORCH_VERSION, "files": {}}
+    for name, dtype in [("f16", torch.float16), ("bf16", torch.bfloat16), ("f64", torch.float64)]:
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(4, 8, dtype=dtype), torch.nn.ReLU(), torch.nn.Linear(8, 3, dtype=dtype)
+        )
+        state = {k: v.detach().contiguous() for k, v in model.state_dict().items()}
+        check(all(v.dtype == dtype for v in state.values()), f"{name}: a tensor is not {dtype}")
+        save_file(state, os.path.join(out_dir, f"mlp-{name}.safetensors"))
+        body["files"][name] = {k: tensor_json(v.float(), F32_DIGITS) for k, v in state.items()}
+    with open(os.path.join(out_dir, "mlp-dtypes.json"), "w") as f:
+        json.dump(body, f, separators=(",", ":"))
+        f.write("\n")
+    print(f"wrote the F16, BF16 and F64 state dicts to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
+
+
 def write_no_bias_network(crates_dir):
     """Saves a seeded `Linear(4, 8, bias=False), ReLU(), Linear(8, 3)`, with its outputs and
     parameter gradients for five inputs and an upstream gradient, then checks that the file
@@ -712,7 +735,7 @@ def main():
         "cavitation-core/tests/fixtures/ops, and --check-rust-save reads under cavitation-nn/tests/fixtures)",
     )
     parser.add_argument(
-        "--only", choices=["state-dict", "no-bias"], help="write only this fixture family"
+        "--only", choices=["state-dict", "no-bias", "dtypes"], help="write only this fixture family"
     )
     parser.add_argument(
         "--check-rust-save",
@@ -731,6 +754,9 @@ def main():
         return
     if args.only == "no-bias":
         write_no_bias_network(args.out)
+        return
+    if args.only == "dtypes":
+        write_dtype_files(args.out)
         return
     make_arithmetic()
     make_matmul()
