@@ -1359,6 +1359,10 @@ pub trait StepControl {
 
 /// The optimiser [`fit`] builds, with its settings.
 ///
+/// The enum is `#[non_exhaustive]`, so a later optimiser is not a breaking change: a
+/// `match` on it outside this crate needs a wildcard arm. Building a value works as for any
+/// enum.
+///
 /// # Examples
 ///
 /// ```
@@ -1367,6 +1371,7 @@ pub trait StepControl {
 /// assert_eq!(opt.learning_rate(), 1e-3);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum OptimizerConfig {
     /// [`Sgd`] with momentum and weight decay (0 turns either off).
     Sgd {

@@ -6,6 +6,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Breaking changes
 
+- `OptimizerConfig` has two new variants, `RmsProp` and `Adagrad`, and is now `#[non_exhaustive]`: a `match` on it outside `cavitation-nn` needs a wildcard arm (which also covers later variants). Building a value works as before.
 - `OptimizerConfig` has two new variants, `RmsProp` and `Adagrad`, so a `match` on it outside `cavitation-nn` needs arms for them.
 - `shrink::ShrinkConfig` and `shrink::Ranking` take a lifetime parameter, and `ShrinkConfig::on_step` and `Ranking::Custom` are `Box<dyn FnMut(..) + Send + 's>`; `cavitation_inspect::ExploreConfig` takes one too, and its `shrink` factory is `Send + 's`. As for `FitConfig`, a callback can borrow local state (an `on_step` can push onto a `Vec` the caller reads after the run, without `Rc<RefCell<..>>`), and a configuration can move to another thread. A callback that captures something that is not `Send` (an `Rc`, a `Cell`) no longer compiles; borrow the value instead, or use `Arc` and an atomic or a `Mutex`. A function with no reference arguments returning one writes `ShrinkConfig<'static>`.
 - `Init` has a new variant, `Normal { std }`, and is now `#[non_exhaustive]`: a `match` on it outside `cavitation-nn` needs a wildcard arm (which also covers later variants). Building a value, such as `Init::HeUniform`, works as before.
