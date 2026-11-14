@@ -767,10 +767,12 @@ mod tests {
     /// Compiled for inference, a network folded on its input answers raw inputs as the
     /// unfolded network answers standardised ones, and a network folded on its output
     /// answers as `inverse_transform` makes of the unfolded one's answers, through both
-    /// `infer` and `infer_batch`, within float rounding. The input fold's bound is looser
-    /// because the folded first layer cancels raw inputs of about 1000 against the folded
-    /// mean (measured worst relative difference 3.0e-5 against a bound of 3e-4); the output
-    /// fold adds none (5.0e-7 against 1e-5); the two together measured 1.2e-4 against 1e-3.
+    /// `infer` and `infer_batch`, within float rounding; each path is checked against the
+    /// same path of the network before the fold. The input fold's bound is looser because
+    /// the folded first layer cancels raw inputs of about 1000 against the folded mean
+    /// (measured worst relative difference 3.0e-5 against a bound of 3e-4 at kernel level
+    /// `sse4.2`); the output fold adds none (5.0e-7 against 1e-5); the two together
+    /// measured 1.2e-4 against 1e-3.
     #[test]
     fn folds_agree_after_compiling() {
         let (rows, width, hidden, outputs) = (48, 5, 9, 3);
@@ -804,16 +806,31 @@ mod tests {
         s_out.fold_into_output(&net, &mut params).unwrap();
         let mut both = InferenceModel::compile(&net, &params).unwrap();
         let (one_out, batch_out) = compiled(&mut both, &x);
-        let mut input_folded = Tensor::from_vec(batch_in, &[rows, outputs]).unwrap();
-        s_out.inverse_transform(&mut input_folded);
+        // Each path against its own answers: `infer` (matvec) and `infer_batch` (GEMM) round
+        // differently at the fused-multiply-add levels, and the input fold's cancellation
+        // scales that up, so comparing across the paths would test the paths, not the fold.
+        let inverse = |answers: Vec<f32>| {
+            let mut t = Tensor::from_vec(answers, &[rows, outputs]).unwrap();
+            s_out.inverse_transform(&mut t);
+            t.data().to_vec()
+        };
         let tight = 1e-5;
+        let (one_want, batch_want) = (inverse(one_in), inverse(batch_in));
         assert!(
-            worst(&batch_out, input_folded.data()) <= tight,
+            worst(&one_out, &one_want) <= tight,
             "{}",
-            worst(&batch_out, input_folded.data())
+            worst(&one_out, &one_want)
         );
-        assert!(worst(&one_out, input_folded.data()) <= tight);
-        assert!(worst(&batch_out, expected.data()) <= 1e-3);
+        assert!(
+            worst(&batch_out, &batch_want) <= tight,
+            "{}",
+            worst(&batch_out, &batch_want)
+        );
+        assert!(
+            worst(&batch_out, expected.data()) <= 1e-3,
+            "{}",
+            worst(&batch_out, expected.data())
+        );
     }
 
     /// A first layer that is not a `Linear` is an `InvalidData` error naming its kind, and
