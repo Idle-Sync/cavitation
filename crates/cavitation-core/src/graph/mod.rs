@@ -393,6 +393,7 @@ impl<T: Real> Graph<T> {
             id: NEXT_TAPE_ID.fetch_add(1, Ordering::Relaxed),
             clamped_logs: 0,
             training,
+            streams: 0,
         }
     }
 
@@ -451,6 +452,8 @@ pub struct Tape<'g, T: Real = f32> {
     clamped_logs: usize,
     /// The seed and step of a training tape; `None` for a tape in evaluation mode.
     training: Option<Training>,
+    /// How many random streams [`Tape::next_stream`] has handed out on this tape.
+    streams: u64,
 }
 
 /// What a training tape seeds its random draws with: the run's seed and the step's number.
@@ -941,6 +944,26 @@ impl<T: Real> Tape<'_, T> {
     pub fn stream_seed(&self, stream: u64) -> Option<u64> {
         self.training
             .map(|t| mix(mix(mix(t.seed) ^ t.step) ^ stream))
+    }
+
+    /// A stream id no earlier call on this tape returned: 0, then 1, and so on, in the order
+    /// of the calls. A layer that draws random numbers, such as dropout, takes one per
+    /// forward pass and passes it to [`stream_seed`](Self::stream_seed) (or to
+    /// [`dropout`](Self::dropout)), so its draws depend only on the run's seed, the step and
+    /// how many drawing layers ran before it on this tape, not on how many nodes they or
+    /// hooks recorded.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.training_tape(&store.values, 0, 1);
+    /// assert_eq!((tape.next_stream(), tape.next_stream()), (0, 1));
+    /// ```
+    pub fn next_stream(&mut self) -> u64 {
+        let id = self.streams;
+        self.streams += 1;
+        id
     }
 
     /// Copies `labels` into the graph's label buffer, which keeps its capacity from step to

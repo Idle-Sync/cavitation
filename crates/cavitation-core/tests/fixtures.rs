@@ -188,6 +188,18 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
         "mul" => tape.mul(v[0], v[1]),
         "scale" => tape.scale(v[0], f32_of("s")),
         "keep_where" => tape.keep_where(v[0], v[1]),
+        "dropout_with_mask" => {
+            let keep: Vec<bool> = p["keep"]
+                .as_array()
+                .expect("dropout_with_mask: `keep` is a list")
+                .iter()
+                .map(|k| {
+                    k.as_bool()
+                        .expect("dropout_with_mask: `keep` holds booleans")
+                })
+                .collect();
+            tape.dropout_with_mask(v[0], &keep, num(p, "p"))
+        }
         "matmul" => tape.matmul(v[0], v[1]),
         "matmul_nt" => tape.matmul_nt(v[0], v[1]),
         "sum" => tape.sum(v[0]),
@@ -656,7 +668,9 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
     match f.op.as_str() {
         "scale" | "relu" | "leaky_relu" | "tanh" | "sigmoid" | "gelu" | "elu" | "selu" | "celu"
         | "silu" | "mish" | "softplus" | "softsign" | "hardtanh" | "relu6" | "hardsigmoid"
-        | "hardswish" | "log_sigmoid" | "glu" | "keep_where" => all_elementwise(),
+        | "hardswish" | "log_sigmoid" | "glu" | "keep_where" | "dropout_with_mask" => {
+            all_elementwise()
+        }
         "prelu" => {
             // The slope's gradient sums over every position of its channel.
             let (x, slope) = (&f.inputs[0], &f.inputs[1]);
@@ -755,6 +769,8 @@ fn check(f: &Fixture) {
 const ARITHMETIC: &[&str] = &["add", "sub", "mul", "scale"];
 /// The select operation.
 const SELECT: &[&str] = &["keep_where"];
+/// Dropout with a mask PyTorch drew.
+const DROPOUT: &[&str] = &["dropout_with_mask"];
 /// The matrix products.
 const MATMUL: &[&str] = &["matmul", "matmul_nt"];
 /// The reductions.
@@ -880,6 +896,9 @@ comparison_tests! {
     /// `keep_where` matches `torch.where(keep != 0, x, 0)`, including its zero gradient for
     /// `keep`.
     keep_where_matches_torch => SELECT,
+    /// `dropout_with_mask` with a mask PyTorch's dropout drew matches `x * keep / (1 - p)`,
+    /// the product PyTorch's dropout forms, and its gradient.
+    dropout_matches_torch => DROPOUT,
     /// `matmul` and `matmul_nt` match PyTorch's float64 result within the GEMM bound.
     matmul_matches_torch => MATMUL,
     /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.

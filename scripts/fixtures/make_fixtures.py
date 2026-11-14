@@ -574,6 +574,28 @@ def make_select():
     add_case("keep-where-7x1-with-scalar", "keep_where", {}, [rnd(7, 1), torch.tensor(0.0)], keep_where)
 
 
+def make_dropout():
+    """dropout_with_mask: inverted dropout with the mask PyTorch's own dropout draws.
+
+    The mask comes from `F.dropout` of ones under a fixed seed (its non-zero positions), and
+    the case computes `x * (keep / (1 - p))`, the product PyTorch's dropout kernel forms
+    (Bernoulli draws divided by `1 - p`, times the input), so the gradient runs through the
+    same multipliers. Built after every other case, so its draws shift none of their inputs.
+    """
+    for p, shape in [(0.3, (16, 33)), (0.5, (4, 7)), (0.9, (3, 5))]:
+        generator_state = torch.get_rng_state()
+        torch.manual_seed(1234)
+        keep = F.dropout(torch.ones(shape), p, training=True) != 0
+        torch.set_rng_state(generator_state)
+        keep_list = [bool(k) for k in keep.reshape(-1).tolist()]
+
+        def dropped(x, keep=keep, p=p):
+            return x * (keep.to(x.dtype) / (1 - p))
+
+        name = f"dropout-with-mask-p{int(p * 10)}-{shape_name(shape)}"
+        add_case(name, "dropout_with_mask", {"p": p, "keep": keep_list}, [rnd(*shape)], dropped)
+
+
 def write_state_dict(crates_dir):
     """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` and its outputs for five inputs."""
     out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
@@ -791,6 +813,7 @@ def main():
     make_layers()
     make_optimizers()
     make_select()
+    make_dropout()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):

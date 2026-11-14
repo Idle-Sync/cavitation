@@ -1,4 +1,4 @@
-//! Training gives bit-identical parameters on 1 and on 4 threads.
+//! Training gives bit-identical parameters on 1 and on 4 threads, dropout masks included.
 //!
 //! This target holds a single test because it sets the process-wide thread count.
 
@@ -6,14 +6,15 @@ use cavitation_core::kernels::gemm::threads_used;
 use cavitation_core::kernels::{Level, level, set_threads};
 use cavitation_core::{ParamStore, Rng, Tensor};
 use cavitation_nn::{
-    Dataset, FitConfig, Health, Init, Linear, Loss, LrSchedule, OptimizerConfig, Relu, Sequential,
-    Targets, fit,
+    Dataset, Dropout, FitConfig, Health, Init, Linear, Loss, LrSchedule, OptimizerConfig, Relu,
+    Sequential, Targets, fit,
 };
 
 /// The batch size of the run: large enough that every product of the step is split.
 const BATCH: usize = 128;
 
-/// The 64 → 256 → 128 → 10 ReLU network with He uniform weights, from `Rng::seed(1)`.
+/// The 64 → 256 → 128 → 10 ReLU network with He uniform weights, from `Rng::seed(1)`, with
+/// dropout (p = 0.2) after each ReLU.
 fn network(params: &mut ParamStore) -> Sequential {
     let mut rng = Rng::seed(1);
     let mut he = |inputs, outputs| {
@@ -29,8 +30,10 @@ fn network(params: &mut ParamStore) -> Sequential {
     Sequential::new()
         .push(he(64, 256))
         .push(Relu)
+        .push(Dropout::new(0.2).unwrap())
         .push(he(256, 128))
         .push(Relu)
+        .push(Dropout::new(0.2).unwrap())
         .push(he(128, 10))
 }
 
@@ -60,7 +63,7 @@ fn train() -> Vec<u32> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(5),
-        dropout_seed: 0,
+        dropout_seed: 3,
         schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: None,
