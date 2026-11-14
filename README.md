@@ -249,7 +249,7 @@ cargo run --release -p cavitation-bench -- shrink                    # shrink th
 
 `all` leaves out `cifar`: an epoch of its network on 50,000 images takes minutes on a small machine, so it is its own command. It is sized so that matrix products, not per-step overheads, take most of the time, which the MNIST run is too short for on a fast machine.
 
-The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH`, which needs numpy; `--python <path>` or the `CAVITATION_BENCH_PYTHON` variable names another interpreter. Results are also written to `target/bench/results.json`.
+The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH`, which needs numpy; `--python <path>` or the `CAVITATION_BENCH_PYTHON` variable names another interpreter. Results are also written to `target/bench/results.json`, or to `bench/results.json` under `CARGO_TARGET_DIR` when that is set.
 
 Two environment variables change how the library runs, for the benchmark and for your own programs:
 
