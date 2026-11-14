@@ -13,6 +13,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Tensors and autograd (`cavitation-core`)
 
+- `Tensor::clone_from` and `ParamValues::clone_from` copy into the buffers the target already has when they are large enough, so copying the values of the same parameters again allocates nothing; before, they allocated a fresh copy as `clone` does.
 - `Tensor::into_vec` gives up a tensor and returns its elements without copying them, so a tensor can grow in place through `from_vec`.
 - When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
 - `kernels::Level::ALL` lists every kernel level, in the order of their numbers, supported on this CPU or not (a slice, so a later level can be added without changing its type).
@@ -20,6 +21,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Layers, training and inference (`cavitation-nn`)
 
+- `Evaluator::refresh` on a model that runs on the tape (one with a layer of your own that has no inference form) copies the new parameter values into the evaluator's own in place when the model has the same layers as before, as on the compiled engine, so `fit`'s validation set allocates nothing from the second epoch on for such a model as well.
 - Learning-rate schedules by step, with a linear warm-up: `LrSchedule::Warmup { steps }` climbs linearly to the optimiser's rate over the first `steps` steps (step `s` trains at `lr · (s + 1) / steps`) and then holds it, and `LrSchedule::WarmupCosine { warmup_steps, min_lr }` follows the warm-up with cosine annealing by step over the rest of the run (with `warmup_steps: 0`, PyTorch's `CosineAnnealingLR` stepped after every batch). `fit`, `fit_controlled` and `cavitation_ml`'s gradient path set their rate before every step; a run under one trains to the same parameters as a manual loop of `Trainer::step` calls at the same rates, bit for bit. `Constant` and `Cosine` still set the rate once per epoch.
 - `Init::Normal { std }`: normal starting values with mean 0 and the given standard deviation, whatever the fans (PyTorch's `normal_(0, std)`, for recipes that say `std = 0.02`). A negative or non-finite deviation panics.
 - `Dataset::extend` appends another data set's rows and targets after the existing ones without copying those, so collecting data in rounds costs time in proportion to the rows added. It panics, leaving the data unchanged, when the feature counts, the target kinds or the output counts differ.

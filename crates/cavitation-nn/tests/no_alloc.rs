@@ -1214,9 +1214,46 @@ fn fit_validation_steady_state() -> usize {
     FIT_AFTER_EPOCH_2.load(Ordering::Relaxed) + control.after
 }
 
+/// Trains the 50k network with its ReLUs written as an activation of your own, so that its
+/// validation runs on the tape, for 6 epochs on 1,000 of the centred rows at batch 128
+/// with the other 437 as the validation set: every epoch's refresh copies the parameter
+/// values into the evaluator's own in place. Returns the allocations made after epoch 2.
+fn fit_validation_tape_steady_state() -> usize {
+    let (train, validation) = synthetic_centred_1437().split_at(1000);
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let mut own = Sequential::new();
+    for i in 0..net.len() {
+        own = match net.linear(i) {
+            Some(linear) => own.push(linear.clone()),
+            None => own.push(ActivationLayer::new(MyRelu)),
+        };
+    }
+    let at_epoch_2 = AtomicUsize::new(0);
+    let after = AtomicUsize::new(0);
+    let config = cavitation_nn::FitConfig {
+        epochs: 6,
+        batch: 128,
+        health: Health::quiet(),
+        validation: Some(validation),
+        on_epoch: Some(Box::new(|report, _, _| {
+            assert!(report.validation.is_some());
+            if report.epoch == 2 {
+                at_epoch_2.store(allocations(), Ordering::Relaxed);
+            } else if report.epoch > 2 {
+                let made = allocations() - at_epoch_2.load(Ordering::Relaxed);
+                after.store(made, Ordering::Relaxed);
+            }
+        })),
+        ..cavitation_nn::FitConfig::default()
+    };
+    cavitation_nn::fit(&own, &mut params, &train, config).unwrap();
+    after.load(Ordering::Relaxed)
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 24] = [
+    let scenarios: [Scenario; 25] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1253,6 +1290,10 @@ fn main() -> ExitCode {
         ),
         ("profiled_step_reuses_buffers", profiled_step_reuses_buffers),
         ("fit_validation_steady_state", fit_validation_steady_state),
+        (
+            "fit_validation_tape_steady_state",
+            fit_validation_tape_steady_state,
+        ),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {
