@@ -494,7 +494,18 @@ impl fmt::Display for Warning {
                         f,
                         "a small norm that is not 0 points at a deep network or saturating \
                          activations such as sigmoid and tanh"
-                    )
+                    )?;
+                    if layer.ends_with(".bias") {
+                        // A batch norm right after the layer subtracts each channel's mean,
+                        // which cancels a per-channel bias: its gradient is rounding noise.
+                        write!(
+                            f,
+                            "; for a bias, it also points at a batch norm right after its \
+                             layer, which cancels the bias: build that layer without one \
+                             (PyTorch's bias=False)"
+                        )?;
+                    }
+                    Ok(())
                 }
             }
             Warning::DeadNeurons {
@@ -2555,6 +2566,31 @@ mod tests {
             "{:?}",
             seen.lock().unwrap()
         );
+    }
+
+    /// A small, non-zero gradient norm on a bias adds the batch-norm hint; on a weight, or
+    /// at exactly 0, it does not.
+    #[test]
+    fn vanishing_bias_names_batch_norm() {
+        let text = |layer: &str, norm: f64| {
+            Warning::Vanishing {
+                step: 5,
+                layer: layer.to_string(),
+                norm,
+            }
+            .to_string()
+        };
+        let bias = text("0.bias", 3.65e-8);
+        assert!(
+            bias.ends_with(
+                "saturating activations such as sigmoid and tanh; for a bias, it also points at \
+                 a batch norm right after its layer, which cancels the bias: build that layer \
+                 without one (PyTorch's bias=False)"
+            ),
+            "{bias}"
+        );
+        assert!(!text("0.weight", 3.65e-8).contains("batch norm"));
+        assert!(!text("0.bias", 0.0).contains("batch norm"));
     }
 
     /// Each warning reads as one plain-English line.

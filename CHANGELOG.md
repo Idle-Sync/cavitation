@@ -38,6 +38,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Layers, training and inference (`cavitation-nn`)
 
+- The vanishing-gradient warning on a bias adds that a batch norm right after its layer cancels the bias, and to build that layer without one: the bias's gradient is then rounding noise, and the warning's other hints (a deep network, saturating activations) do not apply.
 - The shrink tools (`activity`, `ablate`, `compact`, `shrink`, `train_found_size`) refuse a model with an image layer (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d`) with `Error::Unsupported` naming the layer, before doing anything; they work on the neurons of dense networks.
 - `Dropout`, PyTorch's `nn.Dropout`: random masks while training, seeded by `FitConfig::dropout_seed`, the step and the order of the dropout layers on the tape, so a run gives the same masks on every machine and for any thread count; it passes its input through in evaluation and at inference. `Dropout::new` refuses a drop probability outside `[0, 1)`.
 - `Flatten` and `Identity`, PyTorch's `nn.Flatten` and `nn.Identity`, which pass their input through, so a PyTorch `nn.Sequential` that uses them keeps its layer numbers and its state dict loads by key.
