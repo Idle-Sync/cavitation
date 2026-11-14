@@ -3467,7 +3467,7 @@ mod tests {
         }
     }
 
-    // A configuration, a trainer and their health checks can move to another thread.
+    /// A configuration, a trainer and their health checks can move to another thread.
     const _: () = {
         /// Requires `T: Send`.
         const fn send<T: Send>() {}
