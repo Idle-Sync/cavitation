@@ -12,7 +12,11 @@
 //! and `sse4.2` kernel levels and within the rounding bound [`compact()`] states on the
 //! others. [`shrink()`] does the whole job: it removes neurons a step at a time, retrains
 //! after each step and stops by a rule measured on a validation set, to find the smallest
-//! network that is still as good as the one you started from.
+//! network that is still as good as the one you started from, optionally folding each
+//! removed neuron's mean output into the next layer's bias
+//! ([`ShrinkConfig::fold_means`]). [`train_found_size()`] trains a network of the size it
+//! found from new starting values and measures both, to show whether pruning bought more
+//! than the size.
 //!
 //! The items here are reached through this module, `cavitation_nn::shrink`, and are not in
 //! the crate root or the `cavitation` prelude.
@@ -21,6 +25,7 @@ mod ablate;
 mod activity;
 mod compact;
 mod prune;
+mod scratch;
 
 pub use ablate::{Ablation, ablate, ablate_controlled, ablate_with};
 pub use activity::{LayerActivity, activity};
@@ -29,6 +34,7 @@ pub use prune::{
     Criterion, RankContext, Ranking, RetrainConfig, ShrinkConfig, ShrinkReport, ShrinkStep,
     ShrinkWarning, Validation, shrink,
 };
+pub use scratch::{FoundSize, FromScratch, train_found_size};
 
 use cavitation_core::Real;
 

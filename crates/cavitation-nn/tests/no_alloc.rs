@@ -11,8 +11,8 @@ use std::time::Duration;
 use cavitation_core::{Graph, ParamGrads, ParamStore, Reduction, Rng, Tensor, TensorView, Var};
 use cavitation_nn::{
     Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats,
-    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential,
-    Sgd, Targets, TargetsView, Trace, Trainer, Warning,
+    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, OnNonFinite, Optimizer, Relu,
+    Sequential, Sgd, Targets, TargetsView, Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -534,6 +534,103 @@ fn health_steady_state() -> usize {
         made += allocations() - before;
         assert!(sink.is_finite() && sink > 0.0);
         assert_eq!(warnings.get(), 0, "the healthy run produced warnings");
+    }
+    made
+}
+
+/// Tanh written as an activation of your own, whose derivative is NaN where `|x|` is above
+/// 50: a batch of large inputs then has a finite loss and a NaN gradient.
+struct TanhNanBeyond;
+
+impl Activation<f32> for TanhNanBeyond {
+    /// Returns `"tanh_nan_beyond"`.
+    fn name(&self) -> &str {
+        "tanh_nan_beyond"
+    }
+    /// `tanh(x)`.
+    fn f(&self, x: f32) -> f32 {
+        x.tanh()
+    }
+    /// NaN where `|x|` is above 50, else `1 − y²`.
+    fn df(&self, x: f32, y: f32) -> f32 {
+        if x.abs() > 50.0 {
+            f32::NAN
+        } else {
+            1.0 - y * y
+        }
+    }
+}
+
+/// `Trainer::step` under `OnNonFinite::Skip` on a 64 → 256 → `TanhNanBeyond` → 10 network
+/// (He uniform weights from `Rng::seed(1)`) and the centred 1,437-row set at batch 128,
+/// unshuffled so the batches stay put, with SGD and with Adam. Four batches per epoch are
+/// skipped, two on each path: a NaN input in batches 1 and 7 (a non-finite loss), and
+/// inputs of 1,000 in batches 3 and 5 (a finite loss with a NaN gradient, found by reading
+/// every gradient before the update). Every healthy step reads every gradient too. One
+/// whole warm-up epoch, then counts the allocations of every step of a second epoch, and of
+/// its end, except the two steps that send the epoch's warnings (a warning allocates its
+/// text); the second skip on each path, whose warnings were already sent, is counted.
+fn skip_steady_state() -> usize {
+    let mut data = synthetic_centred_1437();
+    let features = 64;
+    data.x.data_mut()[200 * features + 5] = f32::NAN;
+    data.x.data_mut()[900 * features] = f32::NAN;
+    for batch in [3, 5] {
+        let rows = batch * 128..(batch + 1) * 128;
+        data.x.data_mut()[rows.start * features..rows.end * features].fill(1000.0);
+    }
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(1);
+        let mut he = |inputs, outputs| {
+            Linear::with_init(
+                &mut params,
+                inputs,
+                outputs,
+                Init::HeUniform,
+                Init::Zeros,
+                &mut rng,
+            )
+        };
+        let net = Sequential::new()
+            .push(he(64, 256))
+            .push(ActivationLayer::new(TanhNanBeyond))
+            .push(he(256, 10));
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let warnings = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = std::rc::Rc::clone(&warnings);
+        trainer.set_health(Health {
+            on_non_finite: OnNonFinite::Skip,
+            sink: Some(Box::new(move |_: &Warning| counter.set(counter.get() + 1))),
+            ..Health::default()
+        });
+        let mut batcher = Batcher::new(data.len(), 128, None);
+        let mut batch = Batch::new(&data, 128);
+        let mut warning_steps = 0;
+        for epoch in 1..=2 {
+            batcher.epoch();
+            for range in batcher.batches() {
+                let (sent, before) = (warnings.get(), allocations());
+                let view = batcher.gather(&data, range, &mut batch);
+                trainer.step(&net, &mut params, view).unwrap();
+                let step_made = allocations() - before;
+                if warnings.get() != sent {
+                    warning_steps += 1;
+                } else if epoch == 2 {
+                    made += step_made;
+                }
+            }
+            let before = allocations();
+            trainer.end_epoch(epoch).unwrap();
+            if epoch == 2 {
+                made += allocations() - before;
+            }
+        }
+        assert_eq!(trainer.skipped_steps(), 8);
+        // Per epoch: the loss, then `0.weight` and `0.bias` on the first gradient skip.
+        assert_eq!(warnings.get(), 6, "three non-finite warnings per epoch");
+        assert_eq!(warning_steps, 4, "two steps per epoch send warnings");
     }
     made
 }
@@ -1110,7 +1207,7 @@ fn fit_validation_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 23] = [
+    let scenarios: [Scenario; 24] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1122,6 +1219,7 @@ fn main() -> ExitCode {
         ("set_neuron_steady_state", set_neuron_steady_state),
         ("masked_hooks_steady_state", masked_hooks_steady_state),
         ("health_steady_state", health_steady_state),
+        ("skip_steady_state", skip_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),
         ("observed_steady_state", observed_steady_state),
