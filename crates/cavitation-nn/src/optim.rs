@@ -820,13 +820,12 @@ impl<T: Real> AdamCore<T> {
             };
             self.steps[k] += 1;
             let c = AdamStep {
-                lr,
                 b1,
                 b2,
                 eps,
                 wd,
-                correction1: 1.0 - b1.powi(self.steps[k]),
-                correction2: 1.0 - b2.powi(self.steps[k]),
+                step_size: lr / (1.0 - b1.powi(self.steps[k])),
+                inv_sqrt_correction2: 1.0 / (1.0 - b2.powi(self.steps[k])).sqrt(),
                 shrink: 1.0 - lr * wd,
             };
             let c = &c;
@@ -858,8 +857,6 @@ impl<T: Real> AdamCore<T> {
 
 /// The constants of one Adam or AdamW step.
 struct AdamStep {
-    /// The learning rate.
-    lr: f64,
     /// The decay rate of the first moment.
     b1: f64,
     /// The decay rate of the second moment.
@@ -868,10 +865,10 @@ struct AdamStep {
     eps: f64,
     /// The weight decay.
     wd: f64,
-    /// The first moment's bias correction, `1 − β₁ᵗ`.
-    correction1: f64,
-    /// The second moment's bias correction, `1 − β₂ᵗ`.
-    correction2: f64,
+    /// The learning rate over the first moment's bias correction, `lr / (1 − β₁ᵗ)`.
+    step_size: f64,
+    /// One over the square root of the second moment's bias correction, `1 / √(1 − β₂ᵗ)`.
+    inv_sqrt_correction2: f64,
     /// AdamW's decay factor, `1 − lr·wd`.
     shrink: f64,
 }
@@ -903,9 +900,7 @@ fn adam_reference<T: Real>(
         let vi = c.b2 * v[i].to_f64() + (1.0 - c.b2) * g * g;
         m[i] = store_state(mi);
         v[i] = store_state(vi);
-        let m_hat = mi / c.correction1;
-        let v_hat = vi / c.correction2;
-        values[i] = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
+        values[i] = T::from_f64(adam_update(c, p, mi, vi));
     }
     (sum, finite)
 }
@@ -931,10 +926,18 @@ fn adam_chunk<T: Real, const DECOUPLED: bool, const WD: bool>(
         let vi = c.b2 * v.to_f64() + (1.0 - c.b2) * g * g;
         *m = store_state(mi);
         *v = store_state(vi);
-        let m_hat = mi / c.correction1;
-        let v_hat = vi / c.correction2;
-        *value = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
+        *value = T::from_f64(adam_update(c, p, mi, vi));
     })
+}
+
+/// The updated parameter from its value `p` and its new moments `m` and `v`:
+/// `p − step_size · m / (√v / √(1 − β₂ᵗ) + eps)`, the bias corrections folded into two
+/// scalars as `torch.optim.Adam` folds them, so each element takes one square root and
+/// one division. (PyTorch divides `√v` by `√(1 − β₂ᵗ)`; this multiplies by its inverse,
+/// which can differ in the last bit.)
+#[inline(always)]
+fn adam_update(c: &AdamStep, p: f64, m: f64, v: f64) -> f64 {
+    p - c.step_size * m / (v.sqrt() * c.inv_sqrt_correction2 + c.eps)
 }
 
 /// Adam (Kingma and Ba, 2015) with PyTorch's `torch.optim.Adam` semantics: bias-corrected
