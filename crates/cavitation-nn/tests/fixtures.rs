@@ -7,15 +7,20 @@
 //! fixture's inputs. The optimisers are compared with `torch.optim` from the fixtures in
 //! `tests/fixtures/optim/`, on both update paths. A network whose first `Linear` has no bias
 //! is loaded from PyTorch's `state_dict` in `tests/fixtures/state-dict/` and compared on its
-//! output and its parameter gradients, with the same bound carried through the layers.
+//! output and its parameter gradients, with the same bound carried through the layers. The
+//! v0.3 MNIST and CIFAR networks are loaded from PyTorch's state dicts in `tests/fixtures/cnn/`
+//! (the CIFAR one with batch-norm buffers) and compared layer by layer and end to end.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use cavitation_core::kernels::{Level, level, set_level, supported};
-use cavitation_core::{Graph, ParamId, ParamStore, Rng, Tensor};
+use cavitation_core::{
+    Conv2dGeom, Graph, ParamId, ParamStore, Pool2dGeom, Rng, Tensor, TensorView,
+};
 use cavitation_nn::{
-    Adagrad, Adam, AdamW, Init, Layer, Linear, Optimizer, Relu, RmsProp, Sequential, Sgd, load,
+    Adagrad, Adam, AdamW, BatchNorm2d, Conv2d, Dropout, Flatten, InferenceModel, Init, Layer,
+    Linear, MaxPool2d, Optimizer, Relu, RmsProp, Sequential, Sgd, load,
 };
 use serde_json::Value;
 
@@ -540,5 +545,275 @@ fn check_optimizers(at: Level) {
                 &parse_tensor(&a["bias"]),
             );
         }
+    }
+}
+
+/// The fixture folder of the CNN fixtures.
+fn cnn_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cnn")
+}
+
+/// The values of the `F32` tensor `name` in `file`.
+fn f32_tensor(file: &safetensors::SafeTensors<'_>, name: &str) -> Vec<f32> {
+    let t = file.tensor(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(t.dtype(), safetensors::Dtype::F32, "{name}");
+    t.data()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| f32::from_le_bytes(b))
+        .collect()
+}
+
+/// The values of the `F64` tensor `name` in `file`.
+fn f64_tensor(file: &safetensors::SafeTensors<'_>, name: &str) -> Vec<f64> {
+    let t = file.tensor(name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    assert_eq!(t.dtype(), safetensors::Dtype::F64, "{name}");
+    t.data()
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&b| f64::from_le_bytes(b))
+        .collect()
+}
+
+/// PyTorch's `Conv2d(i, o, 3, padding=1, bias=False), BatchNorm2d(o), ReLU()` on `size`
+/// images, appended to `net`.
+fn conv_block(
+    net: Sequential,
+    params: &mut ParamStore,
+    rng: &mut Rng,
+    (i, o): (usize, usize),
+    size: (usize, usize),
+) -> Sequential {
+    let g = Conv2dGeom::with_options(i, o, size, (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+    net.push(Conv2d::with_init(params, g, Init::TorchDefault, None, rng))
+        .push(BatchNorm2d::new(params, o, size))
+        .push(Relu)
+}
+
+/// The v0.3 benchmark network `name` (`"mnist-cnn"` or `"cifar-cnn"`), laid out as the
+/// PyTorch `nn.Sequential` in `make_fixtures.py`, so its state names are PyTorch's keys;
+/// returns it with the number of rows the fixture checks layer by layer.
+fn cnn(name: &str, params: &mut ParamStore) -> (Sequential, usize) {
+    let mut rng = Rng::seed(0);
+    match name {
+        "mnist-cnn" => {
+            let g1 = Conv2dGeom::with_options(1, 6, (28, 28), (5, 5), (1, 1), (2, 2), (1, 1));
+            let g2 = Conv2dGeom::new(6, 16, (14, 14), (5, 5));
+            let net = Sequential::new()
+                .push(Conv2d::new(params, g1.unwrap(), &mut rng))
+                .push(Relu)
+                .push(MaxPool2d::new(
+                    Pool2dGeom::new(6, (28, 28), (2, 2)).unwrap(),
+                ))
+                .push(Conv2d::new(params, g2.unwrap(), &mut rng))
+                .push(Relu)
+                .push(MaxPool2d::new(
+                    Pool2dGeom::new(16, (10, 10), (2, 2)).unwrap(),
+                ))
+                .push(Flatten)
+                .push(Linear::new(params, 400, 120, &mut rng))
+                .push(Relu)
+                .push(Linear::new(params, 120, 84, &mut rng))
+                .push(Relu)
+                .push(Linear::new(params, 84, 10, &mut rng));
+            (net, 8)
+        }
+        "cifar-cnn" => {
+            let net = Sequential::new();
+            let net = conv_block(net, params, &mut rng, (3, 32), (32, 32));
+            let net = conv_block(net, params, &mut rng, (32, 32), (32, 32));
+            let net = net.push(MaxPool2d::new(
+                Pool2dGeom::new(32, (32, 32), (2, 2)).unwrap(),
+            ));
+            let net = conv_block(net, params, &mut rng, (32, 64), (16, 16));
+            let net = conv_block(net, params, &mut rng, (64, 64), (16, 16));
+            let net = net
+                .push(MaxPool2d::new(
+                    Pool2dGeom::new(64, (16, 16), (2, 2)).unwrap(),
+                ))
+                .push(Dropout::new(0.25).unwrap())
+                .push(Flatten)
+                .push(Linear::new(params, 4096, 256, &mut rng))
+                .push(Relu)
+                .push(Dropout::new(0.5).unwrap())
+                .push(Linear::new(params, 256, 10, &mut rng));
+            (net, 2)
+        }
+        _ => unreachable!("no network {name}"),
+    }
+}
+
+/// Layer `layer` of a network alone on an evaluation tape over `values`, on `rows` rows `x`.
+fn run_layer(layer: &dyn Layer<f32>, values: &ParamStore, x: &[f32], rows: usize) -> Vec<f32> {
+    let mut graph = Graph::new();
+    let mut tape = graph.tape(&values.values);
+    let v = tape.input(TensorView::from_slice(x, &[rows, x.len() / rows]).unwrap());
+    let y = layer.forward(&mut tape, v);
+    tape.value(y).data().to_vec()
+}
+
+/// Each element's bound for layer `layer` of `net` against PyTorch's float64 output on the
+/// same input `x`. A convolution or `Linear` sums `k` terms (the bias one of them): the GEMM
+/// bound `γ(k) · Σ|terms|`, with `Σ|terms|` the layer run on `|x|` with `|parameters|`
+/// (`abs`). A batch norm in evaluation computes `((x − mean) · inv) · γ + β` in f32, with
+/// `inv = 1 / √(var + eps)` also in f32. With `u = 2⁻²⁴` the unit roundoff, `inv` carries
+/// about `2.5u` relative error (the add's `u` halved by the square root, then the square
+/// root's and the division's), and the subtraction, the two products and the add carry `u`
+/// each, relative to `S = (|x| + |mean|) · inv · |γ| + |β|`: about `6.5u · S` in all. The
+/// bound is `γ(4) · S`, with `γ(4) = 12 · 1.19e-7 = 24u`, over three times that count.
+fn layer_bound(
+    net: &Sequential,
+    layer: usize,
+    params: &ParamStore,
+    abs: &ParamStore,
+    x: &[f32],
+    rows: usize,
+) -> Vec<f64> {
+    let l = net.layer(layer);
+    let absx: Vec<f32> = x.iter().map(|v| v.abs()).collect();
+    let k = if let Some(conv) = l.as_conv2d() {
+        conv.geom().kernel_len() + usize::from(conv.bias().is_some())
+    } else if let Some(linear) = l.as_linear() {
+        linear.inputs() + usize::from(linear.bias().is_some())
+    } else if let Some(bn) = l.as_batch_norm2d() {
+        let r = bn
+            .running()
+            .expect("the fixture's batch norms keep running statistics");
+        let (mean, var) = (params.value(r.mean).data(), params.value(r.var).data());
+        let (w, b) = (
+            params.value(bn.weight().unwrap()).data(),
+            params.value(bn.bias().unwrap()).data(),
+        );
+        let channels = bn.channels();
+        let spatial = x.len() / rows / channels;
+        return x
+            .iter()
+            .enumerate()
+            .map(|(j, &v)| {
+                let c = (j / spatial) % channels;
+                let inv = 1.0 / (f64::from(var[c]) + bn.eps()).sqrt();
+                let s =
+                    (f64::from(v.abs()) + f64::from(mean[c].abs())) * inv * f64::from(w[c].abs())
+                        + f64::from(b[c].abs());
+                gamma(4) * s
+            })
+            .collect();
+    } else {
+        panic!("layer {layer} has no stored output");
+    };
+    run_layer(l, abs, &absx, rows)
+        .iter()
+        .map(|&s| gamma(k) * f64::from(s))
+        .collect()
+}
+
+/// Loads the PyTorch state dict of fixture `name` and checks the network at the current
+/// kernel level: layer by layer, each convolution, batch norm and `Linear` on PyTorch's
+/// previous output (rounded to f32, as PyTorch's next layer read it) within
+/// [`layer_bound`] plus the reference's own rounding to f32 (`2⁻²³ · |reference|`), the
+/// exact layers between them (ReLU, max pooling, flatten, dropout in evaluation) passing
+/// our own output on; then end to end on the eight inputs, through an evaluation tape and
+/// through `InferenceModel`, within `1e-4 · max(1, |torch|)` of the float64 network.
+fn check_cnn_at_current_level(name: &str) {
+    let mut params = ParamStore::new();
+    let (net, rows) = cnn(name, &mut params);
+    load(
+        cnn_dir().join(format!("{name}.safetensors")),
+        &net,
+        &mut params,
+    )
+    .unwrap_or_else(|e| panic!("{name}: {e}"));
+    for (key, id) in net.state_names() {
+        if key.ends_with("num_batches_tracked") {
+            assert_eq!(params.value(id).data(), &[3.0], "{name}: {key}");
+        }
+    }
+    let bytes = std::fs::read(cnn_dir().join(format!("{name}-io.safetensors"))).unwrap();
+    let io = safetensors::SafeTensors::deserialize(&bytes).unwrap();
+    let input = f32_tensor(&io, "input");
+    let width = input.len() / 8;
+    let mut abs = params.clone();
+    for (_, id) in net.state_names() {
+        for v in abs.value_mut(id).data_mut() {
+            *v = v.abs();
+        }
+    }
+
+    let mut x = input[..rows * width].to_vec();
+    let mut stored = 0;
+    for i in 0..net.len() {
+        let ours = run_layer(net.layer(i), &params, &x, rows);
+        let key = format!("out.{i}");
+        if io.names().iter().any(|n| **n == key) {
+            let want = f32_tensor(&io, &key);
+            let bound = layer_bound(&net, i, &params, &abs, &x, rows);
+            assert_eq!(ours.len(), want.len(), "{name}: layer {i} width");
+            for (j, ((&o, &w), &b)) in ours.iter().zip(&want).zip(&bound).enumerate() {
+                let diff = (f64::from(o) - f64::from(w)).abs();
+                let b = b + f64::from(w.abs()) * 2f64.powi(-23) + 1e-30;
+                assert!(
+                    diff <= b,
+                    "{name} at level {}: layer {i} ({}), element {j}: ours {o:e}, torch {w:e}, \
+                     difference {diff:e} > {b:e}",
+                    level(),
+                    net.layer(i).name()
+                );
+            }
+            x = want;
+            stored += 1;
+        } else {
+            x = ours;
+        }
+    }
+    assert!(stored >= 5, "{name}: {stored} layers compared");
+
+    let want = f64_tensor(&io, "final_f64");
+    let all = TensorView::from_slice(&input, &[8, width]).unwrap();
+    let check = |what: &str, got: &[f32]| {
+        assert_eq!(got.len(), want.len(), "{name}: {what} width");
+        for (j, (&g, &t)) in got.iter().zip(&want).enumerate() {
+            let diff = (f64::from(g) - t).abs();
+            let b = 1e-4 * t.abs().max(1.0);
+            assert!(
+                diff <= b,
+                "{name} at level {}: {what}, element {j}: ours {g:e}, torch {t:e}, difference {diff:e} > {b:e}",
+                level()
+            );
+        }
+    };
+    let mut graph = Graph::new();
+    let mut tape = graph.tape(&params.values);
+    let v = tape.input(all);
+    let y = net.forward(&mut tape, v);
+    check("tape", tape.value(y).data());
+    drop(tape);
+    let mut model = InferenceModel::compile(&net, &params).unwrap();
+    check("InferenceModel", model.infer_batch(all).data());
+}
+
+/// PyTorch's MNIST network (LeNet-5's layout) loads from its state dict and gives PyTorch's
+/// outputs, layer by layer and end to end, at every kernel level this CPU supports.
+#[test]
+fn mnist_cnn_matches_pytorch() {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = RestoreLevel(level());
+    for l in ALL_LEVELS.into_iter().filter(|&l| supported(l)) {
+        set_level(l).expect("a supported level can be set");
+        check_cnn_at_current_level("mnist-cnn");
+    }
+}
+
+/// PyTorch's CIFAR network, with batch norms and their running statistics, loads from its
+/// state dict (saved in F16) and gives PyTorch's outputs, layer by layer and end to end, at
+/// every kernel level this CPU supports.
+#[test]
+fn cifar_cnn_matches_pytorch() {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = RestoreLevel(level());
+    for l in ALL_LEVELS.into_iter().filter(|&l| supported(l)) {
+        set_level(l).expect("a supported level can be set");
+        check_cnn_at_current_level("cifar-cnn");
     }
 }

@@ -32,6 +32,18 @@ Linear(8, 3)` state dict made and saved in float16, bfloat16 and float64
 `mlp-dtypes.json` with the F32 values PyTorch's `.float()` gives for every tensor of each.
 `--only dtypes` writes just these four files.
 
+The CNN fixtures go under `crates/cavitation-nn/tests/fixtures/cnn/`: the v0.3 MNIST network
+(LeNet-5 layout) and CIFAR network (convolutions without a bias, each followed by a batch norm
+whose running statistics come from three training-mode passes) in PyTorch, seeded. Each has
+its `state_dict` (`mnist-cnn.safetensors` in F32; `cifar-cnn.safetensors` in F16, with every
+value first rounded to F16 so the F32 network PyTorch runs holds the same values, which halves
+the file) and an `-io.safetensors` file: `input` (8 images, pixels in [0, 1]), `final_f64`
+(the float64 network's output on them, end to end), and for the first images (8 for MNIST, 2
+for CIFAR) `out.N`, the float64 output of each convolution, batch norm and `Linear` at index
+`N`, run on the previous layer's output rounded to F32 (stored rounded to F32). The layers
+between those (ReLU, max pooling, flatten, dropout in evaluation) are exact in F32, so their
+outputs are not stored. `--only cnn` writes just these four files.
+
 `--check-rust-save [PATH]` writes nothing. It checks the other direction: that a file written by the
 library's `save` loads in PyTorch. The Rust test `save_writes_the_file_pytorch_was_checked_against`
 (in `crates/cavitation-nn/src/io.rs`) keeps `from-rust.safetensors` in the same folder equal,
@@ -899,6 +911,87 @@ def check_rust_file(crates_dir, stem, first_bias, saved=None):
     )
 
 
+def mnist_cnn():
+    """The v0.3 MNIST network: LeNet-5's layout."""
+    nn = torch.nn
+    return nn.Sequential(
+        nn.Conv2d(1, 6, 5, padding=2), nn.ReLU(), nn.MaxPool2d(2),
+        nn.Conv2d(6, 16, 5), nn.ReLU(), nn.MaxPool2d(2), nn.Flatten(),
+        nn.Linear(400, 120), nn.ReLU(), nn.Linear(120, 84), nn.ReLU(), nn.Linear(84, 10),
+    )
+
+
+def cifar_cnn():
+    """The v0.3 CIFAR-10 network; each convolution is followed by a batch norm, so it has no
+    bias."""
+    nn = torch.nn
+
+    def block(i, o):
+        return [nn.Conv2d(i, o, 3, padding=1, bias=False), nn.BatchNorm2d(o), nn.ReLU()]
+
+    return nn.Sequential(
+        *block(3, 32), *block(32, 32), nn.MaxPool2d(2),
+        *block(32, 64), *block(64, 64), nn.MaxPool2d(2),
+        nn.Dropout(0.25), nn.Flatten(), nn.Linear(4096, 256), nn.ReLU(), nn.Dropout(0.5),
+        nn.Linear(256, 10),
+    )
+
+
+def write_cnn_fixtures(crates_dir):
+    """Writes the MNIST and CIFAR networks' state dicts and their per-layer and end-to-end
+    float64 outputs (see the module docs)."""
+    out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "cnn")
+    os.makedirs(out_dir, exist_ok=True)
+    stored = (torch.nn.Conv2d, torch.nn.BatchNorm2d, torch.nn.Linear)
+    for name, make, image, per_layer, half in [
+        ("mnist-cnn", mnist_cnn, (1, 28, 28), 8, False),
+        ("cifar-cnn", cifar_cnn, (3, 32, 32), 2, True),
+    ]:
+        torch.manual_seed(0)
+        model = make()
+        with torch.no_grad():
+            for m in model:
+                if isinstance(m, torch.nn.BatchNorm2d):
+                    m.weight.uniform_(0.5, 1.5)
+                    m.bias.uniform_(-0.2, 0.2)
+            model.train()
+            for _ in range(3):
+                model(torch.randint(0, 256, (16, *image)).float() / 255)
+            model.eval()
+            if half:
+                for t in model.state_dict().values():
+                    if t.is_floating_point():
+                        t.copy_(t.half().float())
+        state = model.state_dict()
+        to_save = {k: (v.half() if half and v.is_floating_point() else v) for k, v in state.items()}
+        save_file(to_save, os.path.join(out_dir, name + ".safetensors"))
+        x = torch.randint(0, 256, (8, *image)).float() / 255
+        model64 = copy.deepcopy(model).double().eval()
+        body = {"input": x.reshape(8, -1).contiguous()}
+        with torch.no_grad():
+            body["final_f64"] = model64(x.double()).contiguous()
+            h = x[:per_layer].double()
+            for i, layer in enumerate(model64):
+                y = layer(h)
+                if isinstance(layer, stored):
+                    body[f"out.{i}"] = y.float().reshape(per_layer, -1).contiguous()
+                else:
+                    exact = torch.equal(y, y.float().double())
+                    check(exact, f"{name}: layer {i} is not exact in f32")
+                h = y.float().double()
+        io_path = os.path.join(out_dir, name + "-io.safetensors")
+        save_file(body, io_path, metadata={"torch_version": TORCH_VERSION})
+        # The saved file loads back into a fresh network with strict keys.
+        fresh = make()
+        saved = load_file(os.path.join(out_dir, name + ".safetensors"))
+        loaded = {k: v.float() if v.is_floating_point() else v for k, v in saved.items()}
+        fresh.load_state_dict(loaded, strict=True)
+        fresh.eval()
+        with torch.no_grad():
+            check(torch.equal(fresh(x), model(x)), f"{name}: the saved file does not reload")
+    print(f"wrote the CNN fixtures to {out_dir} with torch {TORCH_VERSION}", file=sys.stderr)
+
+
 def main():
     """Builds every case and writes the files."""
     parser = argparse.ArgumentParser(description="Write the PyTorch fixtures for the operations.")
@@ -909,7 +1002,7 @@ def main():
         "cavitation-core/tests/fixtures/ops, and --check-rust-save reads under cavitation-nn/tests/fixtures)",
     )
     parser.add_argument(
-        "--only", choices=["state-dict", "no-bias", "dtypes"], help="write only this fixture family"
+        "--only", choices=["state-dict", "no-bias", "dtypes", "cnn"], help="write only this fixture family"
     )
     parser.add_argument(
         "--check-rust-save",
@@ -931,6 +1024,9 @@ def main():
         return
     if args.only == "dtypes":
         write_dtype_files(args.out)
+        return
+    if args.only == "cnn":
+        write_cnn_fixtures(args.out)
         return
     make_arithmetic()
     make_matmul()
@@ -977,6 +1073,7 @@ def main():
     write_state_dict(args.out)
     write_no_bias_network(args.out)
     write_dtype_files(args.out)
+    write_cnn_fixtures(args.out)
 
 
 if __name__ == "__main__":
