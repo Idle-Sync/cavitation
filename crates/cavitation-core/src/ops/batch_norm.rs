@@ -104,7 +104,8 @@ impl<T: Real> Tape<'_, T> {
         }
         if let Some(r) = running {
             for (what, id) in [("running mean", r.mean), ("running variance", r.var)] {
-                let dims = self.param_value(id).shape().dims().to_vec();
+                let value = self.param_value(id);
+                let dims = value.shape().dims();
                 assert!(
                     dims == [channels],
                     "{NAME}: the {what} must be [{channels}], got {dims:?}"

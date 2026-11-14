@@ -16,7 +16,14 @@ use crate::{InferenceLayer, Layer};
 /// which `fit` and `Trainer` call); in evaluation and at inference it uses the running
 /// statistics. Its parameters are `weight` and `bias` and its buffers `running_mean`,
 /// `running_var` and `num_batches_tracked`, under PyTorch's names, so a PyTorch state dict
-/// loads into it by key.
+/// loads into it by key. The batch count is kept as an `f32` in the store, so it stops
+/// growing at 2²⁴ (16,777,216) batches; with momentum `None` (the cumulative average) the
+/// factor then stays at 1 / 2²⁴. It is saved as PyTorch's `I64`.
+///
+/// A convolution or `Linear` right before it needs no bias: subtracting each channel's
+/// mean cancels a per-channel bias, so its gradient is 0 up to rounding (and the health
+/// checks report it as vanishing). Build that layer without one, as with PyTorch's
+/// `bias=False`, for example [`Conv2d::with_init`](crate::Conv2d::with_init) with `None`.
 ///
 /// ```
 /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -196,6 +203,73 @@ impl BatchNorm2d {
     pub fn bias(&self) -> Option<ParamId> {
         self.bias
     }
+
+    /// Whether `form` is this layer's evaluation form for `params` in shape: a
+    /// [`InferenceLayer::BatchNorm2d`] with one value per channel, γ and β present exactly
+    /// when the layer is affine, the layer's spatial size, and running statistics kept, so
+    /// [`refresh_inference`](Self::refresh_inference) can overwrite its values.
+    pub(crate) fn fits_inference(&self, params: &ParamValues<f32>, form: &InferenceLayer) -> bool {
+        let InferenceLayer::BatchNorm2d {
+            mean,
+            inv,
+            weight,
+            bias,
+            spatial,
+        } = form
+        else {
+            return false;
+        };
+        let n = self.channels;
+        let width = |id: ParamId| params.get(id).data().len() == n;
+        self.running.is_some_and(|r| width(r.mean) && width(r.var))
+            && mean.len() == n
+            && inv.len() == n
+            && *spatial == self.spatial
+            && match (weight, self.weight) {
+                (Some(w), Some(id)) => w.len() == n && width(id),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (bias, self.bias) {
+                (Some(b), Some(id)) => b.len() == n && width(id),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    /// Overwrites the values of `form`, this layer's evaluation form, from `params`: each
+    /// channel's running mean, `1 / √(var + eps)` computed as the tape computes it, and γ
+    /// and β. Allocates nothing. Does nothing to a form
+    /// [`fits_inference`](Self::fits_inference) rejects.
+    pub(crate) fn refresh_inference(&self, params: &ParamValues<f32>, form: &mut InferenceLayer) {
+        if !self.fits_inference(params, form) {
+            return;
+        }
+        let (
+            Some(r),
+            InferenceLayer::BatchNorm2d {
+                mean,
+                inv,
+                weight,
+                bias,
+                ..
+            },
+        ) = (self.running, form)
+        else {
+            return;
+        };
+        mean.copy_from_slice(params.get(r.mean).data());
+        let eps = self.eps as f32;
+        for (i, &v) in inv.iter_mut().zip(params.get(r.var).data()) {
+            *i = 1.0 / (v + eps).sqrt();
+        }
+        if let (Some(w), Some(id)) = (weight.as_mut(), self.weight) {
+            w.copy_from_slice(params.get(id).data());
+        }
+        if let (Some(b), Some(id)) = (bias.as_mut(), self.bias) {
+            b.copy_from_slice(params.get(id).data());
+        }
+    }
 }
 
 impl<T: Real> Layer<T> for BatchNorm2d {
@@ -258,16 +332,22 @@ impl<T: Real> Layer<T> for BatchNorm2d {
     /// compiled model gives the tape's bits; `None` for a layer without running statistics,
     /// which normalises by each batch and has no fixed form.
     fn inference(&self, params: &ParamValues<f32>) -> Option<InferenceLayer> {
-        let r = self.running?;
-        let (mean, var) = (params.get(r.mean).data(), params.get(r.var).data());
-        let eps = self.eps as f32;
-        Some(InferenceLayer::BatchNorm2d {
-            mean: mean.to_vec(),
-            inv: var.iter().map(|&v| 1.0 / (v + eps).sqrt()).collect(),
-            weight: self.weight.map(|id| params.get(id).data().to_vec()),
-            bias: self.bias.map(|id| params.get(id).data().to_vec()),
+        self.running?;
+        let n = self.channels;
+        let mut form = InferenceLayer::BatchNorm2d {
+            mean: vec![0.0; n],
+            inv: vec![0.0; n],
+            weight: self.weight.map(|_| vec![0.0; n]),
+            bias: self.bias.map(|_| vec![0.0; n]),
             spatial: self.spatial,
-        })
+        };
+        self.refresh_inference(params, &mut form);
+        Some(form)
+    }
+
+    /// The layer itself.
+    fn batch_norm2d_form(&self, _: crate::layer::private::Token) -> Option<&BatchNorm2d> {
+        Some(self)
     }
 }
 
@@ -401,6 +481,53 @@ mod tests {
             (safetensors::Dtype::I64, &[][..])
         );
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A compiled model refreshes a `BatchNorm2d` in place: new running statistics, γ and β
+    /// give bit for bit the outputs of compiling afresh. A model whose batch norm has a
+    /// different number of channels, or is not affine where the compiled one is, does not
+    /// fit and is left unchanged.
+    #[test]
+    fn refresh_in_place_matches_compile() {
+        let mut params = ParamStore::new();
+        let (net, bn, data) = net_and_data(&mut params);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        let before = model.infer_batch(data.x.view()).data().to_vec();
+        let r = bn.running().unwrap();
+        params
+            .value_mut(r.mean)
+            .data_mut()
+            .copy_from_slice(&[0.25, -0.5]);
+        params
+            .value_mut(r.var)
+            .data_mut()
+            .copy_from_slice(&[2.5, 0.3]);
+        params
+            .value_mut(bn.weight().unwrap())
+            .data_mut()
+            .copy_from_slice(&[1.5, -0.75]);
+        params
+            .value_mut(bn.bias().unwrap())
+            .data_mut()
+            .copy_from_slice(&[0.1, 0.2]);
+        assert!(model.refresh_in_place(&net, &params));
+        let got = model.infer_batch(data.x.view()).data().to_vec();
+        let mut want = InferenceModel::compile(&net, &params).unwrap();
+        assert_eq!(got, want.infer_batch(data.x.view()).data());
+        assert_ne!(got, before);
+
+        let mut rng = Rng::seed(5);
+        let mut other = ParamStore::new();
+        let g = Conv2dGeom::with_options(1, 2, (4, 4), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+        let plain =
+            BatchNorm2d::with_options(&mut other, 2, (4, 4), 1e-5, Some(0.1), false, true).unwrap();
+        let not_affine = Sequential::new()
+            .push(Conv2d::new(&mut other, g, &mut rng))
+            .push(plain)
+            .push(Relu)
+            .push(Linear::new(&mut other, 32, 3, &mut rng));
+        assert!(!model.refresh_in_place(&not_affine, &other));
+        assert_eq!(model.infer_batch(data.x.view()).data(), got.as_slice());
     }
 
     /// Without running statistics the layer normalises by each batch in evaluation too, and

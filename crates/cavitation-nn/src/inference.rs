@@ -513,6 +513,13 @@ impl InferenceModel {
                         bias.copy_from_slice(values.get(id).data());
                     }
                 }
+                Op::Layer(form @ InferenceLayer::BatchNorm2d { .. }) => {
+                    model
+                        .layer(step.layer)
+                        .as_batch_norm2d()
+                        .expect("checked by fits_in_place")
+                        .refresh_inference(values, form);
+                }
                 Op::Layer(InferenceLayer::Prelu(slopes)) => {
                     let prelu = model
                         .layer(step.layer)
@@ -1154,8 +1161,8 @@ impl Compiled {
 
     /// Whether [`InferenceModel::refresh_in_place`] can copy the values of `model` and
     /// `params` into these steps: the steps cover `model`'s layers one for one (a fused
-    /// ReLU covering its layer), each `Linear` and `Prelu` step's layer is still one with the
-    /// same widths and parameters of the compiled sizes, every other layer still has the
+    /// ReLU covering its layer), each `Linear`, `Prelu`, `Conv2d` and `BatchNorm2d` step's
+    /// layer is still one with the same shape and parameters of the compiled sizes, every other layer still has the
     /// compiled inference form (a form with values of its own, from a layer of your own,
     /// does not fit), the mask steps sit on the layers `model` masks plus the added ones,
     /// and each of `model`'s masks has the width of its step's keep values in `masks`.
@@ -1209,11 +1216,15 @@ impl Compiled {
                             }
                     })
                 }
+                InferenceLayer::BatchNorm2d { .. } => layer
+                    .as_batch_norm2d()
+                    .is_some_and(|bn| bn.fits_inference(values, form)),
                 InferenceLayer::Mask(_) => false,
                 other => {
                     layer.as_linear().is_none()
                         && layer.as_prelu().is_none()
                         && layer.as_conv2d().is_none()
+                        && layer.as_batch_norm2d().is_none()
                         && layer.inference(values).as_ref() == Some(other)
                 }
             };
