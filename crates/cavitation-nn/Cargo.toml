@@ -12,7 +12,6 @@ repository.workspace = true
 [lints]
 workspace = true
 
-
 [dependencies]
 cavitation-core = { path = "../cavitation-core", version = "0.2.0" }
 safetensors = "0.8.0"
