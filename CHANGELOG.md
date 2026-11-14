@@ -6,7 +6,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Breaking changes
 
-- `OptimizerConfig` has two new variants, `RmsProp` and `Adagrad`, so a `match` on it outside `cavitation-nn` needs arms for them.
+- `OptimizerConfig` has two new variants, `RmsProp` and `Adagrad`, and is now `#[non_exhaustive]`: a `match` on it outside `cavitation-nn` needs a wildcard arm (which also covers later variants). Building a value works as before.
 - `EpochReport` is `#[non_exhaustive]`, so a field added later is not a breaking change. Code outside `cavitation-nn` that builds one with a struct literal (to test a `StepControl`, say) uses `EpochReport::new(epoch, mean_loss, rows, seconds)`, which leaves `validation` as `None`. Reading the fields works as before; a struct pattern on it needs `..`.
 - `LrSchedule::learning_rate` takes the step and the steps per epoch: `learning_rate(initial, step, steps_per_epoch, epochs)`. For the per-epoch schedules, epoch `e` is any step from `e · steps_per_epoch` to the end of that epoch, so the old `learning_rate(initial, e, epochs)` is `learning_rate(initial, e, 1, epochs)`. `LrSchedule` is `#[non_exhaustive]`: a `match` on it outside `cavitation-nn` needs a wildcard arm.
 - `Init` has a new variant, `Normal { std }`, so a `match` on `Init` outside `cavitation-nn` needs an arm for it.
