@@ -218,7 +218,8 @@ pub trait Layer<T: Real>: Send + Sync {
     ///
     /// # Panics
     ///
-    /// May panic if `x` was not recorded on `tape`.
+    /// Panics, naming both lengths, if `out` does not hold as many values as `x` and the
+    /// layer has an activation; may panic if `x` was not recorded on `tape`.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -235,7 +236,15 @@ pub trait Layer<T: Real>: Send + Sync {
         let Some(act) = self.activation() else {
             return false;
         };
-        for (d, &v) in out.iter_mut().zip(tape.value(x).data()) {
+        let values = tape.value(x).data();
+        assert_eq!(
+            out.len(),
+            values.len(),
+            "Layer::local_derivative: out holds {} values but the input has {}",
+            out.len(),
+            values.len()
+        );
+        for (d, &v) in out.iter_mut().zip(values) {
             *d = act.df(v, act.f(v));
         }
         true

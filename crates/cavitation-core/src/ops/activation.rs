@@ -48,11 +48,6 @@ pub(crate) fn sigmoid_value<T: Real>(x: T) -> T {
     }
 }
 
-/// `max(x, 0)`; NaN stays NaN.
-pub(super) fn relu_value<T: Real>(x: T) -> T {
-    if x <= T::ZERO { T::ZERO } else { x }
-}
-
 /// The derivative of ReLU: 1 above 0, 0 at and below it, NaN for NaN.
 pub(super) fn relu_derivative<T: Real>(x: T) -> T {
     if x > T::ZERO {
@@ -255,7 +250,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0, 2.0]);
     /// ```
     pub fn relu(&mut self, x: Var) -> Var {
-        self.map(Op::Relu(x), x, relu_value)
+        self.map(Op::Relu(x), x, T::relu)
     }
 
     /// Records Leaky ReLU: `x` where `x > 0`, `slope · x` elsewhere. PyTorch's default slope

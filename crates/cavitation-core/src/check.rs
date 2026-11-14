@@ -132,9 +132,15 @@ pub fn gradcheck(
 /// Failures name checked tensors by position: the parameters that were in the store
 /// before the call come first, then the inputs.
 ///
+/// If `build` panics, or the check panics because `build` returned outputs of different
+/// sizes, the store is left as the panic found it: the inputs may still be in it as extra
+/// parameters, one value may still be moved by the step, and the gradients may hold the
+/// analytic pass. Rebuild the store (or keep a copy of it) before using it after a panic.
+///
 /// # Panics
 ///
-/// Panics if `build` returns outputs of different sizes on different calls.
+/// Panics if `build` returns outputs of different sizes on different calls, and when
+/// `build` panics.
 ///
 /// ```
 /// use cavitation_core::{gradcheck_params, ParamStore, Tensor};
