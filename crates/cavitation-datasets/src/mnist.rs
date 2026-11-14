@@ -24,13 +24,14 @@ fn read(path: &Path) -> Result<Vec<u8>, Error> {
 }
 
 /// Splits an IDX file into its dimensions and payload, checking the magic number (2049
-/// for labels, 2051 for images), the number of dimensions and the payload length.
-fn parse_idx(
+/// for labels, 2051 for images), the number of dimensions and the payload length. The
+/// payload is borrowed from `bytes`, not copied.
+fn parse_idx<'a>(
     path: &Path,
-    bytes: &[u8],
+    bytes: &'a [u8],
     magic: u32,
     dims: usize,
-) -> Result<(Vec<usize>, Vec<u8>), Error> {
+) -> Result<(Vec<usize>, &'a [u8]), Error> {
     let bad = |what: String| Error::Format(format!("{}: {what}", path.display()));
     let header = 4 + 4 * dims;
     if bytes.len() < header {
@@ -55,7 +56,7 @@ fn parse_idx(
             bytes.len() - header
         )));
     }
-    Ok((sizes, bytes[header..].to_vec()))
+    Ok((sizes, &bytes[header..]))
 }
 
 /// The side of an MNIST image, in pixels.
@@ -65,8 +66,10 @@ const SIDE: usize = 28;
 fn load_split(dir: &Path, prefix: &str) -> Result<Dataset, Error> {
     let images_path = dir.join(format!("{prefix}-images-idx3-ubyte"));
     let labels_path = dir.join(format!("{prefix}-labels-idx1-ubyte"));
-    let (image_dims, pixels) = parse_idx(&images_path, &read(&images_path)?, 2051, 3)?;
-    let (label_dims, labels) = parse_idx(&labels_path, &read(&labels_path)?, 2049, 1)?;
+    let image_file = read(&images_path)?;
+    let label_file = read(&labels_path)?;
+    let (image_dims, pixels) = parse_idx(&images_path, &image_file, 2051, 3)?;
+    let (label_dims, labels) = parse_idx(&labels_path, &label_file, 2049, 1)?;
     // MNIST's images are 28 by 28; checking the size here also bounds `rows · cols` when
     // the file holds no image, so the product below cannot overflow.
     if image_dims[1..] != [SIDE, SIDE] {
@@ -281,14 +284,14 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// If the real MNIST files are present, they load with the standard sizes.
+    /// The real MNIST files in `data/mnist` load with the standard sizes. Ignored by default
+    /// because the files are not in the repository; with `--ignored` and no files it fails,
+    /// saying how to download them.
     #[test]
-    fn mnist_real_files_if_present() {
+    #[ignore = "needs the MNIST files: run scripts/data/get-mnist.sh, then this test with --ignored"]
+    fn mnist_real_files() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/mnist");
-        if !dir.join("train-images-idx3-ubyte").exists() {
-            return;
-        }
-        let (train, test) = load(&dir).unwrap();
+        let (train, test) = load(&dir).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!((train.len(), test.len()), (60_000, 10_000));
         assert_eq!(train.features(), 784);
     }
