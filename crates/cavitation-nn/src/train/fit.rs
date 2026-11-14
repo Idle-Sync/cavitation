@@ -260,6 +260,9 @@ pub struct Trainer<'s> {
     batch: Option<Batch<f32>>,
     /// The number of steps taken.
     steps: u64,
+    /// The seed of the random draws layers make in training, such as dropout's masks; with
+    /// the step's number it seeds each step's [training tape](Graph::training_tape).
+    dropout_seed: u64,
     /// The number of those steps whose update was left out under
     /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip).
     skipped: u64,
@@ -318,6 +321,7 @@ impl<'s> Trainer<'s> {
             batch_size: batch,
             batch: None,
             steps: 0,
+            dropout_seed: 0,
             skipped: 0,
             health: HealthMonitor::new(Health::default()).with_loss(loss),
             names: model.parameter_names(),
@@ -341,6 +345,38 @@ impl<'s> Trainer<'s> {
     /// ```
     pub fn set_health(&mut self, health: Health<'s>) {
         self.health = HealthMonitor::new(health).with_loss(self.loss);
+    }
+
+    /// Sets the seed of the random draws layers make while training, such as
+    /// [`Dropout`](crate::Dropout)'s masks: each step records on a
+    /// [training tape](Graph::training_tape) seeded with `seed` and the step's number. The
+    /// default is 0; [`fit`] sets [`FitConfig::dropout_seed`].
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 8);
+    /// trainer.set_dropout_seed(42);
+    /// assert_eq!(trainer.dropout_seed(), 42);
+    /// ```
+    pub fn set_dropout_seed(&mut self, seed: u64) {
+        self.dropout_seed = seed;
+    }
+
+    /// The seed of the random draws layers make while training
+    /// ([`set_dropout_seed`](Self::set_dropout_seed)).
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// assert_eq!(Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 8).dropout_seed(), 0);
+    /// ```
+    pub fn dropout_seed(&self) -> u64 {
+        self.dropout_seed
     }
 
     /// Ends epoch `epoch` of the health checks ([`HealthMonitor::end_epoch`]: the dead-neuron
@@ -499,7 +535,9 @@ impl<'s> Trainer<'s> {
         self.profiler.valid = false;
         let start = profiling.then(Instant::now);
         let (value, mut checked) = {
-            let mut tape = self.graph.tape(&params.values);
+            let mut tape = self
+                .graph
+                .training_tape(&params.values, self.dropout_seed, step);
             let x = tape.input(batch.x);
             self.trace.set_timing(profiling);
             let out = model.forward_traced(&mut tape, x, &mut self.trace);
@@ -1716,6 +1754,12 @@ pub struct FitConfig<'s> {
     pub loss: Loss,
     /// The seed that shuffles the rows each epoch; `None` keeps the data's order.
     pub shuffle_seed: Option<u64>,
+    /// The seed of the random draws layers make while training, such as
+    /// [`Dropout`](crate::Dropout)'s masks ([`Trainer::set_dropout_seed`]); independent of
+    /// `shuffle_seed`. Each `fit` call numbers its steps from 1, so two calls with the same
+    /// seed draw the same masks step for step; give a later call another seed to continue
+    /// with fresh masks.
+    pub dropout_seed: u64,
     /// How the learning rate changes from step to step or epoch to epoch, with the
     /// optimiser's rate as its peak.
     pub schedule: LrSchedule,
@@ -1740,8 +1784,8 @@ pub struct FitConfig<'s> {
 }
 
 impl Default for FitConfig<'_> {
-    /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, the
-    /// default health checks, no callback, no validation set.
+    /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, dropout
+    /// seed 0, the default health checks, no callback, no validation set.
     fn default() -> Self {
         FitConfig {
             epochs: 10,
@@ -1752,6 +1796,7 @@ impl Default for FitConfig<'_> {
             },
             loss: Loss::CrossEntropy,
             shuffle_seed: Some(0),
+            dropout_seed: 0,
             schedule: LrSchedule::Constant,
             health: Health::default(),
             on_epoch: None,
@@ -1770,6 +1815,7 @@ impl fmt::Debug for FitConfig<'_> {
             .field("optimizer", &self.optimizer)
             .field("loss", &self.loss)
             .field("shuffle_seed", &self.shuffle_seed)
+            .field("dropout_seed", &self.dropout_seed)
             .field("schedule", &self.schedule)
             .field("health", &self.health)
             .field("on_epoch", &self.on_epoch.as_ref().map(|_| "FnMut"))
@@ -2162,6 +2208,7 @@ fn run_fit(
         .then(|| Evaluator::new(run.model(), params, config.loss, config.batch))
         .transpose()?;
     trainer.set_health(config.health);
+    trainer.set_dropout_seed(config.dropout_seed);
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut history = History {
         epochs: Vec::with_capacity(config.epochs.min(1024)),
@@ -2409,6 +2456,7 @@ mod tests {
             },
             loss: Loss::Mse,
             shuffle_seed: None,
+            dropout_seed: 0,
             schedule: LrSchedule::Constant,
             health: Health::default(),
             on_epoch: None,
@@ -4615,5 +4663,76 @@ mod tests {
         assert!(history.epochs[0].validation.is_some());
         assert_eq!(history.epochs[1].rows, 32);
         assert!(history.epochs[1].validation.is_none());
+    }
+
+    /// A layer that counts the forward passes it records in training and in evaluation mode,
+    /// and passes its input through.
+    struct ModeProbe {
+        /// Forward passes recorded on a training tape.
+        training: Arc<AtomicUsize>,
+        /// Forward passes recorded on an evaluation tape.
+        evaluation: Arc<AtomicUsize>,
+    }
+
+    impl Layer<f32> for ModeProbe {
+        /// Returns `"mode_probe"`.
+        fn name(&self) -> &str {
+            "mode_probe"
+        }
+        /// Keeps the width.
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        /// Counts the pass under the tape's mode and returns `x`.
+        fn forward(&self, tape: &mut Tape<'_, f32>, x: Var) -> Var {
+            let counter = if tape.is_training() {
+                &self.training
+            } else {
+                &self.evaluation
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+            x
+        }
+        /// No parameters.
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+    }
+
+    /// `fit` records every step on a training tape and its held-out validation on
+    /// evaluation tapes; `evaluate` records on evaluation tapes only.
+    #[test]
+    fn fit_trains_in_training_mode_and_evaluates_in_evaluation_mode() {
+        let training = Arc::new(AtomicUsize::new(0));
+        let evaluation = Arc::new(AtomicUsize::new(0));
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 3, 10, &mut Rng::seed(0)))
+            .push(ModeProbe {
+                training: Arc::clone(&training),
+                evaluation: Arc::clone(&evaluation),
+            });
+        let data = classes_dataset(8);
+        let config = FitConfig {
+            epochs: 2,
+            batch: 4,
+            validation: Some(classes_dataset(4)),
+            health: Health::quiet(),
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(
+            training.load(Ordering::Relaxed),
+            4,
+            "two epochs of two steps"
+        );
+        let after_fit = evaluation.load(Ordering::Relaxed);
+        assert!(
+            after_fit > 0,
+            "the validation set is measured on evaluation tapes"
+        );
+        crate::evaluate(&net, &params, &data, Loss::CrossEntropy, 4).unwrap();
+        assert_eq!(training.load(Ordering::Relaxed), 4);
+        assert!(evaluation.load(Ordering::Relaxed) > after_fit);
     }
 }

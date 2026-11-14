@@ -70,6 +70,7 @@ fn fit_config(epochs: usize) -> FitConfig<'static> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(3),
+        dropout_seed: 0,
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,

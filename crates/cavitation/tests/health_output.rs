@@ -63,6 +63,7 @@ fn train_digits(optimizer: OptimizerConfig, epochs: usize) {
         optimizer,
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        dropout_seed: 0,
         schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: None,

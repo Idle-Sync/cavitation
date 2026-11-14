@@ -7,6 +7,7 @@
 
 mod activation;
 mod custom;
+mod dropout;
 mod elementwise;
 mod erf;
 mod glu;

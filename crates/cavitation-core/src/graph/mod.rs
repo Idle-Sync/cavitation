@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::ops::Op;
-use crate::{Real, Shape, TensorView};
+use crate::{Real, Shape, SplitMix64, TensorView};
 use pool::Pool;
 
 /// The id the next [`Tape`] gets, so variables from one tape are recognised on another.
@@ -349,7 +349,42 @@ impl<T: Real> Graph<T> {
     /// let v = tape.param(p);
     /// assert_eq!(tape.value(v).data(), &[3.0, 3.0]);
     /// ```
+    ///
+    /// The tape records in evaluation mode: layers that act differently while training, such
+    /// as dropout, act as they do at inference. A training step opens its tape with
+    /// [`training_tape`](Self::training_tape) instead.
     pub fn tape<'g>(&'g mut self, params: &'g ParamValues<T>) -> Tape<'g, T> {
+        self.open(params, None)
+    }
+
+    /// Starts recording a training step: like [`tape`](Self::tape), with the tape in
+    /// training mode. `seed` and `step` (the step's number in the run) seed the random draws
+    /// of the operations that make any, such as dropout, through
+    /// [`Tape::stream_seed`], so the same seed and step give the same draws on every machine
+    /// and for any thread count.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// assert!(graph.training_tape(&store.values, 0, 1).is_training());
+    /// assert!(!graph.tape(&store.values).is_training());
+    /// ```
+    pub fn training_tape<'g>(
+        &'g mut self,
+        params: &'g ParamValues<T>,
+        seed: u64,
+        step: u64,
+    ) -> Tape<'g, T> {
+        self.open(params, Some(Training { seed, step }))
+    }
+
+    /// The work of [`tape`](Self::tape) and [`training_tape`](Self::training_tape).
+    fn open<'g>(
+        &'g mut self,
+        params: &'g ParamValues<T>,
+        training: Option<Training>,
+    ) -> Tape<'g, T> {
         // A tape that was leaked instead of dropped leaves its nodes behind.
         self.reclaim();
         Tape {
@@ -357,6 +392,8 @@ impl<T: Real> Graph<T> {
             params,
             id: NEXT_TAPE_ID.fetch_add(1, Ordering::Relaxed),
             clamped_logs: 0,
+            training,
+            streams: 0,
         }
     }
 
@@ -413,6 +450,25 @@ pub struct Tape<'g, T: Real = f32> {
     id: u32,
     /// How many logarithms `binary_cross_entropy` has clamped on this tape.
     clamped_logs: usize,
+    /// The seed and step of a training tape; `None` for a tape in evaluation mode.
+    training: Option<Training>,
+    /// How many random streams [`Tape::next_stream`] has handed out on this tape.
+    streams: u64,
+}
+
+/// What a training tape seeds its random draws with: the run's seed and the step's number.
+#[derive(Clone, Copy, Debug)]
+struct Training {
+    /// The run's seed.
+    seed: u64,
+    /// The step's number in the run.
+    step: u64,
+}
+
+/// One SplitMix64 output for `seed`: a well-mixed 64-bit value, so that seeds differing in
+/// one bit give unrelated results.
+fn mix(seed: u64) -> u64 {
+    SplitMix64::new(seed).next_u64()
 }
 
 impl<T: Real> Tape<'_, T> {
@@ -855,6 +911,61 @@ impl<T: Real> Tape<'_, T> {
         self.clamped_logs
     }
 
+    /// Whether this tape records a training step ([`Graph::training_tape`]) rather than an
+    /// evaluation ([`Graph::tape`]).
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// assert!(!graph.tape(&store.values).is_training());
+    /// ```
+    pub fn is_training(&self) -> bool {
+        self.training.is_some()
+    }
+
+    /// The seed of random stream `stream` on this training tape: a value that depends on
+    /// the tape's seed, its step and `stream` together, so each layer that draws (with a
+    /// stream id of its own) gets draws unrelated to every other layer's and every other
+    /// step's, and the same on every machine. `None` on a tape in evaluation mode, which
+    /// makes no random draws.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let a = graph.training_tape(&store.values, 7, 1).stream_seed(0);
+    /// let b = graph.training_tape(&store.values, 7, 1).stream_seed(0);
+    /// let c = graph.training_tape(&store.values, 7, 2).stream_seed(0);
+    /// assert_eq!(a, b);
+    /// assert_ne!(a, c);
+    /// assert_eq!(graph.tape(&store.values).stream_seed(0), None);
+    /// ```
+    pub fn stream_seed(&self, stream: u64) -> Option<u64> {
+        self.training
+            .map(|t| mix(mix(mix(t.seed) ^ t.step) ^ stream))
+    }
+
+    /// A stream id no earlier call on this tape returned: 0, then 1, and so on, in the order
+    /// of the calls. A layer that draws random numbers, such as dropout, takes one per
+    /// forward pass and passes it to [`stream_seed`](Self::stream_seed) (or to
+    /// [`dropout`](Self::dropout)), so its draws depend only on the run's seed, the step and
+    /// how many drawing layers ran before it on this tape, not on how many nodes they or
+    /// hooks recorded.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.training_tape(&store.values, 0, 1);
+    /// assert_eq!((tape.next_stream(), tape.next_stream()), (0, 1));
+    /// ```
+    pub fn next_stream(&mut self) -> u64 {
+        let id = self.streams;
+        self.streams += 1;
+        id
+    }
+
     /// Copies `labels` into the graph's label buffer, which keeps its capacity from step to
     /// step, and returns where they start.
     pub(crate) fn push_labels(&mut self, labels: &[usize]) -> usize {
@@ -1183,5 +1294,46 @@ mod tests {
         let message = message.downcast_ref::<String>().unwrap();
         assert!(message.contains("its gradient has shape [2]"), "{message}");
         assert!(store.grads.is_stale(p));
+    }
+
+    /// A tape from `Graph::tape` is in evaluation mode and has no random streams; a training
+    /// tape is in training mode, keeps that mode for its whole life, and the next plain tape
+    /// of the same graph is back in evaluation mode.
+    #[test]
+    fn tapes_report_their_mode() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let tape = graph.tape(&store.values);
+        assert!(!tape.is_training());
+        assert_eq!(tape.stream_seed(3), None);
+        drop(tape);
+        let mut tape = graph.training_tape(&store.values, 1, 1);
+        let x = crate::Tensor::full(&[2], 1.0f32);
+        let v = tape.input(x.view());
+        tape.add(v, v);
+        assert!(tape.is_training());
+        drop(tape);
+        assert!(!graph.tape(&store.values).is_training());
+    }
+
+    /// A stream's seed changes when the run's seed, the step or the stream changes, each on
+    /// its own, and is the same for the same three.
+    #[test]
+    fn stream_seed_depends_on_seed_step_and_stream() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut seed = |s, step, stream| {
+            graph
+                .training_tape(&store.values, s, step)
+                .stream_seed(stream)
+                .unwrap()
+        };
+        let base = seed(5, 10, 2);
+        assert_eq!(base, seed(5, 10, 2));
+        for other in [seed(6, 10, 2), seed(5, 11, 2), seed(5, 10, 3)] {
+            assert_ne!(other, base);
+        }
+        // Swapping the step and the stream does not give the same seed.
+        assert_ne!(seed(5, 2, 10), base);
     }
 }

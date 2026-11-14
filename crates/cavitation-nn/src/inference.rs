@@ -39,6 +39,7 @@ use crate::{Activation, ActivationKind, NeuronMask, Sequential};
 /// assert!(matches!(form, Some(InferenceLayer::Activation(ActivationKind::Tanh))));
 /// ```
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum InferenceLayer {
     /// A fully connected layer, `y = x · w_t + bias`, or `y = x · w_t` without a bias.
     Linear {
@@ -64,6 +65,8 @@ pub enum InferenceLayer {
     /// A neuron mask: one value per column, 0 to set the column to exactly 0 and anything
     /// else to keep it.
     Mask(Vec<f32>),
+    /// A layer that passes its input through at inference: `Dropout`, `Flatten`, `Identity`.
+    Identity,
 }
 
 /// The closure [`InferenceModel::infer_batch_observed`] calls with each layer's index and
@@ -1432,6 +1435,7 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
             }
         }
         InferenceLayer::Mask(keep) => apply_mask(keep, data, width),
+        InferenceLayer::Identity => {}
         InferenceLayer::Linear { .. }
         | InferenceLayer::Glu(_)
         | InferenceLayer::Softmax
@@ -1873,6 +1877,9 @@ pub(crate) mod tests {
             Box::new(|_| Box::new(Hardsigmoid)),
             Box::new(|_| Box::new(Hardswish)),
             Box::new(|_| Box::new(LogSigmoid)),
+            Box::new(|_| Box::new(crate::Dropout::new(0.5).unwrap())),
+            Box::new(|_| Box::new(crate::Flatten)),
+            Box::new(|_| Box::new(crate::Identity)),
             Box::new(|_| Box::new(ActivationLayer::new(ActivationKind::Silu))),
             Box::new(|p| Box::new(Prelu::new(p, 1))),
             Box::new(|p| {

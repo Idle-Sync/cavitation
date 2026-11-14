@@ -50,6 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         loss: Loss::CrossEntropy,
         shuffle_seed: Some(7),
+        dropout_seed: 0,
         schedule: LrSchedule::Constant,
         health,
         on_epoch: Some(Box::new(

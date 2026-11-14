@@ -350,20 +350,21 @@ impl<'a> LoadOptions<'a> {
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng};
-/// use cavitation_nn::{Linear, LoadOptions, Relu, Sequential, load, load_with, save};
+/// use cavitation_nn::{Dropout, Linear, LoadOptions, Relu, Sequential, load, load_with, save};
 ///
-/// // A file from a PyTorch model that has a `Dropout` after each ReLU. Relu layers stand in
-/// // for the Dropouts here, since they have no parameters either: the Linear layers sit at
-/// // indices 0, 3 and 6, so the file's keys are `0.*`, `3.*` and `6.*`.
+/// // A file from a PyTorch model that has a `Dropout` after each ReLU: the Linear layers sit
+/// // at indices 0, 3 and 6, so the file's keys are `0.*`, `3.*` and `6.*`. (Keeping the
+/// // `Dropout` layers in the model, as here, keeps those indices; a model that leaves them
+/// // out needs the keys renamed, as below.)
 /// let mut file_params = ParamStore::new();
 /// let mut rng = Rng::seed(0);
 /// let in_file = Sequential::new()
 ///     .push(Linear::new(&mut file_params, 2, 3, &mut rng))
 ///     .push(Relu)
-///     .push(Relu)
+///     .push(Dropout::new(0.5).unwrap())
 ///     .push(Linear::new(&mut file_params, 3, 3, &mut rng))
 ///     .push(Relu)
-///     .push(Relu)
+///     .push(Dropout::new(0.5).unwrap())
 ///     .push(Linear::new(&mut file_params, 3, 1, &mut rng));
 /// let path = std::env::temp_dir()
 ///     .join(format!("cavitation-doc-load-with-{}.safetensors", std::process::id()));

@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use cavitation_core::{Graph, ParamGrads, ParamStore, Reduction, Rng, Tensor, TensorView, Var};
 use cavitation_nn::{
-    Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats,
-    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, OnNonFinite, Optimizer, Relu,
-    Sequential, Sgd, Targets, TargetsView, Trace, Trainer, Warning,
+    Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Dropout, Evaluator,
+    GradStats, Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, OnNonFinite,
+    Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -253,6 +253,50 @@ fn training_step() -> usize {
         assert!(sink.is_finite() && sink > 0.0);
     }
     made
+}
+
+/// The `training_step` scenario with Adam on the 50k network with dropout (p = 0.2) after
+/// each ReLU: drawing the masks on each step's training tape allocates nothing either.
+fn dropout_training_step() -> usize {
+    let data = synthetic_1437();
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(1);
+    let mut he = |inputs, outputs| {
+        Linear::with_init(
+            &mut params,
+            inputs,
+            outputs,
+            Init::HeUniform,
+            Init::Zeros,
+            &mut rng,
+        )
+    };
+    let net = Sequential::new()
+        .push(he(64, 256))
+        .push(Relu)
+        .push(Dropout::new(0.2).unwrap())
+        .push(he(256, 128))
+        .push(Relu)
+        .push(Dropout::new(0.2).unwrap())
+        .push(he(128, 10));
+    let mut trainer = Trainer::new(&net, Adam::new(1e-3), Loss::CrossEntropy, 128);
+    trainer.set_dropout_seed(5);
+    let mut batcher = Batcher::new(data.len(), 128, Some(3));
+    let mut batch = Batch::new(&data, 128);
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for epoch in 0..2 {
+        if epoch == 1 {
+            before = allocations();
+        }
+        batcher.epoch();
+        for range in batcher.batches() {
+            let view = batcher.gather(&data, range, &mut batch);
+            sink += trainer.step(&net, &mut params, view).unwrap();
+        }
+    }
+    assert!(sink.is_finite() && sink > 0.0);
+    allocations() - before
 }
 
 /// The manual training loop on the 50k network and the 1,437-row set at batch 128, with SGD
@@ -1253,11 +1297,12 @@ fn fit_validation_tape_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 25] = [
+    let scenarios: [Scenario; 26] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
         ("training_step", training_step),
+        ("dropout_training_step", dropout_training_step),
         ("manual_loop", manual_loop),
         ("no_hooks_no_cost", no_hooks_no_cost),
         ("masked_training_step", masked_training_step),
