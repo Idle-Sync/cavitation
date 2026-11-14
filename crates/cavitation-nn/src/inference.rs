@@ -14,11 +14,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
+use cavitation_core::kernels::activation::{
+    gelu_tanh_f32_with, sigmoid_f32_with, silu_f32_with, tanh_f32_with,
+};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
-use cavitation_core::{Error, Gate, ParamStore, TensorView, log_softmax_row, softmax_row};
+use cavitation_core::{
+    Error, Gate, GeluApprox, ParamStore, Real, TensorView, log_softmax_row, softmax_row,
+};
 
 use crate::{Activation, ActivationKind, NeuronMask, Sequential};
 
@@ -1268,14 +1272,16 @@ impl Run {
                     if cur.is_none() {
                         bufs[c][..n_in].copy_from_slice(&input[..n_in]);
                     }
-                    // In place: output (r, k) is written after its two inputs (r, k) and
-                    // (r, half + k) are read, and every later read is further along.
+                    // In place: row r's gate half becomes its gate values (that half is read
+                    // by row r only), then output (r, k) is written after its two inputs
+                    // (r, k) and (r, half + k) are read, and every later read is further along.
                     let buf = &mut bufs[c];
                     for r in 0..rows {
+                        gate_in_place(self.level, *gate, &mut buf[r * width + half..][..half]);
                         for k in 0..half {
                             let a = buf[r * width + k];
-                            let b = buf[r * width + half + k];
-                            buf[r * half + k] = a * gate_value(*gate, b);
+                            let g = buf[r * width + half + k];
+                            buf[r * half + k] = a * g;
                         }
                     }
                     cur = Some(c);
@@ -1322,7 +1328,7 @@ impl Run {
             (Some(bias), true) => {
                 for row in dst.chunks_exact_mut(outputs) {
                     for (o, &b) in row.iter_mut().zip(bias) {
-                        *o = relu_value(*o + b);
+                        *o = Real::relu(*o + b);
                     }
                 }
             }
@@ -1335,7 +1341,7 @@ impl Run {
             }
             (None, true) => {
                 for o in dst.iter_mut() {
-                    *o = relu_value(*o);
+                    *o = Real::relu(*o);
                 }
             }
             (None, false) => {}
@@ -1368,21 +1374,20 @@ fn apply_mask(keep: &[f32], data: &mut [f32], width: usize) {
     }
 }
 
-/// ReLU as the ReLU layer computes it: 0 at or below 0, `v` above, NaN stays NaN.
-fn relu_value(v: f32) -> f32 {
-    if v <= 0.0 { 0.0 } else { v }
-}
-
-/// The value of a gated linear unit's gate at `x`, as the tape computes it: its sigmoid gate
-/// is the scalar sigmoid, not the SIMD kernel of the `Sigmoid` layer.
-fn gate_value(gate: Gate, x: f32) -> f32 {
+/// Replaces every value with a gated linear unit's gate at it, as the tape computes it:
+/// the sigmoid, SiLU and tanh-GELU gates on the SIMD kernels of `level`, the others one
+/// value at a time.
+fn gate_in_place(level: Level, gate: Gate, values: &mut [f32]) {
     let kind = match gate {
-        Gate::Sigmoid => return crate::activation::sigmoid(x),
+        Gate::Sigmoid => return sigmoid_f32_with(level, values),
+        Gate::Silu => return silu_f32_with(level, values),
+        Gate::Gelu(GeluApprox::Tanh) => return gelu_tanh_f32_with(level, values),
         Gate::Gelu(approx) => ActivationKind::Gelu(approx),
         Gate::Relu => ActivationKind::Relu,
-        Gate::Silu => ActivationKind::Silu,
     };
-    Activation::<f32>::f(&kind, x)
+    for v in values {
+        *v = Activation::<f32>::f(&kind, *v);
+    }
 }
 
 /// Applies a step that keeps the width to `data` in place, `width` values per row; `tanh`
@@ -1391,11 +1396,15 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
     match form {
         InferenceLayer::Activation(ActivationKind::Relu) => {
             for v in data.iter_mut() {
-                *v = relu_value(*v);
+                *v = Real::relu(*v);
             }
         }
         InferenceLayer::Activation(ActivationKind::Tanh) => tanh_f32_with(level, data),
         InferenceLayer::Activation(ActivationKind::Sigmoid) => sigmoid_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Silu) => silu_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Gelu(GeluApprox::Tanh)) => {
+            gelu_tanh_f32_with(level, data)
+        }
         InferenceLayer::Activation(kind) => {
             for v in data.iter_mut() {
                 *v = Activation::<f32>::f(kind, *v);

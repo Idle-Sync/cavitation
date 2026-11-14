@@ -15,44 +15,9 @@ use cavitation::cavitation_nn::shrink::{
     FromScratch, ShrinkConfig, Validation, ablate, compact, shrink, train_found_size,
 };
 use cavitation::prelude::*;
-
-/// The known-result network for the digits: He uniform weights, zero biases, `Rng::seed(seed)`,
-/// with the given hidden widths.
-fn network(params: &mut ParamStore, hidden: [usize; 2], seed: u64) -> Sequential {
-    let mut rng = Rng::seed(seed);
-    let mut he = |inputs, outputs| {
-        Linear::with_init(
-            params,
-            inputs,
-            outputs,
-            Init::HeUniform,
-            Init::Zeros,
-            &mut rng,
-        )
-    };
-    Sequential::new()
-        .push(he(64, hidden[0]))
-        .push(Relu)
-        .push(he(hidden[0], hidden[1]))
-        .push(Relu)
-        .push(he(hidden[1], 10))
-}
-
-/// The known result's recipe for `epochs` epochs (20 in the known result): Adam at 0.002,
-/// batch 32, shuffle seed 7.
-fn recipe(epochs: usize) -> FitConfig<'static> {
-    FitConfig {
-        epochs,
-        batch: 32,
-        optimizer: OptimizerConfig::Adam {
-            lr: 0.002,
-            weight_decay: 0.0,
-        },
-        shuffle_seed: Some(7),
-        health: Health::quiet(),
-        ..FitConfig::default()
-    }
-}
+// The known result's network and recipe, shared with its test and the shrink benchmark:
+// He uniform weights and zero biases from a seed; Adam at 0.002, batch 32, shuffle seed 7.
+use cavitation_datasets::digits::{self, network, recipe};
 
 /// Trains `net` on `data` with the known result's recipe for `epochs` epochs.
 fn train(
@@ -105,11 +70,11 @@ fn ablation(net: &mut Sequential, params: &ParamStore, held_out: &Dataset) -> Re
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flag = |name: &str| std::env::args().any(|a| a == name);
     let (ablate_first, lottery) = (flag("--ablate"), flag("--lottery"));
-    let (all_train, test) = cavitation_datasets::digits::load()?;
+    let (all_train, test) = digits::load()?;
     // Hold out the last 288 training rows before the first training: the stop rule must be
     // measured on rows the network has never seen. The test set is only used at the end.
     // ANCHOR: split
-    let (train_rows, held_out) = all_train.split_at(1149);
+    let (train_rows, held_out) = all_train.split_at(digits::FIT_ROWS);
     // ANCHOR_END: split
 
     let mut params = ParamStore::new();

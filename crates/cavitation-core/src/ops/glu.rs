@@ -3,8 +3,8 @@
 use crate::graph::{BackwardCtx, Var};
 use crate::ops::Op;
 use crate::ops::activation::{
-    GeluApprox, gelu_derivative, gelu_value, relu_derivative, relu_value, sigmoid_value,
-    silu_derivative, silu_value,
+    GeluApprox, gelu_derivative, gelu_value, relu_derivative, sigmoid_value, silu_derivative,
+    silu_value,
 };
 use crate::{Real, Tape};
 
@@ -29,12 +29,28 @@ pub enum Gate {
 }
 
 impl Gate {
+    /// Replaces every value with the gate's value at it: the sigmoid, SiLU and the tanh form
+    /// of GELU through [`Real::sigmoid_in_place`], [`Real::silu_in_place`] and
+    /// [`Real::gelu_tanh_in_place`] (the SIMD kernels in f32), the others one value at a time.
+    fn apply_in_place<T: Real>(self, values: &mut [T]) {
+        match self {
+            Gate::Sigmoid => T::sigmoid_in_place(values),
+            Gate::Silu => T::silu_in_place(values),
+            Gate::Gelu(GeluApprox::Tanh) => T::gelu_tanh_in_place(values),
+            Gate::Gelu(GeluApprox::Exact) | Gate::Relu => {
+                for v in values {
+                    *v = self.value(*v);
+                }
+            }
+        }
+    }
+
     /// The gate's value at `x`.
     fn value<T: Real>(self, x: T) -> T {
         match self {
             Gate::Sigmoid => sigmoid_value(x),
             Gate::Gelu(approx) => gelu_value(x, approx),
-            Gate::Relu => relu_value(x),
+            Gate::Relu => x.relu(),
             Gate::Silu => silu_value(x),
         }
     }
@@ -86,7 +102,7 @@ impl<T: Real> Tape<'_, T> {
         );
         let width = dims[dims.len() - 1];
         let half = width / 2;
-        let mut dims_out = [0usize; 6];
+        let mut dims_out = [0usize; crate::Shape::MAX_RANK];
         dims_out[..dims.len()].copy_from_slice(dims);
         dims_out[dims.len() - 1] = half;
         let out_shape = crate::Shape::new(&dims_out[..dims.len()]);
@@ -97,8 +113,10 @@ impl<T: Real> Tape<'_, T> {
                 .zip(self.data(x).chunks_exact(width))
             {
                 let (a, b) = row.split_at(half);
-                for ((o, &a), &b) in o.iter_mut().zip(a).zip(b) {
-                    *o = a * gate.value(b);
+                o.copy_from_slice(b);
+                gate.apply_in_place(o);
+                for (o, &a) in o.iter_mut().zip(a) {
+                    *o = a * *o;
                 }
             }
         }

@@ -87,7 +87,7 @@ pub use health::{BadInput, Health, HealthMonitor, OnNonFinite, StepInputs, Warni
 pub use hooks::{HookId, Hooks, LayerEvent};
 pub use inference::{InferenceLayer, InferenceModel};
 pub use init::Init;
-pub use io::{LoadOptions, load, load_lenient, load_with, save};
+pub use io::{LoadOptions, TensorInfo, inspect_file, load, load_lenient, load_with, save};
 pub use layer::Layer;
 pub use linear::Linear;
 pub use mask::NeuronMask;

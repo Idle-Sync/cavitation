@@ -79,7 +79,7 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// assert_eq!(config.loss, Loss::CrossEntropy);
 /// assert!(format!("{config:?}").contains("CrossEntropy"));
 /// ```
-pub struct ExploreConfig {
+pub struct ExploreConfig<'s> {
     /// The loss the probe and the ranking measure with: the one the network was trained
     /// with.
     pub loss: Loss,
@@ -89,16 +89,18 @@ pub struct ExploreConfig {
     pub train: Option<Dataset>,
     /// Builds a fresh shrink configuration for each `Shrink` command; its `on_step` is
     /// replaced by one that streams each level to the page and stops on `Cancel`. `None`
-    /// turns the shrink lab off.
+    /// turns the shrink lab off. The factory and what it builds are `Send` and may borrow
+    /// for `'s`, so an `ExploreConfig` can be made on another thread than the one that
+    /// explores.
     // The boxed factory is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
-    pub shrink: Option<Box<dyn FnMut() -> ShrinkConfig>>,
+    pub shrink: Option<Box<dyn FnMut() -> ShrinkConfig<'s> + Send + 's>>,
 }
 
-impl Default for ExploreConfig {
+impl Default for ExploreConfig<'_> {
     /// Cross-entropy, no training rows and no shrink factory: neuron switches and rankings
     /// work, and the shrink lab answers that it needs `train` and `shrink`.
-    fn default() -> ExploreConfig {
+    fn default() -> Self {
         ExploreConfig {
             loss: Loss::CrossEntropy,
             train: None,
@@ -107,7 +109,7 @@ impl Default for ExploreConfig {
     }
 }
 
-impl fmt::Debug for ExploreConfig {
+impl fmt::Debug for ExploreConfig<'_> {
     /// Writes the loss, the training rows' shape and whether there is a shrink factory.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ExploreConfig")
@@ -296,7 +298,7 @@ impl Explore<'_> {
         shared: &Arc<Shared>,
         model: &mut Sequential,
         params: &mut ParamStore,
-        config: &mut ExploreConfig,
+        config: &mut ExploreConfig<'_>,
     ) -> Next {
         match command {
             Command::SetMask { linear, neuron, on } => {
@@ -464,7 +466,7 @@ impl Explore<'_> {
         shared: &Arc<Shared>,
         model: &mut Sequential,
         params: &mut ParamStore,
-        config: &mut ExploreConfig,
+        config: &mut ExploreConfig<'_>,
     ) -> Next {
         let (train, factory) = match (config.train.as_ref(), config.shrink.as_mut()) {
             (Some(train), Some(factory)) => (train, factory),
@@ -672,7 +674,7 @@ impl Inspector {
         &mut self,
         model: &mut Sequential,
         params: &mut ParamStore,
-        mut config: ExploreConfig,
+        mut config: ExploreConfig<'_>,
     ) -> Result<(), Error> {
         let Inspector {
             config: settings,

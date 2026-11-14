@@ -567,6 +567,16 @@ impl<T: Real> Tape<'_, T> {
     /// passes without [`ParamStore::zero_grad`] add up. Calling it again on the same tape
     /// recomputes the intermediate gradients.
     ///
+    /// A loss that depends on no parameter (an input, or a value computed from inputs only)
+    /// has no gradient to write: the call writes nothing to `grads`, every parameter's
+    /// gradient keeps its state (stale after `zero_grad`, so an optimiser skips it), and it
+    /// returns normally.
+    ///
+    /// If an operation's backward pass panics (a [`CustomOp`](crate::CustomOp) of your own,
+    /// say), the gradients of the parameters reached before the panic have been written and
+    /// the others have not; call [`ParamStore::zero_grad`] before using them. The graph
+    /// stays usable: the next [`Graph::tape`] starts clean.
+    ///
     /// # Panics
     ///
     /// Panics if `loss` does not have exactly one element (the message names the loss and its
@@ -586,6 +596,16 @@ impl<T: Real> Tape<'_, T> {
     /// drop(tape);
     /// assert_eq!(store.grad(a).data(), &[1.0]);
     /// assert_eq!(store.grad(b).data(), &[1.0]);
+    ///
+    /// // A loss computed from an input alone writes no gradient.
+    /// store.zero_grad();
+    /// let x = Tensor::full(&[1], 5.0f32);
+    /// let mut tape = graph.tape(&store.values);
+    /// let vx = tape.input(x.view());
+    /// let only_input = tape.add(vx, vx);
+    /// tape.backward(only_input, &mut store.grads);
+    /// drop(tape);
+    /// assert!(store.grads.is_stale(a) && store.grads.is_stale(b));
     /// ```
     pub fn backward(&mut self, loss: Var, grads: &mut ParamGrads<T>) {
         let shape = self.shape(loss);
