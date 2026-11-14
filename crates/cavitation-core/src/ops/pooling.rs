@@ -249,7 +249,7 @@ mod tests {
                 Tensor::from_vec(distinct(2 * g.in_width(), k as u64), &[2, g.in_width()]).unwrap();
             let geom = *g;
             let mut store = ParamStore::<f64>::new_generic();
-            gradcheck_params(&mut store, &[x.clone()], |tape, v| {
+            gradcheck_params(&mut store, std::slice::from_ref(&x), |tape, v| {
                 let y = tape.max_pool2d(v[0], geom);
                 let t = tape.tanh(y);
                 tape.sum(t)
@@ -257,7 +257,7 @@ mod tests {
             .assert_passed();
             if geom.dilation() == (1, 1) {
                 for (include, over) in [(true, None), (false, None), (true, Some(5))] {
-                    gradcheck_params(&mut store, &[x.clone()], |tape, v| {
+                    gradcheck_params(&mut store, std::slice::from_ref(&x), |tape, v| {
                         let y = tape.avg_pool2d(v[0], geom, include, over);
                         let t = tape.tanh(y);
                         tape.sum(t)

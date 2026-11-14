@@ -5,10 +5,10 @@
 
 use cavitation_core::kernels::gemm::threads_used;
 use cavitation_core::kernels::{Level, level, set_threads};
-use cavitation_core::{Conv2dGeom, ParamStore, Rng, Tensor};
+use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng, Tensor};
 use cavitation_nn::{
-    Conv2d, Dataset, Dropout, FitConfig, Health, Init, Linear, Loss, LrSchedule, OptimizerConfig,
-    Relu, Sequential, Targets, fit,
+    Conv2d, Dataset, Dropout, FitConfig, Health, Init, Linear, Loss, LrSchedule, MaxPool2d,
+    OptimizerConfig, Relu, Sequential, Targets, fit,
 };
 
 /// The batch size of the run: large enough that every product of the step is split.
@@ -86,7 +86,8 @@ fn train() -> Vec<u32> {
 
 /// A small CNN on the same rows read as 1 × 8 × 8 images: a 3 × 3 convolution to 16
 /// channels with padding 1, ReLU, dropout, a 3 × 3 convolution to 16 channels with stride 2,
-/// ReLU and a `Linear` head, trained for one epoch; returns the bits of every parameter.
+/// ReLU, 2 × 2 max pooling and a `Linear` head, trained for one epoch; returns the bits of
+/// every parameter.
 fn train_cnn() -> Vec<u32> {
     let data = dataset();
     let mut params = ParamStore::new();
@@ -99,7 +100,8 @@ fn train_cnn() -> Vec<u32> {
         .push(Dropout::new(0.2).unwrap())
         .push(Conv2d::new(&mut params, g2, &mut rng))
         .push(Relu)
-        .push(Linear::new(&mut params, g2.out_width(), 10, &mut rng));
+        .push(MaxPool2d::new(Pool2dGeom::new(16, (4, 4), (2, 2)).unwrap()))
+        .push(Linear::new(&mut params, 16 * 2 * 2, 10, &mut rng));
     let config = FitConfig {
         epochs: 1,
         batch: BATCH,

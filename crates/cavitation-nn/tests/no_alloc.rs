@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cavitation_core::{
-    Conv2dGeom, Graph, ParamGrads, ParamStore, Reduction, Rng, Tensor, TensorView, Var,
+    Conv2dGeom, Graph, ParamGrads, ParamStore, Pool2dGeom, Reduction, Rng, Tensor, TensorView, Var,
 };
 use cavitation_nn::{
-    Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Conv2d, Dataset, Dropout, Evaluator,
-    GradStats, Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, OnNonFinite,
-    Optimizer, Relu, Sequential, Sgd, Targets, TargetsView, Trace, Trainer, Warning,
+    Activation, ActivationLayer, Adam, AdamW, AdaptiveAvgPool2d, AvgPool2d, Batch, Batcher, Conv2d,
+    Dataset, Dropout, Evaluator, GradStats, Health, Hooks, InferenceModel, Init, Linear, Loss,
+    MaxPool2d, NeuronMask, OnNonFinite, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView,
+    Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -302,7 +303,9 @@ fn dropout_training_step() -> usize {
 }
 
 /// A small CNN on 1,437 rows of 1 × 8 × 8 images (a 3 × 3 convolution to 8 channels with
-/// padding 1, ReLU, dropout, a 1 × 1 convolution to 4 channels, ReLU, a `Linear` head),
+/// padding 1, ReLU, 2 × 2 max pooling, dropout, a 1 × 1 convolution to 4 channels, ReLU,
+/// 3 × 3 average pooling with padding 1, adaptive average pooling to 2 × 2, a `Linear`
+/// head),
 /// trained with `Trainer::step` and Adam at batch 128: one warm-up epoch, then the
 /// allocations of a second; then `infer_batch` on the compiled model, after one warm-up call.
 fn conv_training_and_inference() -> usize {
@@ -310,14 +313,19 @@ fn conv_training_and_inference() -> usize {
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(2);
     let g1 = Conv2dGeom::with_options(1, 8, (8, 8), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
-    let g2 = Conv2dGeom::new(8, 4, (8, 8), (1, 1)).unwrap();
+    let pool = Pool2dGeom::new(8, (8, 8), (2, 2)).unwrap();
+    let g2 = Conv2dGeom::new(8, 4, (4, 4), (1, 1)).unwrap();
+    let avg = Pool2dGeom::with_options(4, (4, 4), (3, 3), (1, 1), (1, 1), (1, 1), false).unwrap();
     let net = Sequential::new()
         .push(Conv2d::new(&mut params, g1, &mut rng))
         .push(Relu)
+        .push(MaxPool2d::new(pool))
         .push(Dropout::new(0.1).unwrap())
         .push(Conv2d::new(&mut params, g2, &mut rng))
         .push(Relu)
-        .push(Linear::new(&mut params, g2.out_width(), 10, &mut rng));
+        .push(AvgPool2d::new(avg))
+        .push(AdaptiveAvgPool2d::new(4, (4, 4), (2, 2)).unwrap())
+        .push(Linear::new(&mut params, 16, 10, &mut rng));
     let mut trainer = Trainer::new(&net, Adam::new(1e-3), Loss::CrossEntropy, 128);
     let mut batcher = Batcher::new(data.len(), 128, Some(3));
     let mut batch = Batch::new(&data, 128);
