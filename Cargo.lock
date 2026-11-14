@@ -23,6 +23,7 @@ dependencies = [
  "cavitation-inspect",
  "cavitation-ml",
  "cavitation-nn",
+ "safetensors",
 ]
 
 [[package]]
