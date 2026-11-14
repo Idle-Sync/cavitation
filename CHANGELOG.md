@@ -29,6 +29,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- The inspector's `epoch` event carries the run's validation (`EpochReport::validation`: loss, and accuracy or R²) as `validation`, `null` without a validation set, and the page shows it under the accuracy and loss beside the probe evaluation.
 - `cavitation_datasets::mnist::load` reads each file's pixels and labels straight from the bytes read, instead of copying them into a second buffer first. The test that loads the real files is now ignored by default with its reason shown, rather than passing silently when the files are missing; run it with `cargo test --release -p cavitation-datasets -- --ignored mnist_real_files`, where missing files fail it with the download instructions.
 - The inspector page labels the epoch-end accuracy and loss as from training rows when no `probe` set is given, instead of always calling them held out; the docs of `InspectorConfig::eval_rows`, the `epoch` event's `evaluation` and the inspector chapter say the evaluation is held out only with a probe set and point to the `model` event's `probe_is_training`.
 - `cavitation_datasets::mnist::load` returns `Error::Format` naming the file for images that are not 28 by 28. Before, a header of 0 images with huge row and column counts passed the length check and gave a data set of shape `[0, rows · cols]`, where the product could overflow.

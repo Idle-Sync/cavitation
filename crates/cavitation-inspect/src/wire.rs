@@ -85,6 +85,12 @@
 //!   - `misclassified` (array of integers): up to 100 probe-row indices classified wrong,
 //!     in order, for the page's "show a mistake".
 //!   - `seconds` (number): the evaluation's own time.
+//! - `validation` (object or `null`): the run's validation set (`FitConfig::validation`)
+//!   measured after the epoch, as `EpochReport::validation` holds it, or `null` when the
+//!   run has none (or the epoch was cut short by a stop):
+//!   - `loss` (number or `null`): its mean loss; `null` when it is not finite.
+//!   - `accuracy` (number or `null`): the share classified right, for class targets.
+//!   - `r2` (number or `null`): the coefficient of determination, for value targets.
 //!
 //! # `probe`
 //!
@@ -519,7 +525,9 @@ pub struct EpochEvaluation<'a> {
     pub seconds: f64,
 }
 
-/// Writes the `epoch` event for `report`, of a run of `epochs` epochs.
+/// Writes the `epoch` event for `report`, of a run of `epochs` epochs, with the inspector's
+/// own `evaluation` of the probe rows (or `null`) and the run's `validation` from
+/// [`EpochReport::validation`].
 ///
 /// ```
 /// use cavitation_inspect::json::JsonWriter;
@@ -529,7 +537,7 @@ pub struct EpochEvaluation<'a> {
 ///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 64, seconds: 0.01, validation: None };
 /// let mut w = JsonWriter::new();
 /// wire::epoch(&mut w, &report, 3, None);
-/// assert!(w.as_str().ends_with(r#""evaluation":null}"#));
+/// assert!(w.as_str().ends_with(r#""evaluation":null,"validation":null}"#));
 /// ```
 pub fn epoch(
     w: &mut JsonWriter,
@@ -568,6 +576,19 @@ pub fn epoch(
                 w.uint(i as u64);
             }
             w.end_array().key("seconds").number(e.seconds).end_object();
+        }
+    }
+    w.key("validation");
+    match &report.validation {
+        None => {
+            w.null();
+        }
+        Some(v) => {
+            w.begin_object().key("loss").number(v.loss).key("accuracy");
+            number_or_null(w, v.accuracy);
+            w.key("r2");
+            number_or_null(w, v.r2);
+            w.end_object();
         }
     }
     w.end_object();

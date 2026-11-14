@@ -54,7 +54,7 @@ The top band is the run's speed and progress:
 
 - **samples/s**: training rows per second, counted over the training steps only, so the inspector's own work between steps and any pause are left out.
 - **GFLOPS**: that rate times the floating-point operations of one training row in the `Linear` layers.
-- **accuracy** and **loss**: the last evaluation on the probe rows (held out here, since `probe` is given), and the last batch's loss beside the evaluation's loss.
+- **accuracy** and **loss**: the last evaluation on the probe rows (held out here, since `probe` is given), and the last batch's loss beside the evaluation's loss. When the run has a validation set (`FitConfig::validation`), a second line under each shows its accuracy (or R²) and loss from the last epoch that measured it.
 - **epoch** and **steps**, with the learning rate.
 
 The evaluation runs at the end of an epoch, only while a page is connected, and only when the time since the last one is at least 200 times what that one took (`EVALUATION_FACTOR`), so it takes at most about 0.5% of the run. The last epoch always gets one, and when training ends the page gets one last snapshot, so it shows the final step and epoch. Here the evaluation rows are the test digits, which is fine for watching; to choose anything by them (when to stop, how far to shrink) you would hold out other rows instead, as the chapter on shrinking explains.
