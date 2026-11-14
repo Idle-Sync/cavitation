@@ -45,7 +45,10 @@ fn check_not_torch_save(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 /// Writes every parameter of `model` to `path` as an F32 safetensors file, each tensor
 /// named by [`Sequential::parameter_names`] (`0.weight`, `2.bias`, ...). The names and the
 /// `[outputs, inputs]` weight layout are those of a PyTorch `state_dict`, so the file loads
-/// with `safetensors.torch.load_file` into the same network built in PyTorch.
+/// with `safetensors.torch.load_file` into the same network built in PyTorch. The file's
+/// `__metadata__` records the model's layer kinds under `cavitation.layers` (each layer's
+/// [`Layer::name`](crate::Layer::name), joined with commas: `linear,relu,linear`), which a
+/// strict [`load`] checks; PyTorch ignores it.
 ///
 /// The file is written to a temporary file in the same folder and then renamed over
 /// `path`, so a failed save leaves no partial file. On Unix the temporary file is created
@@ -98,21 +101,40 @@ pub fn save(
         let view = TensorView::new(Dtype::F32, shape, bytes).map_err(|e| convert(path, e))?;
         views.push((name.as_str(), view));
     }
-    serialize_to_file(views, None, path).map_err(|e| convert(path, e))
+    let metadata = HashMap::from([(LAYERS_KEY.to_string(), layer_kinds(model))]);
+    serialize_to_file(views, Some(metadata), path).map_err(|e| convert(path, e))
+}
+
+/// The `__metadata__` key under which [`save`] records the model's layer kinds.
+const LAYERS_KEY: &str = "cavitation.layers";
+
+/// The model's layer kinds, each layer's [`Layer::name`](crate::Layer::name) in order,
+/// joined with commas: `linear,relu,linear`.
+fn layer_kinds(model: &Sequential<f32>) -> String {
+    (0..model.len())
+        .map(|i| model.layer(i).name())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Reads a safetensors file into the parameters of `model`, strictly: every parameter's key
 /// must be present with exactly its shape, and the file must hold no other key. A tensor may
 /// be `F32`, or `F16` or `BF16`, which widen to `F32` exactly, or `F64`, which rounds to the
 /// nearest `F32` (ties to even, as PyTorch's `.float()` does); a finite `F64` value beyond
-/// the `F32` range is refused, since it would become infinite. Nothing is written into
-/// `params` unless every check passes, so a failed load leaves the parameters as they were.
+/// the `F32` range is refused, since it would become infinite. When the file records the
+/// layer kinds it was saved from (every file [`save`] writes does), they must be the
+/// model's: GELU weights loaded into a ReLU network would load and give wrong outputs. The
+/// kinds are the layers' names, so two settings of one kind (GELU's exact and tanh forms)
+/// are not told apart; a file without the record, such as PyTorch's, loads into any kinds.
+/// Nothing is written into `params` unless every check passes, so a failed load leaves the
+/// parameters as they were.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the file cannot be read, [`Error::Format`] if it is not a valid
 /// safetensors file (for example truncated, or a `torch.save` file, which the message says)
-/// or holds an `F64` value beyond the `F32` range (the message names the key),
+/// or holds an `F64` value beyond the `F32` range (the message names the key), or records
+/// layer kinds other than the model's (the message lists both),
 /// [`Error::Keys`] for keys that do not fit: the missing, the unexpected, the wrong-shape and
 /// the wrong-type keys are all found in one pass and listed in one error (an `F64` value
 /// out of range is reported on its own, as soon as it is found; see
@@ -176,7 +198,9 @@ pub fn load(
 ///
 /// # Errors
 ///
-/// The errors of [`load`], except that unexpected keys are not an error.
+/// The errors of [`load`], except that unexpected keys are not an error and the layer kinds
+/// a file records are not checked (a lenient load is for loading part of a file into another
+/// model).
 ///
 /// # Panics
 ///
@@ -253,7 +277,9 @@ pub struct LoadOptions<'a> {
     #[allow(clippy::type_complexity)]
     pub rename: Option<Box<dyn Fn(&str) -> String + 'a>>,
     /// Whether a key that the model lacks (after renaming) is an error, listed in
-    /// [`KeyErrors::unexpected`] (`true`), or ignored (`false`).
+    /// [`KeyErrors::unexpected`], and, without a `rename`, the layer kinds the file records
+    /// must be the model's (`true`), or both are ignored (`false`). A `rename` maps the
+    /// file's layers onto other indices on purpose, so it skips the kinds check.
     pub strict: bool,
 }
 
@@ -383,6 +409,11 @@ pub fn load_with(
     })?;
     check_not_torch_save(path, &bytes)?;
     let file = SafeTensors::deserialize(&bytes).map_err(|e| convert(path, e))?;
+    let (_, metadata) = SafeTensors::read_metadata(&bytes).map_err(|e| convert(path, e))?;
+    let saved_layers = metadata
+        .metadata()
+        .as_ref()
+        .and_then(|m| m.get(LAYERS_KEY).cloned());
     let names = model.parameter_names();
 
     // Renamed key -> key in the file, over every key of the file, so a collision is found
@@ -468,6 +499,21 @@ pub fn load_with(
             problems.file_keys = held.into_iter().take(5).cloned().collect();
         }
         return Err(Error::Keys(Box::new(problems)));
+    }
+    // A file saved by `save` names its layer kinds; a strict load into a model with other
+    // kinds (GELU weights in a ReLU network, say) would load and give wrong outputs. A
+    // rename maps the file's layers onto other indices on purpose, so it skips the check.
+    if options.strict
+        && options.rename.is_none()
+        && let Some(saved) = saved_layers
+    {
+        let ours = layer_kinds(model);
+        if saved != ours {
+            return Err(Error::Format(format!(
+                "{}: the file was saved from layers {saved}, but the model's layers are {ours}",
+                path.display()
+            )));
+        }
     }
 
     for (id, values) in staged {
@@ -558,6 +604,67 @@ mod tests {
             .push(Relu)
             .push(Linear::new(&mut params, 8, 3, &mut rng));
         (net, params)
+    }
+
+    /// The 4 → 8 → 3 network of [`mlp`] with GELU in place of ReLU: the same keys and
+    /// shapes, other layer kinds.
+    fn mlp_gelu(seed: u64) -> (Sequential<f32>, ParamStore<f32>) {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(seed);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 4, 8, &mut rng))
+            .push(crate::Gelu::default())
+            .push(Linear::new(&mut params, 8, 3, &mut rng));
+        (net, params)
+    }
+
+    /// `save` records the layer kinds, and a strict load into a model with the same keys
+    /// and shapes but other kinds is a `Format` error naming both lists that changes
+    /// nothing; a lenient load, and a load into the same kinds, go through.
+    #[test]
+    fn a_strict_load_checks_the_layer_kinds() {
+        let path = temp_path("layer-kinds");
+        let (gelu, gelu_params) = mlp_gelu(1);
+        save(&path, &gelu, &gelu_params).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let (_, meta) = SafeTensors::read_metadata(&bytes).unwrap();
+        assert_eq!(
+            meta.metadata().as_ref().unwrap()["cavitation.layers"],
+            "linear,gelu,linear"
+        );
+        let (relu, mut params) = mlp(2);
+        let before = bits(&relu, &params);
+        let err = load(&path, &relu, &mut params).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, Error::Format(_)), "{text}");
+        assert!(
+            text.contains("saved from layers linear,gelu,linear")
+                && text.contains("the model's layers are linear,relu,linear"),
+            "{text}"
+        );
+        assert_eq!(bits(&relu, &params), before);
+        load_lenient(&path, &relu, &mut params).unwrap();
+        assert_eq!(bits(&relu, &params), bits(&gelu, &gelu_params));
+        let (same, mut same_params) = mlp_gelu(3);
+        load(&path, &same, &mut same_params).unwrap();
+        assert_eq!(bits(&same, &same_params), bits(&gelu, &gelu_params));
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A file without the layer-kinds metadata (PyTorch's, or one written before it was
+    /// recorded) loads into any layer kinds with the same keys and shapes.
+    #[test]
+    fn a_file_without_layer_kinds_loads_as_before() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+        let bytes = std::fs::read(dir.join("mlp.safetensors")).unwrap();
+        let (_, meta) = SafeTensors::read_metadata(&bytes).unwrap();
+        let recorded = meta
+            .metadata()
+            .as_ref()
+            .is_some_and(|m| m.contains_key("cavitation.layers"));
+        assert!(!recorded);
+        let (gelu, mut params) = mlp_gelu(4);
+        load(dir.join("mlp.safetensors"), &gelu, &mut params).unwrap();
     }
 
     /// Every parameter value as raw bits, in the model's parameter order.
