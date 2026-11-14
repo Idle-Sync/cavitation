@@ -581,6 +581,9 @@ impl<'s> Trainer<'s> {
         if apply {
             let update_start = profiling.then(Instant::now);
             self.optimizer.step(params);
+            // Batch normalisation's running statistics, which the tape recorded but could
+            // not write while it borrowed the values; a skipped step leaves them too.
+            self.graph.apply_buffer_updates(&mut params.values);
             if let Some(update_start) = update_start {
                 self.profiler.profile.optimizer = update_start.elapsed();
             }

@@ -7,8 +7,8 @@ use cavitation_core::kernels::gemm::threads_used;
 use cavitation_core::kernels::{Level, level, set_threads};
 use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng, Tensor};
 use cavitation_nn::{
-    Conv2d, Dataset, Dropout, FitConfig, Health, Init, Linear, Loss, LrSchedule, MaxPool2d,
-    OptimizerConfig, Relu, Sequential, Targets, fit,
+    BatchNorm2d, Conv2d, Dataset, Dropout, FitConfig, Health, Init, Linear, Loss, LrSchedule,
+    MaxPool2d, OptimizerConfig, Relu, Sequential, Targets, fit,
 };
 
 /// The batch size of the run: large enough that every product of the step is split.
@@ -85,9 +85,9 @@ fn train() -> Vec<u32> {
 }
 
 /// A small CNN on the same rows read as 1 × 8 × 8 images: a 3 × 3 convolution to 16
-/// channels with padding 1, ReLU, dropout, a 3 × 3 convolution to 16 channels with stride 2,
-/// ReLU, 2 × 2 max pooling and a `Linear` head, trained for one epoch; returns the bits of
-/// every parameter.
+/// channels with padding 1, ReLU, dropout, a 3 × 3 convolution to 16 channels with stride 2
+/// and no bias, batch normalisation, ReLU, 2 × 2 max pooling and a `Linear` head, trained
+/// for one epoch; returns the bits of every parameter and buffer.
 fn train_cnn() -> Vec<u32> {
     let data = dataset();
     let mut params = ParamStore::new();
@@ -98,7 +98,14 @@ fn train_cnn() -> Vec<u32> {
         .push(Conv2d::new(&mut params, g1, &mut rng))
         .push(Relu)
         .push(Dropout::new(0.2).unwrap())
-        .push(Conv2d::new(&mut params, g2, &mut rng))
+        .push(Conv2d::with_init(
+            &mut params,
+            g2,
+            Init::TorchDefault,
+            None,
+            &mut rng,
+        ))
+        .push(BatchNorm2d::new(&mut params, 16, (4, 4)))
         .push(Relu)
         .push(MaxPool2d::new(Pool2dGeom::new(16, (4, 4), (2, 2)).unwrap()))
         .push(Linear::new(&mut params, 16 * 2 * 2, 10, &mut rng));
@@ -110,7 +117,7 @@ fn train_cnn() -> Vec<u32> {
         ..FitConfig::default()
     };
     fit(&net, &mut params, &data, config).unwrap();
-    net.parameter_names()
+    net.state_names()
         .into_iter()
         .flat_map(|(_, id)| {
             params

@@ -204,6 +204,15 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
         }
         "matmul" => tape.matmul(v[0], v[1]),
         "max_pool2d" => tape.max_pool2d(v[0], pool_geom(f)),
+        "batch_norm2d" => {
+            let (w, b) = if v.len() == 3 {
+                (Some(v[1]), Some(v[2]))
+            } else {
+                (None, None)
+            };
+            let (c, s) = (num(p, "channels") as usize, num(p, "spatial") as usize);
+            tape.batch_norm2d(v[0], w, b, None, c, s, num(p, "eps"))
+        }
         "avg_pool2d" => tape.avg_pool2d(
             v[0],
             pool_geom(f),
@@ -792,7 +801,8 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         | "dropout_with_mask"
         | "max_pool2d"
         | "avg_pool2d"
-        | "adaptive_avg_pool2d" => all_elementwise(),
+        | "adaptive_avg_pool2d"
+        | "batch_norm2d" => all_elementwise(),
         "prelu" => {
             // The slope's gradient sums over every position of its channel.
             let (x, slope) = (&f.inputs[0], &f.inputs[1]);
@@ -900,6 +910,8 @@ const MATMUL: &[&str] = &["matmul", "matmul_nt"];
 const CONV: &[&str] = &["conv2d"];
 /// 2-D pooling.
 const POOL: &[&str] = &["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
+/// Batch normalisation with batch statistics.
+const BATCH_NORM: &[&str] = &["batch_norm2d"];
 /// The reductions.
 const REDUCTIONS: &[&str] = &["sum", "mean", "sum_axis", "mean_axis"];
 /// The activations, `prelu` and `glu`.
@@ -1035,6 +1047,9 @@ comparison_tests! {
     /// `ceil_mode` (a dropped last window and an overhanging one), excluded padding, a
     /// divisor override and overlapping adaptive windows match PyTorch.
     pooling_matches_torch => POOL,
+    /// `batch_norm2d` with batch statistics, with and without γ and β, matches PyTorch's
+    /// training-mode `batch_norm`, output and gradients.
+    batch_norm_matches_torch => BATCH_NORM,
     /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
     reductions_match_torch => REDUCTIONS,
     /// Every activation, `prelu` and `glu` match PyTorch.

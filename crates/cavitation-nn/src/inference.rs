@@ -90,6 +90,20 @@ pub enum InferenceLayer {
         /// The divisor used in place of the window's size, if any.
         divisor_override: Option<usize>,
     },
+    /// 2-D batch normalisation's evaluation form: per channel, `(x − mean) · inv · weight +
+    /// bias` (`weight` 1 and `bias` 0 when absent) over `spatial` values per image.
+    BatchNorm2d {
+        /// Each channel's running mean.
+        mean: Vec<f32>,
+        /// Each channel's `1 / √(running variance + eps)`.
+        inv: Vec<f32>,
+        /// γ, if the layer is affine.
+        weight: Option<Vec<f32>>,
+        /// β, if the layer is affine.
+        bias: Option<Vec<f32>>,
+        /// Values per channel of one image.
+        spatial: usize,
+    },
     /// 2-D adaptive average pooling of `channels` planes of `input` to `output`.
     AdaptiveAvgPool2d {
         /// Channels of each image.
@@ -498,6 +512,13 @@ impl InferenceModel {
                     if let (Some(bias), Some(id)) = (bias.as_mut(), conv.bias()) {
                         bias.copy_from_slice(values.get(id).data());
                     }
+                }
+                Op::Layer(form @ InferenceLayer::BatchNorm2d { .. }) => {
+                    model
+                        .layer(step.layer)
+                        .as_batch_norm2d()
+                        .expect("checked by fits_in_place")
+                        .refresh_inference(values, form);
                 }
                 Op::Layer(InferenceLayer::Prelu(slopes)) => {
                     let prelu = model
@@ -1140,8 +1161,8 @@ impl Compiled {
 
     /// Whether [`InferenceModel::refresh_in_place`] can copy the values of `model` and
     /// `params` into these steps: the steps cover `model`'s layers one for one (a fused
-    /// ReLU covering its layer), each `Linear` and `Prelu` step's layer is still one with the
-    /// same widths and parameters of the compiled sizes, every other layer still has the
+    /// ReLU covering its layer), each `Linear`, `Prelu`, `Conv2d` and `BatchNorm2d` step's
+    /// layer is still one with the same shape and parameters of the compiled sizes, every other layer still has the
     /// compiled inference form (a form with values of its own, from a layer of your own,
     /// does not fit), the mask steps sit on the layers `model` masks plus the added ones,
     /// and each of `model`'s masks has the width of its step's keep values in `masks`.
@@ -1195,11 +1216,15 @@ impl Compiled {
                             }
                     })
                 }
+                InferenceLayer::BatchNorm2d { .. } => layer
+                    .as_batch_norm2d()
+                    .is_some_and(|bn| bn.fits_inference(values, form)),
                 InferenceLayer::Mask(_) => false,
                 other => {
                     layer.as_linear().is_none()
                         && layer.as_prelu().is_none()
                         && layer.as_conv2d().is_none()
+                        && layer.as_batch_norm2d().is_none()
                         && layer.inference(values).as_ref() == Some(other)
                 }
             };
@@ -1311,6 +1336,7 @@ fn declared_width(form: &InferenceLayer) -> Option<usize> {
         InferenceLayer::Prelu(slopes) if slopes.len() > 1 => Some(slopes.len()),
         InferenceLayer::Mask(keep) => Some(keep.len()),
         InferenceLayer::Conv2d { geom, .. } => Some(geom.in_width()),
+        InferenceLayer::BatchNorm2d { mean, spatial, .. } => Some(mean.len() * spatial),
         InferenceLayer::MaxPool2d(geom) | InferenceLayer::AvgPool2d { geom, .. } => {
             Some(geom.in_width())
         }
@@ -1658,6 +1684,24 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         }
         InferenceLayer::Mask(keep) => apply_mask(keep, data, width),
         InferenceLayer::Identity => {}
+        InferenceLayer::BatchNorm2d {
+            mean,
+            inv,
+            weight,
+            bias,
+            spatial,
+        } => {
+            // As the tape's evaluation form computes it, value by value.
+            for row in data.chunks_exact_mut(width.max(1)) {
+                for (c, plane) in row.chunks_exact_mut((*spatial).max(1)).enumerate() {
+                    let g = weight.as_ref().map_or(1.0, |w| w[c]);
+                    let s = bias.as_ref().map_or(0.0, |b| b[c]);
+                    for v in plane {
+                        *v = (*v - mean[c]) * inv[c] * g + s;
+                    }
+                }
+            }
+        }
         InferenceLayer::Linear { .. }
         | InferenceLayer::Glu(_)
         | InferenceLayer::Conv2d { .. }
@@ -2129,6 +2173,19 @@ pub(crate) mod tests {
                 })
             }),
             Box::new(|_| Box::new(Glu { gate: Gate::Relu })),
+            Box::new(|p| {
+                let bn = crate::BatchNorm2d::new(p, 2, (2, 2));
+                let r = bn.running().unwrap();
+                p.value_mut(r.mean).data_mut().copy_from_slice(&[0.4, -0.3]);
+                p.value_mut(r.var).data_mut().copy_from_slice(&[2.2, 0.35]);
+                p.value_mut(bn.weight().unwrap())
+                    .data_mut()
+                    .copy_from_slice(&[1.25, -0.6]);
+                p.value_mut(bn.bias().unwrap())
+                    .data_mut()
+                    .copy_from_slice(&[0.05, -0.2]);
+                Box::new(bn)
+            }),
             Box::new(|_| Box::new(Glu { gate: Gate::Silu })),
         ];
         for (index, make) in layers.iter().enumerate() {

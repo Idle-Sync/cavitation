@@ -2,11 +2,11 @@
 
 use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 
-use crate::{Activation, Conv2d, InferenceLayer, Linear, Prelu};
+use crate::{Activation, BatchNorm2d, Conv2d, InferenceLayer, Linear, Prelu};
 
 /// Keeps the layer downcasts closed: only this crate can name `Token`, so only this crate's
-/// `Linear`, `Prelu` and `Conv2d` can override [`Layer::linear_form`],
-/// [`Layer::prelu_form`] and [`Layer::conv2d_form`].
+/// `Linear`, `Prelu`, `Conv2d` and `BatchNorm2d` can override [`Layer::linear_form`],
+/// [`Layer::prelu_form`], [`Layer::conv2d_form`] and [`Layer::batch_norm2d_form`].
 pub(crate) mod private {
     /// The argument of the sealed [`Layer`](super::Layer) hooks; only this crate can make one.
     #[derive(Clone, Copy, Debug)]
@@ -121,6 +121,23 @@ pub trait Layer<T: Real>: Send + Sync {
     /// ```
     fn parameters(&self) -> Vec<(&'static str, ParamId)>;
 
+    /// The layer's buffers with their local names: values it keeps but does not train, such
+    /// as [`BatchNorm2d`](crate::BatchNorm2d)'s running statistics, which `save` and `load`
+    /// carry with the parameters (after them, as PyTorch's state dict orders them). The
+    /// default is none.
+    ///
+    /// ```
+    /// use cavitation_core::ParamStore;
+    /// use cavitation_nn::{BatchNorm2d, Layer, Relu};
+    /// let bn = BatchNorm2d::new(&mut ParamStore::new(), 2, (3, 3));
+    /// let names: Vec<_> = Layer::<f32>::buffers(&bn).iter().map(|b| b.0).collect();
+    /// assert_eq!(names, ["running_mean", "running_var", "num_batches_tracked"]);
+    /// assert!(Layer::<f32>::buffers(&Relu).is_empty());
+    /// ```
+    fn buffers(&self) -> Vec<(&'static str, ParamId)> {
+        Vec::new()
+    }
+
     /// The parameter with local name `local` (for example `"weight"`), if the layer has one.
     /// The default searches [`parameters`](Self::parameters), which allocates; `Linear` and
     /// `Prelu` answer without allocating.
@@ -182,6 +199,14 @@ pub trait Layer<T: Real>: Send + Sync {
     /// `dyn Layer`, closed to other crates as [`linear_form`](Self::linear_form) is.
     #[doc(hidden)]
     fn conv2d_form(&self, _: private::Token) -> Option<&Conv2d> {
+        None
+    }
+
+    /// This layer as a [`BatchNorm2d`], if it is one: the sealed hook behind
+    /// `as_batch_norm2d` on `dyn Layer`, closed to other crates as
+    /// [`linear_form`](Self::linear_form) is.
+    #[doc(hidden)]
+    fn batch_norm2d_form(&self, _: private::Token) -> Option<&BatchNorm2d> {
         None
     }
 
@@ -287,7 +312,7 @@ pub trait Layer<T: Real>: Send + Sync {
     }
 }
 
-/// Adds `as_linear` and `as_prelu` to one form of `dyn Layer` (the bare trait object and
+/// Adds `as_linear`, `as_conv2d`, `as_batch_norm2d` and `as_prelu` to one form of `dyn Layer` (the bare trait object and
 /// the ones with `Send`, `Sync` or both spelled out), each calling the sealed hooks.
 macro_rules! downcasts {
     ($($bounds:tt)*) => {
@@ -325,6 +350,22 @@ macro_rules! downcasts {
             /// ```
             pub fn as_conv2d(&self) -> Option<&Conv2d> {
                 self.conv2d_form(private::Token(()))
+            }
+
+            /// This layer as a [`BatchNorm2d`], if it is one. Only the crate's own
+            /// `BatchNorm2d` answers `Some`. It works on `dyn Layer<T>` and on the same
+            /// object with `+ Send`, `+ Sync` or both.
+            ///
+            /// ```
+            /// use cavitation_core::ParamStore;
+            /// use cavitation_nn::{BatchNorm2d, Layer, Relu};
+            /// let bn = BatchNorm2d::new(&mut ParamStore::new(), 3, (4, 4));
+            /// let layers: [&dyn Layer<f32>; 2] = [&bn, &Relu];
+            /// assert_eq!(layers[0].as_batch_norm2d().unwrap().channels(), 3);
+            /// assert!(layers[1].as_batch_norm2d().is_none());
+            /// ```
+            pub fn as_batch_norm2d(&self) -> Option<&BatchNorm2d> {
+                self.batch_norm2d_form(private::Token(()))
             }
 
             /// This layer as a [`Prelu`], if it is one. Only the crate's own `Prelu`

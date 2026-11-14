@@ -12,10 +12,10 @@ use cavitation_core::{
     Conv2dGeom, Graph, ParamGrads, ParamStore, Pool2dGeom, Reduction, Rng, Tensor, TensorView, Var,
 };
 use cavitation_nn::{
-    Activation, ActivationLayer, Adam, AdamW, AdaptiveAvgPool2d, AvgPool2d, Batch, Batcher, Conv2d,
-    Dataset, Dropout, Evaluator, GradStats, Health, Hooks, InferenceModel, Init, Linear, Loss,
-    MaxPool2d, NeuronMask, OnNonFinite, Optimizer, Relu, Sequential, Sgd, Targets, TargetsView,
-    Trace, Trainer, Warning,
+    Activation, ActivationLayer, Adam, AdamW, AdaptiveAvgPool2d, AvgPool2d, Batch, BatchNorm2d,
+    Batcher, Conv2d, Dataset, Dropout, Evaluator, GradStats, Health, Hooks, InferenceModel, Init,
+    Linear, Loss, MaxPool2d, NeuronMask, OnNonFinite, Optimizer, Relu, Sequential, Sgd, Targets,
+    TargetsView, Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -303,7 +303,7 @@ fn dropout_training_step() -> usize {
 }
 
 /// A small CNN on 1,437 rows of 1 × 8 × 8 images (a 3 × 3 convolution to 8 channels with
-/// padding 1, ReLU, 2 × 2 max pooling, dropout, a 1 × 1 convolution to 4 channels, ReLU,
+/// padding 1 and no bias, batch normalisation, ReLU, 2 × 2 max pooling, dropout, a 1 × 1 convolution to 4 channels, ReLU,
 /// 3 × 3 average pooling with padding 1, adaptive average pooling to 2 × 2, a `Linear`
 /// head),
 /// trained with `Trainer::step` and Adam at batch 128: one warm-up epoch, then the
@@ -317,7 +317,14 @@ fn conv_training_and_inference() -> usize {
     let g2 = Conv2dGeom::new(8, 4, (4, 4), (1, 1)).unwrap();
     let avg = Pool2dGeom::with_options(4, (4, 4), (3, 3), (1, 1), (1, 1), (1, 1), false).unwrap();
     let net = Sequential::new()
-        .push(Conv2d::new(&mut params, g1, &mut rng))
+        .push(Conv2d::with_init(
+            &mut params,
+            g1,
+            Init::TorchDefault,
+            None,
+            &mut rng,
+        ))
+        .push(BatchNorm2d::new(&mut params, 8, (8, 8)))
         .push(Relu)
         .push(MaxPool2d::new(pool))
         .push(Dropout::new(0.1).unwrap())
@@ -1314,10 +1321,11 @@ fn fit_validation_steady_state() -> usize {
     FIT_AFTER_EPOCH_2.load(Ordering::Relaxed) + control.after
 }
 
-/// `fit` with a validation set on a small CNN (the `conv_training_and_inference` network)
-/// for 6 epochs on 1,000 rows, the other 437 validating: from the third epoch on, nothing is
-/// allocated, the compiled model's convolutions included (each epoch's refresh copies the
-/// new weights in place).
+/// `fit` with a validation set on a small CNN (two convolutions, the first without a bias
+/// and followed by batch normalisation) for 6 epochs on 1,000 rows, the other 437
+/// validating: from the third epoch on, nothing is allocated, the compiled model's
+/// convolutions and batch norm included (each epoch's refresh copies the new weights and
+/// running statistics in place).
 fn fit_validation_cnn_steady_state() -> usize {
     let (train, validation) = synthetic_centred_1437().split_at(1000);
     let mut params = ParamStore::new();
@@ -1325,7 +1333,14 @@ fn fit_validation_cnn_steady_state() -> usize {
     let g1 = Conv2dGeom::with_options(1, 8, (8, 8), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
     let g2 = Conv2dGeom::new(8, 4, (8, 8), (1, 1)).unwrap();
     let net = Sequential::new()
-        .push(Conv2d::new(&mut params, g1, &mut rng))
+        .push(Conv2d::with_init(
+            &mut params,
+            g1,
+            Init::TorchDefault,
+            None,
+            &mut rng,
+        ))
+        .push(BatchNorm2d::new(&mut params, 8, (8, 8)))
         .push(Relu)
         .push(Conv2d::new(&mut params, g2, &mut rng))
         .push(Relu)

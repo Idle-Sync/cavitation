@@ -104,6 +104,8 @@ Each epoch is one step on the full batch:
 5. `drop(tape)` ends the tape's borrow of `params.values`, so that `optimizer.step` can change them. `monitor.before_update` says whether to apply the update: always under the default `OnNonFinite::Stop`, and under `OnNonFinite::Skip` only when every gradient is finite, so a NaN never reaches the parameters. Plain SGD subtracts the learning rate times each gradient: W ← W − 0.5 · ∂L/∂W.
 6. `params.zero_grad()` marks the gradients stale, so the next `backward` overwrites them instead of adding to them.
 
+A network with a `BatchNorm2d` layer needs one more line after the optimiser's step: `graph.apply_buffer_updates(&mut params.values)`. A training tape only reads the parameter values, so batch norm records its new running mean and variance on the graph, and this call writes them into their buffers. `fit` and `Trainer` call it for you; in a loop of your own, leaving it out keeps the running statistics at their starting values, and evaluation then normalises with the wrong ones.
+
 The loss falls from 0.26 to under 0.001 over the 2,000 steps.
 
 ## Reading it through hooks

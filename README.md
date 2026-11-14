@@ -78,7 +78,7 @@ let history = fit(&net, &mut params, &data, config).unwrap();
 assert!(history.epochs[199].mean_loss < history.epochs[0].mean_loss);
 ```
 
-**2. The manual loop.** Each step written out: open a tape on the parameter values, record the inputs, run the network forward, record the loss, run `backward` into the gradients, drop the tape, step the optimiser and zero the gradients. Every value on the tape can be read between these lines.
+**2. The manual loop.** Each step written out: open a tape on the parameter values, record the inputs, run the network forward, record the loss, run `backward` into the gradients, drop the tape, step the optimiser, apply the batch-norm buffer updates and zero the gradients. Every value on the tape can be read between these lines.
 
 ```rust
 use cavitation::prelude::*;
@@ -107,6 +107,8 @@ for step in 1..=1000 {
     tape.backward(loss, &mut params.grads);
     drop(tape); // releases `params.values` so the optimiser can change them
     optimizer.step(&mut params);
+    // Moves any batch norm's running statistics; this network has none.
+    graph.apply_buffer_updates(&mut params.values);
     params.zero_grad();
 }
 assert!(last < 0.01);
