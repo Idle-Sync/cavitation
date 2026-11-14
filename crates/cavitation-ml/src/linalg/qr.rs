@@ -278,7 +278,7 @@ impl Qr {
 
 /// The least-squares solution `x` (`[cols, k]`) of `a·x ≈ b`, for `a` of shape
 /// `[rows, cols]` with `rows ≥ cols` and `b` of shape `[rows, k]`: [`Qr::new`], then
-/// [`Qr::dependent_column`], then [`Qr::solve`].
+/// [`Qr::solve`], which refuses dependent columns ([`Qr::dependent_column`]).
 ///
 /// # Errors
 ///
@@ -302,11 +302,7 @@ impl Qr {
 /// assert!(err.to_string().contains("column 2 is a linear combination"));
 /// ```
 pub fn lstsq(a: TensorView<'_, f64>, b: TensorView<'_, f64>) -> Result<Tensor<f64>, Error> {
-    let qr = Qr::new(a)?;
-    if let Some(j) = qr.dependent_column() {
-        return Err(dependent_error(j));
-    }
-    qr.solve(b)
+    Qr::new(a)?.solve(b)
 }
 
 /// Applies the reflector `I − β·v·vᵀ` to `y`, which has `v`'s length.
