@@ -117,6 +117,7 @@ fn fit_config() -> FitConfig {
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,
+        validation: None,
     }
 }
 
@@ -226,6 +227,7 @@ fn publish_run(inspector: &Inspector, title: &str) {
         mean_loss: 0.5,
         rows: 8,
         seconds: 0.01,
+        validation: None,
     };
     assert!(hub.publish_event(Event::Epoch, |w| wire::epoch(w, &report, 3, None), true));
     assert!(hub.publish_event(

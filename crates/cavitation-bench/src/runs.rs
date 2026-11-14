@@ -964,6 +964,7 @@ pub fn shrink_start() -> Result<ShrinkStart, String> {
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,
+        validation: None,
     };
     fit(&net, &mut params, &fit_rows, config).map_err(|e| e.to_string())?;
     Ok(ShrinkStart {
@@ -1222,6 +1223,7 @@ fn inspect_fit_config(epochs: usize) -> FitConfig {
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,
+        validation: None,
     }
 }
 

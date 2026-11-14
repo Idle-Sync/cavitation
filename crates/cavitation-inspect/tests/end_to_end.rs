@@ -73,6 +73,7 @@ fn fit_config(epochs: usize) -> FitConfig {
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,
+        validation: None,
     }
 }
 
