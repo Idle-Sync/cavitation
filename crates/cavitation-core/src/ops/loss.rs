@@ -890,7 +890,8 @@ fn kl_value<T: Real>(x: T, t: T) -> T {
 /// Backward of a loss over two same-shaped inputs `a` and `b`: `grad(a_i, b_i, w_i)` returns
 /// the gradients for `a_i` and `b_i`, with `w_i` the upstream gradient of item `i` from
 /// [`Upstream`] (so `grad` multiplies by it). Every element is written when a slot
-/// overwrites.
+/// overwrites. Each input that takes a gradient gets its own pass; a loss whose two halves
+/// share costly work uses [`pairwise_backward_shared`] instead.
 fn pairwise_backward<T: Real>(
     a: Var,
     b: Var,
@@ -915,6 +916,42 @@ fn pairwise_backward<T: Real>(
     }
 }
 
+/// [`pairwise_backward`] for a loss whose two gradients share costly work (binary
+/// cross-entropy's two logarithms): when both inputs take a gradient, `grad` runs once per
+/// element, `a`'s gradient going straight into its slot and `b`'s into a pooled scratch
+/// buffer that is then contributed to `b`'s slot, which gives the bits of two passes. When
+/// `a` and `b` are the same node, or only one takes a gradient, it runs as
+/// [`pairwise_backward`] does, so a shared slot's sum keeps the order `a` then `b`.
+fn pairwise_backward_shared<T: Real>(
+    a: Var,
+    b: Var,
+    reduction: Reduction,
+    out_grad: &[T],
+    ctx: &mut BackwardCtx<'_, T>,
+    grad: impl Fn(T, T, T) -> (T, T),
+) {
+    if a == b || !ctx.takes_grad(a) || !ctx.takes_grad(b) {
+        return pairwise_backward(a, b, reduction, out_grad, ctx, grad);
+    }
+    let shape = ctx.shape(a);
+    let up = Upstream::new(out_grad, reduction, shape.len(), batch_of(&shape));
+    let (x, y) = (ctx.value(a), ctx.value(b));
+    let mut second = ctx.scratch(x.len());
+    if let Some(slot) = ctx.slot(a) {
+        slot.update_with(|buf, beta| {
+            for (i, (d, s)) in buf.iter_mut().zip(second.iter_mut()).enumerate() {
+                let (ga, gb) = grad(x[i], y[i], up.at(i));
+                *d = if beta == T::ZERO { ga } else { *d + ga };
+                *s = gb;
+            }
+        });
+    }
+    if let Some(slot) = ctx.slot(b) {
+        slot.add_from(&second);
+    }
+    ctx.release(second);
+}
+
 /// Backward of binary cross-entropy: see [`Tape::binary_cross_entropy`] for the convention at
 /// the clamp.
 pub(super) fn bce_backward<T: Real>(
@@ -924,7 +961,7 @@ pub(super) fn bce_backward<T: Real>(
     out_grad: &[T],
     ctx: &mut BackwardCtx<'_, T>,
 ) {
-    pairwise_backward(probs, target, reduction, out_grad, ctx, |p, t, w| {
+    pairwise_backward_shared(probs, target, reduction, out_grad, ctx, |p, t, w| {
         let ((lp, p_clamped), (lq, q_clamped)) = (clamped_ln(p), clamped_ln(T::ONE - p));
         let dp = match (p_clamped, q_clamped) {
             (false, false) => (p - t) / (p * (T::ONE - p)),
@@ -1558,6 +1595,119 @@ mod tests {
         for (x, y) in [(f64::NAN, 0.0), (f64::NAN, 0.5), (-1.0, f64::NAN)] {
             let l = run2(&[x], &[y], &[1], |t, x, y| t.kl_div(x, y, Reduction::Mean));
             assert!(l[0].is_nan(), "{x} {y}");
+        }
+    }
+
+    /// With both inputs taking a gradient, every two-input loss gives each input the bits it
+    /// gets when it alone takes one, for each reduction, on a first backward pass
+    /// (overwrite) and a second (add), with the inputs as parameters and as intermediate
+    /// nodes (`scale` by 1.5 of a parameter). With one parameter recorded twice as both
+    /// inputs, its gradient is the first input's contribution then the second's, in that
+    /// order.
+    #[test]
+    fn two_input_gradients_do_not_depend_on_which_inputs_take_one() {
+        type Loss = fn(&mut crate::Tape<'_, f32>, crate::Var, crate::Var, Reduction) -> crate::Var;
+        let losses: [(&str, Loss); 7] = [
+            ("binary_cross_entropy", |t, a, b, r| {
+                t.binary_cross_entropy(a, b, r)
+            }),
+            ("binary_cross_entropy_with_logits", |t, a, b, r| {
+                t.binary_cross_entropy_with_logits(a, b, r)
+            }),
+            ("l1", |t, a, b, r| t.l1(a, b, r)),
+            ("huber", |t, a, b, r| t.huber(a, b, 0.5, r)),
+            ("smooth_l1", |t, a, b, r| t.smooth_l1(a, b, 0.5, r)),
+            ("kl_div", |t, a, b, r| t.kl_div(a, b, r)),
+            ("mse", |t, a, b, r| t.mse(a, b, r)),
+        ];
+        let a: Vec<f32> = (0..37).map(|i| 0.02 + 0.026 * i as f32).collect();
+        let b: Vec<f32> = (0..37).map(|i| [0.0, 0.3, 1.0, 0.71][i % 4]).collect();
+        // The gradients of the inputs that are parameters (`which`), as bits, after two
+        // backward passes into the same store (so the second pass adds).
+        let grads = |f: Loss, r: Reduction, which: [bool; 2], scaled: bool| -> [Vec<u32>; 2] {
+            let mut store = ParamStore::new();
+            let ids = [
+                store.add(Tensor::from_vec(a.clone(), &[37]).unwrap()),
+                store.add(Tensor::from_vec(b.clone(), &[37]).unwrap()),
+            ];
+            let mut graph = Graph::new();
+            for _ in 0..2 {
+                let mut tape = graph.tape(&store.values);
+                let vars: Vec<_> = (0..2)
+                    .map(|k| {
+                        if which[k] {
+                            let p = tape.param(ids[k]);
+                            if scaled { tape.scale(p, 1.5) } else { p }
+                        } else {
+                            // The same values the scaled parameter would give.
+                            let data = if k == 0 { &a } else { &b };
+                            let s = if scaled { 1.5 } else { 1.0 };
+                            let data: Vec<f32> = data.iter().map(|&v| v * s).collect();
+                            tape.input(Tensor::from_vec(data, &[37]).unwrap().view())
+                        }
+                    })
+                    .collect();
+                let loss = f(&mut tape, vars[0], vars[1], r);
+                if r == Reduction::None {
+                    // A different upstream gradient for every item.
+                    let seed: Vec<f32> = (0..37).map(|i| 0.5 + 0.1 * i as f32).collect();
+                    tape.backward_seeded(loss, &seed, &mut store.grads);
+                } else {
+                    tape.backward(loss, &mut store.grads);
+                }
+            }
+            ids.map(|id| store.grad(id).data().iter().map(|g| g.to_bits()).collect())
+        };
+        for (name, f) in losses {
+            for r in [
+                Reduction::Mean,
+                Reduction::Sum,
+                Reduction::BatchMean,
+                Reduction::None,
+            ] {
+                for scaled in [false, true] {
+                    let both = grads(f, r, [true, true], scaled);
+                    let [first, _] = grads(f, r, [true, false], scaled);
+                    let [_, second] = grads(f, r, [false, true], scaled);
+                    let at = format!("{name}, {r:?}, scaled {scaled}");
+                    assert_eq!(both[0], first, "{at}: first input");
+                    assert_eq!(both[1], second, "{at}: second input");
+                }
+            }
+        }
+        // One parameter as both inputs (two `Var`s of the same parameter): the slot gets the
+        // first input's contribution, then the second's added to it.
+        let one = |f: Loss| -> Vec<u32> {
+            let mut store = ParamStore::new();
+            let id = store.add(Tensor::from_vec(a.clone(), &[37]).unwrap());
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&store.values);
+            let (p, q) = (tape.param(id), tape.param(id));
+            let loss = f(&mut tape, p, q, Reduction::Sum);
+            tape.backward(loss, &mut store.grads);
+            store.grad(id).data().iter().map(|g| g.to_bits()).collect()
+        };
+        // The two contributions on their own: the parameter as the first input with its
+        // values as a fixed second input, and the other way round.
+        let side = |f: Loss, second: bool| -> Vec<f32> {
+            let mut store = ParamStore::new();
+            let id = store.add(Tensor::from_vec(a.clone(), &[37]).unwrap());
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&store.values);
+            let p = tape.param(id);
+            let fixed = tape.input(Tensor::from_vec(a.clone(), &[37]).unwrap().view());
+            let loss = if second {
+                f(&mut tape, fixed, p, Reduction::Sum)
+            } else {
+                f(&mut tape, p, fixed, Reduction::Sum)
+            };
+            tape.backward(loss, &mut store.grads);
+            store.grad(id).data().to_vec()
+        };
+        for (name, f) in losses {
+            let (ga, gb) = (side(f, false), side(f, true));
+            let want: Vec<u32> = ga.iter().zip(&gb).map(|(x, y)| (x + y).to_bits()).collect();
+            assert_eq!(one(f), want, "{name}: one parameter as both inputs");
         }
     }
 
