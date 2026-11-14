@@ -431,7 +431,9 @@ impl InferenceModel {
                             *v = w[j * *inputs + i];
                         }
                     }
-                    bias.copy_from_slice(values.get(linear.bias()).data());
+                    if let (Some(bias), Some(id)) = (bias.as_mut(), linear.bias()) {
+                        bias.copy_from_slice(values.get(id).data());
+                    }
                 }
                 Op::Layer(InferenceLayer::Prelu(slopes)) => {
                     let prelu = model
@@ -918,12 +920,20 @@ impl Compiled {
             let layer = model.layer(step.layer);
             let fits = match form {
                 InferenceLayer::Linear {
-                    inputs, outputs, ..
+                    inputs,
+                    outputs,
+                    bias,
+                    ..
                 } => model.linear(step.layer).is_some_and(|linear| {
                     linear.inputs() == *inputs
                         && linear.outputs() == *outputs
                         && values.get(linear.weight()).shape().dims() == [*outputs, *inputs]
-                        && values.get(linear.bias()).shape().dims() == [*outputs]
+                        // A bias must be present in both or in neither, with the same width.
+                        && match (bias, linear.bias()) {
+                            (Some(_), Some(id)) => values.get(id).shape().dims() == [*outputs],
+                            (None, None) => true,
+                            _ => false,
+                        }
                 }),
                 InferenceLayer::Prelu(slopes) => layer
                     .as_prelu()
