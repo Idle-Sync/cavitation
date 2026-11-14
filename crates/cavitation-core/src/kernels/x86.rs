@@ -4,17 +4,18 @@
 //! kernels.
 
 use std::arch::x86_64::{
-    __m128, __m256, _CMP_GE_OQ, _CMP_LE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, _mm_add_epi32, _mm_add_ps,
-    _mm_and_ps, _mm_andnot_ps, _mm_blendv_ps, _mm_castsi128_ps, _mm_cmpge_ps, _mm_cmpgt_ps,
-    _mm_cmple_ps, _mm_cmplt_ps, _mm_cmpunord_ps, _mm_cvttps_epi32, _mm_div_ps, _mm_floor_ps,
-    _mm_load_ps, _mm_loadu_ps, _mm_max_ps, _mm_min_ps, _mm_movehl_ps, _mm_movelh_ps, _mm_mul_ps,
-    _mm_or_ps, _mm_set1_epi32, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm_slli_epi32,
-    _mm_srai_epi32, _mm_storeu_ps, _mm_sub_epi32, _mm_sub_ps, _mm_unpackhi_ps, _mm_unpacklo_ps,
-    _mm256_add_epi32, _mm256_add_ps, _mm256_and_ps, _mm256_andnot_ps, _mm256_blendv_ps,
-    _mm256_broadcast_ss, _mm256_castsi256_ps, _mm256_cmp_ps, _mm256_cvttps_epi32, _mm256_div_ps,
-    _mm256_floor_ps, _mm256_fmadd_ps, _mm256_fnmadd_ps, _mm256_loadu_ps, _mm256_max_ps,
-    _mm256_mul_ps, _mm256_or_ps, _mm256_set1_epi32, _mm256_set1_ps, _mm256_setzero_ps,
-    _mm256_slli_epi32, _mm256_srai_epi32, _mm256_storeu_ps, _mm256_sub_epi32, _mm256_sub_ps,
+    __m128, __m256, _CMP_GE_OQ, _CMP_GT_OQ, _CMP_LE_OQ, _CMP_LT_OQ, _CMP_UNORD_Q, _mm_add_epi32,
+    _mm_add_ps, _mm_and_ps, _mm_andnot_ps, _mm_blendv_ps, _mm_castsi128_ps, _mm_cmpge_ps,
+    _mm_cmpgt_ps, _mm_cmple_ps, _mm_cmplt_ps, _mm_cmpunord_ps, _mm_cvttps_epi32, _mm_div_ps,
+    _mm_floor_ps, _mm_load_ps, _mm_loadu_ps, _mm_max_ps, _mm_min_ps, _mm_movehl_ps, _mm_movelh_ps,
+    _mm_mul_ps, _mm_or_ps, _mm_set1_epi32, _mm_set1_ps, _mm_setzero_ps, _mm_shuffle_ps,
+    _mm_slli_epi32, _mm_srai_epi32, _mm_storeu_ps, _mm_sub_epi32, _mm_sub_ps, _mm_unpackhi_ps,
+    _mm_unpacklo_ps, _mm256_add_epi32, _mm256_add_ps, _mm256_and_ps, _mm256_andnot_ps,
+    _mm256_blendv_ps, _mm256_broadcast_ss, _mm256_castsi256_ps, _mm256_cmp_ps, _mm256_cvttps_epi32,
+    _mm256_div_ps, _mm256_floor_ps, _mm256_fmadd_ps, _mm256_fnmadd_ps, _mm256_loadu_ps,
+    _mm256_max_ps, _mm256_min_ps, _mm256_mul_ps, _mm256_or_ps, _mm256_set1_epi32, _mm256_set1_ps,
+    _mm256_setzero_ps, _mm256_slli_epi32, _mm256_srai_epi32, _mm256_storeu_ps, _mm256_sub_epi32,
+    _mm256_sub_ps,
 };
 
 use super::MatRef;
@@ -821,6 +822,120 @@ fn exp_neg_avx2(y: __m256) -> __m256 {
     let s1 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(n1, bias)));
     let s2 = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(n2, bias)));
     _mm256_mul_ps(_mm256_mul_ps(p, s1), s2)
+}
+
+/// `e^y − 1` in each lane for `y <= 0`, the reference's `expm1_neg` with fused
+/// multiply-adds (NaN lanes give a meaningless value, which the callers replace).
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn expm1_neg_avx2(y: __m256) -> __m256 {
+    let low = _mm256_cmp_ps::<_CMP_LT_OQ>(y, _mm256_set1_ps(EXPM1_MIN));
+    let y = _mm256_max_ps(y, _mm256_set1_ps(EXPM1_MIN));
+    let n = _mm256_floor_ps(_mm256_fmadd_ps(
+        y,
+        _mm256_set1_ps(LOG2E),
+        _mm256_set1_ps(0.5),
+    ));
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_HI), y);
+    let r = _mm256_fnmadd_ps(n, _mm256_set1_ps(LN2_LO), r);
+    let mut p = _mm256_set1_ps(EXP_P[0]);
+    for &c in &EXP_P[1..] {
+        p = _mm256_fmadd_ps(p, r, _mm256_set1_ps(c));
+    }
+    let q = _mm256_fmadd_ps(_mm256_mul_ps(p, r), r, r);
+    // As in the SSE4.2 kernel: `n` is whole and in [-25, 0].
+    let n = _mm256_cvttps_epi32(n);
+    let s = _mm256_castsi256_ps(_mm256_slli_epi32::<23>(_mm256_add_epi32(
+        n,
+        _mm256_set1_epi32(127),
+    )));
+    let v = _mm256_fmadd_ps(q, s, _mm256_sub_ps(s, _mm256_set1_ps(1.0)));
+    _mm256_blendv_ps(v, _mm256_set1_ps(-1.0), low)
+}
+
+/// `ln(1 + t)` in each lane for `t` in `[0, 1]`, the reference's `log1p_unit` with fused
+/// multiply-adds in the polynomial; `1 + t` and its rounding error stay separate
+/// operations, as the correction needs.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn log1p_unit_avx2(t: __m256) -> __m256 {
+    let one = _mm256_set1_ps(1.0);
+    let m = _mm256_add_ps(one, t);
+    let c = _mm256_sub_ps(t, _mm256_sub_ps(m, one));
+    let big = _mm256_cmp_ps::<_CMP_GT_OQ>(m, _mm256_set1_ps(std::f32::consts::SQRT_2));
+    let f = _mm256_blendv_ps(m, _mm256_mul_ps(m, _mm256_set1_ps(0.5)), big);
+    let k = _mm256_and_ps(big, one);
+    let x = _mm256_sub_ps(f, one);
+    let z = _mm256_mul_ps(x, x);
+    let mut p = _mm256_set1_ps(LOG_P[0]);
+    for &cc in &LOG_P[1..] {
+        p = _mm256_fmadd_ps(p, x, _mm256_set1_ps(cc));
+    }
+    let y = _mm256_mul_ps(_mm256_mul_ps(x, z), p);
+    let y = _mm256_fmadd_ps(k, _mm256_set1_ps(LN2_LO), y);
+    let y = _mm256_fnmadd_ps(_mm256_set1_ps(0.5), z, y);
+    let r = _mm256_add_ps(x, y);
+    let r = _mm256_fmadd_ps(k, _mm256_set1_ps(LN2_HI), r);
+    _mm256_add_ps(r, _mm256_div_ps(c, m))
+}
+
+/// Softplus in each lane, the reference's `softplus_one` with fused multiply-adds.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn softplus_avx2(x: __m256) -> __m256 {
+    let sign = _mm256_castsi256_ps(_mm256_set1_epi32(SIGN as i32));
+    let l = log1p_unit_avx2(exp_neg_avx2(_mm256_or_ps(x, sign)));
+    let m = _mm256_and_ps(x, _mm256_cmp_ps::<_CMP_GT_OQ>(x, _mm256_setzero_ps()));
+    let r = _mm256_add_ps(m, l);
+    _mm256_blendv_ps(r, x, _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x))
+}
+
+/// ELU with `alpha` in each lane, the reference's `elu_one` with fused multiply-adds.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn elu_avx2(alpha: __m256, x: __m256) -> __m256 {
+    let zero = _mm256_setzero_ps();
+    let neg = _mm256_mul_ps(alpha, expm1_neg_avx2(_mm256_min_ps(x, zero)));
+    let r = _mm256_blendv_ps(neg, x, _mm256_cmp_ps::<_CMP_GT_OQ>(x, zero));
+    _mm256_blendv_ps(r, x, _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x))
+}
+
+/// Runs `lanes` over `values` eight at a time, the tail through a zero-padded vector.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn avx2_lanes(values: &mut [f32], lanes: impl Fn(__m256) -> __m256) {
+    let (chunks, tail, mut pad) = split::<8>(values);
+    for c in chunks {
+        // SAFETY: `c` holds 8 floats; the load and store are unaligned.
+        unsafe { _mm256_storeu_ps(c.as_mut_ptr(), lanes(_mm256_loadu_ps(c.as_ptr()))) };
+    }
+    if !tail.is_empty() {
+        // SAFETY: `pad` holds 8 floats; the load and store are unaligned.
+        unsafe { _mm256_storeu_ps(pad.as_mut_ptr(), lanes(_mm256_loadu_ps(pad.as_ptr()))) };
+        let n = tail.len();
+        tail.copy_from_slice(&pad[..n]);
+    }
+}
+
+/// The AVX2 softplus over `values`, in place.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and FMA.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn softplus_avx2_slice(values: &mut [f32]) {
+    avx2_lanes(values, |v| softplus_avx2(v));
+}
+
+/// The AVX2 ELU with `alpha` over `values`, in place.
+///
+/// # Safety
+///
+/// The CPU must support AVX2 and FMA.
+#[target_feature(enable = "avx2,fma")]
+pub(super) unsafe fn elu_avx2_slice(alpha: f32, values: &mut [f32]) {
+    let a = _mm256_set1_ps(alpha);
+    avx2_lanes(values, |v| elu_avx2(a, v));
 }
 
 /// `tanh` in each lane, the reference's `tanh_one` with fused multiply-adds.

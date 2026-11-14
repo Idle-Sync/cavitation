@@ -30,8 +30,9 @@
 //! Cephes `logf` polynomial on the mantissa and `+ c/(1 + t)`. ELU's `e^x − 1` for `x <= 0`
 //! is `q·2^n + (2^n − 1)` with `q = e^r − 1` from the exponential's polynomial, so it keeps
 //! its relative accuracy near 0. Checked for every finite f32 at the reference and SSE4.2
-//! levels, softplus is within 2 ulp and `e^x − 1` within 1 ulp; the other levels run the
-//! reference loop for these two.
+//! levels, softplus is within 2 ulp and `e^x − 1` within 1 ulp. The AVX2 kernels fuse
+//! multiply-adds, so their stated bounds are one ulp more (3 and 2), tested on the sweep;
+//! the NEON and Accelerate levels run the reference loop for these two.
 //!
 //! # Examples
 //!
@@ -332,8 +333,9 @@ pub fn sigmoid_f32_with(level: Level, values: &mut [f32]) {
 /// correctly rounded softplus for every finite f32 (measured over all of them). NaN stays
 /// NaN; a value's result depends only on the value and the level.
 ///
-/// The SSE4.2 kernel gives the reference loop's bits; the AVX2, NEON and Accelerate levels
-/// run the reference loop.
+/// The SSE4.2 kernel gives the reference loop's bits. The AVX2 kernel fuses multiply-adds
+/// and rounds differently: its stated bound is one ulp more, tested on a sweep of one f32
+/// in 1,009. The NEON and Accelerate levels run the reference loop.
 ///
 /// # Panics
 ///
@@ -376,6 +378,11 @@ pub fn softplus_f32_with(level: Level, values: &mut [f32]) {
     );
     match level {
         #[cfg(target_arch = "x86_64")]
+        // SAFETY: this CPU supports AVX2 and FMA (the guard).
+        Level::Avx2Fma if supported(Level::Avx2Fma) => unsafe {
+            super::x86::softplus_avx2_slice(values)
+        },
+        #[cfg(target_arch = "x86_64")]
         // SAFETY: this CPU supports SSE4.2 (the guard).
         Level::Sse42 if supported(Level::Sse42) => unsafe {
             super::x86::softplus_sse_slice(values)
@@ -395,8 +402,9 @@ pub fn softplus_f32_with(level: Level, values: &mut [f32]) {
 /// rounded once. NaN stays NaN; a value's result depends only on the value, `alpha` and
 /// the level.
 ///
-/// The SSE4.2 kernel gives the reference loop's bits; the AVX2, NEON and Accelerate levels
-/// run the reference loop.
+/// The SSE4.2 kernel gives the reference loop's bits. The AVX2 kernel fuses multiply-adds
+/// and rounds differently: its stated bound is one ulp more, tested on a sweep of one f32
+/// in 1,009. The NEON and Accelerate levels run the reference loop.
 ///
 /// # Panics
 ///
@@ -438,6 +446,11 @@ pub fn elu_f32_with(level: Level, alpha: f32, values: &mut [f32]) {
         super::cannot_run(level)
     );
     match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: this CPU supports AVX2 and FMA (the guard).
+        Level::Avx2Fma if supported(Level::Avx2Fma) => unsafe {
+            super::x86::elu_avx2_slice(alpha, values)
+        },
         #[cfg(target_arch = "x86_64")]
         // SAFETY: this CPU supports SSE4.2 (the guard).
         Level::Sse42 if supported(Level::Sse42) => unsafe {
@@ -834,18 +847,20 @@ mod tests {
         worst
     }
 
-    /// Softplus within 2 ulp and ELU within 1 ulp of the correctly rounded result at every
-    /// level, over the sweep and the edge values; at SSE4.2 both give the reference's bits.
+    /// Softplus within 2 ulp and ELU within 1 ulp of the correctly rounded result at the
+    /// levels that round as the reference does, one ulp more at AVX2 (fused multiply-adds),
+    /// over the sweep and the edge values; at SSE4.2 both give the reference's bits.
     #[test]
     fn softplus_and_elu_within_their_bounds() {
         let mut xs = sweep(1009);
         xs.extend(edges());
         xs.push(f32::NAN);
         for level in levels() {
+            let fused = u64::from(level == Level::Avx2Fma);
             let (s, sx) = worst_of(&xs, |v| softplus_f32_with(level, v), softplus_exact);
-            assert!(s <= 2, "{level}: softplus is {s} ulp off at {sx:e}");
+            assert!(s <= 2 + fused, "{level}: softplus is {s} ulp off at {sx:e}");
             let (e, ex) = worst_of(&xs, |v| elu_f32_with(level, 1.0, v), elu_exact);
-            assert!(e <= 1, "{level}: elu is {e} ulp off at {ex:e}");
+            assert!(e <= 1 + fused, "{level}: elu is {e} ulp off at {ex:e}");
         }
         if supported(Level::Sse42) {
             for f in [softplus_f32_with, |l, v: &mut [f32]| {
@@ -892,7 +907,8 @@ mod tests {
                 "{level}: softplus {} ulp at {:e}, elu {} ulp at {:e}",
                 s_max.0, s_max.1, e_max.0, e_max.1
             );
-            assert!(s_max.0 <= 2 && e_max.0 <= 1, "{level}");
+            let fused = u64::from(level == Level::Avx2Fma);
+            assert!(s_max.0 <= 2 + fused && e_max.0 <= 1 + fused, "{level}");
         }
     }
 
