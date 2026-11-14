@@ -387,6 +387,126 @@ fn accelerate_matches_reference() {
     assert_eq!(threads_used(Level::Accelerate, 4, 128, 1024, 784), 1);
 }
 
+/// Products wider than the 2,048-column block of the x86 and Arm kernels, so the loop over
+/// column blocks runs three times (5 x 4,133 x 9), and the same with the driver's swap
+/// (4,133 x 5 x 9, C taller than 4 times its width), match the reference within the
+/// tolerance at every fast level, on 1 and 3 threads, beta 0 and 1.
+#[test]
+fn fast_columns_past_one_block() {
+    for (level, ..) in fast_levels("fast_columns_past_one_block") {
+        let mut rng = Rng::seed(19);
+        for shape in [(5, 2 * 2048 + 37, 9), (2 * 2048 + 37, 5, 9)] {
+            for threads in [1, 3] {
+                check_case(
+                    &mut rng,
+                    level,
+                    threads,
+                    shape,
+                    &[1.0],
+                    &[0.0, 1.0],
+                    0,
+                    false,
+                );
+            }
+        }
+    }
+}
+
+/// With `alpha = 0` the product is `beta · C0` (and exactly 0 with `beta = 0`, from a C that
+/// starts as NaN), within the tolerance, at every fast level and Accelerate.
+#[test]
+fn fast_alpha_zero() {
+    for level in gemm_levels("fast_alpha_zero") {
+        let mut rng = Rng::seed(23);
+        for shape in [(7, 9, 11), (33, 65, 17), (64, 64, 64)] {
+            check_case(
+                &mut rng,
+                level,
+                2,
+                shape,
+                &[0.0],
+                &[0.0, 1.0, 0.25],
+                1,
+                false,
+            );
+        }
+    }
+}
+
+/// At every packed level the result does not depend on layout, bit for bit: A and B each
+/// stored as given or transposed, C row- or column-major (8 combinations), on 37 x 45 x 53
+/// and 130 x 70 x 300, beta 0.5, on 1 and 4 threads.
+#[test]
+fn fast_layout_does_not_change_bits() {
+    for (level, ..) in fast_levels("fast_layout_does_not_change_bits") {
+        let mut rng = Rng::seed(29);
+        for (m, n, k) in [(37, 45, 53), (130, 70, 300)] {
+            let a = random(&mut rng, m * k);
+            let b = random(&mut rng, k * n);
+            let c0 = random(&mut rng, m * n);
+            for threads in [1, 4] {
+                let mut first: Option<Vec<u32>> = None;
+                for ta in [false, true] {
+                    for tb in [false, true] {
+                        for tc in [false, true] {
+                            let (sa, sb) =
+                                (Stored::new(&a, m, k, ta, 0), Stored::new(&b, k, n, tb, 0));
+                            let mut sc = Stored::new(&c0, m, n, tc, 0);
+                            gemm_f32_with(
+                                level,
+                                threads,
+                                0.75,
+                                sa.view(),
+                                sb.view(),
+                                0.5,
+                                sc.view_mut(),
+                            );
+                            let bits: Vec<u32> =
+                                sc.logical().into_iter().map(f32::to_bits).collect();
+                            let what = format!(
+                                "{level}, {m}x{n}x{k}, {threads} threads, A transposed {ta}, \
+                                 B transposed {tb}, C transposed {tc}"
+                            );
+                            match &first {
+                                None => first = Some(bits),
+                                Some(f) => {
+                                    assert!(*f == bits, "{what}: differs from the first layout")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A product whose rows allow no whole number of tasks per thread keeps the split it had
+/// before balancing: 12 x 16 in 6 x 8 tiles with 72-row tasks on 3 threads gives 2 by 2
+/// tasks of one panel each, and the product on 3 threads gives the bits of 1 thread at
+/// every packed level.
+#[test]
+fn grid_without_a_balanced_split() {
+    let grid = Grid::new(12, 16, 6, 8, 72, 3);
+    assert_eq!(
+        (grid.m_panels, grid.m_tasks, grid.n_panels, grid.n_tasks),
+        (1, 2, 1, 2)
+    );
+    assert_eq!(grid.tasks(), 4);
+    for (level, ..) in fast_levels("grid_without_a_balanced_split") {
+        let mut rng = Rng::seed(31);
+        let (m, n, k) = (12, 16, 40);
+        let (a, b, c0) = (
+            random(&mut rng, m * k),
+            random(&mut rng, k * n),
+            random(&mut rng, m * n),
+        );
+        let one = product_bits(level, 1, rm(&a, m, k), rm(&b, k, n), 1.0, &c0);
+        let three = product_bits(level, 3, rm(&a, m, k), rm(&b, k, n), 1.0, &c0);
+        assert!(one == three, "{level}: 3 threads differ from 1");
+    }
+}
+
 /// A 512 x 512 x 512 product on 4 threads matches the reference within the tolerance, at
 /// every fast level.
 #[test]
@@ -471,9 +591,10 @@ fn product_bits(
     c.into_iter().map(f32::to_bits).collect()
 }
 
-/// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500 and on the training
-/// shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and 32 x 256 x 1024, at every fast
-/// level and Accelerate. The test binary re-runs itself as a child that runs only
+/// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500, on the training
+/// shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and 32 x 256 x 1024, and on
+/// 1024 x 128 x 256, which the driver computes with A and B swapped, at every fast level and
+/// Accelerate. The test binary re-runs itself as a child that runs only
 /// `threads_bit_identical_child`, so nothing else holds the thread pool and the multi-threaded
 /// products really use its workers.
 #[test]
@@ -496,6 +617,8 @@ fn threads_bit_identical_child() {
             (300, 700, 500, false),
             (128, 1024, 784, true),
             (32, 256, 1024, false),
+            // C four or more times taller than wide: the driver swaps A and B.
+            (1024, 128, 256, false),
         ] {
             let a = random(&mut rng, m * k);
             let b = Stored::new(&random(&mut rng, k * n), k, n, b_transposed, 0);

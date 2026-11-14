@@ -3007,8 +3007,32 @@ mod tests {
                 let mut tape = graph.tape(&params.values);
                 let xi = tape.input(x.view());
                 let out = net.forward(&mut tape, xi);
-                let view = batcher.gather(data, 0..2, &mut batch);
-                let l = loss.record(&mut tape, out, view.targets);
+                // Each loss's core operation and reduction, as its documentation states,
+                // written out here rather than through `Loss::record`, so a wrong mapping
+                // there fails this test.
+                let mean = Reduction::Mean;
+                let l = match (&loss, &data.targets) {
+                    (Loss::CrossEntropy, Targets::Classes(labels)) => {
+                        tape.softmax_cross_entropy(out, labels, mean)
+                    }
+                    (Loss::Nll, Targets::Classes(labels)) => tape.nll(out, labels, mean),
+                    (_, Targets::Values(values)) => {
+                        let t = tape.input(values.view());
+                        match loss {
+                            Loss::Mse => tape.mse(out, t, mean),
+                            Loss::L1 => tape.l1(out, t, mean),
+                            Loss::Huber { delta } => tape.huber(out, t, delta as f32, mean),
+                            Loss::SmoothL1 { beta } => tape.smooth_l1(out, t, beta as f32, mean),
+                            Loss::BinaryCrossEntropy => tape.binary_cross_entropy(out, t, mean),
+                            Loss::BinaryCrossEntropyWithLogits => {
+                                tape.binary_cross_entropy_with_logits(out, t, mean)
+                            }
+                            Loss::KlDiv => tape.kl_div(out, t, Reduction::BatchMean),
+                            other => panic!("{other:?} takes class targets"),
+                        }
+                    }
+                    (other, Targets::Classes(_)) => panic!("{other:?} takes value targets"),
+                };
                 tape.value(l).data()[0]
             };
             let before = parameter_bits(&net, &params);

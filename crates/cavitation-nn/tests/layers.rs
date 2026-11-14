@@ -222,13 +222,31 @@ fn builtin_f_and_df_match_the_tape_op_at_kinks_and_nan() {
             0.8,
             f64::NAN,
         ];
+        // Every kind is listed, with no wildcard, so a new kind does not compile until its
+        // kinks and boundaries are added here. Those at 0, ±1, ±3 and ±6 are in `xs` already.
         match kind {
             ActivationKind::Hardtanh { min, max } => xs.extend([min, max]),
             ActivationKind::Softplus { beta, threshold } => {
                 xs.extend([threshold / beta, -threshold / beta])
             }
+            // Mish's softplus switches to `x` above 20.
             ActivationKind::Mish => xs.extend([20.0, -20.0]),
-            _ => {}
+            // Kinks at 0 (ReLU, leaky ReLU, the exponential units), at 0 and 6 (ReLU6), at
+            // ±3 (hard sigmoid, hard swish); the others are smooth.
+            ActivationKind::Relu
+            | ActivationKind::LeakyRelu(_)
+            | ActivationKind::Elu(_)
+            | ActivationKind::Selu
+            | ActivationKind::Celu(_)
+            | ActivationKind::Relu6
+            | ActivationKind::Hardsigmoid
+            | ActivationKind::Hardswish
+            | ActivationKind::Tanh
+            | ActivationKind::Sigmoid
+            | ActivationKind::Gelu(_)
+            | ActivationKind::Silu
+            | ActivationKind::Softsign
+            | ActivationKind::LogSigmoid => {}
         }
         check_against_tape(kind, xs);
     }
