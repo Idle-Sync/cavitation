@@ -8,6 +8,10 @@ use cavitation_core::{Real, Rng, Tensor};
 /// `xavier_uniform_` and `xavier_normal_` with gain 1; `HeUniform` and `HeNormal` are
 /// `kaiming_uniform_` and `kaiming_normal_` with `nonlinearity='relu'` and `mode='fan_in'`.
 ///
+/// The enum is `#[non_exhaustive]`, so a later initialiser is not a breaking change: a
+/// `match` on it outside this crate needs a wildcard arm. Building a value works as for
+/// any enum.
+///
 /// ```
 /// use cavitation_core::{Rng, Tensor};
 /// use cavitation_nn::Init;
@@ -17,6 +21,7 @@ use cavitation_core::{Real, Rng, Tensor};
 /// assert!(w.data().iter().all(|v| v.abs() <= bound));
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Init {
     /// Uniform in `±sqrt(6 / (fan_in + fan_out))`.
     XavierUniform,
