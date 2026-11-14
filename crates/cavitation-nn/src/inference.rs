@@ -168,8 +168,8 @@ pub struct InferenceModel {
     bufs: [Vec<f32>; 2],
 }
 
-// Compiles only while `InferenceModel` is `Send` and `Sync`, so a change that loses either
-// (a field that is neither, say) fails the build, not a user's program.
+/// Compiles only while `InferenceModel` is `Send` and `Sync`, so a change that loses either
+/// (a field that is neither, say) fails the build, not a user's program.
 const _: () = {
     /// Requires `T: Send + Sync`.
     const fn send_and_sync<T: Send + Sync>() {}
