@@ -109,7 +109,8 @@ impl Pool2dGeom {
     /// # Errors
     ///
     /// [`Error::InvalidData`] if any count, size, stride or dilation is 0, the padding is more
-    /// than half the dilated window on either axis, or no window fits, naming the sizes.
+    /// than half the window (undilated, as PyTorch checks it) on either axis, or no window
+    /// fits, naming the sizes.
     ///
     /// ```
     /// use cavitation_core::kernels::pooling::Pool2dGeom;
