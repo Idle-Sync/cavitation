@@ -56,11 +56,15 @@ pub enum OnNonFinite {
     /// [`EpochReport::rows`](crate::EpochReport::rows) and its loss out of
     /// [`EpochReport::mean_loss`](crate::EpochReport::mean_loss), and
     /// [`StepControl::after_step`](crate::StepControl::after_step) does not run after it.
-    /// `fit`'s learning-rate schedule is set once per epoch, so a skipped step does not move
-    /// it. A skipped step does not set the loss the vanishing-gradient check compares
-    /// against ([`Health::grad_norm_low`]). With the same seeds and the other batches
-    /// unchanged and in the same order (for example `shuffle_seed: None`), a run that skips a
-    /// step ends with the parameters, bit for bit, of the same run without that step's batch.
+    /// The per-epoch learning-rate schedules ([`LrSchedule::Constant`](crate::LrSchedule::Constant)
+    /// and [`LrSchedule::Cosine`](crate::LrSchedule::Cosine)) do not depend on the step, so a
+    /// skipped step does not move them; the per-step schedules count it as a step position,
+    /// so the steps after it train at the rates they would have had anyway. A skipped step
+    /// does not set the loss the vanishing-gradient check compares against
+    /// ([`Health::grad_norm_low`]). Under a per-epoch schedule, with the same seeds and the
+    /// other batches unchanged and in the same order (for example `shuffle_seed: None`), a
+    /// run that skips a step ends with the parameters, bit for bit, of the same run without
+    /// that step's batch.
     ///
     /// An epoch in which every step was left out ends the run:
     /// [`HealthMonitor::end_epoch`] returns [`Error::NonFinite`] saying so, since the
