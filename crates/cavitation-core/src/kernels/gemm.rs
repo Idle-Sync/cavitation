@@ -475,13 +475,13 @@ impl Shared {
 #[derive(Clone, Copy)]
 pub(super) struct Grid {
     /// `mr`-row panels of `A` per task.
-    m_panels: usize,
+    pub(super) m_panels: usize,
     /// Number of task rows.
-    m_tasks: usize,
+    pub(super) m_tasks: usize,
     /// `nr`-column panels of `B` per task.
-    n_panels: usize,
+    pub(super) n_panels: usize,
     /// Number of task columns.
-    n_tasks: usize,
+    pub(super) n_tasks: usize,
 }
 
 impl Grid {

@@ -14,25 +14,78 @@ pub struct MachineInfo {
 
 /// Reads the CPU model and logical core count from the text of `/proc/cpuinfo`: the first
 /// `model name` line, and the number of `processor` lines. Returns `None` if either is
-/// missing.
+/// missing. On aarch64 Linux, which has no `model name` line, the model is built from the
+/// cores' `CPU implementer` and `CPU part` lines (see [`arm_core_name`]), each distinct core
+/// once in order of first appearance and joined with ` + ` (`ARM Cortex-A76 + ARM
+/// Cortex-A55` on a big.LITTLE chip), after the board's `Model` line when there is one.
 pub fn parse_cpuinfo(text: &str) -> Option<MachineInfo> {
     let mut model = None;
+    let mut board = None;
     let mut cores = 0;
+    let mut implementer: Option<String> = None;
+    let mut arm_cores: Vec<String> = Vec::new();
     for line in text.lines() {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
+        let value = value.trim();
         match key.trim() {
-            "model name" if model.is_none() => model = Some(value.trim().to_string()),
+            "model name" if model.is_none() => model = Some(value.to_string()),
+            "Model" if board.is_none() && !value.is_empty() => board = Some(value.to_string()),
             "processor" => cores += 1,
+            "CPU implementer" => implementer = Some(value.to_string()),
+            "CPU part" => {
+                let name = arm_core_name(implementer.as_deref().unwrap_or(""), value);
+                if !arm_cores.contains(&name) {
+                    arm_cores.push(name);
+                }
+            }
             _ => {}
         }
     }
-    let cpu_model = model.filter(|m| !m.is_empty())?;
+    let arm = (!arm_cores.is_empty()).then(|| {
+        let cores = arm_cores.join(" + ");
+        match &board {
+            Some(board) => format!("{board} ({cores})"),
+            None => cores,
+        }
+    });
+    let cpu_model = model.filter(|m| !m.is_empty()).or(arm).or(board)?;
     (cores > 0).then_some(MachineInfo {
         cpu_model,
         logical_cores: cores,
     })
+}
+
+/// The name of an Arm core from `/proc/cpuinfo`'s `CPU implementer` and `CPU part` values
+/// (hexadecimal, `0x41` and `0xd0b` say): the common Arm Ltd. cores by name, any other as
+/// `implementer 0x.. part 0x...`.
+pub fn arm_core_name(implementer: &str, part: &str) -> String {
+    let known = match (implementer, part) {
+        ("0x41", "0xd03") => Some("ARM Cortex-A53"),
+        ("0x41", "0xd04") => Some("ARM Cortex-A35"),
+        ("0x41", "0xd05") => Some("ARM Cortex-A55"),
+        ("0x41", "0xd07") => Some("ARM Cortex-A57"),
+        ("0x41", "0xd08") => Some("ARM Cortex-A72"),
+        ("0x41", "0xd09") => Some("ARM Cortex-A73"),
+        ("0x41", "0xd0a") => Some("ARM Cortex-A75"),
+        ("0x41", "0xd0b") => Some("ARM Cortex-A76"),
+        ("0x41", "0xd0c") => Some("ARM Neoverse N1"),
+        ("0x41", "0xd0d") => Some("ARM Cortex-A77"),
+        ("0x41", "0xd40") => Some("ARM Neoverse V1"),
+        ("0x41", "0xd41") => Some("ARM Cortex-A78"),
+        ("0x41", "0xd44") => Some("ARM Cortex-X1"),
+        ("0x41", "0xd46") => Some("ARM Cortex-A510"),
+        ("0x41", "0xd47") => Some("ARM Cortex-A710"),
+        ("0x41", "0xd48") => Some("ARM Cortex-X2"),
+        ("0x41", "0xd49") => Some("ARM Neoverse N2"),
+        ("0x41", "0xd4f") => Some("ARM Neoverse V2"),
+        _ => None,
+    };
+    known.map_or_else(
+        || format!("implementer {implementer} part {part}"),
+        str::to_string,
+    )
 }
 
 /// Builds the description from the output of `sysctl -n machdep.cpu.brand_string` and
@@ -219,6 +272,38 @@ mod tests {
         assert_eq!(info.cpu_model, "Intel(R) Celeron(R) N5105 @ 2.00GHz");
         assert_eq!(info.logical_cores, 4);
         assert!(parse_cpuinfo("nothing useful\n").is_none());
+    }
+
+    /// On aarch64 Linux, with no `model name` line, the model comes from the cores' parts:
+    /// a Raspberry Pi 5's four Cortex-A76 cores (captured `/proc/cpuinfo`, trimmed), a
+    /// big.LITTLE chip's two kinds in order, and an unknown part by its numbers.
+    #[test]
+    fn machine_info_parses_aarch64_cpuinfo() {
+        let pi = "processor\t: 0\nBogoMIPS\t: 108.00\nFeatures\t: fp asimd evtstrm aes\n\
+            CPU implementer\t: 0x41\nCPU architecture: 8\nCPU variant\t: 0x4\n\
+            CPU part\t: 0xd0b\nCPU revision\t: 1\n\n\
+            processor\t: 1\nCPU implementer\t: 0x41\nCPU part\t: 0xd0b\n\n\
+            processor\t: 2\nCPU implementer\t: 0x41\nCPU part\t: 0xd0b\n\n\
+            processor\t: 3\nCPU implementer\t: 0x41\nCPU part\t: 0xd0b\n\n\
+            Revision\t: d04170\nSerial\t\t: 0123456789abcdef\n\
+            Model\t\t: Raspberry Pi 5 Model B Rev 1.0\n";
+        let info = parse_cpuinfo(pi).unwrap();
+        assert_eq!(
+            info.cpu_model,
+            "Raspberry Pi 5 Model B Rev 1.0 (ARM Cortex-A76)"
+        );
+        assert_eq!(info.logical_cores, 4);
+        let mixed = "processor\t: 0\nCPU implementer\t: 0x41\nCPU part\t: 0xd05\n\n\
+            processor\t: 1\nCPU implementer\t: 0x41\nCPU part\t: 0xd05\n\n\
+            processor\t: 2\nCPU implementer\t: 0x41\nCPU part\t: 0xd0b\n";
+        let info = parse_cpuinfo(mixed).unwrap();
+        assert_eq!(info.cpu_model, "ARM Cortex-A55 + ARM Cortex-A76");
+        assert_eq!(info.logical_cores, 3);
+        assert_eq!(
+            arm_core_name("0x61", "0x022"),
+            "implementer 0x61 part 0x022"
+        );
+        assert!(parse_cpuinfo("processor\t: 0\nBogoMIPS\t: 108.00\n").is_none());
     }
 
     /// The macOS values come from `sysctl -n machdep.cpu.brand_string` and `hw.ncpu`.
