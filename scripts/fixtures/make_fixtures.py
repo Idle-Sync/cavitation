@@ -701,6 +701,29 @@ def make_pool():
         add_case(f"adaptive-avg-pool2d-{name}", "adaptive_avg_pool2d", params, [rnd(batch, c * h * w)], pool)
 
 
+def make_batch_norm():
+    """batch_norm2d with batch statistics (PyTorch's training mode), on images flattened to
+    rows: `F.batch_norm(x, None, None, weight, bias, training=True, eps=eps)`. Built after
+    every other case, so its draws shift none of their inputs.
+    """
+    for name, batch, c, (h, w), eps, affine in [
+        ("4x3x3", 4, 3, (3, 3), 1e-5, True),
+        ("2x2x5x4", 2, 2, (5, 4), 1e-3, True),
+        ("no-affine", 3, 2, (2, 2), 1e-5, False),
+        ("1x1-spatial", 8, 4, (1, 1), 1e-5, True),
+    ]:
+        x = rnd(batch, c * h * w, scale=2.0) + 0.5
+        inputs = [x] + ([rnd(c) + 1.0, rnd(c)] if affine else [])
+
+        def bn(x, *wb, shape=(batch, c, h, w), eps=eps):
+            weight, bias = (wb[0], wb[1]) if wb else (None, None)
+            y = F.batch_norm(x.reshape(shape), None, None, weight, bias, training=True, eps=eps)
+            return y.reshape(shape[0], -1)
+
+        params = {"channels": c, "spatial": h * w, "eps": eps}
+        add_case(f"batch-norm2d-{name}", "batch_norm2d", params, inputs, bn)
+
+
 def write_state_dict(crates_dir):
     """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` and its outputs for five inputs."""
     out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
@@ -921,6 +944,7 @@ def main():
     make_dropout()
     make_conv()
     make_pool()
+    make_batch_norm()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):

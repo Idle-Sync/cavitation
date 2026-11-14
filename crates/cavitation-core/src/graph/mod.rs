@@ -299,6 +299,32 @@ pub struct Graph<T: Real = f32> {
     /// Class labels recorded by the tape's loss operations, for their backward passes; empty
     /// between tapes, capacity kept.
     labels: Vec<usize>,
+    /// The running-statistics updates the last training tape recorded, for
+    /// [`Graph::apply_buffer_updates`]; capacity kept.
+    updates: Vec<BufferUpdate>,
+    /// The batch statistics those updates carry, one run of `2 · channels` values each
+    /// (means, then unbiased variances); capacity kept.
+    update_values: Vec<T>,
+}
+
+/// One running-statistics update a training step recorded: batch normalisation's running
+/// mean and variance (and its batch count, if it keeps one) move towards the batch's
+/// statistics once the step's tape is dropped.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BufferUpdate {
+    /// The running mean.
+    pub(crate) mean: ParamId,
+    /// The running variance.
+    pub(crate) var: ParamId,
+    /// The count of batches seen, if kept: one value, incremented by each update.
+    pub(crate) count: Option<ParamId>,
+    /// The weight of the batch's statistics, or `None` for the cumulative average (one over
+    /// the batch count after this update).
+    pub(crate) momentum: Option<f64>,
+    /// Where this update's statistics start in `update_values`.
+    pub(crate) start: usize,
+    /// The number of channels.
+    pub(crate) channels: usize,
 }
 
 impl Graph<f32> {
@@ -334,6 +360,8 @@ impl<T: Real> Graph<T> {
             nodes: Vec::new(),
             grads: Vec::new(),
             labels: Vec::new(),
+            updates: Vec::new(),
+            update_values: Vec::new(),
         }
     }
 
@@ -387,6 +415,9 @@ impl<T: Real> Graph<T> {
     ) -> Tape<'g, T> {
         // A tape that was leaked instead of dropped leaves its nodes behind.
         self.reclaim();
+        // Updates the last tape recorded and nobody applied are dropped when the next opens.
+        self.updates.clear();
+        self.update_values.clear();
         Tape {
             graph: self,
             params,
@@ -395,6 +426,63 @@ impl<T: Real> Graph<T> {
             training,
             streams: 0,
         }
+    }
+
+    /// Applies the running-statistics updates the last training tape recorded (batch
+    /// normalisation's, which a tape cannot write while it only borrows the values) to
+    /// `values`, and forgets them; call it once the tape is dropped, after the step's update
+    /// and only if the step is kept. `Trainer` and `fit` call it for you; a hand-written loop
+    /// calls it after the optimiser step. Updates nobody applies are dropped when the next
+    /// tape opens. Allocates nothing.
+    ///
+    /// For each update, as PyTorch's `BatchNorm2d` in training: the batch count (if kept)
+    /// goes up by one, then with `m` the momentum, or one over the new count for a
+    /// cumulative average, `mean ← m · batch_mean + (1 − m) · mean` and the same for the
+    /// variance with the batch's unbiased variance.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, RunningStats, Tensor};
+    /// let mut store = ParamStore::new();
+    /// let (mean, var) = (store.add(Tensor::zeros(&[1])), store.add(Tensor::full(&[1], 1.0f32)));
+    /// let stats = RunningStats { mean, var, count: None, momentum: Some(0.1) };
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.training_tape(&store.values, 0, 1);
+    /// let x = tape.input(Tensor::from_vec(vec![1.0f32, 3.0], &[2, 1]).unwrap().view());
+    /// tape.batch_norm2d(x, None, None, Some(stats), 1, 1, 1e-5);
+    /// drop(tape);
+    /// graph.apply_buffer_updates(&mut store.values);
+    /// assert_eq!(store.value(mean).data(), &[0.2]); // 0.1 · 2
+    /// assert_eq!(store.value(var).data(), &[1.1]); // 0.1 · 2 + 0.9 · 1
+    /// ```
+    pub fn apply_buffer_updates(&mut self, values: &mut ParamValues<T>) {
+        for u in self.updates.drain(..) {
+            let momentum = match (u.momentum, u.count) {
+                (Some(m), count) => {
+                    if let Some(c) = count {
+                        let n = values.get_mut(c).data_mut();
+                        n[0] += T::ONE;
+                    }
+                    T::from_f64(m)
+                }
+                (None, Some(c)) => {
+                    let n = values.get_mut(c).data_mut();
+                    n[0] += T::ONE;
+                    T::ONE / n[0]
+                }
+                (None, None) => T::ONE,
+            };
+            let stats = &self.update_values[u.start..][..2 * u.channels];
+            let keep = T::ONE - momentum;
+            for (id, batch) in [
+                (u.mean, &stats[..u.channels]),
+                (u.var, &stats[u.channels..]),
+            ] {
+                for (r, &b) in values.get_mut(id).data_mut().iter_mut().zip(batch) {
+                    *r = momentum * b + keep * *r;
+                }
+            }
+        }
+        self.update_values.clear();
     }
 
     /// Returns every node value and gradient buffer to the pool and empties the node and
@@ -813,6 +901,7 @@ impl<T: Real> Tape<'_, T> {
             nodes,
             grads: node_grads,
             labels,
+            ..
         } = &mut *self.graph;
         let labels: &[usize] = labels;
         node_grads.resize_with(nodes.len(), || None);
@@ -996,6 +1085,20 @@ impl<T: Real> Tape<'_, T> {
             params: self.params,
         };
         (values.get(v), start, &mut self.graph.labels[start..])
+    }
+
+    /// Records a running-statistics update for [`Graph::apply_buffer_updates`], with the
+    /// batch's `means` and unbiased `variances`.
+    pub(crate) fn push_buffer_update(
+        &mut self,
+        mut update: BufferUpdate,
+        means: &[T],
+        variances: &[T],
+    ) {
+        update.start = self.graph.update_values.len();
+        self.graph.update_values.extend_from_slice(means);
+        self.graph.update_values.extend_from_slice(variances);
+        self.graph.updates.push(update);
     }
 
     /// Appends a node and returns its variable.
