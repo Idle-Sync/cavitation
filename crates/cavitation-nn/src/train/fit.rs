@@ -193,9 +193,10 @@ impl Loss {
 /// The same step written out by hand, the way to train with a loss [`Loss`] does not list:
 /// open a tape on the parameter values, add the batch as an input, run the model (traced,
 /// for the health checks), record the loss, run `backward` into the gradients, run the
-/// [`HealthMonitor`]'s tape checks, drop the tape, ask the monitor whether to apply the update
-/// (it checks the gradients before they reach the parameters), step the optimiser, run the monitor's
-/// gradient checks on the optimiser's statistics and mark the gradients stale; at the end
+/// [`HealthMonitor`]'s tape checks, drop the tape, ask the monitor whether to apply the
+/// update (under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) it checks the gradients
+/// first), step the optimiser, run the monitor's gradient checks on the optimiser's
+/// statistics and mark the gradients stale; at the end
 /// of each epoch, end the monitor's epoch. The tape borrows `params.values` while
 /// `backward` writes `params.grads`; borrowing the two fields separately is what lets this
 /// compile.
@@ -231,7 +232,7 @@ impl Loss {
 ///         };
 ///         monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
 ///         drop(tape);
-///         if monitor.before_update(step, value, &params, &names)? {
+///         if monitor.before_update(step, value, &params, &names) {
 ///             optimizer.step(&mut params);
 ///             monitor.after_update(step, optimizer.last_stats(), &names)?;
 ///         }
@@ -372,15 +373,17 @@ impl Trainer {
     /// parameter, and sends the matching [`Warning::NonFinite`] to the health sink. For a
     /// non-finite loss the error's `detail` names the first NaN or infinite value in the batch's
     /// inputs or value targets (with no dataset row, as `step` does not know one), or says that the
-    /// inputs were finite and the values overflowed. A NaN or infinite loss, or a NaN or infinite
-    /// gradient with a finite loss, stops before the optimiser step, so the parameters and the
-    /// optimiser's state stay as they were. The step is counted and the gradients are marked
-    /// stale either way. [`fit`] stops at this error. Under
+    /// inputs were finite and the values overflowed. A NaN or infinite loss skips the optimiser
+    /// step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is
+    /// found after the update has applied it, so the parameters then hold the NaN. The step is
+    /// counted and the gradients are marked stale either way. [`fit`] stops at this error. Under
     /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not, and the
     /// update is applied. Under [`OnNonFinite::Skip`](crate::OnNonFinite) the step returns its
     /// loss too, but a step whose loss or gradient is NaN or infinite leaves the parameters and
     /// the optimiser's state as they were; it is counted in [`steps`](Self::steps) and in
-    /// [`skipped_steps`](Self::skipped_steps).
+    /// [`skipped_steps`](Self::skipped_steps). Its hooks have run, and a profile asked for
+    /// with [`profile_next_step`](Self::profile_next_step) carries over to the next step that
+    /// trains.
     ///
     /// [`Warning::NonFinite`]: crate::Warning::NonFinite
     ///
@@ -530,16 +533,7 @@ impl Trainer {
                     .after_backward(step, value, &tape, &self.trace, model, inputs);
             (value, checked)
         };
-        let apply = match checked {
-            Ok(()) => match self.health.before_update(step, value, params, &self.names) {
-                Ok(apply) => apply,
-                Err(err) => {
-                    checked = Err(err);
-                    false
-                }
-            },
-            Err(_) => false,
-        };
+        let apply = checked.is_ok() && self.health.before_update(step, value, params, &self.names);
         if apply {
             let update_start = profiling.then(Instant::now);
             self.optimizer.step(params);
@@ -552,12 +546,17 @@ impl Trainer {
         } else if profiling {
             self.profiler.profile.optimizer = Duration::ZERO;
         }
-        if checked.is_ok() && !apply {
+        let skipped = checked.is_ok() && !apply;
+        if skipped {
             self.skipped += 1;
+            // The step that was asked for a profile did not train: ask the next one.
+            self.profiler.asked |= profiling;
         }
         params.zero_grad();
         self.steps = step;
-        if let Some(start) = start {
+        if let Some(start) = start
+            && !skipped
+        {
             self.profiler.profile.total = start.elapsed();
             self.profiler.valid = true;
         }
@@ -1140,6 +1139,23 @@ impl<'a> TrainerHandle<'a> {
     pub fn steps(&self) -> u64 {
         self.trainer.steps()
     }
+
+    /// How many of those steps were left out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip), as [`Trainer::skipped_steps`] gives.
+    /// The control does not run after a skipped step, so a jump in [`StepInfo::step`] is the
+    /// other sign of one.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer, TrainerHandle};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
+    /// assert_eq!(TrainerHandle::new(&mut trainer).skipped_steps(), 0);
+    /// ```
+    pub fn skipped_steps(&self) -> u64 {
+        self.trainer.skipped_steps()
+    }
 }
 
 /// What runs between the steps of [`fit_controlled`]: after each step and after each epoch,
@@ -1388,8 +1404,9 @@ pub struct EpochReport {
     /// The epoch's number, counting from 1.
     pub epoch: usize,
     /// The mean loss over the epoch's rows: each batch's loss weighted by its row count. A
-    /// step left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) does not count, so
-    /// an epoch whose every step was left out has a NaN `mean_loss`.
+    /// step left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) does not count;
+    /// an epoch in which every step was left out gets no report, as it ends the run with
+    /// [`Error::NonFinite`].
     ///
     /// A PyTorch loop that averages the batch means gives a slightly different figure when the
     /// last batch is short, because it counts that batch as much as a full one. This loop
@@ -1675,11 +1692,11 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// with `config.health.on_non_finite` set to [`OnNonFinite::Stop`](crate::OnNonFinite) (the
 /// default), returns [`Error::NonFinite`] at the first step whose loss or gradient is NaN or
 /// infinite, naming the step and `"loss"` or the parameter (for example `"0.weight"`), after
-/// sending the matching warning to the health sink. A non-finite loss, or a non-finite gradient
-/// with a finite loss, stops before the optimiser step, so the parameters keep the values of the
-/// last good step. With
+/// sending the matching warning to the health sink. A non-finite loss stops before the optimiser
+/// step; a non-finite gradient with a finite loss is found after the update applied it. With
 /// [`OnNonFinite::Skip`](crate::OnNonFinite), such a step is left out instead and training
-/// continues (see [`EpochReport::rows`]).
+/// continues (see [`EpochReport::rows`]), but an epoch in which every step was left out ends
+/// the run with [`Error::NonFinite`] naming the epoch, since the parameters did not change.
 ///
 /// # Panics
 ///

@@ -77,8 +77,12 @@ fn main() -> Result<(), Error> {
         };
         monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
         drop(tape);
-        optimizer.step(&mut params);
-        monitor.after_update(step, optimizer.last_stats(), &names)?;
+        // `true` unless the health checks say to leave this update out (under
+        // `OnNonFinite::Skip`, a step with a NaN or infinite loss or gradient).
+        if monitor.before_update(step, value, &params, &names) {
+            optimizer.step(&mut params);
+            monitor.after_update(step, optimizer.last_stats(), &names)?;
+        }
         params.zero_grad();
         monitor.end_epoch(epoch)?;
         if epoch % 400 == 0 || epoch == 1 {

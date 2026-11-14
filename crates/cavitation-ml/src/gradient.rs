@@ -159,7 +159,8 @@ impl LinearRegression {
     /// [`OnNonFinite::Stop`](cavitation_nn::OnNonFinite) (the default), [`Error::NonFinite`]
     /// at the first step whose loss or gradient is NaN or infinite; with
     /// [`OnNonFinite::Skip`](cavitation_nn::OnNonFinite::Skip) such a step is left out
-    /// instead, as [`fit`](cavitation_nn::fit) leaves it out.
+    /// instead, as [`fit`](cavitation_nn::fit) leaves it out, and an epoch in which every
+    /// step was left out ends the fit with [`Error::NonFinite`] naming the epoch.
     ///
     /// # Examples
     ///
@@ -291,7 +292,8 @@ pub(crate) struct Setup {
 /// checks of `config.health` on every step. Returns the network, its parameters and each
 /// epoch's report (the row-weighted mean of the step losses, penalty included). A step left
 /// out under [`OnNonFinite::Skip`](cavitation_nn::OnNonFinite::Skip) changes nothing and
-/// counts toward neither the mean nor the report's rows, as in [`fit`](cavitation_nn::fit).
+/// counts toward neither the mean nor the report's rows, as in [`fit`](cavitation_nn::fit);
+/// an epoch in which every step was left out is the monitor's `end_epoch` error.
 ///
 /// `data`'s targets must suit `setup.loss`: values for [`StepLoss::Mse`] and
 /// [`StepLoss::BceWithLogits`] (`[rows, outputs]`), class labels below `setup.outputs` for
@@ -391,10 +393,9 @@ pub(crate) fn train(
                 let checked = monitor.after_backward(step, value, &tape, &trace, &model, inputs);
                 (value, checked)
             };
-            // `Ok(false)`: `OnNonFinite::Skip` left this step out. Under `Stop`, a NaN or
-            // infinite gradient is an error here, before the update.
+            // `Ok(false)`: `OnNonFinite::Skip` left this step out.
             let checked = checked.and_then(|()| {
-                if !monitor.before_update(step, value, &params, &names)? {
+                if !monitor.before_update(step, value, &params, &names) {
                     return Ok(false);
                 }
                 optimizer.step(&mut params);
@@ -458,10 +459,12 @@ mod tests {
     }
 
     /// Targets of ±1e20 overflow every step's squared error to infinity: `Stop` ends the fit
-    /// with `Error::NonFinite`, and `Skip` leaves every step out, so the model stays finite
-    /// and the same after 1 epoch as after 3, and each epoch reports no rows trained.
+    /// with `Error::NonFinite` at step 1, and `Skip` leaves every step of the first epoch out
+    /// and then ends the fit with `Error::NonFinite` naming that epoch. (A finite loss with a
+    /// NaN gradient goes through the same `before_update` call; the `cavitation-nn` tests
+    /// cover it.)
     #[test]
-    fn skip_leaves_overflowing_steps_out() {
+    fn skip_ends_a_fit_whose_whole_epoch_was_left_out() {
         let mut d = data(20);
         let Targets::Values(y) = &mut d.targets else {
             unreachable!("value targets")
@@ -472,22 +475,21 @@ mod tests {
         let r = LinearRegression::default();
         let err = r.fit_gradient(&d, quiet()).unwrap_err();
         assert!(matches!(err, Error::NonFinite { .. }), "{err:?}");
-        let skip = |epochs| GradientConfig {
-            epochs,
+        let skip = GradientConfig {
+            epochs: 3,
             health: Health {
                 on_non_finite: OnNonFinite::Skip,
                 ..Health::quiet()
             },
             ..GradientConfig::default()
         };
-        let (one, _) = r.fit_gradient(&d, skip(1)).unwrap();
-        let (three, history) = r.fit_gradient(&d, skip(3)).unwrap();
-        assert_eq!(one, three);
-        assert!(three.coef.data().iter().all(|c| c.is_finite()));
-        for report in &history.epochs {
-            assert_eq!(report.rows, 0);
-            assert!(report.mean_loss.is_nan());
-        }
+        let err = r.fit_gradient(&d, skip).unwrap_err();
+        // The default is full batch: one step per epoch.
+        assert!(
+            matches!(&err, Error::NonFinite { step: 1, location, .. } if location == "epoch 1"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("every step of epoch 1"), "{err}");
     }
 
     /// Without an intercept the bias stays exactly 0, and the weights match the exact path.

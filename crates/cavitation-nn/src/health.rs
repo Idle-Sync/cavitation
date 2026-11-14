@@ -23,12 +23,13 @@ use crate::{ActivationKind, GradStats, Loss, Sequential, TargetsView, Trace};
 #[non_exhaustive]
 pub enum OnNonFinite {
     /// Stop training with [`Error::NonFinite`], naming the step and where the value was,
-    /// after sending the matching [`Warning::NonFinite`] to the sink. The step's update is
-    /// not applied: a NaN or infinite loss stops before the optimiser runs, and so does a
-    /// NaN or infinite gradient with a finite loss, so the parameters and the optimiser's
-    /// state stay as the last good step left them. To find the gradient first, each step
-    /// reads every gradient once more before the optimiser runs, as under
-    /// [`Skip`](OnNonFinite::Skip).
+    /// after sending the matching [`Warning::NonFinite`] to the sink. A NaN or infinite loss
+    /// stops before the optimiser runs, so the parameters keep the last good step's values.
+    /// A NaN or infinite gradient with a finite loss is found in the optimiser's own
+    /// statistics, after the update has applied it: the parameters (and the optimiser's
+    /// momentum or moments) then already hold the NaN when the error comes back. Finding it
+    /// sooner would mean reading every gradient once more on every step; to keep the last
+    /// good values on any bad step, use [`Skip`](OnNonFinite::Skip), which pays that read.
     Stop,
     /// Send a [`Warning::NonFinite`] to the sink and keep training. The update is applied
     /// even so: after a NaN or infinite loss the optimiser steps on that loss's gradients,
@@ -42,9 +43,11 @@ pub enum OnNonFinite {
     ///
     /// The step is found bad when its loss is NaN or infinite, or when any gradient of the
     /// model's parameters is. To find the gradient before the update applies it, each step
-    /// reads every gradient once more before the optimiser runs, as under
-    /// [`Stop`](OnNonFinite::Stop); [`Warn`](OnNonFinite::Warn) does not. The warning is
-    /// sent at most once per epoch for each location, as under `Warn`.
+    /// reads every gradient once more before the optimiser runs; [`Stop`](OnNonFinite::Stop)
+    /// and [`Warn`](OnNonFinite::Warn) do not. The warning is sent at most once per epoch
+    /// for each location, as under `Warn`. Forward and backward [`Hooks`](crate::Hooks) run
+    /// on every step, a step that is then left out included, and see its NaN or infinite
+    /// values.
     ///
     /// A skipped step still counts as a step: [`Trainer::steps`](crate::Trainer::steps)
     /// and the step numbers in warnings include it, and
@@ -54,11 +57,17 @@ pub enum OnNonFinite {
     /// [`EpochReport::mean_loss`](crate::EpochReport::mean_loss), and
     /// [`StepControl::after_step`](crate::StepControl::after_step) does not run after it.
     /// `fit`'s learning-rate schedule is set once per epoch, so a skipped step does not move
-    /// it. With the same seeds, a run that skips a step ends with the parameters, bit for
-    /// bit, of the same run without that step's batch.
+    /// it. A skipped step does not set the loss the vanishing-gradient check compares
+    /// against ([`Health::grad_norm_low`]). With the same seeds and the other batches
+    /// unchanged and in the same order (for example `shuffle_seed: None`), a run that skips a
+    /// step ends with the parameters, bit for bit, of the same run without that step's batch.
+    ///
+    /// An epoch in which every step was left out ends the run:
+    /// [`HealthMonitor::end_epoch`] returns [`Error::NonFinite`] saying so, since the
+    /// parameters did not change and every later epoch would be left out too.
     ///
     /// A hand-written loop asks [`HealthMonitor::before_update`] whether to apply each
-    /// update, as it does under `Stop`.
+    /// update.
     Skip,
 }
 
@@ -525,9 +534,9 @@ impl fmt::Display for Warning {
 /// - a layer's dead-neuron report is printed at the end of an epoch in which its share of
 ///   dead neurons passes 25%, 50% or 90% for the first time (one line, however many it
 ///   passes), so a layer at 3% prints nothing;
-/// - an exploding or vanishing gradient, or a non-finite value under [`OnNonFinite::Warn`]
-///   or [`OnNonFinite::Skip`], is printed once for each parameter, and each later epoch adds one line per kind
-///   naming the parameters that repeated.
+/// - an exploding or vanishing gradient, or a non-finite value under
+///   [`OnNonFinite::Warn`] or [`OnNonFinite::Skip`], is printed once for each parameter,
+///   and each later epoch adds one line per kind naming the parameters that repeated.
 /// - a negative loss that cannot be negative on valid inputs ([`Warning::NegativeLoss`]) is
 ///   printed in full once, and each later epoch in which it happens again adds one line.
 ///
@@ -651,13 +660,13 @@ struct ReluLayer {
 ///    [`Optimizer::step`](crate::Optimizer::step) has run: each gradient's finiteness and
 ///    norm, from the optimiser's [`GradStats`] (read with
 ///    [`last_stats`](crate::Optimizer::last_stats)), so the gradients are not read twice.
-///    Call [`before_update`](Self::before_update) after the tape is dropped and before the
-///    optimiser step: under [`OnNonFinite::Stop`] and [`OnNonFinite::Skip`] it finds a
-///    gradient that is not finite while the loss is finite before the update applies it,
-///    and says whether to apply the update at all. Without it, `after_update` finds such a
-///    gradient only after the update has applied it.
-/// 3. [`end_epoch`](Self::end_epoch) once each epoch ends: the dead-neuron report, and the
-///    start of a new epoch for the once-per-epoch warnings.
+///    A gradient that is not finite while the loss is finite is therefore found after the
+///    update has applied it, except under [`OnNonFinite::Skip`], where
+///    [`before_update`](Self::before_update), called after the tape is dropped and before
+///    the optimiser step, finds it first and says whether to apply the update at all.
+/// 3. [`end_epoch`](Self::end_epoch) once each epoch ends: the dead-neuron report, the
+///    check that not every step of the epoch was left out under [`OnNonFinite::Skip`], and
+///    the start of a new epoch for the once-per-epoch warnings.
 ///
 /// After its first epoch the monitor allocates nothing while training is healthy; a
 /// warning that names a parameter or lists neurons allocates its text when it is sent.
@@ -692,11 +701,11 @@ struct ReluLayer {
 ///         };
 ///         let checked = monitor.after_backward(step, value, &tape, &trace, &net, inputs);
 ///         drop(tape);
-///         // Update only if the loss and the gradients were finite, and clear the gradients
-///         // before returning the error, so a stopped step leaves nothing behind for the next
-///         // one to add to.
+///         // Update only if the loss was finite (and, under `Skip`, the gradients too), and
+///         // clear the gradients before returning the error, so a stopped step leaves nothing
+///         // behind for the next one to add to.
 ///         let checked = checked.and_then(|()| {
-///             if monitor.before_update(step, value, &params, &names)? {
+///             if monitor.before_update(step, value, &params, &names) {
 ///                 optimizer.step(&mut params);
 ///                 monitor.after_update(step, optimizer.last_stats(), &names)?;
 ///             }
@@ -748,6 +757,15 @@ pub struct HealthMonitor {
     first_loss: Option<f64>,
     /// The latest finite loss seen by `after_backward`.
     latest_loss: Option<f64>,
+    /// Under [`OnNonFinite::Skip`], this step's finite loss, held by `after_backward` until
+    /// `after_update` shows the step trained.
+    pending_loss: Option<f64>,
+    /// Under [`OnNonFinite::Skip`], the last step of this epoch that `before_update` kept
+    /// out, if any.
+    skipped_this_epoch: Option<u64>,
+    /// Under [`OnNonFinite::Skip`], whether `before_update` let any step of this epoch
+    /// train.
+    trained_this_epoch: bool,
 }
 
 impl HealthMonitor {
@@ -774,6 +792,9 @@ impl HealthMonitor {
             repeats: Vec::new(),
             first_loss: None,
             latest_loss: None,
+            pending_loss: None,
+            skipped_this_epoch: None,
+            trained_this_epoch: false,
         }
     }
 
@@ -790,6 +811,12 @@ impl HealthMonitor {
     pub fn with_loss(mut self, loss: Loss) -> HealthMonitor {
         self.non_negative = loss.non_negative();
         self
+    }
+
+    /// Records `loss` as the latest finite loss, and as the first if there was none.
+    fn record_loss(&mut self, loss: f64) {
+        self.first_loss.get_or_insert(loss);
+        self.latest_loss = Some(loss);
     }
 
     /// Whether the loss has fallen to at most [`CONVERGED_LOSS_RATIO`] of its first value.
@@ -994,8 +1021,12 @@ impl HealthMonitor {
         }
         if loss.is_finite() {
             let loss = f64::from(loss);
-            self.first_loss.get_or_insert(loss);
-            self.latest_loss = Some(loss);
+            if self.health.on_non_finite == OnNonFinite::Skip {
+                // Recorded by `after_update`, once the step is known to have trained.
+                self.pending_loss = Some(loss);
+            } else {
+                self.record_loss(loss);
+            }
             if self.non_negative && loss < 0.0 && !self.negative_warned {
                 self.negative_warned = true;
                 self.emit(Warning::NegativeLoss {
@@ -1095,24 +1126,17 @@ impl HealthMonitor {
 
     /// Whether to apply step `step`'s update, asked after the tape is dropped and before
     /// [`Optimizer::step`](crate::Optimizer::step), with the step's `loss` and the gradients
-    /// in `params`. Under [`OnNonFinite::Warn`] it returns `Ok(true)` and reads nothing.
-    /// Under [`OnNonFinite::Stop`] and [`OnNonFinite::Skip`] it returns `Ok(false)` when
-    /// `loss` is NaN or infinite ([`after_backward`](Self::after_backward) has already
-    /// reported it), and otherwise reads every gradient of `names` once, allocating nothing
-    /// but the warnings: all finite gives `Ok(true)`. Under `Skip` a NaN or infinite gradient
-    /// gives `Ok(false)`, after sending [`Warning::NonFinite`] for each such parameter (at
-    /// most once per epoch each).
+    /// in `params`. Under [`OnNonFinite::Stop`] and [`OnNonFinite::Warn`] it returns `true`
+    /// and reads nothing (under `Stop`, [`after_backward`](Self::after_backward) has already
+    /// returned the error for a non-finite loss). Under [`OnNonFinite::Skip`] it returns
+    /// `false` when `loss` is NaN or infinite (`after_backward` has sent that warning) or
+    /// when the gradient of a parameter in `names` holds a NaN or an infinity, sending
+    /// [`Warning::NonFinite`] for each such parameter (at most once per epoch each); it reads
+    /// every gradient of `names` once to find out, and allocates nothing but the warnings.
     ///
-    /// When it returns `Ok(false)` or an error, leave the optimiser and
-    /// [`after_update`](Self::after_update) out for this step and clear the gradients, so the
-    /// parameters and the optimiser's state stay as they were.
-    ///
-    /// # Errors
-    ///
-    /// Under [`OnNonFinite::Stop`], returns [`Error::NonFinite`] naming the first parameter
-    /// in `names` whose gradient holds a NaN or an infinity, after sending
-    /// [`Warning::NonFinite`] to the sink, as [`after_update`](Self::after_update) would after
-    /// the update.
+    /// When it returns `false`, leave the optimiser and [`after_update`](Self::after_update)
+    /// out for this step and clear the gradients, so the parameters and the optimiser's
+    /// state stay as they were.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Reduction, Rng, Tensor};
@@ -1151,7 +1175,7 @@ impl HealthMonitor {
     ///     };
     ///     monitor.after_backward(step, value, &tape, &trace, &net, inputs).unwrap();
     ///     drop(tape);
-    ///     if monitor.before_update(step, value, &params, &names).unwrap() {
+    ///     if monitor.before_update(step, value, &params, &names) {
     ///         optimizer.step(&mut params);
     ///         monitor.after_update(step, optimizer.last_stats(), &names).unwrap();
     ///     } else {
@@ -1168,15 +1192,29 @@ impl HealthMonitor {
         loss: f32,
         params: &ParamStore,
         names: &[(String, ParamId)],
-    ) -> Result<bool, Error> {
-        let stop = match self.health.on_non_finite {
-            OnNonFinite::Warn => return Ok(true),
-            OnNonFinite::Stop => true,
-            OnNonFinite::Skip => false,
-        };
-        if !loss.is_finite() {
-            return Ok(false);
+    ) -> bool {
+        if self.health.on_non_finite != OnNonFinite::Skip {
+            return true;
         }
+        let apply = loss.is_finite() && self.gradients_finite(step, params, names);
+        if apply {
+            self.trained_this_epoch = true;
+        } else {
+            self.pending_loss = None;
+            self.skipped_this_epoch = Some(step);
+        }
+        apply
+    }
+
+    /// Whether every gradient of `names` in `params` is finite, sending
+    /// [`Warning::NonFinite`] for each parameter whose gradient is not (at most once per
+    /// epoch each).
+    fn gradients_finite(
+        &mut self,
+        step: u64,
+        params: &ParamStore,
+        names: &[(String, ParamId)],
+    ) -> bool {
         self.warned.resize(names.len(), 0);
         let mut apply = true;
         for (k, (name, id)) in names.iter().enumerate() {
@@ -1189,9 +1227,6 @@ impl HealthMonitor {
             if finite {
                 continue;
             }
-            if stop {
-                return Err(self.stop(step, name.clone(), None, None));
-            }
             apply = false;
             if self.warned[k] & WARNED_NON_FINITE != 0 {
                 continue;
@@ -1203,7 +1238,7 @@ impl HealthMonitor {
                 input: None,
             });
         }
-        Ok(apply)
+        apply
     }
 
     /// The checks on the gradients, run after [`Optimizer::step`](crate::Optimizer::step)
@@ -1219,8 +1254,9 @@ impl HealthMonitor {
     /// The update has already applied the gradients when this runs, so a non-finite
     /// gradient has reached the parameters by then, unless
     /// [`before_update`](Self::before_update) kept the update out under
-    /// [`OnNonFinite::Stop`] or [`OnNonFinite::Skip`]; do not call this for a step whose
-    /// update was kept out.
+    /// [`OnNonFinite::Skip`]; do not call this for a step whose update was kept out. Under
+    /// `Skip`, this is also where the step's loss is recorded for the vanishing-gradient
+    /// check, so a step that was kept out never sets it.
     ///
     /// # Errors
     ///
@@ -1273,6 +1309,9 @@ impl HealthMonitor {
                 None => format!("{id:?}"),
             };
             return Err(self.stop(step, location, None, None));
+        }
+        if let Some(loss) = self.pending_loss.take() {
+            self.record_loss(loss);
         }
         self.warned.resize(names.len(), 0);
         let (high, low) = (self.health.grad_norm_high, self.health.grad_norm_low);
@@ -1328,8 +1367,11 @@ impl HealthMonitor {
     ///
     /// # Errors
     ///
-    /// None of the end-of-epoch checks stops training, so this returns `Ok`; it returns a
-    /// `Result` like the per-step calls so that a loop can use `?` on all three.
+    /// Under [`OnNonFinite::Skip`], returns [`Error::NonFinite`] when
+    /// [`before_update`](Self::before_update) kept every step of the epoch out (at least one
+    /// step ran, and none trained): the parameters did not change, so every later epoch
+    /// would be kept out too. The error names the epoch's last step and says so. The other
+    /// end-of-epoch checks never stop training.
     ///
     /// ```
     /// use cavitation_nn::{Health, HealthMonitor};
@@ -1359,13 +1401,30 @@ impl HealthMonitor {
             }
         }
         self.print_repeats(epoch);
+        let all_skipped = match self.skipped_this_epoch.take() {
+            Some(step) if !std::mem::take(&mut self.trained_this_epoch) => Some(step),
+            _ => None,
+        };
+        self.trained_this_epoch = false;
         self.alive.fill(false);
         self.tracked = false;
         self.loss_warned = false;
         self.clamped_warned = false;
         self.negative_warned = false;
         self.warned.fill(0);
-        Ok(())
+        match all_skipped {
+            Some(step) => Err(Error::NonFinite {
+                step,
+                location: format!("epoch {epoch}"),
+                detail: Some(format!(
+                    "every step of epoch {epoch} had a NaN or infinite loss or gradient and was \
+                     left out (OnNonFinite::Skip), so the parameters did not change and every \
+                     later epoch would be left out too; try a lower learning rate or check the \
+                     data"
+                )),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -2018,7 +2077,7 @@ mod tests {
     }
 
     /// A finite loss with a NaN gradient reaching the first layer: `fit` stops with
-    /// `Error::NonFinite` naming `0.weight`, before the update, so no parameter changed.
+    /// `Error::NonFinite` naming `0.weight`.
     #[test]
     fn fit_stops_on_non_finite_gradient() {
         let mut params = ParamStore::new();
@@ -2039,10 +2098,8 @@ mod tests {
             loss: Loss::Mse,
             ..FitConfig::default()
         };
-        let before = parameter_bits(&net, &params);
         let err = fit(&net, &mut params, &data, config).unwrap_err();
         assert!(is_non_finite(&err, 1, "0.weight"), "{err:?}");
-        assert_eq!(parameter_bits(&net, &params), before);
     }
 
     /// Every variant's accessors: `kind`, `step`, `epoch`, `location` and `layer`.
@@ -3063,10 +3120,11 @@ mod tests {
         assert!(history.epochs.iter().all(|e| e.rows == 8));
     }
 
-    /// Under `Skip`, an epoch whose every step is skipped trains on no rows: its report has
-    /// `rows` 0 and a NaN `mean_loss`, and the parameters stay as they were.
+    /// Under `Skip`, an epoch whose every step is skipped ends the run with
+    /// `Error::NonFinite` naming the epoch and its last step, and the parameters stay as they
+    /// were.
     #[test]
-    fn fit_skip_every_step() {
+    fn fit_skip_every_step_ends_the_run() {
         let mut params = ParamStore::new();
         let net = nan_grad_beyond_net(&mut params);
         let before = parameter_bits(&net, &params);
@@ -3075,107 +3133,165 @@ mod tests {
             targets: Targets::Values(Tensor::full(&[8, 1], 0.5f32)),
         };
         let (_, sink) = collecting_sink();
-        let history = fit(
+        let err = fit(
             &net,
             &mut params,
             &data,
             skip_fit_config(health(OnNonFinite::Skip, sink)),
         )
-        .unwrap();
-        assert_eq!(history.epochs.len(), 3);
-        for report in &history.epochs {
-            assert_eq!(report.rows, 0);
-            assert!(report.mean_loss.is_nan());
-        }
+        .unwrap_err();
+        assert!(is_non_finite(&err, 2, "epoch 1"), "{err:?}");
+        assert!(err.to_string().contains("every step of epoch 1"), "{err}");
         assert_eq!(parameter_bits(&net, &params), before);
     }
 
-    /// `before_update` reads nothing under `Warn` and always allows the update. Under
-    /// `Stop` it returns `Error::NonFinite` for the first non-finite gradient, after sending
-    /// the warning, and refuses a non-finite loss without a second warning. Under `Skip` it
-    /// refuses a non-finite loss without a second warning, and refuses a NaN gradient, naming
-    /// each non-finite parameter once per epoch.
+    /// An epoch with at least one trained step does not end the run, however many steps
+    /// were skipped; an epoch with no step at all does not either.
     #[test]
-    fn before_update_by_policy() {
+    fn end_epoch_errs_only_when_nothing_trained() {
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
+        let names = Sequential::new().push(layer).parameter_names();
+        let (_, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Skip, sink));
+        monitor.end_epoch(1).unwrap();
+        assert!(!monitor.before_update(1, f32::NAN, &params, &names));
+        assert!(monitor.before_update(2, 0.5, &params, &names));
+        monitor.end_epoch(2).unwrap();
+        assert!(!monitor.before_update(3, f32::NAN, &params, &names));
+        let err = monitor.end_epoch(3).unwrap_err();
+        assert!(is_non_finite(&err, 3, "epoch 3"), "{err:?}");
+        // The next epoch starts afresh.
+        assert!(monitor.before_update(4, 0.5, &params, &names));
+        monitor.end_epoch(4).unwrap();
+    }
+
+    /// Under `Skip`, a skipped step whose loss is finite does not set the loss the vanishing
+    /// check compares against: after a skipped first step with a loss of 1e6, a zero gradient
+    /// at a loss of 1 is still reported as vanishing.
+    #[test]
+    fn skipped_step_sets_no_loss_baseline() {
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
+        let bias = layer.bias();
+        let net = Sequential::new().push(layer);
+        let names = net.parameter_names();
+        let (seen, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Skip, sink));
+        let mut graph = Graph::new();
+        let trace = crate::Trace::new();
+        let x = Tensor::full(&[1, 1], 0.0f32);
+        {
+            let tape = graph.tape(&params.values);
+            monitor
+                .after_backward(1, 1e6, &tape, &trace, &net, no_labels(&x))
+                .unwrap();
+        }
+        params.grads.accumulate(bias).0.data_mut()[0] = f32::NAN;
+        assert!(!monitor.before_update(1, 1e6, &params, &names));
+        params.zero_grad();
+        {
+            let tape = graph.tape(&params.values);
+            monitor
+                .after_backward(2, 1.0, &tape, &trace, &net, no_labels(&x))
+                .unwrap();
+        }
+        assert!(monitor.before_update(2, 1.0, &params, &names));
+        let mut optimizer = Sgd::new(0.1);
+        optimizer.step(&mut params);
+        monitor
+            .after_update(2, optimizer.last_stats(), &names)
+            .unwrap();
+        let vanishing = seen
+            .borrow()
+            .iter()
+            .filter(|w| matches!(w, Warning::Vanishing { .. }))
+            .count();
+        assert_eq!(vanishing, 2, "{:?}", seen.borrow());
+    }
+
+    /// A profile asked for before a skipped step carries over to the next step that trains.
+    #[test]
+    fn profile_request_survives_a_skipped_step() {
+        let data = one_nan_row();
+        let mut params = ParamStore::new();
+        let net = classifier(&mut params);
+        let (_, sink) = collecting_sink();
+        let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::CrossEntropy, 32);
+        trainer.set_health(health(OnNonFinite::Skip, sink));
+        let batcher = Batcher::new(96, 32, None);
+        let mut batch = Batch::new(&data, 32);
+        trainer.profile_next_step();
+        trainer
+            .step(&net, &mut params, batcher.gather(&data, 32..64, &mut batch))
+            .unwrap();
+        assert_eq!(trainer.skipped_steps(), 1);
+        assert!(trainer.last_profile().is_none());
+        trainer
+            .step(&net, &mut params, batcher.gather(&data, 0..32, &mut batch))
+            .unwrap();
+        assert!(trainer.last_profile().is_some());
+        trainer
+            .step(&net, &mut params, batcher.gather(&data, 64..96, &mut batch))
+            .unwrap();
+        assert!(trainer.last_profile().is_none());
+    }
+
+    /// `before_update` reads the gradients only under `Skip`: there it refuses a non-finite
+    /// loss without a second warning, and refuses a NaN gradient, naming each non-finite
+    /// parameter once per epoch; under `Stop` and `Warn` it always allows the update.
+    #[test]
+    fn before_update_checks_only_under_skip() {
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
         let (weight, bias) = (layer.weight(), layer.bias());
         let names = Sequential::new().push(layer).parameter_names();
         params.grads.accumulate(weight).0.data_mut().fill(0.5);
         params.grads.accumulate(bias).0.data_mut()[0] = f32::NAN;
+        for policy in [OnNonFinite::Stop, OnNonFinite::Warn] {
+            let (seen, sink) = collecting_sink();
+            let mut monitor = HealthMonitor::new(health(policy, sink));
+            assert!(monitor.before_update(1, f32::NAN, &params, &names));
+            assert!(monitor.before_update(1, 0.5, &params, &names));
+            assert!(seen.borrow().is_empty());
+        }
+        let (seen, sink) = collecting_sink();
+        let mut monitor = HealthMonitor::new(health(OnNonFinite::Skip, sink));
+        assert!(!monitor.before_update(1, f32::NAN, &params, &names));
+        assert!(seen.borrow().is_empty());
+        assert!(!monitor.before_update(2, 0.5, &params, &names));
+        assert!(!monitor.before_update(3, 0.5, &params, &names));
+        // Every step of epoch 1 was skipped.
+        assert!(monitor.end_epoch(1).is_err());
+        assert!(!monitor.before_update(4, 0.5, &params, &names));
         let bias_warning = |step| Warning::NonFinite {
             step,
             location: "0.bias".to_string(),
             input: None,
         };
-
-        let (seen, sink) = collecting_sink();
-        let mut monitor = HealthMonitor::new(health(OnNonFinite::Warn, sink));
-        assert!(monitor.before_update(1, f32::NAN, &params, &names).unwrap());
-        assert!(monitor.before_update(1, 0.5, &params, &names).unwrap());
-        assert!(seen.borrow().is_empty());
-
-        let (seen, sink) = collecting_sink();
-        let mut monitor = HealthMonitor::new(health(OnNonFinite::Stop, sink));
-        assert!(!monitor.before_update(1, f32::NAN, &params, &names).unwrap());
-        assert!(seen.borrow().is_empty());
-        let err = monitor.before_update(2, 0.5, &params, &names).unwrap_err();
-        assert!(is_non_finite(&err, 2, "0.bias"), "{err:?}");
-        assert_eq!(*seen.borrow(), [bias_warning(2)]);
-
-        let (seen, sink) = collecting_sink();
-        let mut monitor = HealthMonitor::new(health(OnNonFinite::Skip, sink));
-        assert!(!monitor.before_update(1, f32::NAN, &params, &names).unwrap());
-        assert!(seen.borrow().is_empty());
-        assert!(!monitor.before_update(2, 0.5, &params, &names).unwrap());
-        assert!(!monitor.before_update(3, 0.5, &params, &names).unwrap());
-        monitor.end_epoch(1).unwrap();
-        assert!(!monitor.before_update(4, 0.5, &params, &names).unwrap());
         assert_eq!(*seen.borrow(), [bias_warning(2), bias_warning(4)]);
         params.zero_grad();
-        assert!(monitor.before_update(5, 0.5, &params, &names).unwrap());
+        assert!(monitor.before_update(5, 0.5, &params, &names));
     }
 
-    /// Under `Stop`, a step with a finite loss and a NaN gradient returns `Error::NonFinite`
-    /// naming the parameter before the optimiser runs: the parameters are unchanged, and so is
-    /// Adam's state, since a clean step taken afterwards gives the parameters, bit for bit, of
-    /// a fresh trainer's first clean step.
+    /// Under `Stop`, a step with a finite loss and a NaN gradient applies the update, then
+    /// returns `Error::NonFinite` naming the parameter: the parameter already holds the NaN,
+    /// as the docs of `OnNonFinite::Stop` say.
     #[test]
-    fn stop_applies_no_non_finite_gradient() {
+    fn stop_applies_a_nan_gradient_then_stops() {
         let data = finite_loss_nan_grad_data(true);
         let batcher = Batcher::new(data.len(), 4, None);
         let mut batch = Batch::new(&data, 4);
-        let quiet = || health(OnNonFinite::Stop, collecting_sink().1);
-
         let mut params = ParamStore::new();
         let net = nan_grad_beyond_net(&mut params);
-        let before = parameter_bits(&net, &params);
         let mut trainer = Trainer::new(&net, crate::Adam::new(0.01), Loss::Mse, 4);
-        trainer.set_health(quiet());
+        trainer.set_health(health(OnNonFinite::Stop, collecting_sink().1));
         let err = trainer
             .step(&net, &mut params, batcher.gather(&data, 4..8, &mut batch))
             .unwrap_err();
         assert!(is_non_finite(&err, 1, "0.weight"), "{err:?}");
-        assert_eq!(parameter_bits(&net, &params), before);
-        trainer
-            .step(&net, &mut params, batcher.gather(&data, 0..4, &mut batch))
-            .unwrap();
-
-        let mut fresh_params = ParamStore::new();
-        let fresh_net = nan_grad_beyond_net(&mut fresh_params);
-        let mut fresh = Trainer::new(&fresh_net, crate::Adam::new(0.01), Loss::Mse, 4);
-        fresh.set_health(quiet());
-        fresh
-            .step(
-                &fresh_net,
-                &mut fresh_params,
-                batcher.gather(&data, 0..4, &mut batch),
-            )
-            .unwrap();
-        assert_eq!(
-            parameter_bits(&net, &params),
-            parameter_bits(&fresh_net, &fresh_params)
-        );
+        let (_, weight) = net.parameter_names()[0].clone();
+        assert!(params.value(weight).data().iter().any(|v| v.is_nan()));
     }
 
     /// Under `Skip`, `after_backward` sends the non-finite loss warning once per epoch and

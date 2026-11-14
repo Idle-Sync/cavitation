@@ -101,7 +101,7 @@ Each epoch is one step on the full batch:
 2. `tape.input` records the batch, `net.forward_traced` records the four layers (the trace keeps each layer's input and output for the hooks and health checks), and `tape.mse` records the loss.
 3. `tape.backward(loss, &mut params.grads)` walks the tape from the loss back to the start, applying the rules of the previous section, and writes ∂L/∂W and ∂L/∂b for every parameter into `params.grads`.
 4. The monitor checks that the loss and the gradients are finite and warns about gradients that explode or vanish.
-5. `drop(tape)` ends the tape's borrow of `params.values`, so that `optimizer.step` can change them. Plain SGD subtracts the learning rate times each gradient: W ← W − 0.5 · ∂L/∂W.
+5. `drop(tape)` ends the tape's borrow of `params.values`, so that `optimizer.step` can change them. `monitor.before_update` says whether to apply the update: always under the default `OnNonFinite::Stop`, and under `OnNonFinite::Skip` only when every gradient is finite, so a NaN never reaches the parameters. Plain SGD subtracts the learning rate times each gradient: W ← W − 0.5 · ∂L/∂W.
 6. `params.zero_grad()` marks the gradients stale, so the next `backward` overwrites them instead of adding to them.
 
 The loss falls from 0.26 to under 0.001 over the 2,000 steps.
