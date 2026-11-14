@@ -295,7 +295,7 @@ impl InferenceModel {
         }
         let (compiled, masks) = Compiled::build(model, params, layers)?;
         let max_width = compiled.max_width;
-        let cols = vec![0.0; conv_scratch_len(&compiled.steps, 1)];
+        let cols = vec![0.0; conv_scratch_len(&compiled.steps, 1, 1)];
         Ok(InferenceModel {
             shared: Arc::new(compiled),
             masks,
@@ -669,7 +669,7 @@ impl InferenceModel {
             shared.input_width,
             input.len()
         );
-        let scratch = conv_scratch_len(&shared.steps, 1);
+        let scratch = conv_scratch_len(&shared.steps, 1, 1);
         if self.cols.len() < scratch {
             self.cols.resize(scratch, 0.0);
         }
@@ -845,14 +845,15 @@ impl InferenceModel {
                 buf.resize(need, 0.0);
             }
         }
-        let scratch = conv_scratch_len(&shared.steps[steps.clone()], rows);
+        let one = rows == 1;
+        let threads = if one { 1 } else { kernels::threads() };
+        let scratch = conv_scratch_len(&shared.steps[steps.clone()], rows, threads);
         if self.cols.len() < scratch {
             self.cols.resize(scratch, 0.0);
         }
-        let one = rows == 1;
         let run = Run {
             level: kernels::level(),
-            threads: if one { 1 } else { kernels::threads() },
+            threads,
             rows,
             batched: !one,
             steps,
@@ -1215,24 +1216,14 @@ impl Compiled {
     }
 }
 
-/// The scratch one `Conv2d` step takes for `rows` images: the column matrix's length and
-/// the product's, none for a 1 × 1 kernel with stride 1 and no padding.
-fn conv_scratch(geom: &Conv2dGeom, rows: usize) -> (usize, usize) {
-    if geom.is_pointwise() {
-        (0, 0)
-    } else {
-        conv2d_scratch(geom, rows)
-    }
-}
-
-/// The scratch every `Conv2d` step of `steps` fits in for `rows` images.
-fn conv_scratch_len(steps: &[Step], rows: usize) -> usize {
+/// The scratch every `Conv2d` step of `steps` fits in for `rows` images on `threads`
+/// threads.
+fn conv_scratch_len(steps: &[Step], rows: usize, threads: usize) -> usize {
     steps
         .iter()
         .filter_map(|s| match &s.op {
             Op::Layer(InferenceLayer::Conv2d { geom, .. }) => {
-                let (c, p) = conv_scratch(geom, rows);
-                Some(c + p)
+                Some(conv2d_scratch(geom, rows, threads))
             }
             _ => None,
         })
@@ -1426,8 +1417,7 @@ impl Run {
     /// by [`conv2d_forward`] with the GEMM of this call's level and threads, as the tape
     /// computes it: with the tape's bits, for one input as for a batch, except at the
     /// Accelerate level, where a product of another shape can differ within the GEMM bound
-    /// (see [`conv2d_forward`]); `scratch` holds
-    /// the column matrix and the product ([`conv_scratch`]).
+    /// (see [`conv2d_forward`]); `scratch` holds [`conv2d_scratch`] values.
     fn conv2d(
         &self,
         geom: &Conv2dGeom,
@@ -1437,19 +1427,12 @@ impl Run {
         dst: &mut [f32],
         scratch: &mut [f32],
     ) {
-        let (cols_len, prod_len) = conv_scratch(geom, self.rows);
-        let (cols, rest) = scratch.split_at_mut(cols_len);
         let (level, threads) = (self.level, self.threads);
+        let gemm = |a: MatRef<'_, f32>, b: MatRef<'_, f32>, beta: f32, c: MatMut<'_, f32>| {
+            gemm_f32_with(level, threads, 1.0, a, b, beta, c);
+        };
         conv2d_forward(
-            geom,
-            self.rows,
-            src,
-            weight,
-            bias,
-            dst,
-            cols,
-            &mut rest[..prod_len],
-            |a, b, c| gemm_f32_with(level, threads, 1.0, a, b, 0.0, c),
+            geom, self.rows, src, weight, bias, dst, scratch, threads, &gemm,
         );
     }
 
