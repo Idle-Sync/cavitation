@@ -8,7 +8,7 @@ The program is `crates/cavitation/examples/inspect_digits.rs`. Run it with:
 cargo run --release --example inspect_digits -p cavitation --features inspect
 ```
 
-and open the address it prints. Training starts when the page connects, or after 60 s without one. The digits network trains quickly, so add `-- --epochs 300` if you want to watch it longer.
+and open the address it prints. Training starts when the page connects, or after 60 seconds without one. The digits network trains quickly, so add `-- --epochs 300` if you want to watch it longer.
 
 The printed blocks in this chapter come from that command, run on an Intel Celeron N5105 (4 cores) at kernel level `sse4.2`, rustc 1.99.1. With fixed seeds and no commands from the page, the inspector does not change training: the parameters are those of plain `fit`, bit for bit, so these figures are the same on every run there.
 
@@ -59,7 +59,7 @@ The top band is the run's speed and progress:
 
 The held-out evaluation runs at the end of an epoch, only while a page is connected, and only when the time since the last one is at least 200 times what that one took (`EVALUATION_FACTOR`), so it takes at most about 0.5% of the run. The last epoch always gets one, and when training ends the page gets one last snapshot, so it shows the final step and epoch. Here the evaluation rows are the test digits, which is fine for watching; to choose anything by them (when to stop, how far to shrink) you would hold out other rows instead, as the chapter on shrinking explains.
 
-The **controls** pause and resume the run and set the learning rate. A new rate replaces the schedule for the rest of the run. A paused run resumes by itself after 30 s with no page connected, so a closed tab never leaves your program waiting.
+The **controls** pause and resume the run and set the learning rate. A new rate replaces the schedule for the rest of the run. A paused run resumes by itself after 30 seconds with no page connected, so a closed tab never leaves your program waiting.
 
 **The network** panel runs one probe row through the network, forward and backward, and draws every layer as a grid of cells, one per neuron. A switch picks which value the cells show:
 
@@ -127,7 +127,7 @@ In explore mode:
 - **Rank neurons** switches each neuron of the chosen hidden layer off in turn and measures what its absence costs on the probe rows. The neurons are listed cheapest first, each as soon as it is measured.
 - **Shrink** runs the shrink tool, `cavitation_nn::shrink::shrink`, with the configuration the program gives (here the defaults, with the last 288 training rows as the validation set). The curve of parameters against validation accuracy is drawn level by level. **Cancel** stops after the level in progress and keeps the best level so far.
 
-The chapter on shrinking explains the ranking, the levels and the stop rule. Masks you set in explore mode stay on the network when `explore` returns. `explore` also returns after 30 s with no page connected.
+The chapter on shrinking explains the ranking, the levels and the stop rule. Masks you set in explore mode stay on the network when `explore` returns. `explore` also returns after 30 seconds with no page connected.
 
 ## Saving a view
 
@@ -137,7 +137,7 @@ A view can be saved as one HTML file with the run so far inside it: the model, t
 {{#include ../../crates/cavitation/examples/inspect_digits.rs:export}}
 ```
 
-From a running page, `/export?token=…` (the page's address with `/export` in place of `/`) downloads the same file and writes nothing on the machine that trains. The file contains the network's weights for the probed neuron and the probe row's values, so share it as you would share the data.
+From a running page, `/export?token=…` (the page's address, with its path changed from / to /export) downloads the same file and writes nothing on the machine that trains. The file contains the network's weights for the probed neuron and the probe row's values, so share it as you would share the data.
 
 ## The token
 
@@ -171,7 +171,7 @@ cargo build --release -p cavitation-bench
 target/release/cavitation-bench inspect
 ```
 
-It trains the digits benchmark (the 50k network, SGD at 0.01, batch 128, 100 epochs per run), with the 360 test digits as the probe set and the default `eval_rows` and `snapshot_hz`. First it trains for at least 30 s, past the power limit after which a low-power CPU slows down. Then it runs 8 rounds of four modes, in an order rotated every round, so each mode runs first, second, third and last equally often:
+It trains the digits benchmark (the 50k network, SGD at 0.01, batch 128, 100 epochs per run), with the 360 test digits as the probe set and the default `eval_rows` and `snapshot_hz`. First it trains for at least 30 seconds, past the power limit after which a low-power CPU slows down. Then it runs 8 rounds of four modes, in an order rotated every round, so each mode runs first, second, third and last equally often:
 
 - off (plain `fit`);
 - off again, to show how much two identical runs differ;

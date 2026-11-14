@@ -33,6 +33,8 @@ fn print_row(name: &str, values: [f64; 4]) {
     );
 }
 
+/// Fits OLS and ridge on the Concrete data both ways, prints them side by side, then folds
+/// the scaling into a `Sequential` and saves it.
 fn main() -> Result<(), Error> {
     let (raw_train, raw_test) = concrete::load()?;
     let Targets::Values(strength) = &raw_train.targets else {
