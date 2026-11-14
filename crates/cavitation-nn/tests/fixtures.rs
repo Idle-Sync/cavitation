@@ -14,7 +14,9 @@ use std::sync::Mutex;
 
 use cavitation_core::kernels::{Level, level, set_level, supported};
 use cavitation_core::{Graph, ParamId, ParamStore, Rng, Tensor};
-use cavitation_nn::{Adam, AdamW, Init, Layer, Linear, Optimizer, Relu, Sequential, Sgd, load};
+use cavitation_nn::{
+    Adagrad, Adam, AdamW, Init, Layer, Linear, Optimizer, Relu, RmsProp, Sequential, Sgd, load,
+};
 use serde_json::Value;
 
 /// A tensor read from a fixture: its shape and its values as f64.
@@ -442,6 +444,35 @@ fn optimizer_for(v: &Value) -> Box<dyn Optimizer<f32>> {
                 None => o,
             })
         }
+        "RMSprop" => {
+            let mut o = RmsProp::new(lr);
+            if let Some(a) = get("alpha") {
+                o = o.with_alpha(a);
+            }
+            if let Some(m) = get("momentum") {
+                o = o.with_momentum(m);
+            }
+            if let Some(w) = wd {
+                o = o.with_weight_decay(w);
+            }
+            if let Some(c) = p["centered"].as_bool() {
+                o = o.with_centered(c);
+            }
+            Box::new(o)
+        }
+        "Adagrad" => {
+            let mut o = Adagrad::new(lr);
+            if let Some(d) = get("lr_decay") {
+                o = o.with_lr_decay(d);
+            }
+            if let Some(w) = wd {
+                o = o.with_weight_decay(w);
+            }
+            if let Some(a) = get("initial_accumulator_value") {
+                o = o.with_initial_accumulator(a);
+            }
+            Box::new(o)
+        }
         other => panic!("unknown optimiser {other}"),
     }
 }
@@ -472,7 +503,7 @@ fn check_optimizers(at: Level) {
         .map(|e| e.expect("entry").path())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 7, "expected seven optimiser fixtures");
+    assert_eq!(names.len(), 13, "expected thirteen optimiser fixtures");
     for path in names {
         let case = format!("{} at {at}", path.file_stem().unwrap().to_string_lossy());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

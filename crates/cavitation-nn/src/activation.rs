@@ -144,8 +144,8 @@ pub enum ActivationKind {
 }
 
 /// `1 / (1 + e^-x)` without overflowing the exponential, one value at a time with std's
-/// `exp`: the scalar sigmoid that SiLU, the derivatives and the GLU gate use (the `Sigmoid`
-/// layer runs the SIMD kernels instead).
+/// `exp`: the scalar sigmoid that the derivatives use (the `Sigmoid` and `Silu` layers and
+/// the GLU gates run the SIMD kernels instead).
 pub(crate) fn sigmoid<T: Real>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
@@ -257,8 +257,9 @@ impl ActivationKind {
                 half * x * (T::ONE + (x * c(FRAC_1_SQRT_2)).erf())
             }
             ActivationKind::Gelu(GeluApprox::Tanh) => {
-                let u = c(SQRT_2_OVER_PI) * (x + c(GELU_CUBIC) * x * x * x);
-                half * x * (T::ONE + u.tanh())
+                let mut v = [x];
+                T::gelu_tanh_in_place(&mut v);
+                v[0]
             }
             ActivationKind::Elu(alpha) => {
                 if x > T::ZERO {
@@ -282,7 +283,11 @@ impl ActivationKind {
                     c(alpha) * (x / c(alpha)).exp_m1()
                 }
             }
-            ActivationKind::Silu => x * sigmoid(x),
+            ActivationKind::Silu => {
+                let mut v = [x];
+                T::silu_in_place(&mut v);
+                v[0]
+            }
             ActivationKind::Mish => x * softplus(x, T::ONE, c(MISH_THRESHOLD)).tanh(),
             ActivationKind::Softplus { beta, threshold } => softplus(x, c(beta), c(threshold)),
             ActivationKind::Softsign => x / (T::ONE + x.abs()),
@@ -1178,11 +1183,20 @@ impl<T: Real> Layer<T> for Prelu {
     }
 
     /// 1 where `x` is above 0, the value's slope where `x` is at or below 0, and NaN for a
-    /// NaN input, as the tape's PReLU gradient uses.
+    /// NaN input, as the tape's PReLU gradient uses. Panics, naming both lengths, if `out`
+    /// does not hold as many values as `x`.
     fn local_derivative(&self, tape: &Tape<'_, T>, x: Var, out: &mut [T]) -> bool {
         let slopes = tape.param_value(self.weight);
         let slopes = slopes.data();
-        for (i, (d, &v)) in out.iter_mut().zip(tape.value(x).data()).enumerate() {
+        let values = tape.value(x).data();
+        assert_eq!(
+            out.len(),
+            values.len(),
+            "Prelu::local_derivative: out holds {} values but the input has {}",
+            out.len(),
+            values.len()
+        );
+        for (i, (d, &v)) in out.iter_mut().zip(values).enumerate() {
             *d = if v > T::ZERO {
                 T::ONE
             } else if v <= T::ZERO {
