@@ -493,6 +493,12 @@ def make_optimizers():
         ("adam", torch.optim.Adam, {"lr": 0.01}),
         ("adamw", torch.optim.AdamW, {"lr": 0.01, "weight_decay": 0.01}),
         ("adam-weight-decay", torch.optim.Adam, {"lr": 0.01, "weight_decay": 0.1}),
+        ("sgd-weight-decay", torch.optim.SGD, {"lr": 0.1, "weight_decay": 0.05}),
+        (
+            "sgd-momentum-weight-decay",
+            torch.optim.SGD,
+            {"lr": 0.1, "momentum": 0.9, "weight_decay": 0.05},
+        ),
     ]
     steps = 10
     for name, cls, kwargs in configs:

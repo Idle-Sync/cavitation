@@ -472,7 +472,7 @@ fn check_optimizers(at: Level) {
         .map(|e| e.expect("entry").path())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 5, "expected five optimiser fixtures");
+    assert_eq!(names.len(), 7, "expected seven optimiser fixtures");
     for path in names {
         let case = format!("{} at {at}", path.file_stem().unwrap().to_string_lossy());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
