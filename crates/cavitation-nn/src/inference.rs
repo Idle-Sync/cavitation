@@ -2173,6 +2173,19 @@ pub(crate) mod tests {
                 })
             }),
             Box::new(|_| Box::new(Glu { gate: Gate::Relu })),
+            Box::new(|p| {
+                let bn = crate::BatchNorm2d::new(p, 2, (2, 2));
+                let r = bn.running().unwrap();
+                p.value_mut(r.mean).data_mut().copy_from_slice(&[0.4, -0.3]);
+                p.value_mut(r.var).data_mut().copy_from_slice(&[2.2, 0.35]);
+                p.value_mut(bn.weight().unwrap())
+                    .data_mut()
+                    .copy_from_slice(&[1.25, -0.6]);
+                p.value_mut(bn.bias().unwrap())
+                    .data_mut()
+                    .copy_from_slice(&[0.05, -0.2]);
+                Box::new(bn)
+            }),
             Box::new(|_| Box::new(Glu { gate: Gate::Silu })),
         ];
         for (index, make) in layers.iter().enumerate() {
