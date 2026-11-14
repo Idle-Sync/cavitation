@@ -11,8 +11,8 @@ use std::time::Duration;
 use cavitation_core::{Graph, ParamGrads, ParamStore, Reduction, Rng, Tensor, TensorView, Var};
 use cavitation_nn::{
     Activation, ActivationLayer, Adam, AdamW, Batch, Batcher, Dataset, Evaluator, GradStats,
-    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, Optimizer, Relu, Sequential,
-    Sgd, Targets, TargetsView, Trace, Trainer, Warning,
+    Health, Hooks, InferenceModel, Init, Linear, Loss, NeuronMask, OnNonFinite, Optimizer, Relu,
+    Sequential, Sgd, Targets, TargetsView, Trace, Trainer, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -538,6 +538,54 @@ fn health_steady_state() -> usize {
     made
 }
 
+/// `health_steady_state` under `OnNonFinite::Skip`, on the centred 1,437-row set with a NaN
+/// in two rows of different batches (unshuffled, so the batches stay put): every step reads
+/// every gradient before the update, and two steps per epoch are skipped. One whole warm-up
+/// epoch, then counts the allocations of every step of a second epoch, and of its end,
+/// except the one step that sends the epoch's non-finite loss warning (a warning allocates
+/// its text); the second skipped step of the epoch, whose warning was already sent, is
+/// counted.
+fn skip_steady_state() -> usize {
+    let mut data = synthetic_centred_1437();
+    data.x.data_mut()[200 * 64 + 5] = f32::NAN;
+    data.x.data_mut()[900 * 64] = f32::NAN;
+    let mut made = 0;
+    for optimizer in training_optimizers() {
+        let mut params = ParamStore::new();
+        let net = network_50k(&mut params);
+        let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
+        let warnings = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let counter = std::rc::Rc::clone(&warnings);
+        trainer.set_health(Health {
+            on_non_finite: OnNonFinite::Skip,
+            sink: Some(Box::new(move |_: &Warning| counter.set(counter.get() + 1))),
+            ..Health::default()
+        });
+        let mut batcher = Batcher::new(data.len(), 128, None);
+        let mut batch = Batch::new(&data, 128);
+        for epoch in 1..=2 {
+            batcher.epoch();
+            for range in batcher.batches() {
+                let (sent, before) = (warnings.get(), allocations());
+                let view = batcher.gather(&data, range, &mut batch);
+                trainer.step(&net, &mut params, view).unwrap();
+                let step_made = allocations() - before;
+                if epoch == 2 && warnings.get() == sent {
+                    made += step_made;
+                }
+            }
+            let before = allocations();
+            trainer.end_epoch(epoch).unwrap();
+            if epoch == 2 {
+                made += allocations() - before;
+            }
+        }
+        assert_eq!(trainer.skipped_steps(), 4);
+        assert_eq!(warnings.get(), 2, "one non-finite loss warning per epoch");
+    }
+    made
+}
+
 /// Compiles the 50k network with a mask on its second ReLU and runs one input through it
 /// once as a warm-up, then 10,000 more inputs. Returns the allocations made after the
 /// warm-up.
@@ -1025,7 +1073,7 @@ fn evaluator_neuron_mask_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 22] = [
+    let scenarios: [Scenario; 23] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1037,6 +1085,7 @@ fn main() -> ExitCode {
         ("set_neuron_steady_state", set_neuron_steady_state),
         ("masked_hooks_steady_state", masked_hooks_steady_state),
         ("health_steady_state", health_steady_state),
+        ("skip_steady_state", skip_steady_state),
         ("infer_steady_state", infer_steady_state),
         ("infer_batch_steady_state", infer_batch_steady_state),
         ("observed_steady_state", observed_steady_state),

@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
+- `OnNonFinite` has a new variant, `Skip`. The enum is not `#[non_exhaustive]`, so a `match` on it outside `cavitation-nn` that lists every variant must add `Skip`.
 
 ### Workspace
 
@@ -25,6 +26,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - Least squares: `linalg::lstsq` and `linalg::Qr`, a Householder QR that scales columns by powers of two (so columns from about 1e-300 to 1e300 factor correctly) and names the first column that depends on the ones before it; `linalg::qr_reference` is its plain twin.
 - `LinearRegression` (ordinary least squares, and ridge with `alpha > 0`): `fit` solves exactly by QR and matches scikit-learn's `LinearRegression` and `Ridge` within 1e-9; `fit_gradient` trains one `Linear` with a `GradientConfig` (by default 1,000 full-batch epochs of Adam with cosine decay). Both return a `LinearModel` with `predict`, `score` (R²), `to_sequential` (saves as a PyTorch `nn.Linear`) and `from_sequential`.
 - `LogisticRegression` (scikit-learn's defaults: an intercept and `c = Some(1.0)`): `fit` solves two classes exactly by Newton's method, matching scikit-learn's `newton-cholesky` within 1e-8 and `lbfgs` within 1e-5; `fit_gradient` handles two or more classes. Separable classes without a penalty, a single class, and labels other than 0 and 1 are `Error::InvalidData`, each message suggesting what to change. Both return a `LogisticModel` with `predict_proba`, `predict`, `score` (accuracy), `objective` and `to_sequential`.
+- `fit_gradient` honours `OnNonFinite::Skip` in `GradientConfig::health`: a skipped step changes nothing and counts toward neither `mean_loss` nor `rows`.
 
 ### Inspector (`cavitation-inspect`)
 
@@ -41,6 +43,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `Standardizer`: each column's mean and population standard deviation, `transform` and `inverse_transform`, and `fold_into_input` and `fold_into_output`, which write the scaling into the first or last `Linear` so a trained network takes raw inputs or answers in the targets' units.
 - `shrink::ablate_controlled`: `ablate_with` whose callback returns a `Flow`, so a sweep can stop early.
 - `Loss::record` is public, so a tape of your own can record the training loss.
+- `OnNonFinite::Skip`: a step whose loss or gradient is NaN or infinite sends the warning and is left out, leaving the parameters and the optimiser's state (momentum, moments, Adam's step counts) as they were, and training continues; a run that skips a step ends with the parameters, bit for bit, of the run without that step's batch. It reads every gradient once more per step, before the update. A skipped step counts in `Trainer::steps` and in the new `Trainer::skipped_steps`, but not in `EpochReport::rows` or `mean_loss`, and `StepControl::after_step` does not run after it. A hand-written loop asks the new `HealthMonitor::before_update` whether to apply each update.
+- The docs of `OnNonFinite::Warn` say what it does: the update is applied, so a NaN loss or gradient reaches the parameters and from the next step every parameter.
 
 ### Data, examples, guide and benchmark
 

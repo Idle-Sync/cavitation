@@ -254,6 +254,9 @@ pub struct Trainer {
     batch: Option<Batch<f32>>,
     /// The number of steps taken.
     steps: u64,
+    /// The number of those steps whose update was left out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip).
+    skipped: u64,
     /// The health checks run on every step.
     health: HealthMonitor,
     /// The model's parameter names, for the health checks' messages.
@@ -306,6 +309,7 @@ impl Trainer {
             batch_size: batch,
             batch: None,
             steps: 0,
+            skipped: 0,
             health: HealthMonitor::new(Health::default()).with_loss(loss),
             names: model.parameter_names(),
             profiler: Profiler::default(),
@@ -369,7 +373,11 @@ impl Trainer {
     /// step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is
     /// found after the update has applied it. The step is counted and the gradients are marked
     /// stale either way. [`fit`] stops at this error. Under
-    /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not.
+    /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not, and the
+    /// update is applied. Under [`OnNonFinite::Skip`](crate::OnNonFinite) the step returns its
+    /// loss too, but a step whose loss or gradient is NaN or infinite leaves the parameters and
+    /// the optimiser's state as they were; it is counted in [`steps`](Self::steps) and in
+    /// [`skipped_steps`](Self::skipped_steps).
     ///
     /// [`Warning::NonFinite`]: crate::Warning::NonFinite
     ///
@@ -452,12 +460,14 @@ impl Trainer {
         hooks: &mut Hooks<'_>,
     ) -> Result<f32, Error> {
         let (value, checked) = self.checked_step(model, params, batch, None, hooks);
-        checked.map(|()| value)
+        checked.map(|_| value)
     }
 
     /// The step behind [`step_with_hooks`](Self::step_with_hooks): returns the batch's loss
-    /// and the health checks' verdict. When the tape checks fail the optimiser step is
-    /// skipped; the gradients are marked stale and the step is counted either way.
+    /// and the health checks' verdict, `Ok(true)` when the update was applied and `Ok(false)`
+    /// when [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) left it out. When the tape checks
+    /// fail, or the update is left out, the optimiser step does not run; the gradients are
+    /// marked stale and the step is counted either way.
     ///
     /// A step that was asked for a profile ([`profile_next_step`](Self::profile_next_step))
     /// times its parts into the profile's buffers; any other step reads no clock and only
@@ -469,7 +479,7 @@ impl Trainer {
         batch: BatchView<'_, f32>,
         rows: Option<&[usize]>,
         hooks: &mut Hooks<'_>,
-    ) -> (f32, Result<(), Error>) {
+    ) -> (f32, Result<bool, Error>) {
         self.loss.check_targets(batch.targets);
         hooks.check_layers(model);
         let step = self.steps + 1;
@@ -517,7 +527,8 @@ impl Trainer {
                     .after_backward(step, value, &tape, &self.trace, model, inputs);
             (value, checked)
         };
-        if checked.is_ok() {
+        let apply = checked.is_ok() && self.health.before_update(step, value, params, &self.names);
+        if apply {
             let update_start = profiling.then(Instant::now);
             self.optimizer.step(params);
             if let Some(update_start) = update_start {
@@ -529,13 +540,16 @@ impl Trainer {
         } else if profiling {
             self.profiler.profile.optimizer = Duration::ZERO;
         }
+        if checked.is_ok() && !apply {
+            self.skipped += 1;
+        }
         params.zero_grad();
         self.steps = step;
         if let Some(start) = start {
             self.profiler.profile.total = start.elapsed();
             self.profiler.valid = true;
         }
-        (value, checked)
+        (value, checked.map(|()| apply))
     }
 
     /// Asks the next step to record a [`StepProfile`]: each layer's forward and backward
@@ -657,11 +671,38 @@ impl Trainer {
         self.steps
     }
 
+    /// How many of the steps taken so far left their update out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip), because their loss or a gradient was
+    /// NaN or infinite. Always 0 under the other policies.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{
+    ///     Batch, Batcher, Dataset, Health, Linear, Loss, OnNonFinite, Sequential, Sgd, Targets,
+    ///     Trainer,
+    /// };
+    /// let x = Tensor::from_vec(vec![f32::NAN, 1.0], &[2, 1]).unwrap();
+    /// let data = Dataset { x, targets: Targets::Values(Tensor::zeros(&[2, 1])) };
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 2);
+    /// trainer.set_health(Health { on_non_finite: OnNonFinite::Skip, ..Health::quiet() });
+    /// let mut batch = Batch::new(&data, 2);
+    /// let view = Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch);
+    /// assert!(trainer.step(&net, &mut params, view).unwrap().is_nan());
+    /// assert_eq!((trainer.steps(), trainer.skipped_steps()), (1, 1));
+    /// ```
+    pub fn skipped_steps(&self) -> u64 {
+        self.skipped
+    }
+
     /// Runs epoch `epoch` over `data` in the batches of `batcher` (reshuffled first), running
     /// `hooks` and the health checks on every step and, for a controlled run, the control
     /// after every step. Returns the mean loss over the rows the epoch trained on (each
-    /// batch's loss weighted by its row count), how many rows that was, and whether the
-    /// control stopped the run.
+    /// batch's loss weighted by its row count; a step left out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) trained on none), how many rows that
+    /// was, whether every batch ran, and whether the control stopped the run. The control
+    /// does not run after a step that was left out.
     ///
     /// # Errors
     ///
@@ -682,6 +723,7 @@ impl Trainer {
         batcher.epoch();
         let mut total = 0.0f64;
         let mut trained = 0usize;
+        let mut seen = 0usize;
         let mut checked = Ok(());
         let mut stopped = false;
         for range in batcher.batches() {
@@ -692,12 +734,17 @@ impl Trainer {
             let rows_of_batch = &batcher.order()[range];
             let (loss, step_checked) =
                 self.checked_step(run.model(), params, view, Some(rows_of_batch), hooks);
+            seen += rows;
+            match step_checked {
+                Err(err) => {
+                    checked = Err(err);
+                    break;
+                }
+                Ok(false) => continue,
+                Ok(true) => {}
+            }
             total += f64::from(loss) * rows as f64;
             trained += rows;
-            if step_checked.is_err() {
-                checked = step_checked;
-                break;
-            }
             if let (Run::Controlled(model, control), Some(start)) = (&mut *run, start) {
                 let info = StepInfo {
                     step: self.steps,
@@ -718,6 +765,7 @@ impl Trainer {
         checked.map(|()| EpochEnd {
             mean_loss: total / trained as f64,
             rows: trained,
+            whole: seen == data.len(),
             stopped,
         })
     }
@@ -726,11 +774,15 @@ impl Trainer {
 /// How an epoch of [`Trainer::run_epoch`] ended without an error.
 #[derive(Debug)]
 struct EpochEnd {
-    /// The mean loss over the rows the epoch trained on.
+    /// The mean loss over the rows the epoch trained on; NaN when it trained on none.
     mean_loss: f64,
-    /// The rows the epoch trained on: all of the data's, unless the control stopped the run
-    /// before the epoch's last step.
+    /// The rows the epoch trained on: all of the data's, less the rows of steps left out
+    /// under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) and of the steps after a
+    /// control stopped the run.
     rows: usize,
+    /// Whether every batch of the epoch ran, trained or left out: false only when the
+    /// control stopped the run before the epoch's last step.
+    whole: bool,
     /// Whether the control stopped the run during the epoch.
     stopped: bool,
 }
@@ -1127,7 +1179,8 @@ impl<'a> TrainerHandle<'a> {
 /// assert!(history.epochs.len() < 10_000);
 /// ```
 pub trait StepControl {
-    /// Runs after each step that the health checks passed, before the next step. Changes to
+    /// Runs after each step that the health checks passed, before the next step; not after
+    /// a step left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip). Changes to
     /// the masks through `model` apply from the next step, and so does a learning rate
     /// overridden through `trainer`.
     ///
@@ -1322,7 +1375,9 @@ impl LrSchedule {
 pub struct EpochReport {
     /// The epoch's number, counting from 1.
     pub epoch: usize,
-    /// The mean loss over the epoch's rows: each batch's loss weighted by its row count.
+    /// The mean loss over the epoch's rows: each batch's loss weighted by its row count. A
+    /// step left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) does not count, so
+    /// an epoch whose every step was left out has a NaN `mean_loss`.
     ///
     /// A PyTorch loop that averages the batch means gives a slightly different figure when the
     /// last batch is short, because it counts that batch as much as a full one. This loop
@@ -1338,9 +1393,10 @@ pub struct EpochReport {
     /// mean_loss = total / rows
     /// ```
     pub mean_loss: f64,
-    /// The rows the epoch trained on: every row of the data, except for the last epoch of a
-    /// [`fit_controlled`] run that its control stopped before the epoch's last step, where it
-    /// is the rows of the steps that ran (`mean_loss` is then their mean).
+    /// The rows the epoch trained on: every row of the data, less the rows of each step left
+    /// out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip), and for the last epoch of a
+    /// [`fit_controlled`] run that its control stopped before the epoch's last step, only the
+    /// rows of the steps that ran (`mean_loss` is then their mean).
     pub rows: usize,
     /// The epoch's wall-clock time in seconds, from before its first batch to after its
     /// end-of-epoch health checks: every step with its hooks and health checks and, under
@@ -1608,7 +1664,9 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// default), returns [`Error::NonFinite`] at the first step whose loss or gradient is NaN or
 /// infinite, naming the step and `"loss"` or the parameter (for example `"0.weight"`), after
 /// sending the matching warning to the health sink. A non-finite loss stops before the optimiser
-/// step; a non-finite gradient with a finite loss is found after the update applied it.
+/// step; a non-finite gradient with a finite loss is found after the update applied it. With
+/// [`OnNonFinite::Skip`](crate::OnNonFinite), such a step is left out instead and training
+/// continues (see [`EpochReport::rows`]).
 ///
 /// # Panics
 ///
@@ -1812,8 +1870,7 @@ fn run_fit(
         }
         let start = Instant::now();
         let end = trainer.run_epoch(&mut run, params, train, &mut batcher, hooks, epoch)?;
-        // Every row trained unless the control stopped the run before the epoch's last step.
-        let whole = end.rows == train.len();
+        let whole = end.whole;
         if whole {
             trainer.end_epoch(epoch)?;
         }
