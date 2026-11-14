@@ -124,8 +124,11 @@ fn layer_kinds(model: &Sequential<f32>) -> String {
 /// the `F32` range is refused, since it would become infinite. When the file records the
 /// layer kinds it was saved from (every file [`save`] writes does), they must be the
 /// model's: GELU weights loaded into a ReLU network would load and give wrong outputs. The
-/// kinds are the layers' names, so two settings of one kind (GELU's exact and tanh forms)
-/// are not told apart; a file without the record, such as PyTorch's, loads into any kinds.
+/// kinds are the layers' names, so two settings of one kind (GELU's exact and tanh forms, or
+/// leaky ReLUs of other slopes) are not told apart; a file without the record, such as
+/// PyTorch's, loads into any kinds. A model with a layer the saved one lacked (a `Softmax`
+/// added at the end for inference, say) is another list of kinds: load it with
+/// [`load_lenient`].
 /// Nothing is written into `params` unless every check passes, so a failed load leaves the
 /// parameters as they were.
 ///
@@ -338,7 +341,8 @@ impl<'a> LoadOptions<'a> {
 ///
 /// The errors of [`load`] (the keys in [`Error::Keys`] are the renamed ones), and [`Error::Format`]
 /// when two keys of the file rename to the same key; the message names both. For two keys that
-/// collide, the first in alphabetical order is named first.
+/// collide, the first in alphabetical order is named first. The layer kinds a file records
+/// are checked only when `options.strict` is set and there is no `rename`.
 ///
 /// # Panics
 ///
