@@ -6,6 +6,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Breaking changes
 
+- `EpochReport` is `#[non_exhaustive]`, so a field added later is not a breaking change. Code outside `cavitation-nn` that builds one with a struct literal (to test a `StepControl`, say) uses `EpochReport::new(epoch, mean_loss, rows, seconds)`, which leaves `validation` as `None`. Reading the fields works as before; a struct pattern on it needs `..`.
 - `Health`, `HealthMonitor`, `Trainer`, `FitConfig`, `shrink::FromScratch` and `cavitation_ml::GradientConfig` take a lifetime parameter, and `Health::sink` and `FitConfig::on_epoch` are `Box<dyn FnMut(..) + Send + 's>`. The callbacks can borrow local state (a sink can push onto a `Vec` the caller reads after the run, without `Rc<RefCell<..>>`), and a `FitConfig` or a `Trainer` can be moved to another thread. A callback that captures something that is not `Send` (an `Rc`, a `Cell`) no longer compiles; borrow the value instead, or use `Arc` and an atomic or a `Mutex`. Code that names one of these types where a lifetime cannot be elided, such as a function with no reference arguments returning `FitConfig`, writes `FitConfig<'static>`; `TrainerHandle` and every `StepControl` are unchanged.
 
 ### Tensors and autograd (`cavitation-core`)

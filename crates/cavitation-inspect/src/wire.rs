@@ -524,7 +524,7 @@ pub struct EpochEvaluation<'a> {
 /// use cavitation_inspect::wire;
 /// use cavitation_nn::EpochReport;
 /// let report =
-///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 64, seconds: 0.01, validation: None };
+///     EpochReport::new(1, 0.5, 64, 0.01);
 /// let mut w = JsonWriter::new();
 /// wire::epoch(&mut w, &report, 3, None);
 /// assert!(w.as_str().ends_with(r#""evaluation":null}"#));
