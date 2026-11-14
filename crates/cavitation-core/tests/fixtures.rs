@@ -205,7 +205,11 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
         "matmul" => tape.matmul(v[0], v[1]),
         "max_pool2d" => tape.max_pool2d(v[0], pool_geom(f)),
         "batch_norm2d" => {
-            let (w, b) = if v.len() == 3 { (Some(v[1]), Some(v[2])) } else { (None, None) };
+            let (w, b) = if v.len() == 3 {
+                (Some(v[1]), Some(v[2]))
+            } else {
+                (None, None)
+            };
             let (c, s) = (num(p, "channels") as usize, num(p, "spatial") as usize);
             tape.batch_norm2d(v[0], w, b, None, c, s, num(p, "eps"))
         }

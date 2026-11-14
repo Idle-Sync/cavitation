@@ -935,6 +935,35 @@ impl<T: Real> Sequential<T> {
         }
         names
     }
+
+    /// Every value a saved model holds, named as PyTorch's `state_dict` names them: each
+    /// layer's parameters, then its buffers ([`Layer::buffers`]), layer by layer. This is
+    /// what [`save`](crate::save) writes and [`load`](crate::load) reads; for a model without
+    /// buffers it is [`parameter_names`](Self::parameter_names).
+    ///
+    /// ```
+    /// use cavitation_core::{Conv2dGeom, ParamStore, Rng};
+    /// use cavitation_nn::{BatchNorm2d, Conv2d, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let geom = Conv2dGeom::new(1, 2, (4, 4), (3, 3)).unwrap();
+    /// let net = Sequential::new()
+    ///     .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+    ///     .push(BatchNorm2d::new(&mut params, 2, (2, 2)));
+    /// let names: Vec<String> = net.state_names().into_iter().map(|n| n.0).collect();
+    /// assert_eq!(names, [
+    ///     "0.weight", "0.bias", "1.weight", "1.bias",
+    ///     "1.running_mean", "1.running_var", "1.num_batches_tracked",
+    /// ]);
+    /// ```
+    pub fn state_names(&self) -> Vec<(String, ParamId)> {
+        let mut names = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            for (local, id) in layer.parameters().into_iter().chain(layer.buffers()) {
+                names.push((format!("{i}.{local}"), id));
+            }
+        }
+        names
+    }
 }
 
 #[cfg(test)]

@@ -121,6 +121,23 @@ pub trait Layer<T: Real>: Send + Sync {
     /// ```
     fn parameters(&self) -> Vec<(&'static str, ParamId)>;
 
+    /// The layer's buffers with their local names: values it keeps but does not train, such
+    /// as [`BatchNorm2d`](crate::BatchNorm2d)'s running statistics, which `save` and `load`
+    /// carry with the parameters (after them, as PyTorch's state dict orders them). The
+    /// default is none.
+    ///
+    /// ```
+    /// use cavitation_core::ParamStore;
+    /// use cavitation_nn::{BatchNorm2d, Layer, Relu};
+    /// let bn = BatchNorm2d::new(&mut ParamStore::new(), 2, (3, 3));
+    /// let names: Vec<_> = Layer::<f32>::buffers(&bn).iter().map(|b| b.0).collect();
+    /// assert_eq!(names, ["running_mean", "running_var", "num_batches_tracked"]);
+    /// assert!(Layer::<f32>::buffers(&Relu).is_empty());
+    /// ```
+    fn buffers(&self) -> Vec<(&'static str, ParamId)> {
+        Vec::new()
+    }
+
     /// The parameter with local name `local` (for example `"weight"`), if the layer has one.
     /// The default searches [`parameters`](Self::parameters), which allocates; `Linear` and
     /// `Prelu` answer without allocating.

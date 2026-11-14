@@ -90,6 +90,20 @@ pub enum InferenceLayer {
         /// The divisor used in place of the window's size, if any.
         divisor_override: Option<usize>,
     },
+    /// 2-D batch normalisation's evaluation form: per channel, `(x − mean) · inv · weight +
+    /// bias` (`weight` 1 and `bias` 0 when absent) over `spatial` values per image.
+    BatchNorm2d {
+        /// Each channel's running mean.
+        mean: Vec<f32>,
+        /// Each channel's `1 / √(running variance + eps)`.
+        inv: Vec<f32>,
+        /// γ, if the layer is affine.
+        weight: Option<Vec<f32>>,
+        /// β, if the layer is affine.
+        bias: Option<Vec<f32>>,
+        /// Values per channel of one image.
+        spatial: usize,
+    },
     /// 2-D adaptive average pooling of `channels` planes of `input` to `output`.
     AdaptiveAvgPool2d {
         /// Channels of each image.
@@ -1311,6 +1325,7 @@ fn declared_width(form: &InferenceLayer) -> Option<usize> {
         InferenceLayer::Prelu(slopes) if slopes.len() > 1 => Some(slopes.len()),
         InferenceLayer::Mask(keep) => Some(keep.len()),
         InferenceLayer::Conv2d { geom, .. } => Some(geom.in_width()),
+        InferenceLayer::BatchNorm2d { mean, spatial, .. } => Some(mean.len() * spatial),
         InferenceLayer::MaxPool2d(geom) | InferenceLayer::AvgPool2d { geom, .. } => {
             Some(geom.in_width())
         }
@@ -1658,6 +1673,24 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         }
         InferenceLayer::Mask(keep) => apply_mask(keep, data, width),
         InferenceLayer::Identity => {}
+        InferenceLayer::BatchNorm2d {
+            mean,
+            inv,
+            weight,
+            bias,
+            spatial,
+        } => {
+            // As the tape's evaluation form computes it, value by value.
+            for row in data.chunks_exact_mut(width.max(1)) {
+                for (c, plane) in row.chunks_exact_mut((*spatial).max(1)).enumerate() {
+                    let g = weight.as_ref().map_or(1.0, |w| w[c]);
+                    let s = bias.as_ref().map_or(0.0, |b| b[c]);
+                    for v in plane {
+                        *v = (*v - mean[c]) * inv[c] * g + s;
+                    }
+                }
+            }
+        }
         InferenceLayer::Linear { .. }
         | InferenceLayer::Glu(_)
         | InferenceLayer::Conv2d { .. }

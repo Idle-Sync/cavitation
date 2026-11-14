@@ -83,26 +83,37 @@ pub fn save(
     params: &ParamStore<f32>,
 ) -> Result<(), Error> {
     let path = path.as_ref();
-    let names = model.parameter_names();
+    let names = model.state_names();
     let buffers: Vec<Vec<u8>> = names
         .iter()
-        .map(|(_, id)| {
-            params
-                .value(*id)
-                .data()
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect()
+        .map(|(name, id)| {
+            let data = params.value(*id).data();
+            if is_count(name) {
+                // A batch count, stored as PyTorch stores `num_batches_tracked`.
+                (data[0] as i64).to_le_bytes().to_vec()
+            } else {
+                data.iter().flat_map(|v| v.to_le_bytes()).collect()
+            }
         })
         .collect();
     let mut views = Vec::with_capacity(names.len());
     for ((name, id), bytes) in names.iter().zip(&buffers) {
-        let shape = params.value(*id).shape().dims().to_vec();
-        let view = TensorView::new(Dtype::F32, shape, bytes).map_err(|e| convert(path, e))?;
+        let (dtype, shape) = if is_count(name) {
+            (Dtype::I64, Vec::new())
+        } else {
+            (Dtype::F32, params.value(*id).shape().dims().to_vec())
+        };
+        let view = TensorView::new(dtype, shape, bytes).map_err(|e| convert(path, e))?;
         views.push((name.as_str(), view));
     }
     let metadata = HashMap::from([(LAYERS_KEY.to_string(), layer_kinds(model))]);
     serialize_to_file(views, Some(metadata), path).map_err(|e| convert(path, e))
+}
+
+/// Whether `name` is a batch count (PyTorch's `num_batches_tracked`), stored as one `I64`
+/// with shape `[]` rather than as F32 values.
+fn is_count(name: &str) -> bool {
+    name.rsplit('.').next() == Some("num_batches_tracked")
 }
 
 /// The `__metadata__` key under which [`save`] records the model's layer kinds.
@@ -419,7 +430,7 @@ pub fn load_with(
         .metadata()
         .as_ref()
         .and_then(|m| m.get(LAYERS_KEY).cloned());
-    let names = model.parameter_names();
+    let names = model.state_names();
 
     // Renamed key -> key in the file, over every key of the file, so a collision is found
     // before anything is read from a tensor.
@@ -445,9 +456,35 @@ pub fn load_with(
     let mut staged: Vec<(ParamId, Vec<f32>)> = Vec::with_capacity(names.len());
     for (name, id) in &names {
         let Some(tensor) = by_name.get(name).and_then(|key| file.tensor(key).ok()) else {
-            problems.missing.push(name.clone());
+            if is_count(name) {
+                // PyTorch's own loader fills in a missing batch count for a state dict
+                // without version metadata, which every dict from safetensors is: 0.
+                staged.push((*id, vec![0.0]));
+            } else {
+                problems.missing.push(name.clone());
+            }
             continue;
         };
+        if is_count(name) {
+            let count = match (tensor.dtype(), tensor.shape()) {
+                (Dtype::I64, []) | (Dtype::I64, [1]) => {
+                    let bytes: [u8; 8] = tensor.data()[..8].try_into().expect("8 bytes");
+                    Some(i64::from_le_bytes(bytes) as f32)
+                }
+                (Dtype::F32, [] | [1]) => {
+                    let bytes: [u8; 4] = tensor.data()[..4].try_into().expect("4 bytes");
+                    Some(f32::from_le_bytes(bytes))
+                }
+                _ => None,
+            };
+            match count {
+                Some(c) => staged.push((*id, vec![c])),
+                None => problems
+                    .wrong_shape
+                    .push((name.clone(), vec![], tensor.shape().to_vec())),
+            }
+            continue;
+        }
         let readable = matches!(
             tensor.dtype(),
             Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64

@@ -63,6 +63,7 @@
 //! ```
 
 mod activation;
+mod batch_norm;
 mod conv;
 mod dropout;
 mod health;
@@ -86,6 +87,7 @@ pub use activation::{
     Hardtanh, LeakyRelu, LogSigmoid, LogSoftmax, Mish, Prelu, Relu, Relu6, Selu, Sigmoid, Silu,
     Softmax, Softplus, Softsign, Tanh,
 };
+pub use batch_norm::BatchNorm2d;
 pub use conv::Conv2d;
 pub use dropout::{Dropout, Flatten, Identity};
 pub use health::{BadInput, Health, HealthMonitor, OnNonFinite, StepInputs, Warning, WarningKind};
