@@ -24,7 +24,7 @@ use crate::server::{Inspector, InspectorConfig};
 use crate::sse::{Event, Hub, Snapshot};
 use crate::wire::{self, EpochEvaluation, ModelInfo, RunState, Stats};
 
-/// How far apart the held-out evaluations are: after an evaluation that took `c`, an
+/// How far apart the evaluations are: after an evaluation that took `c`, an
 /// epoch end evaluates again only once at least `EVALUATION_FACTOR · c` has passed since it
 /// ended, so evaluation takes at most about 1/200 = 0.5% of a run's time, besides the
 /// evaluation the last epoch always gets.
@@ -34,7 +34,7 @@ use crate::wire::{self, EpochEvaluation, ModelInfo, RunState, Stats};
 /// ```
 pub const EVALUATION_FACTOR: u32 = 200;
 
-/// Whether a held-out evaluation is due at an epoch end, `since` after the last one ended,
+/// Whether an evaluation is due at an epoch end, `since` after the last one ended,
 /// when that one took `cost`: at least [`EVALUATION_FACTOR`] times `cost` must have passed.
 /// A cost so large that the product does not fit a `Duration` is never due again.
 fn evaluation_due(since: Duration, cost: Duration) -> bool {
@@ -125,7 +125,7 @@ pub(crate) struct Training {
     last_loss: f32,
     /// The learning rate after the last step, for the final snapshot.
     learning_rate: f64,
-    /// The held-out evaluator, made at the first evaluation.
+    /// The evaluator of the probe rows, made at the first evaluation.
     evaluator: Option<Evaluator>,
     /// The rows the last evaluation classified wrong.
     misclassified: Vec<usize>,
@@ -518,7 +518,7 @@ impl Training {
         }
     }
 
-    /// Runs the held-out evaluation on the first `eval_rows` probe rows: its measures, the
+    /// Runs the evaluation on the first `eval_rows` probe rows: its measures, the
     /// rows measured and its seconds, or `None` (with a `status` message on an error) when
     /// there is nothing to measure.
     fn evaluate(
@@ -829,7 +829,7 @@ impl StepControl for Inspector {
         Flow::Continue
     }
 
-    /// After an epoch: carries out waiting commands, runs the held-out evaluation when it
+    /// After an epoch: carries out waiting commands, runs the evaluation when it
     /// is due, and publishes the `epoch` event.
     ///
     /// The evaluation runs only while a client is connected, and only when the time since
