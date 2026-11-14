@@ -64,6 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             },
         )),
+        validation: None,
     };
     fit(&net, &mut params, &train, config)?;
 

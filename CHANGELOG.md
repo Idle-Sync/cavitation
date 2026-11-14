@@ -7,6 +7,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
+- `EpochReport` has a new public field, `validation: Option<Evaluation>`, so code that builds an `EpochReport` with a struct literal must set it (`validation: None`).
+- `FitConfig` has a new public field, `validation: Option<Dataset>`. A struct literal that ends with `..FitConfig::default()` needs no change (the default is `None`); one that lists every field must add `validation: None`.
 
 ### Workspace
 
@@ -41,6 +43,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `Standardizer`: each column's mean and population standard deviation, `transform` and `inverse_transform`, and `fold_into_input` and `fold_into_output`, which write the scaling into the first or last `Linear` so a trained network takes raw inputs or answers in the targets' units.
 - `shrink::ablate_controlled`: `ablate_with` whose callback returns a `Flow`, so a sweep can stop early.
 - `Loss::record` is public, so a tape of your own can record the training loss.
+- `FitConfig::validation`: a held-out set that `fit`, `fit_with_hooks` and `fit_controlled` measure after every whole epoch with the run's loss, recorded in `EpochReport::validation` (the loss, and the accuracy or R²) before `on_epoch` runs. It is bit for bit what `evaluate` gives on the parameters and neuron masks as the epoch left them, follows the masks a `StepControl` changes, and after the first epoch allocates nothing for a model that compiles. An unsuitable validation set is `Error::InvalidData` before training, with a message that starts with `validation: `. A control that stops the run mid-epoch leaves that epoch without a validation.
+- `Evaluator::refresh` copies new weights and mask values in place without allocating when the model has the same layers, the masks sit where they did and no clone shares its weights (it used to allocate on every call).
 
 ### Data, examples, guide and benchmark
 

@@ -66,6 +66,7 @@ fn train_digits(optimizer: OptimizerConfig, epochs: usize) {
         schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: None,
+        validation: None,
     };
     fit(&net, &mut params, &train, config).unwrap();
 }

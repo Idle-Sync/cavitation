@@ -55,6 +55,7 @@ fn digits_known_result() {
                 );
             },
         )),
+        validation: None,
     };
     let history = fit(&net, &mut params, &train, config).unwrap();
     assert_eq!(history.epochs.len(), 20);
@@ -161,6 +162,7 @@ fn mnist_known_result() {
                 measured.borrow_mut().push(acc);
             },
         )),
+        validation: None,
     };
     fit(&net, &mut params, &train, config).unwrap();
 
@@ -227,6 +229,7 @@ fn shrink_start() -> ShrinkStart {
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,
+        validation: None,
     };
     fit(&net, &mut params, &fit_rows, config).unwrap();
     ShrinkStart {

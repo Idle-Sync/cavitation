@@ -297,9 +297,12 @@ impl Evaluator {
     /// moves there with its values, and the model is compiled afresh so that no mask is
     /// left on the old layer.
     ///
-    /// `refresh` allocates, even in place: it builds the new weights before copying them
-    /// in. Only [`evaluate`](Self::evaluate) and [`misclassified`](Self::misclassified) are
-    /// free of allocations in steady state.
+    /// When `model` has the very layers the evaluator was last made or refreshed with (the
+    /// model itself, or a clone of it, with only parameter values and mask values changed
+    /// since, as during [`fit`](crate::fit)), the model compiles, no clone shares its
+    /// weights and no mask was added or removed, `refresh` copies the new values in place
+    /// and allocates nothing. Otherwise it allocates: it builds the new weights before
+    /// copying them in, and on the tape it copies the parameter values afresh.
     ///
     /// # Errors
     ///
@@ -335,6 +338,9 @@ impl Evaluator {
     /// The work of [`refresh`](Self::refresh), saying which way it went.
     fn reload(&mut self, model: &Sequential, params: &ParamStore) -> Result<Reload, Error> {
         check_layers(model)?;
+        if self.reload_in_place(model, params) {
+            return Ok(Reload::InPlace);
+        }
         // The evaluator's own copy of `model`: each listed `Linear` without a neuron mask
         // in `model` gets the mask in use now (or every neuron on, if its width changed).
         let mut copy = model.clone();
@@ -400,6 +406,42 @@ impl Evaluator {
         }
         self.model = copy;
         Ok(reload)
+    }
+
+    /// The work of [`refresh`](Self::refresh) without allocating, when `model` has the same
+    /// layers as the evaluator's copy and the masks sit where they did: copies the new
+    /// weights into the compiled model and each of `model`'s mask values into the compiled
+    /// model and the copy, as [`reload`](Self::reload) would. A mask added by
+    /// [`with_neuron_masks`](Self::with_neuron_masks) on a `Linear` that `model` does not
+    /// mask keeps its values. Returns `false`, changing nothing, when it cannot: the layers
+    /// differ, a mask was added, removed or changed width, the model runs on the tape, or
+    /// the compiled model refuses ([`InferenceModel::refresh_in_place`]).
+    fn reload_in_place(&mut self, model: &Sequential, params: &ParamStore) -> bool {
+        if !self.model.same_layers(model) {
+            return false;
+        }
+        for i in 0..model.len() {
+            let carried = (self.linears.iter())
+                .any(|&l| model.neuron_layer(l) == i && model.neuron_mask(l).is_none());
+            match (model.mask(i), self.model.mask(i)) {
+                (Some(new), Some(old)) if new.width() == old.width() => {}
+                (None, Some(_)) if carried => {}
+                (None, None) if !carried => {}
+                _ => return false,
+            }
+        }
+        let Engine::Compiled(compiled) = &mut self.engine else {
+            return false;
+        };
+        if !compiled.refresh_in_place(model, params) {
+            return false;
+        }
+        for i in 0..model.len() {
+            if let Some(mask) = model.mask(i) {
+                self.model.copy_mask(i, mask);
+            }
+        }
+        true
     }
 
     /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
