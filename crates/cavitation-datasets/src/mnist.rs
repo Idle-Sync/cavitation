@@ -58,12 +58,25 @@ fn parse_idx(
     Ok((sizes, bytes[header..].to_vec()))
 }
 
+/// The side of an MNIST image, in pixels.
+const SIDE: usize = 28;
+
 /// Loads one split: `{prefix}-images-idx3-ubyte` and `{prefix}-labels-idx1-ubyte`.
 fn load_split(dir: &Path, prefix: &str) -> Result<Dataset, Error> {
     let images_path = dir.join(format!("{prefix}-images-idx3-ubyte"));
     let labels_path = dir.join(format!("{prefix}-labels-idx1-ubyte"));
     let (image_dims, pixels) = parse_idx(&images_path, &read(&images_path)?, 2051, 3)?;
     let (label_dims, labels) = parse_idx(&labels_path, &read(&labels_path)?, 2049, 1)?;
+    // MNIST's images are 28 by 28; checking the size here also bounds `rows · cols` when
+    // the file holds no image, so the product below cannot overflow.
+    if image_dims[1..] != [SIDE, SIDE] {
+        return Err(Error::Format(format!(
+            "{}: images are {} by {}, expected {SIDE} by {SIDE}",
+            images_path.display(),
+            image_dims[1],
+            image_dims[2]
+        )));
+    }
     if image_dims[0] != label_dims[0] {
         return Err(Error::Format(format!(
             "{} has {} images but {} has {} labels",
@@ -94,7 +107,8 @@ fn load_split(dir: &Path, prefix: &str) -> Result<Dataset, Error> {
 /// Returns [`Error::Io`] naming the file if one cannot be read; for a missing file the message
 /// points to `scripts/data/get-mnist.sh`. Returns [`Error::Format`] if a file has the wrong
 /// magic number, a length that does not match its dimensions (including dimensions whose
-/// product overflows `usize`), or if the image and label counts differ.
+/// product overflows `usize`), images that are not 28 by 28, or if the image and label counts
+/// differ.
 ///
 /// # Examples
 ///
@@ -138,12 +152,12 @@ mod tests {
     /// Writes the four files with `train` and `test` images of 2 by 2 pixels.
     fn write_set(dir: &Path, train: usize, test: usize) {
         for (prefix, n) in [("train", train), ("t10k", test)] {
-            let pixels: Vec<u8> = (0..n * 4).map(|i| (i * 51 % 256) as u8).collect();
+            let pixels: Vec<u8> = (0..n * 784).map(|i| (i * 51 % 256) as u8).collect();
             let labels: Vec<u8> = (0..n).map(|i| (i % 10) as u8).collect();
             write_idx(
                 &dir.join(format!("{prefix}-images-idx3-ubyte")),
                 2051,
-                &[n as u32, 2, 2],
+                &[n as u32, 28, 28],
                 &pixels,
             );
             write_idx(
@@ -173,7 +187,7 @@ mod tests {
         write_set(&dir, 3, 2);
         let (train, test) = load(&dir).unwrap();
         assert_eq!((train.len(), test.len()), (3, 2));
-        assert_eq!(train.x.shape().dims(), &[3, 4]);
+        assert_eq!(train.x.shape().dims(), &[3, 784]);
         assert_eq!(
             &train.x.data()[..5],
             &[
@@ -203,8 +217,8 @@ mod tests {
         write_idx(
             &dir.join("t10k-images-idx3-ubyte"),
             2051,
-            &[2, 2, 2],
-            &[0; 7],
+            &[2, 28, 28],
+            &[0; 2 * 784 - 1],
         );
         assert!(matches!(load(&dir), Err(Error::Format(_))));
 
@@ -231,6 +245,39 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("overflow"), "{text}");
         assert!(text.contains("train-images-idx3-ubyte"), "{text}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A header of 0 images with rows and columns of `u32::MAX`, which the length check
+    /// does not bound, and images of another size are `Format` errors naming the file and
+    /// the size.
+    #[test]
+    fn images_must_be_28_by_28() {
+        let dir = temp_dir("side");
+        for (dims, bytes) in [
+            ([0, u32::MAX, u32::MAX], 0usize),
+            ([3, 2, 2], 12),
+            ([3, 28, 27], 3 * 28 * 27),
+        ] {
+            write_set(&dir, 3, 2);
+            write_idx(
+                &dir.join("train-images-idx3-ubyte"),
+                2051,
+                &dims,
+                &vec![0; bytes],
+            );
+            if dims[0] == 0 {
+                write_idx(&dir.join("train-labels-idx1-ubyte"), 2049, &[0], &[]);
+            }
+            let err = load(&dir).unwrap_err();
+            assert!(matches!(err, Error::Format(_)), "{dims:?}: {err:?}");
+            let text = err.to_string();
+            assert!(text.contains("train-images-idx3-ubyte"), "{text}");
+            assert!(
+                text.contains(&format!("images are {} by {}", dims[1], dims[2])),
+                "{text}"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
