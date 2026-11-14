@@ -331,6 +331,79 @@ mod tests {
         }
     }
 
+    /// `shuffle` gives this permutation of 0..10 for seed 5 (checked against an independent
+    /// implementation of SplitMix64 seeding, xoshiro256++, Lemire's `below` and the
+    /// Fisher–Yates loop), and leaves an empty or one-item slice alone.
+    #[test]
+    fn shuffle_order_is_pinned() {
+        let mut rng = Rng::seed(5);
+        let mut v: Vec<u32> = (0..10).collect();
+        rng.shuffle(&mut v);
+        assert_eq!(v, [9, 4, 6, 1, 8, 3, 7, 0, 5, 2]);
+        let mut one = [7u8];
+        rng.shuffle(&mut one);
+        assert_eq!(one, [7]);
+        rng.shuffle::<u8>(&mut []);
+    }
+
+    /// Every draw of `range(-2, 3)` is in [-2, 3), and the draws reach both ends' tenths.
+    #[test]
+    fn range_stays_in_bounds() {
+        let mut rng = Rng::seed(8);
+        let (mut low, mut high) = (false, false);
+        for _ in 0..10_000 {
+            let x = rng.range(-2.0, 3.0);
+            assert!((-2.0..3.0).contains(&x), "{x}");
+            low |= x < -1.5;
+            high |= x >= 2.5;
+        }
+        assert!(low && high);
+    }
+
+    /// `normal` draws two values from one Box–Muller pair: the second call returns the
+    /// cached sine value without drawing, so it leaves the generator's state as the first
+    /// call left it, and the third call draws again.
+    #[test]
+    fn normal_alternates_fresh_and_cached() {
+        let mut rng = Rng::seed(9);
+        let first = rng.normal();
+        let state = rng.s;
+        let cached = rng.cached_normal.expect("the pair's second value is kept");
+        let second = rng.normal();
+        assert_eq!(second.to_bits(), cached.to_bits());
+        assert_eq!(rng.s, state, "the cached value draws nothing");
+        assert!(rng.cached_normal.is_none());
+        rng.normal();
+        assert_ne!(rng.s, state, "the next pair draws again");
+        assert!(first.is_finite() && second.is_finite());
+    }
+
+    /// `below(1)` is always 0; `below(u64::MAX)` stays below it; and with `n = 2^63 + 1`,
+    /// where Lemire's method rejects about half the draws, every value is below `n` and both
+    /// halves of the range come up.
+    #[test]
+    fn below_at_the_extremes() {
+        let mut rng = Rng::seed(10);
+        assert!((0..100).all(|_| rng.below(1) == 0));
+        assert!((0..100).all(|_| rng.below(u64::MAX) < u64::MAX));
+        let n = (1u64 << 63) + 1;
+        let (mut low, mut high) = (false, false);
+        for _ in 0..1000 {
+            let k = rng.below(n);
+            assert!(k < n);
+            low |= k < 1 << 62;
+            high |= k > 3 << 61;
+        }
+        assert!(low && high);
+    }
+
+    /// `below(0)` panics, naming the function.
+    #[test]
+    #[should_panic(expected = "Rng::below: n must be positive, got 0")]
+    fn below_zero_panics() {
+        Rng::seed(0).below(0);
+    }
+
     /// With equal bounds the only possible value is the bound itself.
     #[test]
     fn range_equal_bounds_returns_lo() {

@@ -82,4 +82,21 @@ mod tests {
             assert_eq!(format!("{:.10}", rng.next_f64()), want);
         }
     }
+
+    /// The edge seeds 0 and `u32::MAX` (the state wraps on the first step) and the 1,000th
+    /// output for seed 42 match the JavaScript generator (values from a direct port of its
+    /// `Math.imul` code).
+    #[test]
+    fn mulberry32_edge_seeds_and_a_long_run() {
+        let take = |seed: u32, n: usize| -> Vec<u32> {
+            let mut rng = Mulberry32::new(seed);
+            (0..n).map(|_| rng.next_u32()).collect()
+        };
+        assert_eq!(take(0, 4), [1144304738, 1416247, 958946056, 627933444]);
+        assert_eq!(
+            take(u32::MAX, 4),
+            [3850105811, 813802916, 3073704848, 4054706436]
+        );
+        assert_eq!(take(42, 1000)[999], 2759564329);
+    }
 }

@@ -716,6 +716,10 @@ pub(super) fn softmax_backward<T: Real>(
 ) {
     let width = ctx.shape(x).dims().last().copied().unwrap_or(0);
     if width == 0 {
+        // Nothing to write, but a parameter's gradient is still marked current.
+        if let Some(slot) = ctx.slot(x) {
+            slot.update_with(|_, _| {});
+        }
         return;
     }
     let y = ctx.value(out);
@@ -745,6 +749,10 @@ pub(super) fn log_softmax_backward<T: Real>(
 ) {
     let width = ctx.shape(x).dims().last().copied().unwrap_or(0);
     if width == 0 {
+        // Nothing to write, but a parameter's gradient is still marked current.
+        if let Some(slot) = ctx.slot(x) {
+            slot.update_with(|_, _| {});
+        }
         return;
     }
     let y = ctx.value(out);
@@ -777,6 +785,10 @@ pub(super) fn cross_entropy_backward<T: Real>(
     let shape = ctx.shape(logits);
     let (batch, classes) = (shape.dims()[0], shape.dims()[1]);
     if classes == 0 {
+        // Nothing to write, but a parameter's gradient is still marked current.
+        if let Some(slot) = ctx.slot(logits) {
+            slot.update_with(|_, _| {});
+        }
         return;
     }
     let labels = &ctx.labels()[labels_start..][..batch];
@@ -999,6 +1011,10 @@ pub(super) fn nll_backward<T: Real>(
     let shape = ctx.shape(log_probs);
     let (batch, classes) = (shape.dims()[0], shape.dims()[1]);
     if classes == 0 {
+        // Nothing to write, but a parameter's gradient is still marked current.
+        if let Some(slot) = ctx.slot(log_probs) {
+            slot.update_with(|_, _| {});
+        }
         return;
     }
     let labels = &ctx.labels()[labels_start..][..batch];
@@ -1257,8 +1273,9 @@ mod tests {
         tape.mse(p, t, Reduction::Mean);
     }
 
-    /// The cross-entropy gradient is `(softmax - onehot) / batch` for `Mean`, and the labels
-    /// of an earlier loss on the same tape are not mixed up with a later one's.
+    /// The cross-entropy gradient is `(softmax - onehot) / batch` for `Mean` and
+    /// `softmax - onehot` for `Sum`, and each of two losses on the same tape reads its own
+    /// labels: the second (labels 0 and 1, scaled by 0.5) adds its own gradient.
     #[test]
     fn cross_entropy_gradient_by_hand() {
         let mut store = ParamStore::<f64>::new_generic();
@@ -1268,8 +1285,8 @@ mod tests {
         let z = tape.param(p);
         let first = tape.softmax_cross_entropy(z, &[2, 0], Reduction::Mean);
         let second = tape.softmax_cross_entropy(z, &[0, 1], Reduction::Sum);
-        let zero = tape.scale(second, 0.0);
-        let loss = tape.add(first, zero);
+        let half = tape.scale(second, 0.5);
+        let loss = tape.add(first, half);
         tape.backward(loss, &mut store.grads);
         drop(tape);
         let sm = |row: &[f64]| -> Vec<f64> {
@@ -1279,14 +1296,43 @@ mod tests {
         };
         let (r0, r1) = (sm(&[1.0, 2.0, 3.0]), sm(&[1.0, 0.0, 0.0]));
         let want = [
-            r0[0] / 2.0,
-            r0[1] / 2.0,
-            (r0[2] - 1.0) / 2.0,
-            (r1[0] - 1.0) / 2.0,
-            r1[1] / 2.0,
-            r1[2] / 2.0,
+            r0[0] / 2.0 + 0.5 * (r0[0] - 1.0),
+            r0[1] / 2.0 + 0.5 * r0[1],
+            (r0[2] - 1.0) / 2.0 + 0.5 * r0[2],
+            (r1[0] - 1.0) / 2.0 + 0.5 * r1[0],
+            r1[1] / 2.0 + 0.5 * (r1[1] - 1.0),
+            r1[2] / 2.0 + 0.5 * r1[2],
         ];
         assert_close(store.grad(p).data(), &want, 1e-15);
+    }
+
+    /// A NaN in one row's logits makes only that row's loss and gradient NaN: the other
+    /// row's loss and gradient (`softmax - onehot`) are the values without the NaN row.
+    #[test]
+    fn cross_entropy_nan_stays_in_its_row() {
+        let (y, _) = run(&[f64::NAN, 0.0, 1.0, 2.0, 0.5, -1.0], &[2, 3], |t, x| {
+            t.softmax_cross_entropy(x, &[1, 0], Reduction::None)
+        });
+        assert!(y[0].is_nan());
+        let (alone, _) = run(&[2.0, 0.5, -1.0], &[1, 3], |t, x| {
+            t.softmax_cross_entropy(x, &[0], Reduction::None)
+        });
+        assert_eq!(y[1].to_bits(), alone[0].to_bits());
+        let mut store = ParamStore::<f64>::new_generic();
+        let p =
+            store.add(Tensor::from_vec(vec![f64::NAN, 0.0, 1.0, 2.0, 0.5, -1.0], &[2, 3]).unwrap());
+        let mut graph = Graph::<f64>::new_generic();
+        let mut tape = graph.tape(&store.values);
+        let z = tape.param(p);
+        let loss = tape.softmax_cross_entropy(z, &[1, 0], Reduction::Sum);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        let g = store.grad(p).data();
+        assert!(g[..3].iter().all(|v| v.is_nan()), "{g:?}");
+        let e: Vec<f64> = [2.0f64, 0.5, -1.0].iter().map(|v| v.exp()).collect();
+        let sum: f64 = e.iter().sum();
+        let want = [e[0] / sum - 1.0, e[1] / sum, e[2] / sum];
+        assert_close(&g[3..], &want, 1e-15);
     }
 
     /// Records `f` on a fresh f64 tape over two inputs `a` and `b` (shape `dims`) and returns
@@ -1708,6 +1754,39 @@ mod tests {
             let (ga, gb) = (side(f, false), side(f, true));
             let want: Vec<u32> = ga.iter().zip(&gb).map(|(x, y)| (x + y).to_bits()).collect();
             assert_eq!(one(f), want, "{name}: one parameter as both inputs");
+        }
+    }
+
+    /// With nothing to differentiate (a last axis of width 0, or no classes and no rows),
+    /// softmax, log-softmax, cross-entropy and NLL still mark a parameter's gradient
+    /// current in the backward pass, as every operation does.
+    #[test]
+    fn empty_softmax_and_class_losses_mark_the_gradient() {
+        type Op = fn(&mut crate::Tape<'_, f32>, crate::Var) -> crate::Var;
+        let ops: [(&str, &[usize], Op); 4] = [
+            ("softmax", &[3, 0], |t, x| {
+                let y = t.softmax(x);
+                t.sum(y)
+            }),
+            ("log_softmax", &[3, 0], |t, x| {
+                let y = t.log_softmax(x);
+                t.sum(y)
+            }),
+            ("softmax_cross_entropy", &[0, 0], |t, x| {
+                t.softmax_cross_entropy(x, &[], Reduction::Sum)
+            }),
+            ("nll", &[0, 0], |t, x| t.nll(x, &[], Reduction::Sum)),
+        ];
+        for (name, dims, f) in ops {
+            let mut store = ParamStore::new();
+            let p = store.add(Tensor::<f32>::zeros(dims));
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&store.values);
+            let x = tape.param(p);
+            let loss = f(&mut tape, x);
+            tape.backward(loss, &mut store.grads);
+            drop(tape);
+            assert!(!store.grads.is_stale(p), "{name}");
         }
     }
 

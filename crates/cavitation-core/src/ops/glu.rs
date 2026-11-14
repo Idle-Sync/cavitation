@@ -108,15 +108,18 @@ impl<T: Real> Tape<'_, T> {
 
 /// Backward of `glu`: `a` gets `g ⊙ gate(b)` and `b` gets `g ⊙ a ⊙ gate′(b)`, both written
 /// into the halves of `x`'s gradient buffer in one pass. Every element is written when the
-/// slot overwrites.
+/// slot overwrites. With a last axis of width 0 there is nothing to write, but the slot is
+/// still contributed to, so a parameter's gradient is marked current, as every other
+/// operation leaves it.
 pub(super) fn backward<T: Real>(x: Var, gate: Gate, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
     let input = ctx.value(x);
     let width = ctx.shape(x).dims().last().copied().unwrap_or(0);
     let half = width / 2;
+    let Some(slot) = ctx.slot(x) else { return };
     if half == 0 {
+        slot.update_with(|_, _| {});
         return;
     }
-    let Some(slot) = ctx.slot(x) else { return };
     slot.update_with(|buf, beta| {
         let rows = buf.chunks_exact_mut(width).zip(input.chunks_exact(width));
         for ((d, row), g) in rows.zip(out_grad.chunks_exact(half)) {
@@ -209,6 +212,84 @@ mod tests {
         let mut tape = graph.tape(&store.values);
         let x = tape.input(Tensor::<f32>::zeros(&[2, 5]).view());
         tape.glu(x, Gate::Sigmoid);
+    }
+
+    /// The gradient of `x` (12 values in shape `dims`) after `uses` `glu`s of it, summed, as
+    /// bits.
+    fn glu_grad_bits(gate: Gate, uses: usize, dims: &[usize]) -> Vec<u32> {
+        let values: Vec<f32> = (0..12).map(|i| (i as f32 - 5.5) * 0.37).collect();
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::from_vec(values, dims).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.param(p);
+        let mut loss = None;
+        for _ in 0..uses {
+            let y = tape.glu(x, gate);
+            let s = tape.sum(y);
+            loss = Some(loss.map_or(s, |l| tape.add(l, s)));
+        }
+        tape.backward(loss.unwrap(), &mut store.grads);
+        store.grad(p).data().iter().map(|g| g.to_bits()).collect()
+    }
+
+    /// A second `glu` of the same input adds to its gradient: two uses give exactly twice
+    /// the gradient of one, for every gate.
+    #[test]
+    fn glu_gradient_accumulates() {
+        for gate in [
+            Gate::Sigmoid,
+            Gate::Gelu(GeluApprox::Exact),
+            Gate::Relu,
+            Gate::Silu,
+        ] {
+            let once = glu_grad_bits(gate, 1, &[2, 6]);
+            let twice = glu_grad_bits(gate, 2, &[2, 6]);
+            let doubled: Vec<u32> = once
+                .iter()
+                .map(|&b| (2.0 * f32::from_bits(b)).to_bits())
+                .collect();
+            assert_eq!(twice, doubled, "{gate:?}");
+        }
+    }
+
+    /// A rank-3 input is split along its last axis, row by row: its values and gradient
+    /// are those of the same data as rank 2.
+    #[test]
+    fn glu_rank_three_matches_rank_two() {
+        let values: Vec<f32> = (0..24).map(|i| (i as f32 - 11.0) * 0.21).collect();
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x3 = tape.input(Tensor::from_vec(values.clone(), &[2, 3, 4]).unwrap().view());
+        let x2 = tape.input(Tensor::from_vec(values, &[6, 4]).unwrap().view());
+        let (y3, y2) = (tape.glu(x3, Gate::Sigmoid), tape.glu(x2, Gate::Sigmoid));
+        assert_eq!(tape.shape(y3).dims(), &[2, 3, 2]);
+        assert_eq!(tape.value(y3).data(), tape.value(y2).data());
+        drop(tape);
+        for gate in [Gate::Sigmoid, Gate::Silu] {
+            assert_eq!(
+                glu_grad_bits(gate, 1, &[2, 3, 2]),
+                glu_grad_bits(gate, 1, &[6, 2])
+            );
+        }
+    }
+
+    /// With a last axis of width 0 the output is empty and the backward pass still marks
+    /// the parameter's gradient current.
+    #[test]
+    fn glu_of_width_zero_marks_the_gradient() {
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::<f32>::zeros(&[3, 0]));
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.param(p);
+        let y = tape.glu(x, Gate::Sigmoid);
+        assert_eq!(tape.shape(y).dims(), &[3, 0]);
+        let loss = tape.sum(y);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        assert!(!store.grads.is_stale(p));
     }
 
     /// NaN in either half reaches the output and the gradients, also through a ReLU gate.

@@ -385,11 +385,83 @@ mod tests {
     use super::*;
     use crate::Error;
 
-    /// Six values cannot fill a [2, 4] tensor.
+    /// Six values cannot fill a [2, 4] tensor: the error names the shape asked for and the
+    /// number of values given. A view checks its length the same way.
     #[test]
     fn from_vec_rejects_wrong_length() {
         let r = Tensor::from_vec(vec![0.0f32; 6], &[2, 4]);
-        assert!(matches!(r, Err(Error::ShapeMismatch { .. })));
+        match r {
+            Err(Error::ShapeMismatch { expected, found }) => {
+                assert_eq!((expected, found), (vec![2, 4], vec![6]));
+            }
+            other => panic!("expected a shape mismatch, got {other:?}"),
+        }
+        let data = [0.0f32; 5];
+        match TensorView::from_slice(&data, &[2, 3]) {
+            Err(Error::ShapeMismatch { expected, found }) => {
+                assert_eq!((expected, found), (vec![2, 3], vec![5]));
+            }
+            other => panic!("expected a shape mismatch, got {other:?}"),
+        }
+    }
+
+    /// A reshape to a shape of another size fails, naming the shape asked for and the
+    /// current one, and leaves the tensor as it was.
+    #[test]
+    fn reshape_to_another_size_fails() {
+        let mut t = Tensor::from_vec((0..6).map(|v| v as f32).collect(), &[2, 3]).unwrap();
+        match t.reshape(&[4, 2]) {
+            Err(Error::ShapeMismatch { expected, found }) => {
+                assert_eq!((expected, found), (vec![4, 2], vec![2, 3]));
+            }
+            other => panic!("expected a shape mismatch, got {other:?}"),
+        }
+        assert_eq!(t.shape().dims(), &[2, 3]);
+        assert_eq!(t.data(), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    }
+
+    /// `get` with an index of the wrong rank panics naming the index and the shape.
+    #[test]
+    #[should_panic(expected = "index [1] has 1 entries but the shape is [2, 3]")]
+    fn get_with_the_wrong_rank_panics() {
+        Tensor::zeros(&[2, 3]).get(&[1]);
+    }
+
+    /// `get` past the end of a dimension panics naming the index and the shape.
+    #[test]
+    #[should_panic(expected = "index [0, 3] is out of range for shape [2, 3]")]
+    fn get_out_of_range_panics() {
+        Tensor::zeros(&[2, 3]).get(&[0, 3]);
+    }
+
+    /// A view reads the tensor's data and shape; a mutable view writes through to it; and
+    /// `to_tensor` copies either into a tensor of its own.
+    #[test]
+    fn views_read_and_write_the_tensor() {
+        let mut t = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        let v = t.view();
+        assert_eq!(
+            (v.shape().dims(), v.data()),
+            (&[2usize, 2][..], &[1.0f32, 2.0, 3.0, 4.0][..])
+        );
+        let copy = v.to_tensor();
+        let mut m = t.view_mut();
+        m.data_mut()[3] = 9.0;
+        assert_eq!(m.data(), &[1.0, 2.0, 3.0, 9.0]);
+        let copied = m.to_tensor();
+        assert_eq!(t.data(), &[1.0, 2.0, 3.0, 9.0]);
+        assert_eq!(
+            copy.data(),
+            &[1.0, 2.0, 3.0, 4.0],
+            "the earlier copy is its own"
+        );
+        assert_eq!(
+            (copied.shape().dims(), copied.data()),
+            (&[2usize, 2][..], t.data())
+        );
+        let data = [5.0f32, 6.0, 7.0];
+        let from = TensorView::from_slice(&data, &[3]).unwrap();
+        assert_eq!(from.data(), &data);
     }
 
     /// Reshaping changes the shape, not the data.
