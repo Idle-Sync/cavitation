@@ -92,7 +92,8 @@ pub struct InspectorConfig {
     /// The rows the page can probe. `None` (the default) uses the first `eval_rows` training
     /// rows, which the page labels as training rows.
     pub probe: Option<Dataset>,
-    /// How many probe rows the held-out evaluation uses; 1,000 by default.
+    /// How many probe rows the evaluation at epoch ends uses; 1,000 by default. The
+    /// evaluation is held out only when [`probe`](Self::probe) is given.
     pub eval_rows: usize,
     /// `Some((height, width))` when each input row is an image of that size, so the page
     /// draws inputs and incoming weights as pictures.

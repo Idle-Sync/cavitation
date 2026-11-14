@@ -517,7 +517,7 @@ mod tests {
     //! Tests for [`Standardizer`]: statistics, the transforms, and both folds.
 
     use super::*;
-    use crate::{Linear, Relu};
+    use crate::{InferenceModel, Linear, Relu};
     use cavitation_core::{Graph, Rng};
 
     /// The bound a float computation of `k` accumulated terms with absolute sum `sum` must
@@ -740,6 +740,97 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Runs `model` on every row of `x` through `infer` and through `infer_batch`, and
+    /// returns both answers, row after row.
+    fn compiled(model: &mut InferenceModel, x: &Tensor<f32>) -> (Vec<f32>, Vec<f32>) {
+        let width = x.shape().dims()[1];
+        let one = x
+            .data()
+            .chunks(width)
+            .flat_map(|row| model.infer(row).to_vec())
+            .collect();
+        let batch = model.infer_batch(x.view()).data().to_vec();
+        (one, batch)
+    }
+
+    /// The largest `|a − b| / max(|b|, 1)` over two answers.
+    fn worst(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| (a - b).abs() / b.abs().max(1.0))
+            .fold(0.0, f32::max)
+    }
+
+    /// Compiled for inference, a network folded on its input answers raw inputs as the
+    /// unfolded network answers standardised ones, and a network folded on its output
+    /// answers as `inverse_transform` makes of the unfolded one's answers, through both
+    /// `infer` and `infer_batch`, within float rounding; each path is checked against the
+    /// same path of the network before the fold. The input fold's bound is looser because
+    /// the folded first layer cancels raw inputs of about 1000 against the folded mean
+    /// (measured worst relative difference 3.0e-5 against a bound of 3e-4 at kernel level
+    /// `sse4.2`); the output fold adds none (5.0e-7 against 1e-5); the two together
+    /// measured 1.2e-4 against 1e-3.
+    #[test]
+    fn folds_agree_after_compiling() {
+        let (rows, width, hidden, outputs) = (48, 5, 9, 3);
+        let x = raw_inputs(rows, width, 6);
+        let s_in = Standardizer::fit(x.view());
+        let s_out = Standardizer::from_parts(vec![500.0, -40.0, 3.0], vec![25.0, 0.5, 9.0]);
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(7);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, width, hidden, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, hidden, outputs, &mut rng));
+        let mut z = x.clone();
+        s_in.transform(&mut z);
+
+        let mut unfolded = InferenceModel::compile(&net, &params).unwrap();
+        let (one, batch) = compiled(&mut unfolded, &z);
+        let mut expected = Tensor::from_vec(batch.clone(), &[rows, outputs]).unwrap();
+        s_out.inverse_transform(&mut expected);
+
+        s_in.fold_into_input(&net, &mut params).unwrap();
+        let mut folded = InferenceModel::compile(&net, &params).unwrap();
+        let (one_in, batch_in) = compiled(&mut folded, &x);
+        assert!(worst(&one_in, &one) <= 3e-4, "{}", worst(&one_in, &one));
+        assert!(
+            worst(&batch_in, &batch) <= 3e-4,
+            "{}",
+            worst(&batch_in, &batch)
+        );
+
+        s_out.fold_into_output(&net, &mut params).unwrap();
+        let mut both = InferenceModel::compile(&net, &params).unwrap();
+        let (one_out, batch_out) = compiled(&mut both, &x);
+        // Each path against its own answers: `infer` (matvec) and `infer_batch` (GEMM) round
+        // differently at the fused-multiply-add levels, and the input fold's cancellation
+        // scales that up, so comparing across the paths would test the paths, not the fold.
+        let inverse = |answers: Vec<f32>| {
+            let mut t = Tensor::from_vec(answers, &[rows, outputs]).unwrap();
+            s_out.inverse_transform(&mut t);
+            t.data().to_vec()
+        };
+        let tight = 1e-5;
+        let (one_want, batch_want) = (inverse(one_in), inverse(batch_in));
+        assert!(
+            worst(&one_out, &one_want) <= tight,
+            "{}",
+            worst(&one_out, &one_want)
+        );
+        assert!(
+            worst(&batch_out, &batch_want) <= tight,
+            "{}",
+            worst(&batch_out, &batch_want)
+        );
+        assert!(
+            worst(&batch_out, expected.data()) <= 1e-3,
+            "{}",
+            worst(&batch_out, expected.data())
+        );
     }
 
     /// A first layer that is not a `Linear` is an `InvalidData` error naming its kind, and

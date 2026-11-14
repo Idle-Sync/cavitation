@@ -31,7 +31,7 @@
 //! - `probe_rows` (integer): how many rows the page can probe.
 //! - `probe_is_training` (boolean): whether the probe rows are training rows (no separate
 //!   probe set was given), so the page labels them as such.
-//! - `eval_rows` (integer): how many of the probe rows the held-out evaluation uses.
+//! - `eval_rows` (integer): how many of the probe rows the evaluation uses.
 //! - `parameters` (integer): the number of parameter values.
 //! - `flops_per_sample` (integer): the floating-point operations one training sample takes
 //!   in the `Linear` layers: for each `Linear` of `in` inputs and `out` outputs,
@@ -72,8 +72,9 @@
 //! - `rows` (integer): the rows the epoch trained on; steps left out under
 //!   `OnNonFinite::Skip` do not count.
 //! - `seconds` (number): the epoch's wall-clock time, pauses included.
-//! - `evaluation` (object or `null`): the held-out evaluation on the first `eval_rows` probe
-//!   rows, or `null` when it was skipped (no client was connected, or the time since the
+//! - `evaluation` (object or `null`): the evaluation on the first `eval_rows` probe rows,
+//!   which are held out only when a probe set was given (see `probe_is_training` in the
+//!   `model` event), or `null` when it was skipped (no client was connected, or the time since the
 //!   last evaluation was under [`EVALUATION_FACTOR`](crate::EVALUATION_FACTOR), 200, times
 //!   that evaluation's own cost; the last epoch always has one while a client is
 //!   connected):
@@ -84,6 +85,12 @@
 //!   - `misclassified` (array of integers): up to 100 probe-row indices classified wrong,
 //!     in order, for the page's "show a mistake".
 //!   - `seconds` (number): the evaluation's own time.
+//! - `validation` (object or `null`): the run's validation set (`FitConfig::validation`)
+//!   measured after the epoch, as `EpochReport::validation` holds it, or `null` when the
+//!   run has none (or the epoch was cut short by a stop):
+//!   - `loss` (number or `null`): its mean loss; `null` when it is not finite.
+//!   - `accuracy` (number or `null`): the share classified right, for class targets.
+//!   - `r2` (number or `null`): the coefficient of determination, for value targets.
 //!
 //! # `probe`
 //!
@@ -490,7 +497,8 @@ pub fn stats(w: &mut JsonWriter, s: &Stats) {
         .end_object();
 }
 
-/// A held-out evaluation as the `epoch` event reports it.
+/// The evaluation on the probe rows as the `epoch` event reports it: held out only when a
+/// probe set was given ([`ModelInfo::probe_is_training`] is `false`).
 ///
 /// # Examples
 ///
@@ -517,17 +525,19 @@ pub struct EpochEvaluation<'a> {
     pub seconds: f64,
 }
 
-/// Writes the `epoch` event for `report`, of a run of `epochs` epochs.
+/// Writes the `epoch` event for `report`, of a run of `epochs` epochs, with the inspector's
+/// own `evaluation` of the probe rows (or `null`) and the run's `validation` from
+/// [`EpochReport::validation`].
 ///
 /// ```
 /// use cavitation_inspect::json::JsonWriter;
 /// use cavitation_inspect::wire;
 /// use cavitation_nn::EpochReport;
 /// let report =
-///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 64, seconds: 0.01, validation: None };
+///     EpochReport::new(1, 0.5, 64, 0.01);
 /// let mut w = JsonWriter::new();
 /// wire::epoch(&mut w, &report, 3, None);
-/// assert!(w.as_str().ends_with(r#""evaluation":null}"#));
+/// assert!(w.as_str().ends_with(r#""evaluation":null,"validation":null}"#));
 /// ```
 pub fn epoch(
     w: &mut JsonWriter,
@@ -566,6 +576,19 @@ pub fn epoch(
                 w.uint(i as u64);
             }
             w.end_array().key("seconds").number(e.seconds).end_object();
+        }
+    }
+    w.key("validation");
+    match &report.validation {
+        None => {
+            w.null();
+        }
+        Some(v) => {
+            w.begin_object().key("loss").number(v.loss).key("accuracy");
+            number_or_null(w, v.accuracy);
+            w.key("r2");
+            number_or_null(w, v.r2);
+            w.end_object();
         }
     }
     w.end_object();
