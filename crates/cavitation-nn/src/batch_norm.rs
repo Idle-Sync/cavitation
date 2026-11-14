@@ -438,8 +438,9 @@ mod tests {
         assert_eq!(params.value(r.count.unwrap()).data(), &[3.0]);
     }
 
-    /// The compiled model gives the tape's evaluation bits, and a saved model with its
-    /// buffers loads back exactly; a file without `num_batches_tracked` loads with a count of
+    /// The compiled model gives the tape's evaluation bits (within `1e-5 · max(1, |tape|)`
+    /// at the Accelerate level, where the network's convolution may round differently), and
+    /// a saved model with its buffers loads back exactly; a file without `num_batches_tracked` loads with a count of
     /// 0.
     #[test]
     fn inference_and_save_load_carry_the_buffers() {
@@ -462,7 +463,17 @@ mod tests {
         let want = tape.value(y).data().to_vec();
         drop(tape);
         let mut model = InferenceModel::compile(&net, &params).unwrap();
-        assert_eq!(model.infer_batch(data.x.view()).data(), want.as_slice());
+        // The network's convolution gives the tape's bits at the library's own kernel
+        // levels; Accelerate's sgemm may block the compiled model's products, of other
+        // shapes than the tape's, differently, so there it is within 1e-5 · max(1, |tape|).
+        let got = model.infer_batch(data.x.view()).data().to_vec();
+        if cavitation_core::kernels::level() == cavitation_core::kernels::Level::Accelerate {
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() <= 1e-5 * w.abs().max(1.0), "{g} against {w}");
+            }
+        } else {
+            assert_eq!(got, want);
+        }
         let path =
             std::env::temp_dir().join(format!("cavitation-bn-{}.safetensors", std::process::id()));
         save(&path, &net, &params).unwrap();
