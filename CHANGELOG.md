@@ -22,6 +22,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- `cavitation_datasets::mnist::load` returns `Error::Format` naming the file for images that are not 28 by 28. Before, a header of 0 images with huge row and column counts passed the length check and gave a data set of shape `[0, rows · cols]`, where the product could overflow.
 - `cavitation-bench` writes `results.json` under `CARGO_TARGET_DIR` (in its `bench` folder) when that is set, instead of always the workspace's `target/bench`; prints the usage text only for a command-line error, not after a failure while running (which now exits with status 1, not 2); and on aarch64 Linux, whose `/proc/cpuinfo` has no `model name`, names the CPU from its cores' `CPU implementer` and `CPU part` (`ARM Cortex-A76`, with the board's `Model` line when there is one) instead of `unknown`.
 - The README lists all five guide chapters, in the guide's order, and "Coming from PyTorch" explains where a neuron mask goes in one paragraph instead of two that overlapped.
 
