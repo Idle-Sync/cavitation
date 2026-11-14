@@ -1,5 +1,6 @@
-//! The f32 activation kernels: `tanh` and the logistic sigmoid over a slice, in place, on
-//! the SIMD kernel of the current level.
+//! The f32 activation kernels: `tanh`, the logistic sigmoid, softplus and ELU over a slice,
+//! in place, on the SIMD kernel of the current level, and SiLU and GELU's tanh form built
+//! on the first two.
 //!
 //! Both are built from one exponential, `e^y` for `y <= 0`: `y` is split as `n · ln 2 + r`
 //! with `|r| <= ln 2 / 2`, `e^r` comes from a degree-7 polynomial (the coefficients of the
@@ -23,6 +24,14 @@
 //! multiply-adds and round differently from the reference (they are tested on a sweep of
 //! one f32 in 1,009 and the edge values). The SSE4.2 kernel performs the reference's
 //! operations in the same order and matches it bit for bit.
+//!
+//! Softplus and ELU use the same exponential. Softplus is `max(x, 0) + ln(1 + e^(−|x|))`,
+//! the logarithm a `log1p` on `(0, 1]`: `1 + t` rounded, its exact rounding error `c`, the
+//! Cephes `logf` polynomial on the mantissa and `+ c/(1 + t)`. ELU's `e^x − 1` for `x <= 0`
+//! is `q·2^n + (2^n − 1)` with `q = e^r − 1` from the exponential's polynomial, so it keeps
+//! its relative accuracy near 0. Checked for every finite f32 at the reference and SSE4.2
+//! levels, softplus is within 2 ulp and `e^x − 1` within 1 ulp; the other levels run the
+//! reference loop for these two.
 //!
 //! # Examples
 //!
@@ -76,6 +85,21 @@ pub(super) const TANH_Q: [f32; 5] = [
 
 /// The sign bit of an f32.
 pub(super) const SIGN: u32 = 0x8000_0000;
+/// Below this `y`, `e^y − 1` rounds to −1 in f32 (`e^y < 2⁻²⁵`).
+pub(super) const EXPM1_MIN: f32 = -17.5;
+/// The coefficients of `P` in `ln f ≈ x − x²/2 + x³·P(x)`, `x = f − 1`, `f ∈ [√½, √2)`,
+/// highest degree first (Cephes `logf`).
+pub(super) const LOG_P: [f32; 9] = [
+    7.037_683_6e-2,
+    -1.151_461e-1,
+    1.167_699_9e-1,
+    -1.242_014_1e-1,
+    1.424_932_3e-1,
+    -1.666_805_8e-1,
+    2.000_071_5e-1,
+    -2.499_999_4e-1,
+    3.333_333e-1,
+];
 
 /// `2^n` for `-126 <= n <= 127`, built from its exponent bits.
 fn pow2(n: i32) -> f32 {
@@ -98,6 +122,79 @@ pub(super) fn exp_neg(y: f32) -> f32 {
     let n = n as i32;
     let n1 = n >> 1;
     p * pow2(n1) * pow2(n - n1)
+}
+
+/// `e^y − 1` for `y <= 0` (NaN for NaN), as the kernels compute it, one rounding per
+/// operation: with `y = n·ln 2 + r`, `e^r − 1 = q = r + r²·P(r)`, which keeps its relative
+/// accuracy near 0, and `e^y − 1 = q·2^n + (2^n − 1)`. Within 1 ulp of the correctly rounded
+/// result for every `y <= 0` (measured over every such f32).
+pub(super) fn expm1_neg(y: f32) -> f32 {
+    if y.is_nan() {
+        return y;
+    }
+    if y < EXPM1_MIN {
+        return -1.0;
+    }
+    let n = (y * LOG2E + 0.5).floor();
+    let r = y - n * LN2_HI;
+    let r = r - n * LN2_LO;
+    let mut p = EXP_P[0];
+    for &c in &EXP_P[1..] {
+        p = p * r + c;
+    }
+    let q = p * r * r + r;
+    // `n` is a whole number in [-25, 0], so `2^n` is a normal power of two.
+    let s = pow2(n as i32);
+    q * s + (s - 1.0)
+}
+
+/// `ln(1 + t)` for `t` in `(0, 1]`, as the kernels compute it, one rounding per operation:
+/// `m = 1 + t` rounded, its rounding error `c = t − (m − 1)` (exact), `m = 2^k·f` with
+/// `f ∈ [√½, √2)` and `k` 0 or 1, `ln f` from Cephes' polynomial in `x = f − 1` (exact),
+/// and `ln(1 + t) = k·ln 2 + ln f + c/m`. Within 1 ulp of the correctly rounded result for
+/// every such `t` (measured over every such f32).
+pub(super) fn log1p_unit(t: f32) -> f32 {
+    let m = 1.0 + t;
+    let c = t - (m - 1.0);
+    let (f, k) = if m > std::f32::consts::SQRT_2 {
+        (m * 0.5, 1.0f32)
+    } else {
+        (m, 0.0)
+    };
+    let x = f - 1.0;
+    let z = x * x;
+    let mut p = LOG_P[0];
+    for &cc in &LOG_P[1..] {
+        p = p * x + cc;
+    }
+    let y = x * z * p;
+    let y = y + k * LN2_LO;
+    let y = y - 0.5 * z;
+    let r = x + y;
+    let r = r + k * LN2_HI;
+    r + c / m
+}
+
+/// `ln(1 + e^x)` as the kernels compute it, one element at a time: `max(x, 0)` plus
+/// [`log1p_unit`] of [`exp_neg`]`(−|x|)`, NaN for NaN. The reference twin of the SIMD
+/// softplus.
+pub(super) fn softplus_one(x: f32) -> f32 {
+    if x.is_nan() {
+        return x;
+    }
+    let l = log1p_unit(exp_neg(-x.abs()));
+    let m = if x > 0.0 { x } else { 0.0 };
+    m + l
+}
+
+/// ELU with `alpha` as the kernels compute it, one element at a time: `x` above 0, `alpha`
+/// times [`expm1_neg`]`(x)` at or below, NaN for NaN. The reference twin of the SIMD ELU.
+pub(super) fn elu_one(alpha: f32, x: f32) -> f32 {
+    if x.is_nan() || x > 0.0 {
+        x
+    } else {
+        alpha * expm1_neg(x)
+    }
 }
 
 /// `tanh(x)` as the kernels compute it, one element at a time: the reference twin of the
@@ -226,6 +323,132 @@ pub fn sigmoid_f32(values: &mut [f32]) {
 /// ```
 pub fn sigmoid_f32_with(level: Level, values: &mut [f32]) {
     run(level, Func::Sigmoid, values);
+}
+
+/// Replaces every value `x` with softplus, `ln(1 + e^x)`, computed as `max(x, 0)` plus
+/// `ln(1 + e^(−|x|))` so nothing overflows, with the kernel for the current
+/// [`level`](super::level). The exponential is the one `tanh` and the sigmoid use and the
+/// logarithm a `log1p` on `(0, 1]` within 1 ulp; the result is within 2 ulp of the
+/// correctly rounded softplus for every finite f32 (measured over all of them). NaN stays
+/// NaN; a value's result depends only on the value and the level.
+///
+/// The SSE4.2 kernel gives the reference loop's bits; the AVX2, NEON and Accelerate levels
+/// run the reference loop.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::softplus_f32;
+/// let mut v = [0.0f32, 30.0, -30.0];
+/// softplus_f32(&mut v);
+/// assert!((v[0] - std::f32::consts::LN_2).abs() <= f32::EPSILON);
+/// assert_eq!(v[1], 30.0);
+/// assert!((v[2] - 9.357_623e-14).abs() <= 1e-19);
+/// ```
+pub fn softplus_f32(values: &mut [f32]) {
+    softplus_f32_with(super::level(), values);
+}
+
+/// [`softplus_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::softplus_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [1.0f32];
+/// softplus_f32_with(Level::Reference, &mut v);
+/// assert!((v[0] - 1.313_261_7).abs() <= 2.0 * f32::EPSILON);
+/// ```
+pub fn softplus_f32_with(level: Level, values: &mut [f32]) {
+    assert!(
+        supported(level),
+        "activation kernel: {}",
+        super::cannot_run(level)
+    );
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: this CPU supports SSE4.2 (the guard).
+        Level::Sse42 if supported(Level::Sse42) => unsafe {
+            super::x86::softplus_sse_slice(values)
+        },
+        _ => {
+            for v in values {
+                *v = softplus_one(*v);
+            }
+        }
+    }
+}
+
+/// Replaces every value `x` with ELU, `x` above 0 and `alpha · (e^x − 1)` at or below, with
+/// the kernel for the current [`level`](super::level). `e^x − 1` is computed so that it
+/// keeps its relative accuracy near 0, within 1 ulp of the correctly rounded result for
+/// every finite f32 (measured over all of them), and is then multiplied by `alpha`,
+/// rounded once. NaN stays NaN; a value's result depends only on the value, `alpha` and
+/// the level.
+///
+/// The SSE4.2 kernel gives the reference loop's bits; the AVX2, NEON and Accelerate levels
+/// run the reference loop.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::elu_f32;
+/// let mut v = [2.0f32, -1e-7, -50.0];
+/// elu_f32(1.0, &mut v);
+/// assert_eq!(v[0], 2.0);
+/// assert!((v[1] + 1e-7).abs() <= 1e-14);
+/// assert_eq!(v[2], -1.0);
+/// ```
+pub fn elu_f32(alpha: f32, values: &mut [f32]) {
+    elu_f32_with(super::level(), alpha, values);
+}
+
+/// [`elu_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::elu_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [-1.0f32];
+/// elu_f32_with(Level::Reference, 1.0, &mut v);
+/// assert!((v[0] + 0.632_120_56).abs() <= f32::EPSILON);
+/// ```
+pub fn elu_f32_with(level: Level, alpha: f32, values: &mut [f32]) {
+    assert!(
+        supported(level),
+        "activation kernel: {}",
+        super::cannot_run(level)
+    );
+    match level {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: this CPU supports SSE4.2 (the guard).
+        Level::Sse42 if supported(Level::Sse42) => unsafe {
+            super::x86::elu_sse_slice(alpha, values)
+        },
+        _ => {
+            for v in values {
+                *v = elu_one(alpha, *v);
+            }
+        }
+    }
 }
 
 /// Runs `func` over `values` with the kernel for `level`.
@@ -389,6 +612,95 @@ mod tests {
             assert!(t <= 3, "{level}: tanh is {t} ulp off at {tx:e}");
             let (s, sx) = worst(level, Func::Sigmoid, &xs, sigmoid_exact);
             assert!(s <= 3, "{level}: sigmoid is {s} ulp off at {sx:e}");
+        }
+    }
+
+    /// Softplus from f64, rounded to f32.
+    fn softplus_exact(x: f32) -> f32 {
+        let x = x as f64;
+        (x.max(0.0) + (-x.abs()).exp().ln_1p()) as f32
+    }
+
+    /// ELU with alpha 1 from f64, rounded to f32.
+    fn elu_exact(x: f32) -> f32 {
+        let w = x as f64;
+        (if w > 0.0 { w } else { w.exp_m1() }) as f32
+    }
+
+    /// The worst ulp error of `f` over `xs` against `exact`, NaN only where `exact` is.
+    fn worst_of(xs: &[f32], f: impl Fn(&mut [f32]), exact: fn(f32) -> f32) -> (u64, f32) {
+        let mut v = xs.to_vec();
+        f(&mut v);
+        let mut worst = (0, 0.0);
+        for (&x, &g) in xs.iter().zip(&v) {
+            let w = exact(x);
+            assert_eq!(g.is_nan(), w.is_nan(), "{x:e}: {g:e} against {w:e}");
+            if !w.is_nan() && ulps(g, w) > worst.0 {
+                worst = (ulps(g, w), x);
+            }
+        }
+        worst
+    }
+
+    /// Softplus within 2 ulp and ELU within 1 ulp of the correctly rounded result at every
+    /// level, over the sweep and the edge values; at SSE4.2 both give the reference's bits.
+    #[test]
+    fn softplus_and_elu_within_their_bounds() {
+        let mut xs = sweep(1009);
+        xs.extend(edges());
+        xs.push(f32::NAN);
+        for level in levels() {
+            let (s, sx) = worst_of(&xs, |v| softplus_f32_with(level, v), softplus_exact);
+            assert!(s <= 2, "{level}: softplus is {s} ulp off at {sx:e}");
+            let (e, ex) = worst_of(&xs, |v| elu_f32_with(level, 1.0, v), elu_exact);
+            assert!(e <= 1, "{level}: elu is {e} ulp off at {ex:e}");
+        }
+        if supported(Level::Sse42) {
+            for f in [softplus_f32_with, |l, v: &mut [f32]| {
+                elu_f32_with(l, 1.5, v)
+            }] {
+                let (mut a, mut b) = (xs.clone(), xs.clone());
+                f(Level::Reference, &mut a);
+                f(Level::Sse42, &mut b);
+                for ((x, a), b) in xs.iter().zip(&a).zip(&b) {
+                    assert!(
+                        a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                        "{x:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every finite f32 through softplus and ELU at every level, within the stated bounds.
+    /// Slow, so run by hand:
+    /// `cargo test --release -p cavitation-core --lib every_f32_softplus -- --ignored`.
+    #[test]
+    #[ignore = "checks all 4 billion f32 values; minutes in release"]
+    fn every_f32_softplus_and_elu_within_their_bounds() {
+        const BLOCK: u32 = 1 << 20;
+        for level in levels() {
+            let (mut s_max, mut e_max) = ((0, 0.0f32), (0, 0.0f32));
+            let mut start = 0u32;
+            while start < 0x7f80_0000 {
+                let xs: Vec<f32> = (start..start.saturating_add(BLOCK).min(0x7f80_0000))
+                    .flat_map(|b| [f32::from_bits(b), f32::from_bits(b | SIGN)])
+                    .collect();
+                let s = worst_of(&xs, |v| softplus_f32_with(level, v), softplus_exact);
+                if s.0 > s_max.0 {
+                    s_max = s;
+                }
+                let e = worst_of(&xs, |v| elu_f32_with(level, 1.0, v), elu_exact);
+                if e.0 > e_max.0 {
+                    e_max = e;
+                }
+                start = start.saturating_add(BLOCK);
+            }
+            println!(
+                "{level}: softplus {} ulp at {:e}, elu {} ulp at {:e}",
+                s_max.0, s_max.1, e_max.0, e_max.1
+            );
+            assert!(s_max.0 <= 2 && e_max.0 <= 1, "{level}");
         }
     }
 
