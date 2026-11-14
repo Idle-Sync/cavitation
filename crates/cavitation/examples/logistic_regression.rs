@@ -49,6 +49,8 @@ fn compare(logistic: LogisticRegression, train: &Dataset, test: &Dataset) -> Res
     Ok(gap)
 }
 
+/// Fits logistic regression on the Breast Cancer data both ways and prints the test
+/// accuracy and the objective of each.
 fn main() -> Result<(), Error> {
     let (mut train, mut test) = breast_cancer::load()?;
     println!(
