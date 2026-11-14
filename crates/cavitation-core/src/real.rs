@@ -85,28 +85,28 @@ pub trait Real:
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(0.25f32.to_f64(), 0.25f64);
+    /// assert_eq!(Real::to_f64(0.25f32), 0.25f64);
     /// ```
     fn to_f64(self) -> f64;
     /// The exponential `e^self`.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(0.0f64.exp(), 1.0);
+    /// assert_eq!(Real::exp(0.0f64), 1.0);
     /// ```
     fn exp(self) -> Self;
     /// The natural logarithm.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(1.0f64.ln(), 0.0);
+    /// assert_eq!(Real::ln(1.0f64), 0.0);
     /// ```
     fn ln(self) -> Self;
     /// `ln(1 + self)`, accurate for small values.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(0.0f64.ln_1p(), 0.0);
+    /// assert_eq!(Real::ln_1p(0.0f64), 0.0);
     /// ```
     fn ln_1p(self) -> Self;
     /// `e^self - 1`, accurate for small values: `(-1e-10f64).exp_m1()` is `-1e-10` to the last
@@ -114,15 +114,15 @@ pub trait Real:
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(0.0f64.exp_m1(), 0.0);
-    /// assert_eq!((-1e-10f32).exp_m1(), -1e-10);
+    /// assert_eq!(Real::exp_m1(0.0f64), 0.0);
+    /// assert_eq!(Real::exp_m1(-1e-10f32), -1e-10);
     /// ```
     fn exp_m1(self) -> Self;
     /// The hyperbolic tangent.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(0.0f32.tanh(), 0.0);
+    /// assert_eq!(Real::tanh(0.0f32), 0.0);
     /// ```
     fn tanh(self) -> Self;
     /// The error function, `2/√π` times the integral of `e^(-t²)` from 0 to `self`. Ported
@@ -130,50 +130,63 @@ pub trait Real:
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(0.0f64.erf(), 0.0);
-    /// assert!((1.0f64.erf() - 0.8427007929497149).abs() < 1e-15);
+    /// assert_eq!(Real::erf(0.0f64), 0.0);
+    /// assert!((Real::erf(1.0f64) - 0.8427007929497149).abs() < 1e-15);
     /// ```
     fn erf(self) -> Self;
     /// The square root.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(9.0f32.sqrt(), 3.0);
+    /// assert_eq!(Real::sqrt(9.0f32), 3.0);
     /// ```
     fn sqrt(self) -> Self;
     /// The absolute value.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!((-2.0f32).abs(), 2.0);
+    /// assert_eq!(Real::abs(-2.0f32), 2.0);
     /// ```
     fn abs(self) -> Self;
     /// The larger of two values; if one is NaN, the other.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(1.0f32.max(2.0), 2.0);
+    /// assert_eq!(Real::max(1.0f32, 2.0), 2.0);
     /// ```
     fn max(self, other: Self) -> Self;
     /// The smaller of two values; if one is NaN, the other.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(1.0f32.min(2.0), 1.0);
+    /// assert_eq!(Real::min(1.0f32, 2.0), 1.0);
     /// ```
     fn min(self, other: Self) -> Self;
+    /// The rectified linear unit, as the `Relu` layer computes it: 0 at or below 0 (so `-0`
+    /// becomes `+0`), the value above 0, and NaN stays NaN.
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// assert_eq!(Real::relu(-2.0f32), 0.0);
+    /// assert!(Real::relu(-0.0f64).is_sign_positive());
+    /// assert_eq!(Real::relu(1.5f32), 1.5);
+    /// assert!(Real::relu(f32::NAN).is_nan());
+    /// ```
+    fn relu(self) -> Self {
+        if self <= Self::ZERO { Self::ZERO } else { self }
+    }
     /// Raises to an integer power.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert_eq!(2.0f64.powi(3), 8.0);
+    /// assert_eq!(Real::powi(2.0f64, 3), 8.0);
     /// ```
     fn powi(self, n: i32) -> Self;
     /// Whether the value is neither NaN nor infinite.
     ///
     /// ```
     /// use cavitation_core::Real;
-    /// assert!(!f32::NAN.is_finite());
+    /// assert!(!Real::is_finite(f32::NAN));
     /// ```
     fn is_finite(self) -> bool;
     /// General matrix multiply, `C = alpha * A * B + beta * C`, with the kernel for this type:
@@ -213,7 +226,7 @@ pub trait Real:
     /// use cavitation_core::Real;
     /// let mut v = [0.0f64, 1.0];
     /// f64::tanh_in_place(&mut v);
-    /// assert_eq!(v, [0.0, 1.0f64.tanh()]);
+    /// assert_eq!(v, [0.0, Real::tanh(1.0f64)]);
     /// ```
     fn tanh_in_place(values: &mut [Self]);
 

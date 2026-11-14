@@ -57,7 +57,9 @@ pub struct LayerEvent<'a, T: Real = f32> {
     pub grad_input: Option<TensorView<'a, T>>,
 }
 
-/// Names one registered hook, so it can be removed with [`Hooks::remove`].
+/// Names one registered hook, so it can be removed with [`Hooks::remove`]. An id belongs to
+/// the [`Hooks`] that made it: ids from two collections can be equal, so removing an id
+/// from a collection that did not make it may remove one of that collection's own hooks.
 ///
 /// ```
 /// use cavitation_nn::Hooks;

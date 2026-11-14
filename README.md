@@ -15,7 +15,7 @@ What it contains:
 
 - An f32 tensor and reverse-mode autograd over a recorded tape.
 - Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, 17 activations plus the learnable PReLU layer (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
-- `Linear`, activation layers and `Sequential`; Xavier and He initialisation; SGD (with momentum and weight decay), Adam and AdamW; cosine learning-rate decay.
+- `Linear`, activation layers and `Sequential`; Xavier and He initialisation; SGD (with momentum and weight decay), Adam, AdamW, RMSprop and Adagrad; cosine learning-rate decay.
 - `fit`, a step-by-step `Trainer`, and the manual loop.
 - Hooks, neuron masks, and health checks that warn about NaN or infinity, exploding and vanishing gradients and dead ReLU neurons.
 - An inference mode that runs a trained network without the training tape, for one input or a batch.
@@ -249,7 +249,7 @@ cargo run --release -p cavitation-bench -- shrink                    # shrink th
 
 `all` leaves out `cifar`: an epoch of its network on 50,000 images takes minutes on a small machine, so it is its own command. It is sized so that matrix products, not per-step overheads, take most of the time, which the MNIST run is too short for on a fast machine.
 
-The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH`, which needs numpy; `--python <path>` or the `CAVITATION_BENCH_PYTHON` variable names another interpreter. Results are also written to `target/bench/results.json`, or to `bench/results.json` under `CARGO_TARGET_DIR` when that is set.
+The numpy baseline (`scripts/bench/numpy_mlp.py`) runs with `python3` from `PATH`, which needs numpy; `--python <path>` or the `CAVITATION_BENCH_PYTHON` variable names another interpreter. Results are also written to `target/bench/results.json`, or to a `bench` folder under `CARGO_TARGET_DIR` when that is set.
 
 Two environment variables change how the library runs, for the benchmark and for your own programs:
 

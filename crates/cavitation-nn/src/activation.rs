@@ -1174,11 +1174,20 @@ impl<T: Real> Layer<T> for Prelu {
     }
 
     /// 1 where `x` is above 0, the value's slope where `x` is at or below 0, and NaN for a
-    /// NaN input, as the tape's PReLU gradient uses.
+    /// NaN input, as the tape's PReLU gradient uses. Panics, naming both lengths, if `out`
+    /// does not hold as many values as `x`.
     fn local_derivative(&self, tape: &Tape<'_, T>, x: Var, out: &mut [T]) -> bool {
         let slopes = tape.param_value(self.weight);
         let slopes = slopes.data();
-        for (i, (d, &v)) in out.iter_mut().zip(tape.value(x).data()).enumerate() {
+        let values = tape.value(x).data();
+        assert_eq!(
+            out.len(),
+            values.len(),
+            "Prelu::local_derivative: out holds {} values but the input has {}",
+            out.len(),
+            values.len()
+        );
+        for (i, (d, &v)) in out.iter_mut().zip(values).enumerate() {
             *d = if v > T::ZERO {
                 T::ONE
             } else if v <= T::ZERO {
