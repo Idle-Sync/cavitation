@@ -14,9 +14,9 @@ workspace = true
 
 [dependencies]
 # `Error`, which a failed bind is reported as (`Error::Net`).
-cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
+cavitation-core = { path = "../cavitation-core", version = "0.2.0" }
 # `Dataset`, the probe rows the configuration can name.
-cavitation-nn = { path = "../cavitation-nn", version = "0.1.0" }
+cavitation-nn = { path = "../cavitation-nn", version = "0.2.0" }
 
 # Counts the training thread's allocations under the inspector; it installs its own global
 # allocator, so it runs alone, without the test harness.

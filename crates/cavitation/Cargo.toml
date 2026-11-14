@@ -14,10 +14,10 @@ readme = "../../README.md"
 workspace = true
 
 [dependencies]
-cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
-cavitation-nn = { path = "../cavitation-nn", version = "0.1.0" }
-cavitation-ml = { path = "../cavitation-ml", version = "0.1.0", optional = true }
-cavitation-inspect = { path = "../cavitation-inspect", version = "0.1.0", optional = true }
+cavitation-core = { path = "../cavitation-core", version = "0.2.0" }
+cavitation-nn = { path = "../cavitation-nn", version = "0.2.0" }
+cavitation-ml = { path = "../cavitation-ml", version = "0.2.0", optional = true }
+cavitation-inspect = { path = "../cavitation-inspect", version = "0.2.0", optional = true }
 
 [features]
 default = ["ml"]
