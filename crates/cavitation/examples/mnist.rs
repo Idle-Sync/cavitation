@@ -59,10 +59,9 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
     // so it passed no signal forward and received no gradient. The warnings are counted, every
     // epoch's, and summarised at the end; without a sink each layer's first report would be
     // printed.
-    let count = std::rc::Rc::new(std::cell::Cell::new(0usize));
-    let counter = std::rc::Rc::clone(&count);
+    let mut count = 0usize;
     let health = Health {
-        sink: Some(Box::new(move |_: &Warning| counter.set(counter.get() + 1))),
+        sink: Some(Box::new(|_: &Warning| count += 1)),
         ..Health::default()
     };
     let config = FitConfig {
@@ -94,6 +93,6 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
         acc * 100.0,
         test.len()
     );
-    println!("health: {} warnings", count.get());
+    println!("health: {count} warnings");
     Ok(())
 }

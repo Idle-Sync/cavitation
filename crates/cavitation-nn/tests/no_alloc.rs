@@ -506,13 +506,13 @@ fn health_steady_state() -> usize {
     for optimizer in training_optimizers() {
         let mut params = ParamStore::new();
         let net = network_50k(&mut params);
+        // The sink borrows the counter, so the counter is made before the trainer.
+        let warnings = AtomicUsize::new(0);
         let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
-        let warnings = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let counter = std::rc::Rc::clone(&warnings);
         trainer.set_health(Health {
-            sink: Some(Box::new(move |w: &Warning| {
+            sink: Some(Box::new(|w: &Warning| {
                 eprintln!("health_steady_state: {w}");
-                counter.set(counter.get() + 1);
+                warnings.fetch_add(1, Ordering::Relaxed);
             })),
             ..Health::default()
         });
@@ -533,7 +533,11 @@ fn health_steady_state() -> usize {
         }
         made += allocations() - before;
         assert!(sink.is_finite() && sink > 0.0);
-        assert_eq!(warnings.get(), 0, "the healthy run produced warnings");
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            0,
+            "the healthy run produced warnings"
+        );
     }
     made
 }
@@ -597,12 +601,13 @@ fn skip_steady_state() -> usize {
             .push(he(64, 256))
             .push(ActivationLayer::new(TanhNanBeyond))
             .push(he(256, 10));
+        let warnings = AtomicUsize::new(0);
         let mut trainer = Trainer::new(&net, optimizer, Loss::CrossEntropy, 128);
-        let warnings = std::rc::Rc::new(std::cell::Cell::new(0usize));
-        let counter = std::rc::Rc::clone(&warnings);
         trainer.set_health(Health {
             on_non_finite: OnNonFinite::Skip,
-            sink: Some(Box::new(move |_: &Warning| counter.set(counter.get() + 1))),
+            sink: Some(Box::new(|_: &Warning| {
+                warnings.fetch_add(1, Ordering::Relaxed);
+            })),
             ..Health::default()
         });
         let mut batcher = Batcher::new(data.len(), 128, None);
@@ -611,11 +616,11 @@ fn skip_steady_state() -> usize {
         for epoch in 1..=2 {
             batcher.epoch();
             for range in batcher.batches() {
-                let (sent, before) = (warnings.get(), allocations());
+                let (sent, before) = (warnings.load(Ordering::Relaxed), allocations());
                 let view = batcher.gather(&data, range, &mut batch);
                 trainer.step(&net, &mut params, view).unwrap();
                 let step_made = allocations() - before;
-                if warnings.get() != sent {
+                if warnings.load(Ordering::Relaxed) != sent {
                     warning_steps += 1;
                 } else if epoch == 2 {
                     made += step_made;
@@ -629,7 +634,11 @@ fn skip_steady_state() -> usize {
         }
         assert_eq!(trainer.skipped_steps(), 8);
         // Per epoch: the loss, then `0.weight` and `0.bias` on the first gradient skip.
-        assert_eq!(warnings.get(), 6, "three non-finite warnings per epoch");
+        assert_eq!(
+            warnings.load(Ordering::Relaxed),
+            6,
+            "three non-finite warnings per epoch"
+        );
         assert_eq!(warning_steps, 4, "two steps per epoch send warnings");
     }
     made
@@ -1121,7 +1130,7 @@ fn evaluator_neuron_mask_steady_state() -> usize {
 }
 
 /// The allocation count at the end of epoch 2 of the validated run's plain `fit`, read in
-/// its `on_epoch` callback (which must be `'static`).
+/// its `on_epoch` callback.
 static FIT_EPOCH_2: AtomicUsize = AtomicUsize::new(0);
 
 /// The allocations made after epoch 2 of the validated run's plain `fit`, read in its

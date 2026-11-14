@@ -1,9 +1,7 @@
 //! Known results: real data sets that a correct library must learn to a stated accuracy.
 
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, TensorView};
-use std::cell::RefCell;
 use std::path::Path;
-use std::rc::Rc;
 
 use cavitation_nn::shrink::{Ranking, ShrinkConfig, Validation, shrink};
 use cavitation_nn::{
@@ -127,16 +125,13 @@ fn mnist_known_result() {
         .push(he(256, 10));
 
     // Warnings are collected, not printed as they come, so the per-epoch table stays readable.
-    let warnings: Rc<RefCell<Vec<String>>> = Rc::default();
-    let sink = Rc::clone(&warnings);
+    // The sink and the epoch callback borrow these lists, read once `fit` has returned.
+    let mut warnings: Vec<String> = Vec::new();
     let health = Health {
-        sink: Some(Box::new(move |w: &Warning| {
-            sink.borrow_mut().push(w.to_string())
-        })),
+        sink: Some(Box::new(|w: &Warning| warnings.push(w.to_string()))),
         ..Health::default()
     };
-    let accuracies: Rc<RefCell<Vec<f64>>> = Rc::default();
-    let measured = Rc::clone(&accuracies);
+    let mut accuracies: Vec<f64> = Vec::new();
     let epochs = 10;
     let config = FitConfig {
         epochs,
@@ -150,7 +145,7 @@ fn mnist_known_result() {
         schedule: LrSchedule::Cosine { min_lr: 0.0 },
         health,
         on_epoch: Some(Box::new(
-            move |r: &EpochReport, net: &Sequential, params: &ParamStore| {
+            |r: &EpochReport, net: &Sequential, params: &ParamStore| {
                 let acc = accuracy(net, params, &test, 256);
                 println!(
                     "epoch {:2}: mean loss {:.6}, test accuracy {:.2}%, {:.3} s",
@@ -159,19 +154,17 @@ fn mnist_known_result() {
                     acc * 100.0,
                     r.seconds
                 );
-                measured.borrow_mut().push(acc);
+                accuracies.push(acc);
             },
         )),
         validation: None,
     };
     fit(&net, &mut params, &train, config).unwrap();
 
-    let warnings = warnings.borrow();
     println!("health: {} warnings", warnings.len());
     for w in warnings.iter() {
         println!("  {w}");
     }
-    let accuracies = accuracies.borrow();
     assert_eq!(accuracies.len(), epochs);
     let acc = accuracies[epochs - 1];
     println!("mnist test accuracy: {:.2}%", acc * 100.0);

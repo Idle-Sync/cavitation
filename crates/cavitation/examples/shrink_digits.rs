@@ -40,7 +40,7 @@ fn network(params: &mut ParamStore, hidden: [usize; 2], seed: u64) -> Sequential
 
 /// The known result's recipe for `epochs` epochs (20 in the known result): Adam at 0.002,
 /// batch 32, shuffle seed 7.
-fn recipe(epochs: usize) -> FitConfig {
+fn recipe(epochs: usize) -> FitConfig<'static> {
     FitConfig {
         epochs,
         batch: 32,
