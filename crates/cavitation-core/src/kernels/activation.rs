@@ -678,6 +678,7 @@ pub fn softplus_beta_f32_with(level: Level, beta: f32, threshold: f32, values: &
 /// let mut v = [-1000.0f32, 1000.0, 0.0];
 /// log_sigmoid_f32(&mut v);
 /// assert_eq!(&v[..2], &[-1000.0, 0.0]);
+/// assert!(v[1].is_sign_positive());
 /// assert!((v[2] + std::f32::consts::LN_2).abs() <= f32::EPSILON);
 /// ```
 pub fn log_sigmoid_f32(values: &mut [f32]) {
@@ -704,8 +705,10 @@ pub fn log_sigmoid_f32_with(level: Level, values: &mut [f32]) {
         *v = -*v;
     }
     softplus_f32_with(level, values);
+    // `0 − s` rather than `−s`: where `e^(−|x|)` underflows, softplus is `+0` and the
+    // scalar formula `min(x, 0) − 0` gives `+0`, not `−0`.
     for v in values.iter_mut() {
-        *v = -*v;
+        *v = 0.0 - *v;
     }
 }
 
@@ -820,7 +823,9 @@ pub fn selu_f32_with(level: Level, values: &mut [f32]) {
 /// [`level`](super::level). For a positive `alpha`, `x / alpha` is rounded once and
 /// `e^y − 1` has a relative condition number of at most 1 for `y ≤ 0`, so the result is
 /// within 3 ulp of the correctly rounded CELU at the reference and SSE4.2 levels and 4 at
-/// the fused levels (the worst over a sweep of one f32 in 1,009 is 2). A negative `alpha` puts `x / alpha` above 0,
+/// the fused levels while `x / alpha` is a normal `f32` (the worst over a sweep of one f32
+/// in 1,009 is 2); where the quotient is subnormal, its rounding is absolute and CELU,
+/// about `alpha · x / alpha`, carries it, as the scalar formula does. A negative `alpha` puts `x / alpha` above 0,
 /// outside the kernel's `e^y − 1`, so it takes std's `exp_m1` one value at a time instead.
 /// NaN stays NaN; a value's result depends only on the value, `alpha` and the level.
 ///
@@ -1173,6 +1178,12 @@ mod tests {
             assert!(
                 v[0].is_sign_negative() && v[1].is_sign_positive(),
                 "{level}: celu"
+            );
+            let mut v = [1000.0f32, f32::INFINITY];
+            log_sigmoid_f32_with(level, &mut v);
+            assert!(
+                v.iter().all(|v| *v == 0.0 && v.is_sign_positive()),
+                "{level}: log_sigmoid {v:?}"
             );
         }
     }
