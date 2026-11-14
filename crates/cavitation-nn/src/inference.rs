@@ -632,6 +632,7 @@ impl InferenceModel {
             threads: 1,
             rows: 1,
             batched: false,
+            steps: 0..shared.steps.len(),
         };
         let at = run.forward(shared, &self.masks, input, &mut self.bufs, None);
         &self.bufs[at][..shared.output_width]
@@ -766,7 +767,23 @@ impl InferenceModel {
     /// set-up costs more than a single row's work), more with the GEMM on
     /// [`threads`](cavitation_core::kernels::threads) threads.
     fn run_rows(&mut self, inputs: &[f32], rows: usize, observe: Option<Observer<'_>>) -> &[f32] {
+        let steps = 0..self.shared.steps.len();
+        self.run_steps(steps, inputs, rows, observe)
+    }
+
+    /// [`run_rows`](Self::run_rows) for the steps `steps` only (a non-empty range): `inputs`
+    /// holds `rows` rows of the first step's input width, and the result `rows` rows of the
+    /// last step's output width. Running a model's steps in two ranges, the second on the
+    /// first's output, gives the bits of running them all at once.
+    fn run_steps(
+        &mut self,
+        steps: std::ops::Range<usize>,
+        inputs: &[f32],
+        rows: usize,
+        observe: Option<Observer<'_>>,
+    ) -> &[f32] {
         let shared = &*self.shared;
+        let width = shared.steps[steps.end - 1].outputs;
         let need = rows
             .checked_mul(shared.max_width)
             .expect("the batch's buffers fit in memory");
@@ -781,9 +798,59 @@ impl InferenceModel {
             threads: if one { 1 } else { kernels::threads() },
             rows,
             batched: !one,
+            steps,
         };
         let at = run.forward(shared, &self.masks, inputs, &mut self.bufs, observe);
-        &self.bufs[at][..rows * shared.output_width]
+        &self.bufs[at][..rows * width]
+    }
+
+    /// The index of the step where layer `layer` begins, when the layer is a `Linear` that
+    /// a step of its own computes: the steps before it compute layers `0..layer` (their
+    /// mask steps included), so their output is the `Linear`'s input. `None` for any other
+    /// layer, or one past the last.
+    pub(crate) fn linear_step(&self, layer: usize) -> Option<usize> {
+        let steps = &self.shared.steps;
+        let k = steps.iter().position(|s| s.layer >= layer)?;
+        let begins = steps[k].layer == layer
+            && matches!(steps[k].op, Op::Layer(InferenceLayer::Linear { .. }));
+        begins.then_some(k)
+    }
+
+    /// The number of steps.
+    pub(crate) fn steps(&self) -> usize {
+        self.shared.steps.len()
+    }
+
+    /// The width of each row step `k` reads.
+    pub(crate) fn step_inputs(&self, k: usize) -> usize {
+        self.shared.steps[k].inputs
+    }
+
+    /// Runs `rows` rows of `inputs` through the steps `steps` (a non-empty range; `inputs`
+    /// holds `rows` rows of the first step's input width), as [`infer_batch`] runs them,
+    /// and returns the last step's output: `infer_batch`'s output, bit for bit, when the
+    /// range ends with the last step and `inputs` is what the steps before the range
+    /// give.
+    ///
+    /// [`infer_batch`]: Self::infer_batch
+    pub(crate) fn infer_steps(
+        &mut self,
+        steps: std::ops::Range<usize>,
+        inputs: &[f32],
+        rows: usize,
+    ) -> &[f32] {
+        assert!(
+            !steps.is_empty() && steps.end <= self.steps(),
+            "infer_steps: steps {steps:?} of {}",
+            self.steps()
+        );
+        let width = self.step_inputs(steps.start);
+        assert!(
+            Some(inputs.len()) == rows.checked_mul(width),
+            "infer_steps: expected {rows} rows of width {width}, got {} values",
+            inputs.len()
+        );
+        self.run_steps(steps, inputs, rows, None)
     }
 }
 
@@ -1104,10 +1171,13 @@ struct Run {
     rows: usize,
     /// Whether `Linear` steps use the GEMM (a batch) rather than the matvec (one input).
     batched: bool,
+    /// The steps to run, a non-empty range of the model's steps.
+    steps: std::ops::Range<usize>,
 }
 
 impl Run {
-    /// Runs every step of `model` on `input` (`rows` rows of the input width), with the
+    /// Runs the steps `self.steps` of `model` on `input` (`rows` rows of the first step's
+    /// input width), with the
     /// keep values of each mask step in `masks`, writing into `bufs` in turn, and returns
     /// the index of the buffer that holds the output. After each step that completes a
     /// layer, calls `observe` (if given) with the layer's index and its output.
@@ -1124,7 +1194,7 @@ impl Run {
         let rows = self.rows;
         // The buffer holding the current rows, or `None` while they are still `input`.
         let mut cur: Option<usize> = None;
-        for step in &model.steps {
+        for step in &model.steps[self.steps.clone()] {
             let (n_in, n_out) = (rows * step.inputs, rows * step.outputs);
             let form = match &step.op {
                 Op::Layer(form) => form,
@@ -1214,7 +1284,7 @@ impl Run {
             let c = cur.expect("every step writes into a buffer");
             observe_step(step, &mut observe, &bufs[c][..n_out], rows);
         }
-        cur.expect("a compiled model has at least one step")
+        cur.expect("the range holds at least one step")
     }
 
     /// One `Linear` step, `(w_t, bias, inputs, outputs, relu)`, from `src` (`rows` rows of

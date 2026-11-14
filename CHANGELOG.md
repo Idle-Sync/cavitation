@@ -4,6 +4,16 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
+
+### Layers, training and inference (`cavitation-nn`)
+
+- `shrink::ablate` (and `ablate_with`, `ablate_controlled`) runs the layers before each swept `Linear` once, keeping that `Linear`'s input for every row, and then only the layers from the `Linear` on for each of its neurons; the results are bit-identical. Sweeping the second hidden `Linear` of a 64 → 256 → 256 → 10 network over 1,000 rows: 2.67–2.78 s before, 2.22 s after (one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`). The gain grows with the share of the work before the swept layer; the first `Linear`'s input is the data, so its sweep is unchanged. The kept input takes `rows × width` values for the swept layer's input width.
+
+## v0.2.0 (2026-11-14)
+
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
@@ -26,7 +36,6 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `ParamGrads::like` makes a second gradient set for a store, allocated on first use, so a second backward pass leaves `ParamStore::grads` untouched; `ParamGrads::zero_grad` clears it.
 - SIMD `tanh` and sigmoid for f32: `kernels::activation::tanh_f32` and `sigmoid_f32` (and `_with` variants that take a `Level`), with SSE4.2, AVX2 and NEON kernels and the scalar twins `kernels::reference::tanh_f32` and `sigmoid_f32`. Results are within 3 ulp of the correctly rounded value at every level (2 ulp at the reference and SSE4.2 levels, checked for every finite f32); the SSE4.2 kernel matches the reference bit for bit; a value's result does not depend on where it sits in the slice. `Tape::tanh` and `Tape::sigmoid` in f32 run them, as do the new `Real::tanh_in_place` and `Real::sigmoid_in_place` (`Real` is sealed, so adding methods breaks no code). f32 results change in the last bits; f64 is unchanged. On an Intel Celeron N5105 at SSE4.2, over 4,096 values, measured with `cavitation-bench activation` pinned to one core while the machine was busy (load average 5): tanh 7.3 ns per value against 29.7 ns for the scalar `f32::tanh` loop (4.1x), sigmoid 5.4 ns against 14.5 ns (2.7x).
 - The backward pass of `Tape::binary_cross_entropy` with both inputs taking a gradient computes each element's logarithms once instead of twice, with the same gradients bit for bit: 3.29 ms before, 2.43 after for 65,536 values (forward and backward, one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`, load average about 2.5). The other two-input losses, `kl_div` included, are unchanged: their two gradients share no costly work, and the one-pass form measured no faster for `kl_div`.
-- When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
 
 ### Classic machine learning (`cavitation-ml`)
 
