@@ -511,6 +511,12 @@ def make_optimizers():
             torch.optim.RMSprop,
             {"lr": 0.01, "alpha": 0.9, "momentum": 0.9, "weight_decay": 0.05},
         ),
+        ("rmsprop-centered", torch.optim.RMSprop, {"lr": 0.01, "centered": True}),
+        (
+            "rmsprop-centered-momentum",
+            torch.optim.RMSprop,
+            {"lr": 0.01, "centered": True, "momentum": 0.9},
+        ),
         ("adagrad", torch.optim.Adagrad, {"lr": 0.1}),
         (
             "adagrad-decay-weight-decay",

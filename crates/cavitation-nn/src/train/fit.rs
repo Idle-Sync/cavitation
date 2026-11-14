@@ -1401,6 +1401,8 @@ pub enum OptimizerConfig {
         momentum: f64,
         /// The weight decay added to the gradient.
         weight_decay: f64,
+        /// Whether the average is centred ([`RmsProp::with_centered`]).
+        centered: bool,
     },
     /// [`Adagrad`], with sums starting at 0 and eps 1e-10.
     Adagrad {
@@ -1448,11 +1450,13 @@ impl OptimizerConfig {
                 alpha,
                 momentum,
                 weight_decay,
+                centered,
             } => Box::new(
                 RmsProp::new(lr)
                     .with_alpha(alpha)
                     .with_momentum(momentum)
-                    .with_weight_decay(weight_decay),
+                    .with_weight_decay(weight_decay)
+                    .with_centered(centered),
             ),
             OptimizerConfig::Adagrad {
                 lr,
@@ -3440,6 +3444,7 @@ mod tests {
                 alpha: 0.99,
                 momentum: 0.9,
                 weight_decay: 0.0,
+                centered: true,
             },
             OptimizerConfig::Adagrad {
                 lr: 0.05,

@@ -1379,12 +1379,14 @@ impl<T: Real> Optimizer<T> for AdamW<T> {
     }
 }
 
-/// RMSprop (Hinton's lecture notes, 2012) with PyTorch's `torch.optim.RMSprop` semantics,
-/// uncentred: a running average of the squared gradient, `v ← α·v + (1 − α)·g²`, divides
-/// each step, `p ← p − lr·g / (√v + eps)`, with weight decay added to the gradient as
-/// `wd·p` and, with momentum `μ`, a buffer `b ← μ·b + g / (√v + eps)` that the step takes
-/// instead, `p ← p − lr·b`. The average and the buffer start at 0. Defaults as PyTorch's:
-/// α 0.99, eps 1e-8, no momentum, no weight decay.
+/// RMSprop (Hinton's lecture notes, 2012) with PyTorch's `torch.optim.RMSprop` semantics:
+/// a running average of the squared gradient, `v ← α·v + (1 − α)·g²`, divides each step,
+/// `p ← p − lr·g / (√v + eps)`, with weight decay added to the gradient as `wd·p` and, with
+/// momentum `μ`, a buffer `b ← μ·b + g / (√v + eps)` that the step takes instead,
+/// `p ← p − lr·b`. [Centred](Self::with_centered), it also keeps a running average of the
+/// gradient, `ḡ ← ḡ + (1 − α)·(g − ḡ)`, and divides by `√(v − ḡ²) + eps`. Every average
+/// and the buffer start at 0. Defaults as PyTorch's: α 0.99, eps 1e-8, no momentum, no
+/// weight decay, uncentred.
 ///
 /// # Examples
 ///
@@ -1410,10 +1412,14 @@ pub struct RmsProp<T: Real = f32> {
     momentum: f64,
     /// The weight decay added to the gradient.
     weight_decay: f64,
+    /// Whether the squared-gradient average is centred by the gradient's average.
+    centered: bool,
     /// The sizes seen on the first step.
     sizes: Sizes,
     /// The squared-gradient average of each parameter.
     square_avg: Vec<Vec<T>>,
+    /// The gradient average of each parameter (empty unless centred).
+    grad_avg: Vec<Vec<T>>,
     /// The momentum buffer of each parameter (empty without momentum).
     buffers: Vec<Vec<T>>,
     /// Whether each parameter has been updated: its state means something only then.
@@ -1422,10 +1428,13 @@ pub struct RmsProp<T: Real = f32> {
     stats: GradStats,
     /// One slot per chunk of a step, for the chunks' statistics.
     partials: Vec<ChunkStats>,
-    /// The parameters of a chunked step without momentum (empty between steps).
+    /// The parameters of a chunked step, uncentred without momentum (empty between steps).
     plain: Parts<T, (), 2>,
-    /// The parameters of a chunked step with momentum (empty between steps).
-    with_momentum: Parts<T, (), 3>,
+    /// The parameters of a chunked step with momentum or centred, one extra buffer (empty
+    /// between steps).
+    three: Parts<T, (), 3>,
+    /// The parameters of a chunked step with momentum and centred (empty between steps).
+    four: Parts<T, (), 4>,
 }
 
 impl<T: Real> RmsProp<T> {
@@ -1442,14 +1451,17 @@ impl<T: Real> RmsProp<T> {
             eps: 1e-8,
             momentum: 0.0,
             weight_decay: 0.0,
+            centered: false,
             sizes: Sizes::default(),
             square_avg: Vec::new(),
+            grad_avg: Vec::new(),
             buffers: Vec::new(),
             started: Vec::new(),
             stats: GradStats::new(),
             partials: Vec::new(),
             plain: Parts::new(),
-            with_momentum: Parts::new(),
+            three: Parts::new(),
+            four: Parts::new(),
         }
     }
 
@@ -1505,6 +1517,25 @@ impl<T: Real> RmsProp<T> {
         self
     }
 
+    /// Centres the squared-gradient average by the gradient's own running average, as
+    /// PyTorch's `centered=True`: the step divides by `√(v − ḡ²) + eps`, an estimate of the
+    /// gradient's variance rather than its second moment.
+    ///
+    /// As in PyTorch, `v − ḡ²` is not clamped at 0: it cannot be negative in exact
+    /// arithmetic, but rounding can make it slightly so when the gradient barely varies (a
+    /// constant gradient, say), and the step is then NaN, which the step's statistics do not
+    /// report (they see the gradient, which is finite). Use the uncentred form for a gradient
+    /// that may stay constant.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::RmsProp = cavitation_nn::RmsProp::new(0.01).with_centered(true);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_centered(mut self, centered: bool) -> RmsProp<T> {
+        self.centered = centered;
+        self
+    }
+
     /// The squared-gradient average of parameter `id`, or `None` until it has been updated
     /// once. The ids are those of the store the optimiser steps.
     ///
@@ -1526,10 +1557,14 @@ impl<T: Real> RmsProp<T> {
 
     /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
     fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
+        let (momentum, centered) = (self.momentum != 0.0, self.centered);
         if self.sizes.prepare("RmsProp", params) {
             let zeros = |lens: &[usize]| lens.iter().map(|&n| vec![T::ZERO; n]).collect();
             self.square_avg = zeros(&self.sizes.lens);
-            if self.momentum != 0.0 {
+            if centered {
+                self.grad_avg = zeros(&self.sizes.lens);
+            }
+            if momentum {
                 self.buffers = zeros(&self.sizes.lens);
             }
             self.started = vec![false; self.square_avg.len()];
@@ -1543,71 +1578,95 @@ impl<T: Real> RmsProp<T> {
             mu: self.momentum,
             wd: self.weight_decay,
         };
-        let momentum = self.momentum != 0.0;
         // A step that panicked may have left parts behind.
         self.plain.0.clear();
-        self.with_momentum.0.clear();
+        self.three.0.clear();
+        self.four.0.clear();
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
             let grads = grad.as_ref().map(|g| g.data());
             if grads.is_some() {
                 self.started[k] = true;
             }
-            let avg = &mut self.square_avg[k][..];
-            let buffer: &mut [T] = if momentum {
+            let v = &mut self.square_avg[k][..];
+            let ga: &mut [T] = if centered {
+                &mut self.grad_avg[k][..]
+            } else {
+                &mut []
+            };
+            let b: &mut [T] = if momentum {
                 &mut self.buffers[k][..]
             } else {
                 &mut []
             };
-            match (path, grads) {
-                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
-                (Path::Reference, None) => stats.push(id, 0.0, true),
-                (Path::Reference, Some(g)) => {
-                    let (sum, finite) = rms_reference(&c, value.data_mut(), avg, buffer, g);
-                    stats.push(id, sum, finite);
+            let Path::Chunked(_) = path else {
+                match grads {
+                    // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
+                    None => stats.push(id, 0.0, true),
+                    Some(g) => {
+                        let (sum, finite) =
+                            rms_reference(&c, centered, value.data_mut(), v, ga, b, g);
+                        stats.push(id, sum, finite);
+                    }
                 }
-                (Path::Chunked(_), g) if momentum => {
-                    let muts = match g {
-                        Some(_) => [value.data_mut(), avg, buffer],
-                        None => [&mut [][..], &mut [], &mut []],
-                    };
-                    self.with_momentum.push(id, muts, g, ());
-                }
-                (Path::Chunked(_), g) => {
-                    let muts = match g {
-                        Some(_) => [value.data_mut(), avg],
-                        None => [&mut [][..], &mut []],
-                    };
-                    self.plain.push(id, muts, g, ());
-                }
+                continue;
+            };
+            // A parameter with no gradient is a part with no chunks.
+            let p: &mut [T] = if grads.is_some() {
+                value.data_mut()
+            } else {
+                &mut []
+            };
+            let (v, ga, b) = if grads.is_some() {
+                (v, ga, b)
+            } else {
+                (&mut [][..], &mut [][..], &mut [][..])
+            };
+            match (momentum, centered) {
+                (false, false) => self.plain.push(id, [p, v], grads, ()),
+                (true, false) => self.three.push(id, [p, v, b], grads, ()),
+                (false, true) => self.three.push(id, [p, v, ga], grads, ()),
+                (true, true) => self.four.push(id, [p, v, ga, b], grads, ()),
             }
         }
         let Path::Chunked(threads) = path else {
             return;
         };
         let parts = &mut self.partials;
-        let decay = c.wd != 0.0;
-        if momentum {
-            run_parts(
+        // Each chunk picks the loop made for its case, so no element tests the settings.
+        macro_rules! chunk {
+            ($v:expr, $ga:expr, $b:expr, $p:expr, $g:expr, $m:literal, $c_:literal) => {
+                if c.wd != 0.0 {
+                    rms_chunk::<T, true, $m, $c_>(&c, $p, $v, $ga, $b, $g)
+                } else {
+                    rms_chunk::<T, false, $m, $c_>(&c, $p, $v, $ga, $b, $g)
+                }
+            };
+        }
+        match (momentum, centered) {
+            (false, false) => run_parts(threads, &mut self.plain, parts, stats, &|_, [p, v], g| {
+                chunk!(v, &mut [], &mut [], p, g, false, false)
+            }),
+            (true, false) => run_parts(
                 threads,
-                &mut self.with_momentum,
+                &mut self.three,
                 parts,
                 stats,
-                &|_, [p, v, b], g| {
-                    if decay {
-                        rms_chunk::<T, true, true>(&c, p, v, b, g)
-                    } else {
-                        rms_chunk::<T, false, true>(&c, p, v, b, g)
-                    }
-                },
-            );
-        } else {
-            run_parts(threads, &mut self.plain, parts, stats, &|_, [p, v], g| {
-                if decay {
-                    rms_chunk::<T, true, false>(&c, p, v, &mut [], g)
-                } else {
-                    rms_chunk::<T, false, false>(&c, p, v, &mut [], g)
-                }
-            });
+                &|_, [p, v, b], g| chunk!(v, &mut [], b, p, g, true, false),
+            ),
+            (false, true) => run_parts(
+                threads,
+                &mut self.three,
+                parts,
+                stats,
+                &|_, [p, v, ga], g| chunk!(v, ga, &mut [], p, g, false, true),
+            ),
+            (true, true) => run_parts(
+                threads,
+                &mut self.four,
+                parts,
+                stats,
+                &|_, [p, v, ga, b], g| chunk!(v, ga, b, p, g, true, true),
+            ),
         }
     }
 }
@@ -1617,7 +1676,7 @@ impl<T: Real> RmsProp<T> {
 struct RmsStep {
     /// The learning rate.
     lr: f64,
-    /// The decay rate of the squared-gradient average.
+    /// The decay rate of the averages.
     alpha: f64,
     /// Added to the square root of the average.
     eps: f64,
@@ -1628,27 +1687,47 @@ struct RmsStep {
 }
 
 /// One element of RMSprop: from the value `p`, the gradient `g` (weight decay already
-/// added) and the old average `v` (and buffer `b` with momentum), the new value, average
-/// and buffer.
+/// added), the old squared-gradient average `v`, gradient average `ga` (used when
+/// `centered`) and buffer `b` (used with `momentum`), the new value and state, in that
+/// order. PyTorch's operations in PyTorch's order: the gradient average by `lerp`.
 #[inline(always)]
-fn rms_element(c: &RmsStep, momentum: bool, p: f64, g: f64, v: f64, b: f64) -> (f64, f64, f64) {
+#[allow(clippy::too_many_arguments)]
+fn rms_element(
+    c: &RmsStep,
+    momentum: bool,
+    centered: bool,
+    p: f64,
+    g: f64,
+    v: f64,
+    ga: f64,
+    b: f64,
+) -> (f64, f64, f64, f64) {
     let v = c.alpha * v + (1.0 - c.alpha) * g * g;
-    let ratio = g / (v.sqrt() + c.eps);
+    let (ga, root) = if centered {
+        let ga = ga + (1.0 - c.alpha) * (g - ga);
+        (ga, (v - ga * ga).sqrt())
+    } else {
+        (ga, v.sqrt())
+    };
+    let ratio = g / (root + c.eps);
     if momentum {
         let b = c.mu * b + ratio;
-        (p - c.lr * b, v, b)
+        (p - c.lr * b, v, ga, b)
     } else {
-        (p - c.lr * ratio, v, b)
+        (p - c.lr * ratio, v, ga, b)
     }
 }
 
 /// The plain RMSprop loop over one parameter, element by element on the calling thread:
-/// the reference for [`rms_chunk`]. `buffer` is the momentum buffer (empty without
-/// momentum). Returns the gradient's sum of squares and whether it was all finite.
+/// the reference for [`rms_chunk`]. `grad_avg` is the gradient average (empty unless
+/// `centered`) and `buffer` the momentum buffer (empty without momentum). Returns the
+/// gradient's sum of squares and whether it was all finite.
 fn rms_reference<T: Real>(
     c: &RmsStep,
+    centered: bool,
     values: &mut [T],
     avg: &mut [T],
+    grad_avg: &mut [T],
     buffer: &mut [T],
     grads: &[T],
 ) -> (f64, bool) {
@@ -1663,9 +1742,13 @@ fn rms_reference<T: Real>(
         if c.wd != 0.0 {
             g += c.wd * p;
         }
+        let ga = if centered { grad_avg[i].to_f64() } else { 0.0 };
         let b = if momentum { buffer[i].to_f64() } else { 0.0 };
-        let (p, v, b) = rms_element(c, momentum, p, g, avg[i].to_f64(), b);
+        let (p, v, ga, b) = rms_element(c, momentum, centered, p, g, avg[i].to_f64(), ga, b);
         avg[i] = store_state(v);
+        if centered {
+            grad_avg[i] = store_state(ga);
+        }
         if momentum {
             buffer[i] = store_state(b);
         }
@@ -1674,35 +1757,50 @@ fn rms_reference<T: Real>(
     (sum, finite)
 }
 
-/// One chunk of RMSprop, with weight decay when `WD` and the momentum buffer `buffer` when
-/// `MOMENTUM` (empty otherwise): the arithmetic of [`rms_reference`] per element.
-fn rms_chunk<T: Real, const WD: bool, const MOMENTUM: bool>(
+/// One chunk of RMSprop, with weight decay when `WD`, the momentum buffer `buffer` when
+/// `MOMENTUM` and the gradient average `grad_avg` when `CENTERED` (each empty otherwise):
+/// the arithmetic of [`rms_reference`] per element.
+fn rms_chunk<T: Real, const WD: bool, const MOMENTUM: bool, const CENTERED: bool>(
     c: &RmsStep,
     values: &mut [T],
     avg: &mut [T],
+    grad_avg: &mut [T],
     buffer: &mut [T],
     grads: &[T],
 ) -> ChunkStats {
-    let element = |p: &mut T, v: &mut T, b: Option<&mut T>, raw: f64| {
+    let element = |p: &mut T, v: &mut T, ga: Option<&mut T>, b: Option<&mut T>, raw: f64| {
         let x = p.to_f64();
         let mut g = raw;
         if WD {
             g += c.wd * x;
         }
+        let old_ga = ga.as_ref().map_or(0.0, |a| a.to_f64());
         let old_b = b.as_ref().map_or(0.0, |b| b.to_f64());
-        let (x, nv, nb) = rms_element(c, MOMENTUM, x, g, v.to_f64(), old_b);
+        let (x, nv, nga, nb) = rms_element(c, MOMENTUM, CENTERED, x, g, v.to_f64(), old_ga, old_b);
         *v = store_state(nv);
+        if let Some(a) = ga {
+            *a = store_state(nga);
+        }
         if let Some(b) = b {
             *b = store_state(nb);
         }
         *p = T::from_f64(x);
     };
-    if MOMENTUM {
-        sweep([values, avg, buffer], grads, |[p, v, b], raw| {
-            element(p, v, Some(b), raw)
-        })
-    } else {
-        sweep([values, avg], grads, |[p, v], raw| element(p, v, None, raw))
+    match (MOMENTUM, CENTERED) {
+        (false, false) => sweep([values, avg], grads, |[p, v], raw| {
+            element(p, v, None, None, raw)
+        }),
+        (true, false) => sweep([values, avg, buffer], grads, |[p, v, b], raw| {
+            element(p, v, None, Some(b), raw)
+        }),
+        (false, true) => sweep([values, avg, grad_avg], grads, |[p, v, a], raw| {
+            element(p, v, Some(a), None, raw)
+        }),
+        (true, true) => sweep(
+            [values, avg, grad_avg, buffer],
+            grads,
+            |[p, v, a, b], raw| element(p, v, Some(a), Some(b), raw),
+        ),
     }
 }
 
@@ -2222,6 +2320,21 @@ mod tests {
                     )
                 }),
             ),
+            (
+                "rmsprop centred",
+                Box::new(|| Either::Rms(RmsProp::new(0.01).with_centered(true))),
+            ),
+            (
+                "rmsprop centred momentum wd",
+                Box::new(|| {
+                    Either::Rms(
+                        RmsProp::new(0.01)
+                            .with_centered(true)
+                            .with_momentum(0.9)
+                            .with_weight_decay(0.01),
+                    )
+                }),
+            ),
             ("adagrad", Box::new(|| Either::Adagrad(Adagrad::new(0.1)))),
             (
                 "adagrad decay wd start",
@@ -2271,6 +2384,7 @@ mod tests {
                 Either::Sgd(o) => o.buffers.get(k).map(bits).into_iter().collect(),
                 Either::Adam(o, _) => vec![bits(&o.m[k]), bits(&o.v[k])],
                 Either::Rms(o) => std::iter::once(bits(&o.square_avg[k]))
+                    .chain(o.grad_avg.get(k).map(bits))
                     .chain(o.buffers.get(k).map(bits))
                     .collect(),
                 Either::Adagrad(o) => vec![bits(&o.sums[k])],
@@ -2287,7 +2401,9 @@ mod tests {
             match self {
                 Either::Sgd(o) => bits(&o.buffers),
                 Either::Adam(o, _) => [bits(&o.m), bits(&o.v)].concat(),
-                Either::Rms(o) => [bits(&o.square_avg), bits(&o.buffers)].concat(),
+                Either::Rms(o) => {
+                    [bits(&o.square_avg), bits(&o.grad_avg), bits(&o.buffers)].concat()
+                }
                 Either::Adagrad(o) => bits(&o.sums),
             }
         }
