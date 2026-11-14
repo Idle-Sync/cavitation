@@ -16,7 +16,7 @@ use cavitation_core::kernels::activation::{
 };
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
-use cavitation_core::{ParamStore, Rng, Tensor};
+use cavitation_core::{Conv2dGeom, ParamStore, Rng, Tensor};
 use cavitation_datasets::{cifar10, digits, mnist};
 use cavitation_inspect::{Inspector, InspectorConfig};
 use cavitation_nn::shrink::{ShrinkConfig, ShrinkStep, Validation, shrink};
@@ -1554,4 +1554,84 @@ pub fn activation_controllers() -> Result<Vec<InferenceModel>, String> {
         models.push(InferenceModel::compile(&net, &params).map_err(|e| e.to_string())?);
     }
     Ok(models)
+}
+
+/// The four convolutions of the CIFAR-10 CNN benchmark network, in order: each a 3 × 3
+/// kernel with padding 1 (3 → 32 and 32 → 32 channels on 32 × 32 images, then 32 → 64 and
+/// 64 → 64 on 16 × 16), with the name the `conv` table prints.
+pub fn cifar_convs() -> Vec<(&'static str, Conv2dGeom)> {
+    let g = |cin, cout, size| {
+        Conv2dGeom::with_options(cin, cout, (size, size), (3, 3), (1, 1), (1, 1), (1, 1))
+            .expect("a valid geometry")
+    };
+    vec![
+        ("conv1 3->32 32x32", g(3, 32, 32)),
+        ("conv2 32->32 32x32", g(32, 32, 32)),
+        ("conv3 32->64 16x16", g(32, 64, 16)),
+        ("conv4 64->64 16x16", g(64, 64, 16)),
+    ]
+}
+
+/// The median times of one convolution at batch `batch`: the forward pass alone, and the
+/// forward and backward pass together (with the input's gradient unless `first`, the
+/// network's first layer, whose input is the data).
+pub struct ConvTiming {
+    /// Seconds for the forward pass.
+    pub forward: f64,
+    /// Seconds for the forward and the backward pass.
+    pub step: f64,
+}
+
+/// Times `Tape::conv2d` with `geom` on `batch` seeded images at the current kernel level and
+/// thread count: 3 warm-up runs, then the median of `samples` runs of the forward pass and
+/// of the forward and backward passes.
+pub fn time_conv(geom: Conv2dGeom, batch: usize, first: bool, samples: usize) -> ConvTiming {
+    let mut rng = Rng::seed(11);
+    let mut params = ParamStore::new();
+    let mut draw = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.range(-1.0, 1.0) as f32).collect() };
+    let (kh, kw) = geom.kernel();
+    let x = Tensor::from_vec(draw(batch * geom.in_width()), &[batch, geom.in_width()]).unwrap();
+    let w = params.add(
+        Tensor::from_vec(
+            draw(geom.weight_len()),
+            &[geom.out_channels(), geom.in_channels(), kh, kw],
+        )
+        .unwrap(),
+    );
+    let b =
+        params.add(Tensor::from_vec(draw(geom.out_channels()), &[geom.out_channels()]).unwrap());
+    let xp = params.add(x.clone());
+    let up = Tensor::from_vec(draw(batch * geom.out_width()), &[batch, geom.out_width()]).unwrap();
+    let mut graph = cavitation_core::Graph::new();
+    let mut run = |backward: bool| -> f64 {
+        let start = Instant::now();
+        let mut tape = graph.tape(&params.values);
+        let xv = if first {
+            tape.input(x.view())
+        } else {
+            tape.param(xp)
+        };
+        let (wv, bv) = (tape.param(w), tape.param(b));
+        let y = tape.conv2d(xv, wv, Some(bv), geom);
+        if backward {
+            let u = tape.input(up.view());
+            let p = tape.mul(y, u);
+            let loss = tape.sum(p);
+            tape.backward(loss, &mut params.grads);
+        }
+        black_box(tape.value(y).data()[0]);
+        drop(tape);
+        let t = start.elapsed().as_secs_f64();
+        params.zero_grad();
+        t
+    };
+    for _ in 0..3 {
+        run(true);
+    }
+    let forward: Vec<f64> = (0..samples).map(|_| run(false)).collect();
+    let step: Vec<f64> = (0..samples).map(|_| run(true)).collect();
+    ConvTiming {
+        forward: median(&forward),
+        step: median(&step),
+    }
 }

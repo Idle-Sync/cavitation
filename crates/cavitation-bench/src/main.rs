@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|activation|shrink|inspect|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|subnormal|small|activation|shrink|inspect|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -33,6 +33,13 @@
 //!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
 //!   only; its ticks are taken as 1/100 s (`USER_HZ` = 100, as on x86 and Arm Linux).
 //!   `small --child` is the child's side: one run at the current thread count.
+//! - `conv [--batch N]` (default 128) times the four convolutions of the CIFAR-10 CNN
+//!   benchmark network (3 × 3 kernels with padding 1: 3 → 32 and 32 → 32 channels on
+//!   32 × 32 images, 32 → 64 and 64 → 64 on 16 × 16) through `Tape::conv2d` at the current
+//!   kernel level and thread count: the median of 11 forward passes and of 11 forward and
+//!   backward passes (the first layer without the input gradient, as for data), with
+//!   GFLOPS counting `2 · out · in · kh · kw` per output value, three times that for a whole
+//!   step (two for the first layer).
 //! - `activation` times `tanh` and the sigmoid over 64 and 4,096 values: the plain scalar
 //!   loop on std's `f32::tanh` and `f32::exp`, then the kernels at every level this CPU
 //!   runs, in 301 interleaved rounds, and prints the median nanoseconds per value and each
@@ -88,13 +95,14 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|activation|shrink|inspect|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|subnormal|small|activation|shrink|inspect|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
     \x20 digits  [--python PATH] [--numpy-best]\n\
     \x20 latency [--python PATH] [--numpy-best]\n\
     \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
+    \x20 conv    [--batch N]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
@@ -137,6 +145,7 @@ fn main() -> ExitCode {
             .then(info)
             .ok_or_else(|| "info takes no arguments".to_string()),
         "gemm" => gemm(rest),
+        "conv" => conv(rest),
         "subnormal" => subnormal(rest),
         "small" => small(rest),
         "activation" => activation(rest),
@@ -527,6 +536,61 @@ fn gemm(args: &[String]) -> Result<(), String> {
         "all eight: {:.1} us, {:.2} GFLOPS (total FLOPs over the sum of the median times)",
         seconds * 1e6,
         flops / seconds / 1e9
+    );
+    Ok(())
+}
+
+/// Runs the `conv` subcommand with its arguments (after `conv`).
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument or a `--batch` that is not a positive number.
+fn conv(args: &[String]) -> Result<(), String> {
+    let mut batch = 128usize;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--batch" => {
+                let v = rest.next().ok_or("--batch needs a value")?;
+                batch = v
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0)
+                    .ok_or_else(|| format!("--batch must be a positive number, got `{v}`"))?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    running();
+    println!(
+        "conv: batch {batch}, kernel {}, {} threads, medians of 11 runs",
+        level(),
+        threads()
+    );
+    println!(
+        "{:<20} {:>12} {:>9} {:>12} {:>9}",
+        "layer", "forward ms", "GFLOPS", "step ms", "GFLOPS"
+    );
+    let (mut fwd, mut step) = (0.0, 0.0);
+    for (i, (name, geom)) in runs::cifar_convs().into_iter().enumerate() {
+        let first = i == 0;
+        let t = runs::time_conv(geom, batch, first, 11);
+        let flops = 2.0 * (batch * geom.out_width() * geom.kernel_len()) as f64;
+        let passes = if first { 2.0 } else { 3.0 };
+        fwd += t.forward;
+        step += t.step;
+        println!(
+            "{name:<20} {:>12.2} {:>9.2} {:>12.2} {:>9.2}",
+            t.forward * 1e3,
+            flops / t.forward / 1e9,
+            t.step * 1e3,
+            passes * flops / t.step / 1e9
+        );
+    }
+    println!(
+        "all four: forward {:.2} ms, forward and backward {:.2} ms",
+        fwd * 1e3,
+        step * 1e3
     );
     Ok(())
 }

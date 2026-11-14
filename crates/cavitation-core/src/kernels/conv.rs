@@ -22,6 +22,7 @@
 //! assert_eq!(out, [12.0, 16.0, 24.0, 28.0]);
 //! ```
 
+use crate::kernels::{MatMut, MatRef};
 use crate::{Error, Real};
 
 /// The shape of a 2-D convolution: input channels and image size, output channels, kernel,
@@ -479,23 +480,32 @@ pub fn im2col<T: Real>(geom: &Conv2dGeom, batch: usize, x: &[T], cols: &mut [T])
     let ((sh, sw), (ph, pw), (dh, dw)) = (geom.stride, geom.padding, geom.dilation);
     for c in 0..geom.in_channels {
         for i in 0..kh {
+            let rows = span(oh, i, sh, ph, dh, h);
             for j in 0..kw {
+                let across = span(ow, j, sw, pw, dw, w);
                 let row = &mut cols[((c * kh + i) * kw + j) * n_cols..][..n_cols];
                 for n in 0..batch {
                     let plane = &x[(n * geom.in_channels + c) * h * w..][..h * w];
                     let dst = &mut row[n * windows..][..windows];
                     for oy in 0..oh {
                         let line = &mut dst[oy * ow..][..ow];
-                        match Conv2dGeom::source(oy, i, sh, ph, dh, h) {
-                            None => line.fill(T::ZERO),
-                            Some(y) => {
-                                let src = &plane[y * w..][..w];
-                                for (ox, v) in line.iter_mut().enumerate() {
-                                    *v = match Conv2dGeom::source(ox, j, sw, pw, dw, w) {
-                                        Some(xx) => src[xx],
-                                        None => T::ZERO,
-                                    };
-                                }
+                        if !rows.contains(&oy) {
+                            line.fill(T::ZERO);
+                            continue;
+                        }
+                        let y = oy * sh + i * dh - ph;
+                        let src = &plane[y * w..][..w];
+                        line[..across.start].fill(T::ZERO);
+                        line[across.end..].fill(T::ZERO);
+                        if across.is_empty() {
+                            continue;
+                        }
+                        let first = across.start * sw + j * dw - pw;
+                        if sw == 1 {
+                            line[across.clone()].copy_from_slice(&src[first..][..across.len()]);
+                        } else {
+                            for (k, v) in line[across.clone()].iter_mut().enumerate() {
+                                *v = src[first + k * sw];
                             }
                         }
                     }
@@ -503,6 +513,33 @@ pub fn im2col<T: Real>(geom: &Conv2dGeom, batch: usize, x: &[T], cols: &mut [T])
             }
         }
     }
+}
+
+/// The output positions `lo..hi` along one axis whose tap `t` falls inside the image (not
+/// in the padding): those `o` with `0 <= o · stride + t · dilation − padding < size`.
+fn span(
+    out: usize,
+    t: usize,
+    stride: usize,
+    padding: usize,
+    dilation: usize,
+    size: usize,
+) -> std::ops::Range<usize> {
+    let offset = t * dilation;
+    // The first `o` with o · stride + offset >= padding.
+    let lo = if offset >= padding {
+        0
+    } else {
+        (padding - offset).div_ceil(stride)
+    };
+    // One past the last `o` with o · stride + offset < padding + size.
+    let limit = padding + size;
+    let hi = if offset >= limit {
+        0
+    } else {
+        ((limit - offset - 1) / stride + 1).min(out)
+    };
+    lo.min(hi)..hi
 }
 
 /// Adds the column matrix `cols` (laid out as [`im2col`] writes it) back onto the `batch`
@@ -536,20 +573,147 @@ pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]
         for c in 0..geom.in_channels {
             let plane = &mut dx[(n * geom.in_channels + c) * h * w..][..h * w];
             for i in 0..kh {
+                let rows = span(oh, i, sh, ph, dh, h);
                 for j in 0..kw {
+                    let across = span(ow, j, sw, pw, dw, w);
+                    if across.is_empty() {
+                        continue;
+                    }
                     let src = &cols[((c * kh + i) * kw + j) * n_cols + n * windows..][..windows];
-                    for oy in 0..oh {
-                        let Some(y) = Conv2dGeom::source(oy, i, sh, ph, dh, h) else {
-                            continue;
-                        };
-                        let line = &src[oy * ow..][..ow];
+                    let first = across.start * sw + j * dw - pw;
+                    for oy in rows.clone() {
+                        let y = oy * sh + i * dh - ph;
+                        let line = &src[oy * ow + across.start..][..across.len()];
                         let dst = &mut plane[y * w..][..w];
-                        for (ox, &v) in line.iter().enumerate() {
-                            if let Some(xx) = Conv2dGeom::source(ox, j, sw, pw, dw, w) {
-                                dst[xx] += v;
-                            }
+                        for (k, &v) in line.iter().enumerate() {
+                            dst[first + k * sw] += v;
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/// The most column-matrix values [`conv2d_forward`] and the tape's backward pass hold at
+/// once: images are taken in chunks of `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so
+/// each GEMM is wide enough to use the packed kernels well while the columns stay in a few
+/// megabytes. The chunk size depends on the geometry alone, never on the thread count, so
+/// results do too.
+pub const COLUMN_BUDGET: usize = 1 << 21;
+
+/// The number of images [`conv2d_forward`] takes per GEMM for `geom`, at most `batch`.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{COLUMN_BUDGET, Conv2dGeom, images_per_chunk};
+/// let geom = Conv2dGeom::with_options(32, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// assert_eq!(images_per_chunk(&geom, 128), COLUMN_BUDGET / (288 * 1024));
+/// assert_eq!(images_per_chunk(&geom, 3), 3);
+/// ```
+pub fn images_per_chunk(geom: &Conv2dGeom, batch: usize) -> usize {
+    let (oh, ow) = geom.out_size();
+    let per_image = geom.kernel_len() * oh * ow;
+    (COLUMN_BUDGET / per_image).clamp(1, batch.max(1))
+}
+
+/// The scratch [`conv2d_forward`] needs for `batch` images of `geom`: the column matrix's
+/// length and the product's, for one chunk of images.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_scratch};
+/// let geom = Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap();
+/// assert_eq!(conv2d_scratch(&geom, 1), (4 * 4, 2 * 4));
+/// ```
+pub fn conv2d_scratch(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
+    let (oh, ow) = geom.out_size();
+    let images = images_per_chunk(geom, batch);
+    let windows = images * oh * ow;
+    (geom.kernel_len() * windows, geom.out_channels() * windows)
+}
+
+/// The convolution of `batch` images `x` by `weight` (`[out, kernel_len]` row-major, the
+/// `[out, in, kh, kw]` weight's own layout), plus `bias`, into `out`, with `gemm(a, b, c)`
+/// computing `c = a · b`: chunk by chunk of [`images_per_chunk`] images, the chunk's
+/// column matrix in `cols` times the weight into `prod` (`[out, images · windows]`), then
+/// each value moved to its output image with the bias added. A 1 × 1 kernel with stride 1
+/// and no padding multiplies each image itself instead. The tape and `InferenceModel` both
+/// run this, so they agree bit for bit; `cols` and `prod` hold at least
+/// [`conv2d_scratch`]'s lengths.
+///
+/// # Panics
+///
+/// Panics if any slice is too short or has the wrong length, naming it.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_forward, conv2d_scratch};
+/// use cavitation_core::kernels::{MatMut, MatRef, reference};
+/// let geom = Conv2dGeom::new(1, 1, (3, 3), (2, 2)).unwrap();
+/// let x: Vec<f64> = (1..=9).map(f64::from).collect();
+/// let (c, p) = conv2d_scratch(&geom, 1);
+/// let (mut cols, mut prod, mut out) = (vec![0.0; c], vec![0.0; p], vec![0.0; 4]);
+/// let gemm = |a: MatRef<f64>, b: MatRef<f64>, c: MatMut<f64>| reference::gemm(1.0, a, b, 0.0, c);
+/// conv2d_forward(&geom, 1, &x, &[1.0; 4], Some(&[0.5]), &mut out, &mut cols, &mut prod, gemm);
+/// assert_eq!(out, [12.5, 16.5, 24.5, 28.5]);
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn conv2d_forward<T: Real>(
+    geom: &Conv2dGeom,
+    batch: usize,
+    x: &[T],
+    weight: &[T],
+    bias: Option<&[T]>,
+    out: &mut [T],
+    cols: &mut [T],
+    prod: &mut [T],
+    mut gemm: impl FnMut(MatRef<'_, T>, MatRef<'_, T>, MatMut<'_, T>),
+) {
+    let (oh, ow) = geom.out_size();
+    let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
+    let (in_w, out_w) = (geom.in_width(), geom.out_width());
+    check_len("the input", x.len(), batch * in_w);
+    check_len("the weight", weight.len(), geom.weight_len());
+    check_len("the output", out.len(), batch * out_w);
+    let wm = MatRef::new(weight, cout, kl, kl, 1).expect("checked length");
+    if geom.is_pointwise() {
+        for (image, y) in x.chunks_exact(in_w).zip(out.chunks_exact_mut(out_w)) {
+            let rhs = MatRef::new(image, kl, windows, windows, 1).expect("checked length");
+            gemm(
+                wm,
+                rhs,
+                MatMut::new(y, cout, windows, windows, 1).expect("checked length"),
+            );
+        }
+    } else {
+        let per = images_per_chunk(geom, batch);
+        let mut n0 = 0;
+        while n0 < batch {
+            let nb = per.min(batch - n0);
+            let cols_n = nb * windows;
+            let cm = &mut cols[..kl * cols_n];
+            im2col(geom, nb, &x[n0 * in_w..][..nb * in_w], cm);
+            let pm = &mut prod[..cout * cols_n];
+            gemm(
+                wm,
+                MatRef::new(&*cm, kl, cols_n, cols_n, 1).expect("checked length"),
+                MatMut::new(pm, cout, cols_n, cols_n, 1).expect("checked length"),
+            );
+            for (k, y) in out[n0 * out_w..][..nb * out_w]
+                .chunks_exact_mut(out_w)
+                .enumerate()
+            {
+                for (o, plane) in y.chunks_exact_mut(windows).enumerate() {
+                    plane.copy_from_slice(&pm[o * cols_n + k * windows..][..windows]);
+                }
+            }
+            n0 += nb;
+        }
+    }
+    if let Some(b) = bias {
+        check_len("the bias", b.len(), cout);
+        for image in out.chunks_exact_mut(out_w) {
+            for (plane, &bo) in image.chunks_exact_mut(windows).zip(b) {
+                for v in plane {
+                    *v += bo;
                 }
             }
         }

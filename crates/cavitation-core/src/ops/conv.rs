@@ -1,13 +1,15 @@
 //! 2-D convolution on the tape: `conv2d`, with its backward pass.
 //!
-//! Each image is turned into its column matrix ([`im2col`]) and multiplied by the weight
-//! with the GEMM of the current kernel level (`Real::gemm`), one image at a time, so the
-//! column buffer holds one image's windows and nothing is kept between the forward and the
-//! backward pass: the backward pass builds each image's columns again. A 1 × 1 kernel with
-//! stride 1 and no padding multiplies the image itself.
+//! Images are taken in chunks of a few megabytes of columns ([`images_per_chunk`]): each
+//! chunk's column matrix ([`im2col`]) is multiplied by the weight with the GEMM of the
+//! current kernel level (`Real::gemm`), and nothing is kept between the forward and the
+//! backward pass, which builds each chunk's columns again. A 1 × 1 kernel with stride 1 and
+//! no padding multiplies each image itself.
 
 use crate::graph::{BackwardCtx, Var};
-use crate::kernels::conv::{Conv2dGeom, col2im, im2col};
+use crate::kernels::conv::{
+    Conv2dGeom, col2im, conv2d_forward, conv2d_scratch, im2col, images_per_chunk,
+};
 use crate::kernels::{MatMut, MatRef};
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
@@ -60,9 +62,10 @@ impl<T: Real> Tape<'_, T> {
     /// `[out]`. The result is `[batch, out_channels · out_height · out_width]`, each row one
     /// output image in the same order.
     ///
-    /// Each image's windows are copied into a column matrix and multiplied by the weight
-    /// with the GEMM of the current kernel level; the gradients are GEMMs too, image by
-    /// image in order, so they are the same for any thread count. An input that takes no
+    /// The windows of a chunk of images are copied into a column matrix and multiplied by
+    /// the weight with the GEMM of the current kernel level; the gradients are GEMMs too,
+    /// chunk by chunk in order (the chunk size depends on the geometry alone), so they are
+    /// the same for any thread count. An input that takes no
     /// gradient costs no input-gradient work.
     ///
     /// # Panics
@@ -88,51 +91,46 @@ impl<T: Real> Tape<'_, T> {
     pub fn conv2d(&mut self, x: Var, weight: Var, bias: Option<Var>, geom: Conv2dGeom) -> Var {
         let sb = bias.map(|b| self.shape(b));
         let batch = check_shapes(&geom, &self.shape(x), &self.shape(weight), sb.as_ref());
-        let (oh, ow) = geom.out_size();
-        let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
         let mut out = self.take_buffer(batch * geom.out_width());
-        let mut cols = if geom.is_pointwise() {
-            Vec::new()
-        } else {
-            self.take_buffer(kl * windows)
-        };
-        {
-            let xv = self.data(x);
-            let wm = mat(self.data(weight), cout, kl);
-            for n in 0..batch {
-                let image = &xv[n * geom.in_width()..][..geom.in_width()];
-                let y = &mut out[n * geom.out_width()..][..geom.out_width()];
-                let rhs = if geom.is_pointwise() {
-                    mat(image, kl, windows)
-                } else {
-                    im2col(&geom, 1, image, &mut cols);
-                    mat(&cols, kl, windows)
-                };
-                // beta = 0 writes every output value; the pooled buffer's old contents are
-                // unused.
-                T::gemm(T::ONE, wm, rhs, T::ZERO, mat_mut(y, cout, windows));
-            }
-            if let Some(b) = bias {
-                let bv = self.data(b);
-                for image in out.chunks_exact_mut(geom.out_width()) {
-                    for (plane, &bo) in image.chunks_exact_mut(windows).zip(bv) {
-                        for v in plane {
-                            *v += bo;
-                        }
-                    }
-                }
-            }
-        }
+        let (cols_len, prod_len) = scratch_lens(&geom, batch);
+        let mut cols = self.take_buffer(cols_len);
+        let mut prod = self.take_buffer(prod_len);
+        let bv = bias.map(|b| self.data(b));
+        conv2d_forward(
+            &geom,
+            batch,
+            self.data(x),
+            self.data(weight),
+            bv,
+            &mut out,
+            &mut cols,
+            &mut prod,
+            // beta = 0 writes every value; the pooled buffers' old contents are unused.
+            |a, b, c| T::gemm(T::ONE, a, b, T::ZERO, c),
+        );
         self.give_buffer(cols);
+        self.give_buffer(prod);
         let start = self.push_labels(&geom.to_words());
         let so = Shape::new(&[batch, geom.out_width()]);
         self.push(Op::Conv2d(x, weight, bias, start), so, out)
     }
 }
 
-/// Backward of `conv2d`: for each input that takes a gradient, image by image in order,
-/// `dW += dY_n · cols_nᵀ`, `db += Σ dY_n` and `dX_n = col2im(Wᵀ · dY_n)`, with `cols_n` the
-/// image's column matrix built again.
+/// The scratch `conv2d` takes for `batch` images: [`conv2d_scratch`]'s lengths, or none for
+/// a 1 × 1 kernel with stride 1 and no padding, which multiplies the images themselves.
+fn scratch_lens(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
+    if geom.is_pointwise() {
+        (0, 0)
+    } else {
+        conv2d_scratch(geom, batch)
+    }
+}
+
+/// Backward of `conv2d`, chunk by chunk of images as the forward pass takes them
+/// ([`images_per_chunk`]), in order: `db` sums the output gradient; `dW += dY' · colsᵀ` and
+/// `dX = col2im(Wᵀ · dY')`, with `cols` the chunk's column matrix built again and `dY'` the
+/// chunk's output gradient gathered to `[out, images · windows]`. A 1 × 1 kernel with stride
+/// 1 and no padding works on each image directly.
 pub(super) fn backward<T: Real>(
     x: Var,
     weight: Var,
@@ -147,7 +145,6 @@ pub(super) fn backward<T: Real>(
     let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
     let (in_w, out_w) = (geom.in_width(), geom.out_width());
     let (xv, wv) = (ctx.value(x), ctx.value(weight));
-    let pointwise = geom.is_pointwise();
     if let Some(b) = bias
         && let Some(slot) = ctx.slot(b)
     {
@@ -163,26 +160,50 @@ pub(super) fn backward<T: Real>(
             }
         });
     }
-    let mut cols = if pointwise {
-        Vec::new()
-    } else {
-        ctx.scratch(kl * windows)
+    let pointwise = geom.is_pointwise();
+    let per = images_per_chunk(&geom, batch);
+    let (cols_len, prod_len) = scratch_lens(&geom, batch);
+    let mut cols = ctx.scratch(cols_len);
+    let mut dyp = ctx.scratch(prod_len);
+    // Gathers images `n0..n0 + nb` of the output gradient to `[out, nb · windows]`.
+    let gather = |dyp: &mut [T], n0: usize, nb: usize| {
+        let cols_n = nb * windows;
+        for k in 0..nb {
+            let image = &out_grad[(n0 + k) * out_w..][..out_w];
+            for (o, plane) in image.chunks_exact(windows).enumerate() {
+                dyp[o * cols_n + k * windows..][..windows].copy_from_slice(plane);
+            }
+        }
     };
     if ctx.takes_grad(weight)
         && let Some(slot) = ctx.slot(weight)
     {
         slot.update_with(|buf, beta| {
-            for n in 0..batch {
-                let image = &xv[n * in_w..][..in_w];
-                let cm = if pointwise {
-                    mat(image, kl, windows)
-                } else {
-                    im2col(&geom, 1, image, &mut cols);
-                    mat(&cols, kl, windows)
-                };
-                let dy = mat(&out_grad[n * out_w..][..out_w], cout, windows);
-                let beta = if n == 0 { beta } else { T::ONE };
+            if pointwise {
+                for n in 0..batch {
+                    let cm = mat(&xv[n * in_w..][..in_w], kl, windows);
+                    let dy = mat(&out_grad[n * out_w..][..out_w], cout, windows);
+                    let beta = if n == 0 { beta } else { T::ONE };
+                    T::gemm(T::ONE, dy, cm.transpose(), beta, mat_mut(buf, cout, kl));
+                }
+                return;
+            }
+            let mut n0 = 0;
+            while n0 < batch {
+                let nb = per.min(batch - n0);
+                let cols_n = nb * windows;
+                im2col(
+                    &geom,
+                    nb,
+                    &xv[n0 * in_w..][..nb * in_w],
+                    &mut cols[..kl * cols_n],
+                );
+                gather(&mut dyp, n0, nb);
+                let dy = mat(&dyp[..cout * cols_n], cout, cols_n);
+                let cm = mat(&cols[..kl * cols_n], kl, cols_n);
+                let beta = if n0 == 0 { beta } else { T::ONE };
                 T::gemm(T::ONE, dy, cm.transpose(), beta, mat_mut(buf, cout, kl));
+                n0 += nb;
             }
         });
     }
@@ -191,29 +212,42 @@ pub(super) fn backward<T: Real>(
     {
         let wt = mat(wv, cout, kl).transpose();
         slot.update_with(|buf, beta| {
-            for n in 0..batch {
-                let dy = mat(&out_grad[n * out_w..][..out_w], cout, windows);
-                let dx = &mut buf[n * in_w..][..in_w];
-                if pointwise {
+            if pointwise {
+                for n in 0..batch {
+                    let dy = mat(&out_grad[n * out_w..][..out_w], cout, windows);
+                    let dx = &mut buf[n * in_w..][..in_w];
                     T::gemm(T::ONE, wt, dy, beta, mat_mut(dx, kl, windows));
-                } else {
-                    T::gemm(T::ONE, wt, dy, T::ZERO, mat_mut(&mut cols, kl, windows));
-                    if beta == T::ZERO {
-                        dx.fill(T::ZERO);
-                    }
-                    col2im(&geom, 1, &cols, dx);
                 }
+                return;
+            }
+            let mut n0 = 0;
+            while n0 < batch {
+                let nb = per.min(batch - n0);
+                let cols_n = nb * windows;
+                gather(&mut dyp, n0, nb);
+                let dy = mat(&dyp[..cout * cols_n], cout, cols_n);
+                let dcols = &mut cols[..kl * cols_n];
+                T::gemm(T::ONE, wt, dy, T::ZERO, mat_mut(dcols, kl, cols_n));
+                let dx = &mut buf[n0 * in_w..][..nb * in_w];
+                if beta == T::ZERO {
+                    dx.fill(T::ZERO);
+                }
+                col2im(&geom, nb, dcols, dx);
+                n0 += nb;
             }
         });
     }
     ctx.release(cols);
+    ctx.release(dyp);
 }
 
 /// Tests for the convolution operation: against the direct loops, the 1 × 1 path, the
 /// gradient check, skipped input gradients and reused buffers.
 #[cfg(test)]
 mod tests {
-    use crate::kernels::conv::{Conv2dGeom, conv2d_backward_reference, conv2d_reference};
+    use crate::kernels::conv::{
+        Conv2dGeom, conv2d_backward_reference, conv2d_reference, images_per_chunk,
+    };
     use crate::real::GEMM_CALLS;
     use crate::{Graph, ParamStore, Rng, Tensor, gradcheck_params};
 
@@ -229,6 +263,9 @@ mod tests {
             (2, 1, (5, 4), (2, 3), (2, 2), (1, 1), (1, 1)),
             (1, 1, (3, 3), (3, 3), (1, 1), (1, 1), (1, 1)),
             (2, 3, (3, 3), (3, 3), (1, 1), (0, 0), (1, 1)),
+            // 288 · 1,024 column values per image: 7 images per chunk, so the 9 images of a
+            // `conv2d_matches_direct_loops` batch span two chunks, the second short.
+            (32, 2, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)),
         ];
         cases
             .into_iter()
@@ -251,7 +288,7 @@ mod tests {
     fn conv2d_matches_direct_loops() {
         for (k, g) in geometries().iter().enumerate() {
             for with_bias in [true, false] {
-                let batch = 3;
+                let batch = if images_per_chunk(g, 9) < 9 { 9 } else { 3 };
                 let x = values(batch * g.in_width(), k as u64);
                 let wv = values(g.weight_len(), 10 + k as u64);
                 let bv = values(g.out_channels(), 20 + k as u64);

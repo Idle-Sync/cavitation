@@ -18,7 +18,7 @@ use cavitation_core::kernels::activation::{
     celu_f32_with, elu_f32_with, gelu_tanh_f32_with, log_sigmoid_f32_with, mish_f32_with,
     selu_f32_with, sigmoid_f32_with, silu_f32_with, softplus_beta_f32_with, tanh_f32_with,
 };
-use cavitation_core::kernels::conv::im2col;
+use cavitation_core::kernels::conv::{conv2d_forward, conv2d_scratch};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
@@ -131,8 +131,6 @@ struct Compiled {
     output_width: usize,
     /// The widest row any step reads or writes.
     max_width: usize,
-    /// The largest column matrix of one image any convolution step builds (0 without one).
-    max_cols: usize,
     /// For each mask slot, the [`Sequential`] layer whose output the mask applies to, in
     /// increasing order.
     mask_layers: Vec<usize>,
@@ -183,7 +181,8 @@ pub struct InferenceModel {
     /// Two buffers the steps write to in turn, each at least `max_width` values per row of
     /// the largest batch seen so far.
     bufs: [Vec<f32>; 2],
-    /// One image's column matrix for the convolution steps: `max_cols` values.
+    /// The convolution steps' scratch: a column matrix and a product, as long as the
+    /// largest batch seen so far needs ([`conv_scratch_len`]).
     cols: Vec<f32>,
 }
 
@@ -295,12 +294,13 @@ impl InferenceModel {
             )));
         }
         let (compiled, masks) = Compiled::build(model, params, layers)?;
-        let (max_width, max_cols) = (compiled.max_width, compiled.max_cols);
+        let max_width = compiled.max_width;
+        let cols = vec![0.0; conv_scratch_len(&compiled.steps, 1)];
         Ok(InferenceModel {
             shared: Arc::new(compiled),
             masks,
             bufs: [vec![0.0; max_width], vec![0.0; max_width]],
-            cols: vec![0.0; max_cols],
+            cols,
         })
     }
 
@@ -415,9 +415,6 @@ impl InferenceModel {
             if buf.len() < fresh.max_width {
                 buf.resize(fresh.max_width, 0.0);
             }
-        }
-        if self.cols.len() < fresh.max_cols {
-            self.cols.resize(fresh.max_cols, 0.0);
         }
         self.shared = Arc::new(fresh);
         Ok(false)
@@ -662,6 +659,10 @@ impl InferenceModel {
             shared.input_width,
             input.len()
         );
+        let scratch = conv_scratch_len(&shared.steps, 1);
+        if self.cols.len() < scratch {
+            self.cols.resize(scratch, 0.0);
+        }
         let run = Run {
             level: kernels::level(),
             threads: 1,
@@ -834,6 +835,10 @@ impl InferenceModel {
                 buf.resize(need, 0.0);
             }
         }
+        let scratch = conv_scratch_len(&shared.steps[steps.clone()], rows);
+        if self.cols.len() < scratch {
+            self.cols.resize(scratch, 0.0);
+        }
         let one = rows == 1;
         let run = Run {
             level: kernels::level(),
@@ -941,7 +946,6 @@ impl Compiled {
         let mut steps: Vec<Step> = Vec::with_capacity(2 * forms.len());
         let (mut masks, mut mask_layers) = (Vec::new(), Vec::new());
         let (mut width, mut max_width) = (input_width, input_width);
-        let mut max_cols = 0;
         for (i, form) in forms.into_iter().enumerate() {
             let layer = model.layer(i);
             let name = layer.name();
@@ -985,10 +989,6 @@ impl Compiled {
                          {biases} biases for {geom:?}",
                         weight.len(),
                     );
-                    if !geom.is_pointwise() {
-                        let (oh, ow) = geom.out_size();
-                        max_cols = max_cols.max(geom.kernel_len() * oh * ow);
-                    }
                     geom.out_width()
                 }
                 InferenceLayer::Glu(_) => {
@@ -1067,7 +1067,6 @@ impl Compiled {
             input_width,
             output_width: width,
             max_width,
-            max_cols,
             mask_layers,
             extra: extra.to_vec(),
             neurons,
@@ -1177,7 +1176,6 @@ impl Compiled {
         self.input_width == other.input_width
             && self.output_width == other.output_width
             && self.max_width == other.max_width
-            && self.max_cols == other.max_cols
             && self.mask_layers == other.mask_layers
             && self.neurons == other.neurons
             && self.steps.len() == other.steps.len()
@@ -1191,6 +1189,31 @@ impl Compiled {
                     && params(&a.op) == params(&b.op)
             })
     }
+}
+
+/// The scratch one `Conv2d` step takes for `rows` images: the column matrix's length and
+/// the product's, none for a 1 × 1 kernel with stride 1 and no padding.
+fn conv_scratch(geom: &Conv2dGeom, rows: usize) -> (usize, usize) {
+    if geom.is_pointwise() {
+        (0, 0)
+    } else {
+        conv2d_scratch(geom, rows)
+    }
+}
+
+/// The scratch every `Conv2d` step of `steps` fits in for `rows` images.
+fn conv_scratch_len(steps: &[Step], rows: usize) -> usize {
+    steps
+        .iter()
+        .filter_map(|s| match &s.op {
+            Op::Layer(InferenceLayer::Conv2d { geom, .. }) => {
+                let (c, p) = conv_scratch(geom, rows);
+                Some(c + p)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 /// The width a layer's form itself requires of its input: a `Linear`'s inputs, the slopes
@@ -1375,10 +1398,10 @@ impl Run {
         cur.expect("the range holds at least one step")
     }
 
-    /// One `Conv2d` step from `src` (`rows` input images) into `dst` (`rows` output images):
-    /// for each image, its column matrix in `cols` (or the image itself for a 1 × 1 kernel
-    /// with stride 1 and no padding) times the weight with the GEMM, then the bias, as the
-    /// tape computes it, for one input as for a batch.
+    /// One `Conv2d` step from `src` (`rows` input images) into `dst` (`rows` output images),
+    /// by [`conv2d_forward`] with the GEMM of this call's level and threads, as the tape
+    /// computes it (so with the tape's bits), for one input as for a batch; `scratch` holds
+    /// the column matrix and the product ([`conv_scratch`]).
     fn conv2d(
         &self,
         geom: &Conv2dGeom,
@@ -1386,33 +1409,22 @@ impl Run {
         bias: Option<&[f32]>,
         src: &[f32],
         dst: &mut [f32],
-        cols: &mut [f32],
+        scratch: &mut [f32],
     ) {
-        let (oh, ow) = geom.out_size();
-        let (windows, kl, cout) = (oh * ow, geom.kernel_len(), geom.out_channels());
-        let w = MatRef::new(weight, cout, kl, kl, 1).expect("compile checked the weight's length");
-        let cols = &mut cols[..if geom.is_pointwise() { 0 } else { kl * windows }];
-        for (image, out) in src
-            .chunks_exact(geom.in_width())
-            .zip(dst.chunks_exact_mut(geom.out_width()))
-        {
-            let rhs = if geom.is_pointwise() {
-                MatRef::new(image, kl, windows, windows, 1)
-            } else {
-                im2col(geom, 1, image, cols);
-                MatRef::new(&*cols, kl, windows, windows, 1)
-            }
-            .expect("kernel_len × windows values");
-            let y = MatMut::new(out, cout, windows, windows, 1).expect("out × windows values");
-            gemm_f32_with(self.level, self.threads, 1.0, w, rhs, 0.0, y);
-            if let Some(bias) = bias {
-                for (plane, &b) in out.chunks_exact_mut(windows).zip(bias) {
-                    for v in plane {
-                        *v += b;
-                    }
-                }
-            }
-        }
+        let (cols_len, prod_len) = conv_scratch(geom, self.rows);
+        let (cols, rest) = scratch.split_at_mut(cols_len);
+        let (level, threads) = (self.level, self.threads);
+        conv2d_forward(
+            geom,
+            self.rows,
+            src,
+            weight,
+            bias,
+            dst,
+            cols,
+            &mut rest[..prod_len],
+            |a, b, c| gemm_f32_with(level, threads, 1.0, a, b, 0.0, c),
+        );
     }
 
     /// One `Linear` step, `(w_t, bias, inputs, outputs, relu)`, from `src` (`rows` rows of
