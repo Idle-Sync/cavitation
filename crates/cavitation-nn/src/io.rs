@@ -102,16 +102,20 @@ pub fn save(
 }
 
 /// Reads a safetensors file into the parameters of `model`, strictly: every parameter's key
-/// must be present with exactly its shape and the `F32` element type, and the file must hold
-/// no other key. Nothing is written into `params` unless every check passes, so a failed
-/// load leaves the parameters as they were.
+/// must be present with exactly its shape, and the file must hold no other key. A tensor may
+/// be `F32`, or `F16` or `BF16`, which widen to `F32` exactly, or `F64`, which rounds to the
+/// nearest `F32` (ties to even, as PyTorch's `.float()` does); a finite `F64` value beyond
+/// the `F32` range is refused, since it would become infinite. Nothing is written into
+/// `params` unless every check passes, so a failed load leaves the parameters as they were.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Io`] if the file cannot be read, [`Error::Format`] if it is not a valid
-/// safetensors file (for example truncated, or a `torch.save` file, which the message says),
+/// safetensors file (for example truncated, or a `torch.save` file, which the message says)
+/// or holds an `F64` value beyond the `F32` range (the message names the key),
 /// [`Error::Keys`] for keys that do not fit: the missing, the unexpected, the wrong-shape and
-/// the wrong-type keys are all found in one pass and listed in one error (see
+/// the wrong-type keys are all found in one pass and listed in one error (an `F64` value
+/// out of range is reported on its own, as soon as it is found; see
 /// [`KeyErrors`]), with the file's own first keys when none of the model's keys is there
 /// and a hint when a weight looks transposed.
 ///
@@ -167,8 +171,8 @@ pub fn load(
 /// Like [`load`], but keys in the file that the model does not have are ignored, and
 /// returned: the result is those keys, sorted, so the caller can print or check what was
 /// dropped (for example the slopes of a `Prelu` loaded into a network that uses `Relu`).
-/// Every key the model needs must still be present with its exact shape and the `F32` type,
-/// and nothing is written unless all of them check out.
+/// Every key the model needs must still be present with its exact shape and an element type
+/// [`load`] reads, and nothing is written unless all of them check out.
 ///
 /// # Errors
 ///
@@ -408,7 +412,11 @@ pub fn load_with(
             problems.missing.push(name.clone());
             continue;
         };
-        if tensor.dtype() != Dtype::F32 {
+        let readable = matches!(
+            tensor.dtype(),
+            Dtype::F32 | Dtype::F16 | Dtype::BF16 | Dtype::F64
+        );
+        if !readable {
             problems
                 .wrong_dtype
                 .push((name.clone(), format!("{:?}", tensor.dtype())));
@@ -421,14 +429,23 @@ pub fn load_with(
                 .push((name.clone(), expected.to_vec(), tensor.shape().to_vec()));
             continue;
         }
-        let values = tensor
-            .data()
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect();
-        staged.push((*id, values));
+        if tensor.dtype() == Dtype::F64 {
+            // A finite F64 too large for F32 would become infinite, so it is refused; an
+            // infinity in the file stays one.
+            let mut too_large = tensor
+                .data()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c));
+            if let Some(v) = too_large.find(|v| v.is_finite() && (*v as f32).is_infinite()) {
+                return Err(Error::Format(format!(
+                    "{}: key `{name}` holds the F64 value {v:e}, beyond the F32 range",
+                    path.display()
+                )));
+            }
+        }
+        staged.push((*id, read_f32(tensor.dtype(), tensor.data())));
     }
     let mut extra: Vec<String> = by_name
         .keys()
@@ -457,6 +474,58 @@ pub fn load_with(
         params.value_mut(id).data_mut().copy_from_slice(&values);
     }
     Ok(if options.strict { Vec::new() } else { extra })
+}
+
+/// The little-endian values in `bytes`, of element type `dtype` (F32, F16, BF16 or F64), as
+/// F32: F16 and BF16 widen exactly, F64 rounds to the nearest F32 (ties to even).
+fn read_f32(dtype: Dtype, bytes: &[u8]) -> Vec<f32> {
+    match dtype {
+        Dtype::F16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16_to_f32(u16::from_le_bytes(*c)))
+            .collect(),
+        Dtype::BF16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f32::from_bits(u32::from(u16::from_le_bytes(*c)) << 16))
+            .collect(),
+        Dtype::F64 => bytes
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| f64::from_le_bytes(*c) as f32)
+            .collect(),
+        _ => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect(),
+    }
+}
+
+/// The IEEE half-precision value with bits `h`, exactly, as an `f32`: subnormals become
+/// normal `f32` values, infinities stay infinite, and a NaN keeps its sign and payload (the
+/// payload's bits moved to the top of the `f32` mantissa, the quiet bit included).
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h >> 15) << 31;
+    let exp = u32::from((h >> 10) & 0x1f);
+    let man = u32::from(h & 0x3ff);
+    let bits = match (exp, man) {
+        (0, 0) => sign,
+        (0, _) => {
+            // man · 2^-24: shift the leading 1 up to the implicit bit's place.
+            let shift = man.leading_zeros() - 21;
+            let normal = (man << shift) & 0x3ff;
+            sign | ((127 - 15 + 1 - shift) << 23) | (normal << 13)
+        }
+        (0x1f, _) => sign | (0xff << 23) | (man << 13),
+        _ => sign | ((exp + 127 - 15) << 23) | (man << 13),
+    };
+    f32::from_bits(bits)
 }
 
 #[cfg(test)]
@@ -769,25 +838,121 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
     }
 
-    /// An f16 tensor is a dtype error naming the key.
+    /// An integer tensor is a dtype error naming the key and the types a load reads.
     #[test]
-    fn f16_tensor_is_dtype_error() {
-        let path = temp_path("f16");
+    fn integer_tensor_is_dtype_error() {
+        let path = temp_path("i32");
         let mut entries = good_entries();
         entries[1] = Entry {
             name: "0.bias",
-            dtype: Dtype::F16,
+            dtype: Dtype::I32,
             shape: vec![8],
-            bytes: vec![0; 16],
+            bytes: vec![0; 32],
         };
         write_entries(&path, &entries);
         let (net, mut params) = mlp(1);
         let err = load(&path, &net, &mut params).unwrap_err();
         assert_eq!(
             keys_of(&err).wrong_dtype,
-            [("0.bias".to_string(), "F16".to_string())]
+            [("0.bias".to_string(), "I32".to_string())]
         );
-        assert!(err.to_string().contains("F32"), "{err}");
+        assert!(err.to_string().contains("F32, F16, BF16 or F64"), "{err}");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// Every F16 bit pattern widens to the `f32` of the same value: normal and subnormal
+    /// values against `±(1024 + m) · 2^(e − 25)` and `±m · 2^-24` computed in f64, the
+    /// infinities, and every NaN with its sign and payload in the top of the mantissa.
+    #[test]
+    fn every_f16_widens_exactly() {
+        for h in 0..=u16::MAX {
+            let (sign, exp, man) = (h >> 15, (h >> 10) & 0x1f, u32::from(h & 0x3ff));
+            let got = super::f16_to_f32(h);
+            let s: f64 = if sign == 1 { -1.0 } else { 1.0 };
+            match exp {
+                0x1f if man == 0 => assert_eq!(f64::from(got), s * f64::INFINITY, "{h:#06x}"),
+                0x1f => {
+                    assert!(got.is_nan(), "{h:#06x}");
+                    assert_eq!(got.to_bits() >> 31, u32::from(sign), "{h:#06x} sign");
+                    assert_eq!(got.to_bits() & 0x7f_ffff, man << 13, "{h:#06x} payload");
+                }
+                _ => {
+                    let value = if exp == 0 {
+                        f64::from(man) * 2f64.powi(-24)
+                    } else {
+                        f64::from(1024 + man) * 2f64.powi(i32::from(exp) - 25)
+                    };
+                    let want = (s * value) as f32;
+                    assert_eq!(f64::from(want), s * value, "{h:#06x} is exact in f32");
+                    assert_eq!(got.to_bits(), want.to_bits(), "{h:#06x}");
+                }
+            }
+        }
+    }
+
+    /// F16, BF16 and F64 state dicts written by PyTorch load into F32 parameters with the
+    /// values PyTorch's `.float()` gives, bit for bit: exact for F16 and BF16, the nearest
+    /// F32 for F64 (whose network was made in float64, so the values round).
+    #[test]
+    fn pytorch_f16_bf16_and_f64_files_load() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+        let text = std::fs::read_to_string(dir.join("mlp-dtypes.json")).unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        for name in ["f16", "bf16", "f64"] {
+            let (net, mut params) = mlp(7);
+            load(
+                dir.join(format!("mlp-{name}.safetensors")),
+                &net,
+                &mut params,
+            )
+            .expect(name);
+            for (key, id) in net.parameter_names() {
+                let want: Vec<u32> = v["files"][name][&key]["data"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| (x.as_f64().unwrap() as f32).to_bits())
+                    .collect();
+                let got: Vec<u32> = params
+                    .value(id)
+                    .data()
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect();
+                assert_eq!(got, want, "{name} {key}");
+            }
+        }
+    }
+
+    /// A finite F64 value beyond the F32 range is refused, naming the key and the value, and
+    /// nothing is loaded; an F64 infinity loads as one.
+    #[test]
+    fn f64_beyond_the_f32_range_is_refused() {
+        let f64_entry = |name: &'static str, values: &[f64]| Entry {
+            name,
+            dtype: Dtype::F64,
+            shape: vec![values.len()],
+            bytes: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        };
+        let path = temp_path("f64-range");
+        let mut entries = good_entries();
+        entries[3] = f64_entry("2.bias", &[0.5, 1e300, -1.0]);
+        write_entries(&path, &entries);
+        let (net, mut params) = mlp(1);
+        let before = bits(&net, &params);
+        let err = load(&path, &net, &mut params).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, Error::Format(_)), "{text}");
+        assert!(
+            text.contains("`2.bias`") && text.contains("1e300"),
+            "{text}"
+        );
+        assert_eq!(bits(&net, &params), before);
+        entries[3] = f64_entry("2.bias", &[0.5, f64::INFINITY, -1.0]);
+        write_entries(&path, &entries);
+        load(&path, &net, &mut params).unwrap();
+        let bias = params.value(net.parameter_names()[3].1).data();
+        assert_eq!(bias, &[0.5, f32::INFINITY, -1.0]);
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -883,9 +1048,9 @@ mod tests {
         let mut entries = good_entries();
         entries[1] = Entry {
             name: "0.bias",
-            dtype: Dtype::F16,
+            dtype: Dtype::I32,
             shape: vec![8],
-            bytes: vec![0; 16],
+            bytes: vec![0; 32],
         };
         entries[2] = zeros("2.weight", &[3, 7]);
         write_entries(&path, &entries);
@@ -898,7 +1063,7 @@ mod tests {
         );
         assert_eq!(
             keys.wrong_dtype,
-            [("0.bias".to_string(), "F16".to_string())]
+            [("0.bias".to_string(), "I32".to_string())]
         );
         assert!(keys.missing.is_empty() && keys.unexpected.is_empty());
         let text = err.to_string();
@@ -906,7 +1071,7 @@ mod tests {
             text.contains("2.weight") && text.contains("[3, 7]"),
             "{text}"
         );
-        assert!(text.contains("0.bias") && text.contains("F16"), "{text}");
+        assert!(text.contains("0.bias") && text.contains("I32"), "{text}");
         assert!(!text.contains("transposed"), "{text}");
         std::fs::remove_file(&path).unwrap();
     }
