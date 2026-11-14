@@ -3,6 +3,8 @@
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, TensorView};
 use std::path::Path;
 
+use cavitation_datasets::digits;
+
 use cavitation_nn::shrink::{Ranking, ShrinkConfig, Validation, shrink};
 use cavitation_nn::{
     Dataset, EpochReport, FitConfig, Health, Init, Linear, Loss, LrSchedule, OptimizerConfig, Relu,
@@ -15,35 +17,10 @@ use cavitation_nn::{
 /// them gives that accuracy and the loss a loop over the batches on the tape gives.
 #[test]
 fn digits_known_result() {
-    let (train, test) = cavitation_datasets::digits::load().unwrap();
+    let (train, test) = digits::load().unwrap();
     let mut params = ParamStore::new();
-    let mut rng = Rng::seed(1);
-    let mut he = |inputs, outputs| {
-        Linear::with_init(
-            &mut params,
-            inputs,
-            outputs,
-            Init::HeUniform,
-            Init::Zeros,
-            &mut rng,
-        )
-    };
-    let net = Sequential::new()
-        .push(he(64, 256))
-        .push(Relu)
-        .push(he(256, 128))
-        .push(Relu)
-        .push(he(128, 10));
+    let net = digits::network(&mut params, [256, 128], 1);
     let config = FitConfig {
-        epochs: 20,
-        batch: 32,
-        optimizer: OptimizerConfig::Adam {
-            lr: 0.002,
-            weight_decay: 0.0,
-        },
-        loss: Loss::CrossEntropy,
-        shuffle_seed: Some(7),
-        schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: Some(Box::new(
             |r: &EpochReport, _: &Sequential, _: &ParamStore| {
@@ -53,7 +30,7 @@ fn digits_known_result() {
                 );
             },
         )),
-        validation: None,
+        ..digits::recipe(20)
     };
     let history = fit(&net, &mut params, &train, config).unwrap();
     assert_eq!(history.epochs.len(), 20);
@@ -190,41 +167,11 @@ struct ShrinkStart {
 /// weights, zero biases, `Rng::seed(1)`) and trains it the same way (Adam lr 0.002, batch 32,
 /// 20 epochs, shuffle seed 7), on the first 1,149 training rows only.
 fn shrink_start() -> ShrinkStart {
-    let (train, test) = cavitation_datasets::digits::load().unwrap();
-    let (fit_rows, validation) = train.split_at(1149);
+    let (train, test) = digits::load().unwrap();
+    let (fit_rows, validation) = train.split_at(digits::FIT_ROWS);
     let mut params = ParamStore::new();
-    let mut rng = Rng::seed(1);
-    let mut he = |inputs, outputs| {
-        Linear::with_init(
-            &mut params,
-            inputs,
-            outputs,
-            Init::HeUniform,
-            Init::Zeros,
-            &mut rng,
-        )
-    };
-    let net = Sequential::new()
-        .push(he(64, 256))
-        .push(Relu)
-        .push(he(256, 128))
-        .push(Relu)
-        .push(he(128, 10));
-    let config = FitConfig {
-        epochs: 20,
-        batch: 32,
-        optimizer: OptimizerConfig::Adam {
-            lr: 0.002,
-            weight_decay: 0.0,
-        },
-        loss: Loss::CrossEntropy,
-        shuffle_seed: Some(7),
-        schedule: LrSchedule::Constant,
-        health: Health::quiet(),
-        on_epoch: None,
-        validation: None,
-    };
-    fit(&net, &mut params, &fit_rows, config).unwrap();
+    let net = digits::network(&mut params, [256, 128], 1);
+    fit(&net, &mut params, &fit_rows, digits::recipe(20)).unwrap();
     ShrinkStart {
         net,
         params,

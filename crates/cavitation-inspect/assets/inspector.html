@@ -828,7 +828,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       const shrunk = S.network && ok(S.network.parameters);
       // Without a probe set the evaluated rows are training rows, not held out.
       const kind = S.model && S.model.probe_is_training ? 'training' : 'held-out';
-      setText('tAccSub', int(ev.rows) + ' ' + kind + ' rows' + (S.explored ? ' · from training' + (shrunk ? ', before shrinking' : '') : ''));
+      setText('tAccSub', int(ev.rows) + ' ' + kind + ' rows' + (S.explored ? ' · last evaluation of the run' + (shrunk ? ', before shrinking' : '') : ''));
       setText('tLossSub', 'last batch · ' + kind + ' ' + fmt(ev.loss, 4));
     }
     // The run's own validation set, beside the probe evaluation, when it has one.

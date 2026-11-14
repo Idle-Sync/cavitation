@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
+use cavitation_core::kernels::activation::{
+    gelu_tanh_f32_with, sigmoid_f32_with, silu_f32_with, tanh_f32_with,
+};
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
 use cavitation_core::{ParamStore, Rng, Tensor};
@@ -908,7 +910,7 @@ pub fn small_once() -> Result<SmallRun, String> {
 
 /// The training rows the `shrink` run trains on: the first 1,149 of the 1,437 training
 /// digits. The other 288 are its validation set.
-pub const SHRINK_FIT_ROWS: usize = 1149;
+pub const SHRINK_FIT_ROWS: usize = digits::FIT_ROWS;
 
 /// Timed rounds of the `shrink` run's latency comparison.
 pub const SHRINK_ROUNDS: usize = 301;
@@ -933,9 +935,10 @@ pub struct ShrinkStart {
     pub test: Dataset,
 }
 
-/// Trains the 64 → 256 → 128 → 10 ReLU network as the digits known result does (He uniform
-/// weights, zero biases, `Rng::seed(1)`, Adam lr 0.002, batch 32, 20 epochs, shuffle seed
-/// 7), on the first [`SHRINK_FIT_ROWS`] training rows, with quiet health checks.
+/// Trains the 64 → 256 → 128 → 10 ReLU network as the digits known result does
+/// ([`digits::network`] with seed 1, [`digits::recipe`] for 20 epochs: He uniform weights,
+/// zero biases, Adam lr 0.002, batch 32, shuffle seed 7, quiet health checks), on the first
+/// [`SHRINK_FIT_ROWS`] training rows.
 ///
 /// # Errors
 ///
@@ -944,36 +947,8 @@ pub fn shrink_start() -> Result<ShrinkStart, String> {
     let (train, test) = digits::load().map_err(|e| e.to_string())?;
     let (fit_rows, validation) = train.split_at(SHRINK_FIT_ROWS);
     let mut params = ParamStore::new();
-    let mut rng = Rng::seed(1);
-    let mut net = Sequential::new();
-    for (i, pair) in DIGITS_NET.windows(2).enumerate() {
-        net = net.push(Linear::with_init(
-            &mut params,
-            pair[0],
-            pair[1],
-            Init::HeUniform,
-            Init::Zeros,
-            &mut rng,
-        ));
-        if i + 2 < DIGITS_NET.len() {
-            net = net.push(Relu);
-        }
-    }
-    let config = FitConfig {
-        epochs: 20,
-        batch: 32,
-        optimizer: OptimizerConfig::Adam {
-            lr: 0.002,
-            weight_decay: 0.0,
-        },
-        loss: Loss::CrossEntropy,
-        shuffle_seed: Some(7),
-        schedule: LrSchedule::Constant,
-        health: Health::quiet(),
-        on_epoch: None,
-        validation: None,
-    };
-    fit(&net, &mut params, &fit_rows, config).map_err(|e| e.to_string())?;
+    let net = digits::network(&mut params, [DIGITS_NET[1], DIGITS_NET[2]], 1);
+    fit(&net, &mut params, &fit_rows, digits::recipe(20)).map_err(|e| e.to_string())?;
     Ok(ShrinkStart {
         net,
         params,
@@ -1367,10 +1342,11 @@ pub struct ActivationCase {
     pub run: SliceFn,
 }
 
-/// The `activation` run's cases: `tanh` and the sigmoid, each as the plain scalar loop the
-/// library ran before the SIMD kernels (std's `f32::tanh`; the overflow-free
-/// `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`), then through the kernels at
-/// every level in `levels`.
+/// The `activation` run's cases: `tanh`, the sigmoid, SiLU and the tanh form of GELU, each
+/// as the plain scalar loop the library ran before the SIMD kernels (std's `f32::tanh`; the
+/// overflow-free `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`; `x` times
+/// that sigmoid; GELU's formula with std's `f32::tanh`), then through the kernels at every
+/// level in `levels`.
 pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
     let mut cases = vec![ActivationCase {
         name: "tanh scalar std".to_string(),
@@ -1403,6 +1379,41 @@ pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
         cases.push(ActivationCase {
             name: format!("sigmoid {level}"),
             run: Box::new(move |v: &mut [f32]| sigmoid_f32_with(level, v)),
+        });
+    }
+    cases.push(ActivationCase {
+        name: "silu scalar std".to_string(),
+        run: Box::new(|v: &mut [f32]| {
+            for x in v {
+                let s = if *x >= 0.0 {
+                    1.0 / (1.0 + (-*x).exp())
+                } else {
+                    let e = x.exp();
+                    e / (1.0 + e)
+                };
+                *x *= s;
+            }
+        }),
+    });
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("silu {level}"),
+            run: Box::new(move |v: &mut [f32]| silu_f32_with(level, v)),
+        });
+    }
+    cases.push(ActivationCase {
+        name: "gelu-tanh scalar std".to_string(),
+        run: Box::new(|v: &mut [f32]| {
+            for x in v {
+                let u = 0.797_884_6f32 * (*x + 0.044715 * *x * *x * *x);
+                *x = 0.5 * *x * (1.0 + u.tanh());
+            }
+        }),
+    });
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("gelu-tanh {level}"),
+            run: Box::new(move |v: &mut [f32]| gelu_tanh_f32_with(level, v)),
         });
     }
     cases

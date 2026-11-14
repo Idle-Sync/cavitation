@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::Real;
 use crate::graph::{BackwardCtx, ParamId, Var};
 pub use activation::GeluApprox;
-pub(crate) use activation::sigmoid_value;
+pub(crate) use activation::{GELU_CUBIC, SQRT_2_OVER_PI, gelu_value, sigmoid_value, silu_value};
 pub use custom::CustomOp;
 use elementwise::Kind;
 pub(crate) use erf::{erf_f32, erf_f64};
