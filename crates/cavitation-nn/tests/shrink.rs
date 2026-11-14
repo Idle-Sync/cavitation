@@ -2909,3 +2909,79 @@ fn train_found_size_keeps_layers_without_a_bias() {
         assert_bits(got.data(), want.data(), name);
     }
 }
+
+/// Every shrink tool refuses a model with an image layer, before doing anything, with
+/// `Error::Unsupported` naming the layer: each of the five built-in image layers, at layer
+/// 1 behind a `Linear`, in a small network on 1 × 4 × 4 images.
+#[test]
+fn image_layers_are_refused() {
+    use cavitation_core::{Conv2dGeom, Pool2dGeom};
+    use cavitation_nn::{AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv2d, MaxPool2d};
+    type Make = fn(&mut ParamStore, Sequential) -> (Sequential, usize, &'static str);
+    let makes: [Make; 5] = [
+        |p, n| {
+            let g = Conv2dGeom::new(1, 1, (4, 4), (3, 3)).unwrap();
+            (n.push(Conv2d::new(p, g, &mut Rng::seed(1))), 4, "conv2d")
+        },
+        |p, n| (n.push(BatchNorm2d::new(p, 1, (4, 4))), 16, "batch_norm2d"),
+        |_, n| {
+            let g = Pool2dGeom::new(1, (4, 4), (2, 2)).unwrap();
+            (n.push(MaxPool2d::new(g)), 4, "max_pool2d")
+        },
+        |_, n| {
+            let g = Pool2dGeom::new(1, (4, 4), (2, 2)).unwrap();
+            (n.push(AvgPool2d::new(g)), 4, "avg_pool2d")
+        },
+        |_, n| {
+            let l = AdaptiveAvgPool2d::new(1, (4, 4), (2, 2)).unwrap();
+            (n.push(l), 4, "adaptive_avg_pool2d")
+        },
+    ];
+    let mut rng = Rng::seed(0);
+    let x: Vec<f32> = (0..8 * 16).map(|_| rng.range(-1.0, 1.0) as f32).collect();
+    let data = Dataset {
+        x: Tensor::from_vec(x, &[8, 16]).unwrap(),
+        targets: Targets::Classes(vec![0, 1, 0, 1, 0, 1, 0, 1]),
+    };
+    for make in makes {
+        let mut params = ParamStore::new();
+        let first = Sequential::new().push(Linear::new(&mut params, 16, 16, &mut rng));
+        let (net, out, name) = make(&mut params, first);
+        let mut net = net
+            .push(Linear::new(&mut params, out, 6, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 6, 2, &mut rng));
+        let refused = |tool: &str, r: Result<(), Error>| match r {
+            Err(Error::Unsupported(m)) => {
+                assert!(m.starts_with(&format!("{tool}: layer 1 ")), "{m}");
+                assert!(m.contains(name), "{m}");
+            }
+            other => panic!("{tool} on {name}: {other:?}"),
+        };
+        refused(
+            "activity",
+            activity(&net, &params, &data, &[2], 4).map(drop),
+        );
+        refused(
+            "ablate",
+            ablate(&net, &params, &data, &[2], Loss::CrossEntropy, 4).map(drop),
+        );
+        refused("compact", compact(&net, &params).map(drop));
+        refused(
+            "train_found_size",
+            train_found_size(&net, &params, &data, &data, FromScratch::default()).map(drop),
+        );
+        let config = ShrinkConfig {
+            validation: Some(Validation::Given(data.clone())),
+            ..ShrinkConfig::default()
+        };
+        let before = params.clone();
+        refused(
+            "shrink",
+            shrink(&mut net, &mut params, &data, config).map(drop),
+        );
+        for (_, id) in net.state_names() {
+            assert_eq!(params.value(id).data(), before.value(id).data());
+        }
+    }
+}

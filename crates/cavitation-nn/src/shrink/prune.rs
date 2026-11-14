@@ -566,6 +566,10 @@ pub struct ShrinkReport {
 ///
 /// # Errors
 ///
+/// Returns [`Error::Unsupported`], naming the layer, if the model has an image layer
+/// (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or `AdaptiveAvgPool2d`): the shrink
+/// tools work on the neurons of dense networks.
+///
 /// Returns [`Error::InvalidData`], before changing anything, if
 /// [`ShrinkConfig::validation`] is `None`; if the training data or a given validation set
 /// is not a matrix of inputs with at least one row and one target per row (the message
@@ -653,6 +657,7 @@ pub(crate) fn run(
     mut config: ShrinkConfig<'_>,
     measure: &mut Measure<'_>,
 ) -> Result<ShrinkReport, Error> {
+    super::refuse_image_layers(model, "shrink")?;
     let (train, validation) = split(train, config.validation.take())?;
     let linears = hidden_linears(model, &config.linears)?;
     check_masks(model, &linears)?;
