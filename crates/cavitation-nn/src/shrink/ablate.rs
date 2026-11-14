@@ -94,8 +94,12 @@ pub fn ablate(
 /// One [`Evaluator`] runs the whole sweep: it is made once with masks on the listed
 /// `Linear`s, and each neuron is switched off with
 /// [`Evaluator::set_neuron_mask`], measured and switched back on, so nothing is compiled
-/// or allocated per neuron. A model with a layer that has no inference form (an activation
-/// of your own, say) is swept on the tape, as an [`Evaluator`] runs it. `model` is not
+/// or allocated per neuron. The layers before a swept `Linear` give the same outputs for
+/// each of its neurons, so they run once per `Linear`: its input is kept for every row of
+/// `data` (`rows × width` values), and each neuron's measurement runs only the layers from
+/// the `Linear` on, with the same results bit for bit. A model with a layer that has no
+/// inference form (an activation of your own, say) is swept on the tape, as an
+/// [`Evaluator`] runs it, without the kept input. `model` is not
 /// changed. A neuron that is off in any mask of its `Linear`'s run (the `Linear` itself and
 /// the element-wise layers after it, up to [`Sequential::neuron_layer`]) is already off: it
 /// has no entry and stays off in every measurement, so each entry is the model's own masked
@@ -210,10 +214,13 @@ pub fn ablate_controlled(
             .cloned()
             .unwrap_or_else(|| NeuronMask::all_on(width));
         let mut work = start.clone();
+        // The layers before this `Linear` give the same outputs for every neuron of it, so
+        // they run once and each neuron runs only the layers from the `Linear` on.
+        let prefix = evaluator.prefix(data, linear);
         for neuron in (0..width).filter(|&n| on[n]) {
             work.set(neuron, false);
             evaluator.set_neuron_mask(linear, &work)?;
-            let evaluation = evaluator.evaluate(data)?;
+            let evaluation = evaluator.evaluate_from(data, prefix.as_ref())?;
             work.set(neuron, true);
             let ablation = Ablation {
                 linear,
