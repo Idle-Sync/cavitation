@@ -57,6 +57,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- PyTorch fixtures for whole CNNs: `scripts/fixtures/make_fixtures.py --only cnn` writes the v0.3 MNIST network (LeNet-5's layout) and CIFAR network (batch norm after each convolution) as PyTorch state dicts, with float64 outputs layer by layer and end to end. The fixture tests load both with `load` and check them through the tape and `InferenceModel` at every kernel level the CPU supports.
 - `cavitation-bench conv [--batch N]` times the four convolutions of the CIFAR-10 CNN benchmark network, forward and forward with backward, at the current kernel level and thread count; `scripts/bench/torch_conv.py` times the same in PyTorch.
 - The inspector's `epoch` event carries the run's validation (`EpochReport::validation`: loss, and accuracy or R²) as `validation`, `null` without a validation set, and the page shows it under the accuracy and loss beside the probe evaluation.
 - The digits known result's network, training recipe and training-row count live in `cavitation_datasets::digits` (`network`, `recipe`, `FIT_ROWS`), which the known-result tests, the `shrink_digits` example and `cavitation-bench shrink` all use, instead of three copies that nothing checked against each other. The trained network and every figure are unchanged.
