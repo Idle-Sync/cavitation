@@ -11,12 +11,29 @@ use crate::{Error, Real, Shape};
 /// let t = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
 /// assert_eq!(t.get(&[1, 0]), 3.0);
 /// ```
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Tensor<T: Real = f32> {
     /// The elements in row-major order.
     data: Vec<T>,
     /// The dimensions; `shape.len() == data.len()`.
     shape: Shape,
+}
+
+impl<T: Real> Clone for Tensor<T> {
+    /// A tensor with the same shape and a copy of the elements.
+    fn clone(&self) -> Self {
+        Tensor {
+            data: self.data.clone(),
+            shape: self.shape,
+        }
+    }
+
+    /// Makes this tensor a copy of `source`, reusing this tensor's buffer when it is large
+    /// enough, so copying a tensor of the same size again allocates nothing.
+    fn clone_from(&mut self, source: &Self) {
+        self.data.clone_from(&source.data);
+        self.shape = source.shape;
+    }
 }
 
 impl Tensor<f32> {
@@ -478,5 +495,18 @@ mod tests {
     fn row_major_get() {
         let t = Tensor::from_vec((0..6).map(|v| v as f32).collect(), &[2, 3]).unwrap();
         assert_eq!(t.get(&[1, 2]), 5.0);
+    }
+
+    /// `clone_from` copies the shape and the elements into the buffer the tensor already
+    /// has when it is large enough, and `clone` copies everything.
+    #[test]
+    fn clone_from_reuses_the_buffer() {
+        let source = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+        let mut target = Tensor::zeros(&[4]);
+        let buffer = target.data().as_ptr();
+        target.clone_from(&source);
+        assert_eq!(target, source);
+        assert_eq!(target.data().as_ptr(), buffer);
+        assert_eq!(source.clone(), source);
     }
 }
