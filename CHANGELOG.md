@@ -57,6 +57,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- `cavitation-bench mnist-cnn` and `cifar-cnn` train the v0.3 benchmark CNNs (LeNet-5's layout on MNIST: Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR-10 network: batch 128, 10 epochs) here and with `scripts/bench/torch_cnn.py` at the same thread count, from the same initial weights and batch order, which the run writes as files the script reads. Each epoch's loss, test accuracy and training time are printed for both, with the median epoch time after the first and ours over PyTorch's; `--seed`, `--epochs`, `--rows` and `--ours-only` adjust the run.
 - `cavitation-bench conv [--batch N]` times the four convolutions of the CIFAR-10 CNN benchmark network, forward and forward with backward, at the current kernel level and thread count; `scripts/bench/torch_conv.py` times the same in PyTorch.
 - The inspector's `epoch` event carries the run's validation (`EpochReport::validation`: loss, and accuracy or R²) as `validation`, `null` without a validation set, and the page shows it under the accuracy and loss beside the probe evaluation.
 - The digits known result's network, training recipe and training-row count live in `cavitation_datasets::digits` (`network`, `recipe`, `FIT_ROWS`), which the known-result tests, the `shrink_digits` example and `cavitation-bench shrink` all use, instead of three copies that nothing checked against each other. The trained network and every figure are unchanged.
