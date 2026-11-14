@@ -63,6 +63,7 @@ fn train() -> Vec<u32> {
         schedule: LrSchedule::Constant,
         health: Health::default(),
         on_epoch: None,
+        validation: None,
     };
     fit(&net, &mut params, &data, config).unwrap();
     net.parameter_names()

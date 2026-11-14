@@ -605,6 +605,17 @@ impl<T: Real> Sequential<T> {
     /// does.
     pub(crate) fn copy_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> bool {
         let layer = self.neuron_layer(linear);
+        self.copy_mask(layer, mask)
+    }
+
+    /// Copies `mask` into the existing mask on the output of layer `layer`, without
+    /// allocating. Returns `false`, changing nothing, if there is no mask there or its width
+    /// differs from `mask`'s.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there is no layer `layer`.
+    pub(crate) fn copy_mask(&mut self, layer: usize, mask: &NeuronMask) -> bool {
         match &mut self.masks[layer] {
             Some(existing) if existing.mask.width() == mask.width() => {
                 for j in 0..mask.width() {
@@ -616,6 +627,15 @@ impl<T: Real> Sequential<T> {
             }
             _ => false,
         }
+    }
+
+    /// Whether `other` has the very same layers as this model, in the same order: the
+    /// layers a clone shares. Masks are not compared.
+    pub(crate) fn same_layers(&self, other: &Sequential<T>) -> bool {
+        self.layers.len() == other.layers.len()
+            && (self.layers.iter())
+                .zip(&other.layers)
+                .all(|(a, b)| std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b)))
     }
 
     /// Puts `mask` on the neurons of the `Linear` at layer `linear`, as

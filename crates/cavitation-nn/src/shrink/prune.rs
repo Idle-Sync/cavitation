@@ -992,6 +992,7 @@ impl Run<'_, '_> {
             schedule: LrSchedule::Constant,
             health: Health::quiet(),
             on_epoch: None,
+            validation: None,
         };
         fit(self.model, self.params, self.train, config).map(|_| ())
     }

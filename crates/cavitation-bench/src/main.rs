@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|inspect|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -41,6 +41,18 @@
 //!   on one test digit for the full network, the full network with the first run's masks,
 //!   and the first run's network compacted: 20,000 warm-up calls each, then 301 interleaved
 //!   rounds of 1,000 calls of each, and prints the medians and the speed-ups.
+//! - `inspect [--rounds N]` (default 8, a multiple of 4) measures what the inspector costs
+//!   on the `digits` training (the 50k network, SGD lr 0.01, batch 128, 100 epochs per run,
+//!   timed around the `fit` call) with the 360 test digits as the probe set and the default
+//!   `eval_rows` and `snapshot_hz`. It first trains, untimed, for at least 30 s in every mode
+//!   in turn, past the package power-limit window, so every round runs at the same power
+//!   limit. Each round runs four modes, starting one mode later every round: off
+//!   (`cavitation_nn::fit`), off again (the A/A pair), on with one client reading `/events`
+//!   on its own thread, and on with one client connected and not reading (both
+//!   `cavitation_inspect::fit`). It prints every round's times and ratios (off's time over
+//!   the mode's: 1 is no cost, 0.98 is 2% slower), the median ratios, the off/off spread (the
+//!   median over rounds of `|1 − off / off again|`: how far a typical round strays from 1,
+//!   the machine's noise) and whether each passes.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
 //! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy). Both sides
@@ -67,7 +79,7 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|inspect|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
     \x20 digits  [--python PATH] [--numpy-best]\n\
@@ -77,6 +89,7 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 shrink\n\
+    \x20 inspect [--rounds N]\n\
     \x20 info";
 
 /// Entry point of the benchmark runner.
@@ -95,6 +108,7 @@ fn main() -> ExitCode {
         "gemm" => gemm(rest),
         "subnormal" => subnormal(rest),
         "small" => small(rest),
+        "inspect" => inspect(rest),
         "shrink" => {
             if rest.is_empty() {
                 shrink()
@@ -632,6 +646,188 @@ fn parse_small_line(line: &str) -> Option<runs::SmallRun> {
         }),
         _ => None,
     }
+}
+
+/// Runs the `inspect` subcommand with its arguments (after `inspect`): the four modes in
+/// rotating order for the rounds asked, then the medians and the criteria.
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument, a `--rounds` that is not a positive multiple
+/// of 4, a run that fails, or runs that ended on different losses.
+fn inspect(args: &[String]) -> Result<(), String> {
+    use runs::InspectMode;
+    let mut rounds = runs::INSPECT_ROUNDS;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--rounds" => {
+                let v = rest.next().ok_or("--rounds needs a value")?;
+                rounds = v
+                    .parse()
+                    .ok()
+                    .filter(|&n: &usize| n > 0 && n % 4 == 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "--rounds must be a positive multiple of 4, so every mode runs in \
+                             every position equally often; got `{v}`"
+                        )
+                    })?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    let whole = std::time::Instant::now();
+    let cpu_start = machine::process_cpu_seconds();
+    let machine = machine::detect();
+    println!(
+        "inspect: {} ({} logical cores), kernel {}, {} threads, {}",
+        machine.cpu_model,
+        machine.logical_cores,
+        level(),
+        threads(),
+        machine::rustc_version()
+    );
+    println!("load average at the start {}", machine::load_average());
+    let data = runs::inspect_data()?;
+    println!(
+        "training: the digits benchmark, {} network (ReLU, He normal from seed 1), SGD lr 0.01, \
+         batch 128, {} rows in order, Health::quiet(), {} epochs per run, timed around fit",
+        runs::DIGITS_NET.map(|w| w.to_string()).join(","),
+        data.train.len(),
+        runs::INSPECT_EPOCHS
+    );
+    println!(
+        "inspector: probe set the {} test digits, eval_rows {} ({} used), snapshot_hz {}, \
+         a new inspector and client for each run, connected before the clock starts",
+        data.test.len(),
+        cavitation_inspect::InspectorConfig::default().eval_rows,
+        cavitation_inspect::InspectorConfig::default()
+            .eval_rows
+            .min(data.test.len()),
+        cavitation_inspect::InspectorConfig::default().snapshot_hz
+    );
+    let warm = std::time::Instant::now();
+    let mut warm_runs = 0;
+    while warm.elapsed() < runs::INSPECT_WARMUP || warm_runs < InspectMode::ALL.len() {
+        let mode = InspectMode::ALL[warm_runs % InspectMode::ALL.len()];
+        runs::inspect_once(mode, &data, runs::INSPECT_EPOCHS)?;
+        warm_runs += 1;
+    }
+    println!(
+        "warm-up: {warm_runs} untimed runs, the modes in turn, {:.1} s (at least {} s, past the \
+         power-limit window)",
+        warm.elapsed().as_secs_f64(),
+        runs::INSPECT_WARMUP.as_secs()
+    );
+    let samples = (data.train.len() * runs::INSPECT_EPOCHS) as f64;
+    let mut seconds = [const { Vec::new() }; 4];
+    let mut loss_bits = None;
+    let timed = std::time::Instant::now();
+    for round in 0..rounds {
+        let order: Vec<InspectMode> = (0..4).map(|k| InspectMode::ALL[(round + k) % 4]).collect();
+        let mut parts = Vec::new();
+        let mut notes = Vec::new();
+        for &mode in &order {
+            let run = runs::inspect_once(mode, &data, runs::INSPECT_EPOCHS)?;
+            if *loss_bits.get_or_insert(run.loss_bits) != run.loss_bits {
+                return Err(format!(
+                    "round {}: {} ended on another loss",
+                    round + 1,
+                    mode.name()
+                ));
+            }
+            seconds[mode as usize].push(run.seconds);
+            parts.push(format!(
+                "{} {:.4} s ({:.0} samples/s)",
+                mode.name(),
+                run.seconds,
+                samples / run.seconds
+            ));
+            if mode.inspected() {
+                notes.push(format!(
+                    "{}: {} snapshots, {} client at the end",
+                    mode.name(),
+                    run.snapshots,
+                    run.clients_at_end
+                ));
+            }
+        }
+        let off = seconds[0][round];
+        let ratios: Vec<String> = InspectMode::ALL[1..]
+            .iter()
+            .map(|&m| format!("{} {:.4}", m.name(), off / seconds[m as usize][round]))
+            .collect();
+        println!("round {}: {}", round + 1, parts.join(", "));
+        println!(
+            "  ratio to off: {}; {}",
+            ratios.join(", "),
+            notes.join("; ")
+        );
+    }
+    let timed_seconds = timed.elapsed().as_secs_f64();
+    let ratio = |m: InspectMode| -> Vec<f64> {
+        seconds[0]
+            .iter()
+            .zip(&seconds[m as usize])
+            .map(|(off, t)| off / t)
+            .collect()
+    };
+    println!("ratio = off's time over the mode's time in the same round (below 1 is slower)");
+    for mode in InspectMode::ALL {
+        let t = &seconds[mode as usize];
+        println!(
+            "median {}: {:.4} s ({:.0} samples/s)",
+            mode.name(),
+            runs::median(t),
+            samples / runs::median(t)
+        );
+    }
+    let aa = ratio(InspectMode::OffAgain);
+    let spread = runs::aa_spread(&aa);
+    let (lo, hi) = aa
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &r| {
+            (lo.min(r), hi.max(r))
+        });
+    println!(
+        "off / off again: median ratio {:.4}; spread (median over rounds of |1 - ratio|) \
+         {:.2}%; rounds {lo:.4} to {hi:.4}",
+        runs::median(&aa),
+        spread * 100.0
+    );
+    let verdict = |ok: bool| if ok { "met" } else { "not met" };
+    let mut worst = f64::INFINITY;
+    for mode in [InspectMode::Reading, InspectMode::Connected] {
+        let r = ratio(mode);
+        let m = runs::median(&r);
+        worst = worst.min(m);
+        let (lo, hi) = r
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+                (lo.min(x), hi.max(x))
+            });
+        println!(
+            "{}: median ratio {m:.4} ({:+.2}% time; rounds {lo:.4} to {hi:.4}); at least 0.98: {}",
+            mode.name(),
+            (1.0 / m - 1.0) * 100.0,
+            verdict(m >= 0.98)
+        );
+    }
+    println!("off/off spread at most 1%: {}", verdict(spread <= 0.01));
+    println!(
+        "worse \"on\" mode: median ratio {worst:.4}, {:.2}% slower than off",
+        (1.0 - worst) * 100.0
+    );
+    println!(
+        "rounds {timed_seconds:.1} s; whole run {:.1} s",
+        whole.elapsed().as_secs_f64()
+    );
+    if let (Some(a), Some(b)) = (cpu_start, machine::process_cpu_seconds()) {
+        println!("cpu time of this process {:.1} s", b - a);
+    }
+    println!("load average at the end {}", machine::load_average());
+    Ok(())
 }
 
 /// The hidden neurons of the digits network: 256 + 128.

@@ -38,3 +38,8 @@ required-features = ["ml"]
 [[example]]
 name = "logistic_regression"
 required-features = ["ml"]
+
+# The inspector example needs the inspector, which the `inspect` feature provides.
+[[example]]
+name = "inspect_digits"
+required-features = ["inspect"]

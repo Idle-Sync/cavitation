@@ -24,6 +24,28 @@ use crate::server::{Inspector, InspectorConfig};
 use crate::sse::{Event, Hub, Snapshot};
 use crate::wire::{self, EpochEvaluation, ModelInfo, RunState, Stats};
 
+/// How far apart the held-out evaluations are: after an evaluation that took `c`, an
+/// epoch end evaluates again only once at least `EVALUATION_FACTOR · c` has passed since it
+/// ended, so evaluation takes at most about 1/200 = 0.5% of a run's time, besides the
+/// evaluation the last epoch always gets.
+///
+/// ```
+/// assert_eq!(cavitation_inspect::EVALUATION_FACTOR, 200);
+/// ```
+pub const EVALUATION_FACTOR: u32 = 200;
+
+/// Whether a held-out evaluation is due at an epoch end, `since` after the last one ended,
+/// when that one took `cost`: at least [`EVALUATION_FACTOR`] times `cost` must have passed.
+/// A cost so large that the product does not fit a `Duration` is never due again.
+fn evaluation_due(since: Duration, cost: Duration) -> bool {
+    cost.checked_mul(EVALUATION_FACTOR)
+        .is_some_and(|budget| since >= budget)
+}
+
+/// How long the end of a run keeps trying to publish its last snapshot, [`PAUSE_POLL`]
+/// apart, while the hub's lock is busy.
+const FINAL_CAPTURE_WINDOW: Duration = Duration::from_secs(1);
+
 /// How often a paused run looks for commands and for its clients leaving.
 const PAUSE_POLL: Duration = Duration::from_millis(5);
 
@@ -101,6 +123,8 @@ pub(crate) struct Training {
     epoch: usize,
     /// The last step's batch loss.
     last_loss: f32,
+    /// The learning rate after the last step, for the final snapshot.
+    learning_rate: f64,
     /// The held-out evaluator, made at the first evaluation.
     evaluator: Option<Evaluator>,
     /// The rows the last evaluation classified wrong.
@@ -142,6 +166,7 @@ impl Training {
             step: 0,
             epoch: 0,
             last_loss: f32::NAN,
+            learning_rate: f64::NAN,
             evaluator: None,
             misclassified: Vec::new(),
             last_eval: None,
@@ -661,9 +686,11 @@ impl Inspector {
         Ok(())
     }
 
-    /// Ends a run: says how it ended and publishes every waiting event, waiting for the
-    /// hub's lock now that training is over.
-    fn end(&mut self, model: &Sequential, result: &Result<History, Error>) {
+    /// Ends a run: while a client is connected, captures one last snapshot, so the page
+    /// shows the final step and epoch rather than the last sampled one; then says how the
+    /// run ended and publishes every waiting event, waiting for the hub's lock now that
+    /// training is over.
+    fn end(&mut self, model: &Sequential, params: &ParamStore, result: &Result<History, Error>) {
         let Inspector {
             config,
             shared,
@@ -671,6 +698,21 @@ impl Inspector {
             ..
         } = self;
         t.paused = false;
+        if t.step > 0 {
+            // Training is over, so a capture the hub's lock refuses can wait a little and try
+            // again, for at most `FINAL_CAPTURE_WINDOW` after the first attempt; a client that
+            // leaves, or a hub that closes, ends the attempts. However many attempts it
+            // takes, it counts as one snapshot.
+            let (deadline, captures) = (Instant::now() + FINAL_CAPTURE_WINDOW, t.captures);
+            while shared.hub.clients() > 0
+                && !shared.hub.stopping().load(Ordering::Acquire)
+                && !t.capture(config, &shared.hub, model, params, t.learning_rate)
+                && Instant::now() < deadline
+            {
+                thread::sleep(PAUSE_POLL);
+            }
+            t.captures = t.captures.min(captures + 1);
+        }
         let message = match result {
             Ok(history) => format!(
                 "training finished after {}",
@@ -739,6 +781,7 @@ impl StepControl for Inspector {
         t.step = info.step;
         t.epoch = info.epoch;
         t.last_loss = info.loss;
+        t.learning_rate = trainer.learning_rate();
         t.rows_since += info.rows;
         t.seconds_since += info.seconds;
         if hub.clients() > 0
@@ -773,8 +816,9 @@ impl StepControl for Inspector {
     /// is due, and publishes the `epoch` event.
     ///
     /// The evaluation runs only while a client is connected, and only when the time since
-    /// the last one ended is at least 100 times that one's own cost, so it takes at most
-    /// about 1% of the run; the last epoch always has one while a client is connected.
+    /// the last one ended is at least [`EVALUATION_FACTOR`] (200) times that one's own cost,
+    /// so it takes at most about 0.5% of the run; the last epoch always has one while a
+    /// client is connected.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -791,7 +835,8 @@ impl StepControl for Inspector {
     /// let mut params = ParamStore::new();
     /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
-    /// let report = EpochReport { epoch: 1, mean_loss: 0.5, rows: 4, seconds: 0.01 };
+    /// let report =
+    ///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 4, seconds: 0.01, validation: None };
     /// let flow = inspector.after_epoch(
     ///     &report,
     ///     &mut ModelHandle::new(&mut net),
@@ -820,7 +865,7 @@ impl StepControl for Inspector {
         let last = report.epoch >= t.epochs;
         let due = t
             .last_eval
-            .is_none_or(|(end, cost)| end.elapsed() >= cost.saturating_mul(100));
+            .is_none_or(|(end, cost)| evaluation_due(end.elapsed(), cost));
         let evaluation = if hub.clients() > 0 && (last || due) {
             t.evaluate(config, model.model(), params)
         } else {
@@ -892,6 +937,26 @@ pub fn fit(
 ) -> Result<History, Error> {
     inspector.begin(model, params, train, &config)?;
     let result = fit_controlled(model, params, train, config, &mut Hooks::new(), inspector);
-    inspector.end(model, &result);
+    inspector.end(model, params, &result);
     result
+}
+
+/// Tests of the training side's pure rules.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An evaluation is due from exactly `EVALUATION_FACTOR` times its cost on: not at 199
+    /// times, yes at 200 and after, and never when the budget does not fit a `Duration`.
+    #[test]
+    fn evaluation_due_at_the_budget_edge() {
+        let cost = Duration::from_millis(3);
+        assert_eq!(EVALUATION_FACTOR, 200);
+        assert!(!evaluation_due(cost * 199, cost));
+        assert!(!evaluation_due(cost * 200 - Duration::from_nanos(1), cost));
+        assert!(evaluation_due(cost * 200, cost));
+        assert!(evaluation_due(cost * 201, cost));
+        assert!(evaluation_due(Duration::ZERO, Duration::ZERO));
+        assert!(!evaluation_due(Duration::MAX, Duration::MAX / 2));
+    }
 }

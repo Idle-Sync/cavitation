@@ -1120,9 +1120,94 @@ fn evaluator_neuron_mask_steady_state() -> usize {
     made
 }
 
+/// The allocation count at the end of epoch 2 of the validated run's plain `fit`, read in
+/// its `on_epoch` callback (which must be `'static`).
+static FIT_EPOCH_2: AtomicUsize = AtomicUsize::new(0);
+
+/// The allocations made after epoch 2 of the validated run's plain `fit`, read in its
+/// `on_epoch` callback at each later epoch.
+static FIT_AFTER_EPOCH_2: AtomicUsize = AtomicUsize::new(0);
+
+/// Switches neuron `epoch % 256` of the first `Linear` on after an even epoch and off after
+/// an odd one (the mask is on the model from the start, so this only changes its values),
+/// and counts the allocations from the end of epoch 2 to the end of the last.
+struct MaskEachEpoch {
+    /// The allocation count at the end of epoch 2.
+    at_epoch_2: usize,
+    /// The allocations made since then, as of the last epoch.
+    after: usize,
+}
+
+impl cavitation_nn::StepControl for MaskEachEpoch {
+    fn after_epoch(
+        &mut self,
+        report: &cavitation_nn::EpochReport,
+        model: &mut cavitation_nn::ModelHandle<'_>,
+        _params: &ParamStore,
+        _trainer: &mut cavitation_nn::TrainerHandle<'_>,
+    ) -> cavitation_nn::Flow {
+        assert!(report.validation.is_some());
+        if report.epoch == 2 {
+            self.at_epoch_2 = allocations();
+        } else if report.epoch > 2 {
+            self.after = allocations() - self.at_epoch_2;
+        }
+        model.set_neuron(0, report.epoch % 256, report.epoch.is_multiple_of(2));
+        cavitation_nn::Flow::Continue
+    }
+}
+
+/// Trains the 50k network for 6 epochs on 1,000 of the centred rows at batch 128 (a last
+/// batch of 104) with the other 437 as the validation set (a last validation batch of 53):
+/// once with `fit`, and once with `fit_controlled` and a control that changes the first
+/// `Linear`'s neuron mask after every epoch, which the validation follows. Returns the
+/// allocations made in epochs 3 to 6 of both runs, validation included.
+fn fit_validation_steady_state() -> usize {
+    let (train, validation) = synthetic_centred_1437().split_at(1000);
+    let config = |validation: &Dataset| cavitation_nn::FitConfig {
+        epochs: 6,
+        batch: 128,
+        health: Health::quiet(),
+        validation: Some(validation.clone()),
+        ..cavitation_nn::FitConfig::default()
+    };
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let plain = cavitation_nn::FitConfig {
+        on_epoch: Some(Box::new(|report, _, _| {
+            assert!(report.validation.is_some());
+            if report.epoch == 2 {
+                FIT_EPOCH_2.store(allocations(), Ordering::Relaxed);
+            } else if report.epoch > 2 {
+                let made = allocations() - FIT_EPOCH_2.load(Ordering::Relaxed);
+                FIT_AFTER_EPOCH_2.store(made, Ordering::Relaxed);
+            }
+        })),
+        ..config(&validation)
+    };
+    cavitation_nn::fit(&net, &mut params, &train, plain).unwrap();
+    let mut params = ParamStore::new();
+    let mut net = network_50k(&mut params);
+    net.set_neuron(0, 0, false);
+    let mut control = MaskEachEpoch {
+        at_epoch_2: 0,
+        after: 0,
+    };
+    cavitation_nn::fit_controlled(
+        &mut net,
+        &mut params,
+        &train,
+        config(&validation),
+        &mut Hooks::new(),
+        &mut control,
+    )
+    .unwrap();
+    FIT_AFTER_EPOCH_2.load(Ordering::Relaxed) + control.after
+}
+
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 23] = [
+    let scenarios: [Scenario; 24] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1158,6 +1243,7 @@ fn main() -> ExitCode {
             profiling_off_allocates_nothing,
         ),
         ("profiled_step_reuses_buffers", profiled_step_reuses_buffers),
+        ("fit_validation_steady_state", fit_validation_steady_state),
     ];
     let mut failed = false;
     for (name, scenario) in scenarios {

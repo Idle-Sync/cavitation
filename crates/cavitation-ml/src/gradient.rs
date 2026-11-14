@@ -419,6 +419,7 @@ pub(crate) fn train(
             mean_loss: total / trained as f64,
             rows: trained,
             seconds: start.elapsed().as_secs_f64(),
+            validation: None,
         });
     }
     if !setup.fit_intercept {

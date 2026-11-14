@@ -73,6 +73,7 @@ fn fit_config(epochs: usize) -> FitConfig {
         schedule: LrSchedule::Constant,
         health: Health::quiet(),
         on_epoch: None,
+        validation: None,
     }
 }
 
@@ -629,8 +630,10 @@ fn probe_leaves_training_untouched() {
     }
 }
 
-/// An evaluation that costs more than 1% of an epoch is skipped at the epoch ends that
-/// follow it, and the last epoch always carries one.
+/// An evaluation that costs more than the epochs after it is skipped at their ends, and the
+/// first and the last epoch always carry one. (A 40,000-row evaluation costs more than the
+/// four epochs between them, so their ends are under any budget. The budget's edge, 199
+/// against 200 times the cost, is checked by the unit test of `evaluation_due`.)
 #[test]
 fn evaluation_skipped_when_budget_spent() {
     let data = digits(256, 13);
@@ -655,26 +658,85 @@ fn evaluation_skipped_when_budget_spent() {
         &mut inspector,
     )
     .unwrap();
-    let mut evaluations = Vec::new();
+    // For each epoch: whether it was evaluated, its seconds, and the evaluation's own cost.
+    let mut epochs_seen = Vec::new();
     for m in client.until_finished().iter().filter(|m| m.name == "epoch") {
         let e = m.json.get("evaluation");
-        evaluations.push(!e.is_null());
-        if !e.is_null() {
+        let cost = if e.is_null() {
+            None
+        } else {
             assert_eq!(e.get("rows").num(), 40_000.0);
             assert!(e.get("misclassified").arr().len() <= 100);
             assert!((0.0..=1.0).contains(&e.get("accuracy").num()));
-        }
+            Some(e.get("seconds").num())
+        };
+        epochs_seen.push((cost, m.json.get("seconds").num()));
     }
-    assert_eq!(evaluations.len(), epochs);
+    assert_eq!(epochs_seen.len(), epochs);
     assert!(
-        evaluations[0],
+        epochs_seen[0].0.is_some(),
         "the first epoch has no earlier evaluation to wait for"
     );
     assert!(
-        evaluations.iter().any(|e| !e),
-        "no evaluation was skipped: {evaluations:?}"
+        epochs_seen[epochs - 1].0.is_some(),
+        "the last epoch has no evaluation"
     );
-    assert!(evaluations[epochs - 1], "the last epoch has no evaluation");
+    assert!(
+        epochs_seen.iter().any(|e| e.0.is_none()),
+        "no evaluation was skipped"
+    );
+    let (first_cost, middle): (f64, f64) = (
+        epochs_seen[0].0.unwrap(),
+        epochs_seen[1..epochs - 1].iter().map(|e| e.1).sum(),
+    );
+    assert!(
+        middle < first_cost * f64::from(cavitation_inspect::EVALUATION_FACTOR),
+        "the middle epochs ({middle:.4} s) are not under the budget of an evaluation costing \
+         {first_cost:.4} s"
+    );
+    // Every epoch between the first and the last is skipped: each is far under the budget.
+    assert!(
+        epochs_seen[1..epochs - 1].iter().all(|e| e.0.is_none()),
+        "an epoch under the budget was evaluated: {epochs_seen:?}"
+    );
+    client.close();
+}
+
+/// When training ends with a client connected, one last snapshot shows the final step and
+/// epoch, even when the sampling period is far longer than the run, so the page does not
+/// stop at the last sampled step.
+#[test]
+fn final_snapshot_shows_the_last_step() {
+    let data = digits(256, 24);
+    let mut params = ParamStore::new();
+    let mut model = network(&mut params, 16);
+    let mut inspector = Inspector::start(InspectorConfig {
+        snapshot_hz: 0.01,
+        ..inspector_config()
+    })
+    .unwrap();
+    let (addr, token) = endpoint(&inspector);
+    let client = Client::open(addr, &token);
+    wait_clients(&inspector, 1);
+    let epochs = 4;
+    cavitation_inspect::fit(
+        &mut model,
+        &mut params,
+        &data,
+        fit_config(epochs),
+        &mut inspector,
+    )
+    .unwrap();
+    let stats: Vec<Message> = client
+        .until_finished()
+        .into_iter()
+        .filter(|m| m.name == "stats")
+        .collect();
+    let last = stats.last().expect("no stats snapshot arrived");
+    // 256 rows in batches of 32: 8 steps an epoch.
+    assert_eq!(last.json.get("step").num(), (epochs * 8) as f64);
+    assert_eq!(last.json.get("epoch").num(), epochs as f64);
+    assert_eq!(last.json.get("epochs").num(), epochs as f64);
     client.close();
 }
 

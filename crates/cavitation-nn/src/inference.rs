@@ -83,6 +83,9 @@ enum Op {
 struct Step {
     /// What the step computes.
     op: Op,
+    /// The index of the [`Sequential`] layer the step comes from: the layer whose inference
+    /// form it holds, or the layer whose output it masks.
+    layer: usize,
     /// For a `Linear` step, whether a ReLU that followed it is fused into it.
     relu: bool,
     /// The width of each row the step reads.
@@ -344,6 +347,9 @@ impl InferenceModel {
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
     ) -> Result<bool, Error> {
+        if self.refresh_in_place(model, params) {
+            return Ok(true);
+        }
         let extra: Vec<usize> = (self.shared.extra.iter())
             .copied()
             .filter(|&l| l < model.len())
@@ -379,6 +385,72 @@ impl InferenceModel {
         }
         self.shared = Arc::new(fresh);
         Ok(false)
+    }
+
+    /// Copies the weights of `model` and `params` into this compiled model in place, and the
+    /// values of each mask `model` has into its mask step, without allocating: what
+    /// [`refresh`](Self::refresh) does when the layout stays the same, for a model whose
+    /// layers have not changed since it was compiled (only their parameter values and mask
+    /// values). A mask step added by [`compile_with_masks`](Self::compile_with_masks) keeps
+    /// its values, as in `refresh`.
+    ///
+    /// Returns `false`, changing nothing, when it cannot do that: a clone shares the
+    /// weights, a mask was added or removed or changed width, a layer is not the kind or
+    /// width it was, or a layer with parameters is neither a [`Linear`](crate::Linear) nor a
+    /// [`Prelu`](crate::Prelu) (a layer of your own, whose values only its
+    /// [`inference`](crate::Layer::inference) can give). [`refresh`](Self::refresh) then
+    /// compiles afresh.
+    ///
+    /// Each parameter-free layer is checked by comparing its inference form with the
+    /// compiled one; the built-in forms of those layers hold no heap data, so the check
+    /// allocates nothing.
+    pub(crate) fn refresh_in_place(
+        &mut self,
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+    ) -> bool {
+        let Some(compiled) = Arc::get_mut(&mut self.shared) else {
+            return false;
+        };
+        if !compiled.fits_in_place(model, params, &self.masks) {
+            return false;
+        }
+        let values = &params.values;
+        for step in &mut compiled.steps {
+            match &mut step.op {
+                Op::Layer(InferenceLayer::Linear {
+                    w_t,
+                    bias,
+                    inputs,
+                    outputs,
+                }) => {
+                    let linear = model.linear(step.layer).expect("checked by fits_in_place");
+                    let w = values.get(linear.weight()).data();
+                    for (i, row) in w_t.chunks_exact_mut(*outputs).enumerate() {
+                        for (j, v) in row.iter_mut().enumerate() {
+                            *v = w[j * *inputs + i];
+                        }
+                    }
+                    bias.copy_from_slice(values.get(linear.bias()).data());
+                }
+                Op::Layer(InferenceLayer::Prelu(slopes)) => {
+                    let prelu = model
+                        .layer(step.layer)
+                        .as_prelu()
+                        .expect("checked by fits_in_place");
+                    slopes.copy_from_slice(values.get(prelu.weight()).data());
+                }
+                Op::Mask { slot } => {
+                    if let Some(mask) = model.mask(step.layer) {
+                        for (j, k) in self.masks[*slot].iter_mut().enumerate() {
+                            *k = if mask.is_on(j) { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+                Op::Layer(_) => {}
+            }
+        }
+        true
     }
 
     /// Whether this model and `other` share their compiled steps, the weights (one is a
@@ -768,6 +840,7 @@ impl Compiled {
                 }
                 _ => steps.push(Step {
                     op: Op::Layer(form),
+                    layer: i,
                     relu: false,
                     inputs: width,
                     outputs: produced,
@@ -791,6 +864,7 @@ impl Compiled {
                 };
                 steps.push(Step {
                     op: Op::Mask { slot: masks.len() },
+                    layer: i,
                     relu: false,
                     inputs: produced,
                     outputs: produced,
@@ -816,6 +890,79 @@ impl Compiled {
             neurons,
         };
         Ok((compiled, masks))
+    }
+
+    /// Whether [`InferenceModel::refresh_in_place`] can copy the values of `model` and
+    /// `params` into these steps: the steps cover `model`'s layers one for one (a fused
+    /// ReLU covering its layer), each `Linear` and `Prelu` step's layer is still one with the
+    /// same widths and parameters of the compiled sizes, every other layer still has the
+    /// compiled inference form (a form with values of its own, from a layer of your own,
+    /// does not fit), the mask steps sit on the layers `model` masks plus the added ones,
+    /// and each of `model`'s masks has the width of its step's keep values in `masks`.
+    /// Allocates nothing for built-in layers.
+    fn fits_in_place(
+        &self,
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+        masks: &[Vec<f32>],
+    ) -> bool {
+        let values = &params.values;
+        let mut covered = 0;
+        for step in &self.steps {
+            let Op::Layer(form) = &step.op else {
+                continue;
+            };
+            if step.layer != covered || step.layer >= model.len() {
+                return false;
+            }
+            let layer = model.layer(step.layer);
+            let fits = match form {
+                InferenceLayer::Linear {
+                    inputs, outputs, ..
+                } => model.linear(step.layer).is_some_and(|linear| {
+                    linear.inputs() == *inputs
+                        && linear.outputs() == *outputs
+                        && values.get(linear.weight()).shape().dims() == [*outputs, *inputs]
+                        && values.get(linear.bias()).shape().dims() == [*outputs]
+                }),
+                InferenceLayer::Prelu(slopes) => layer
+                    .as_prelu()
+                    .is_some_and(|prelu| values.get(prelu.weight()).data().len() == slopes.len()),
+                InferenceLayer::Mask(_) => false,
+                other => {
+                    layer.as_linear().is_none()
+                        && layer.as_prelu().is_none()
+                        && layer.inference(values).as_ref() == Some(other)
+                }
+            };
+            if !fits {
+                return false;
+            }
+            covered = step.layer + 1;
+            if step.relu {
+                let relu = InferenceLayer::Activation(ActivationKind::Relu);
+                if covered >= model.len() || model.layer(covered).inference(values) != Some(relu) {
+                    return false;
+                }
+                covered += 1;
+            }
+        }
+        if covered != model.len() {
+            return false;
+        }
+        let mut slots = self.mask_layers.iter().zip(masks);
+        for i in 0..model.len() {
+            let mask = model.mask(i);
+            if mask.is_none() && !self.extra.contains(&i) {
+                continue;
+            }
+            match slots.next() {
+                Some((&layer, keep))
+                    if layer == i && mask.is_none_or(|m| m.width() == keep.len()) => {}
+                _ => return false,
+            }
+        }
+        slots.next().is_none()
     }
 
     /// Whether `other` has the same steps as `self`, in the same order, with the same
@@ -844,6 +991,7 @@ impl Compiled {
             && self.steps.len() == other.steps.len()
             && self.steps.iter().zip(&other.steps).all(|(a, b)| {
                 kind(&a.op) == kind(&b.op)
+                    && a.layer == b.layer
                     && a.relu == b.relu
                     && a.inputs == b.inputs
                     && a.outputs == b.outputs
@@ -1957,6 +2105,81 @@ pub(crate) mod tests {
         assert!(got.chunks(10).all(|row| row[7].to_bits() == 0));
         assert_same(copy.infer_batch(view).data(), &copy_before, "the clone");
         model.set_mask(1, &NeuronMask::all_on(32)).unwrap();
+    }
+
+    /// `refresh_in_place` copies new weights, PReLU slopes and mask values into the
+    /// compiled model, giving bit for bit the outputs of compiling afresh (a `Linear` fused
+    /// with a ReLU, a per-channel PReLU, a model mask and a mask step `compile_with_masks`
+    /// added, whose values it keeps). It changes nothing and returns `false` when a clone
+    /// shares the weights, when a mask is added or removed, and when the layers differ.
+    #[test]
+    fn refresh_in_place_matches_compile() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(41);
+        let prelu = Prelu::new(&mut params, 6);
+        let slopes = prelu.weight();
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 5, 6, &mut rng))
+            .push(prelu)
+            .push(Linear::new(&mut params, 6, 7, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 7, 3, &mut rng));
+        net.set_mask(1, NeuronMask::from_off(6, &[2]));
+        let x = inputs(9, 5, 42);
+        let view = TensorView::from_slice(&x, &[9, 5]).unwrap();
+        let added = NeuronMask::from_off(7, &[4]);
+        let mut model = InferenceModel::compile_with_masks(&net, &params, &[3]).unwrap();
+        model.set_mask(3, &added).unwrap();
+        let want = |net: &Sequential, params: &ParamStore| {
+            let mut masked = net.clone();
+            masked.set_mask(3, added.clone());
+            InferenceModel::compile(&masked, params)
+                .unwrap()
+                .infer_batch(view)
+                .data()
+                .to_vec()
+        };
+        let before = model.infer_batch(view).data().to_vec();
+
+        for (_, id) in net.parameter_names() {
+            for v in params.value_mut(id).data_mut() {
+                *v = *v * 0.75 + 0.01;
+            }
+        }
+        params.value_mut(slopes).data_mut()[4] = -0.5;
+        net.set_mask(1, NeuronMask::from_off(6, &[0, 5]));
+        assert!(model.refresh_in_place(&net, &params));
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &want(&net, &params), "in place");
+        assert_ne!(got, before);
+
+        let copy = model.clone();
+        params.value_mut(slopes).data_mut()[0] = 0.5;
+        assert!(!model.refresh_in_place(&net, &params));
+        assert_same(model.infer_batch(view).data(), &got, "shared, unchanged");
+        drop(copy);
+
+        let mut unmasked = net.clone();
+        unmasked.clear_mask(1);
+        assert!(!model.refresh_in_place(&unmasked, &params));
+        let mut more = net.clone();
+        more.set_mask(2, NeuronMask::all_on(7));
+        assert!(!model.refresh_in_place(&more, &params));
+        let mut other = ParamStore::new();
+        let tanh = Sequential::new()
+            .push(Linear::new(&mut other, 5, 6, &mut rng))
+            .push(Tanh)
+            .push(Linear::new(&mut other, 6, 7, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut other, 7, 3, &mut rng));
+        assert!(!model.refresh_in_place(&tanh, &other));
+        assert_same(model.infer_batch(view).data(), &got, "refused, unchanged");
+        assert!(model.refresh_in_place(&net, &params));
+        assert_same(
+            model.infer_batch(view).data(),
+            &want(&net, &params),
+            "again",
+        );
     }
 
     /// Linear(3 → 4) → Sigmoid → Linear(4 → 2), with weights from `Rng::seed(seed)`.
