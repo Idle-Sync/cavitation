@@ -149,7 +149,7 @@ fn network(params: &mut ParamStore) -> Sequential {
 
 /// The digits benchmark's training: SGD at 0.01, batch 128, the rows in order, quiet health
 /// checks.
-fn fit_config(epochs: usize) -> FitConfig {
+fn fit_config(epochs: usize) -> FitConfig<'static> {
     FitConfig {
         epochs,
         batch: BATCH,

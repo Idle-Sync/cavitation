@@ -60,7 +60,7 @@ fn network(params: &mut ParamStore, hidden: usize) -> Sequential {
 
 /// A training configuration: Adam at 1e-3, batch 32, shuffled with seed 3, quiet health
 /// checks.
-fn fit_config(epochs: usize) -> FitConfig {
+fn fit_config(epochs: usize) -> FitConfig<'static> {
     FitConfig {
         epochs,
         batch: 32,
@@ -80,7 +80,7 @@ fn fit_config(epochs: usize) -> FitConfig {
 /// [`fit_config`] whose `on_epoch` adds one to `epochs` and then, at the end of each epoch,
 /// waits until `gate` is open (for at most [`DEADLINE`]), so a test can be sure its commands
 /// reach the run before it ends.
-fn gated(epochs: usize, gate: Arc<AtomicBool>, counter: Arc<AtomicUsize>) -> FitConfig {
+fn gated(epochs: usize, gate: Arc<AtomicBool>, counter: Arc<AtomicUsize>) -> FitConfig<'static> {
     FitConfig {
         on_epoch: Some(Box::new(move |_, _, _| {
             counter.fetch_add(1, Ordering::SeqCst);
@@ -491,7 +491,6 @@ fn pause_resumes_when_client_leaves() {
         let client = Client::open(addr, &token);
         wait_clients(&inspector, 1);
         let run = s.spawn(|| {
-            // Made on the training thread: a `FitConfig` holds callbacks and is not `Send`.
             let config = gated(4, Arc::clone(&open), counter);
             cavitation_inspect::fit(&mut model, &mut params, &data, config, &mut inspector)
         });

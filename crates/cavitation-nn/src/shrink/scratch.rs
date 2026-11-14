@@ -35,7 +35,7 @@ const EVAL_BATCH: usize = 256;
 /// assert_eq!(FromScratch::default().weights, Init::XavierUniform);
 /// ```
 #[derive(Debug)]
-pub struct FromScratch {
+pub struct FromScratch<'s> {
     /// How each `Linear`'s weight starts. Default [`Init::XavierUniform`].
     pub weights: Init,
     /// How each `Linear`'s bias starts. Default [`Init::Zeros`].
@@ -45,12 +45,12 @@ pub struct FromScratch {
     pub seed: u64,
     /// The training: epochs, batch, optimiser, loss, schedule, shuffle seed, health checks.
     /// Its loss is also the one both networks are measured with.
-    pub fit: FitConfig,
+    pub fit: FitConfig<'s>,
 }
 
-impl Default for FromScratch {
+impl Default for FromScratch<'_> {
     /// Xavier uniform weights, zero biases, seed 0, [`FitConfig::default`].
-    fn default() -> FromScratch {
+    fn default() -> Self {
         FromScratch {
             weights: Init::XavierUniform,
             biases: Init::Zeros,

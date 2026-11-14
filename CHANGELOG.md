@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Breaking changes
+
+- `Health`, `HealthMonitor`, `Trainer`, `FitConfig`, `shrink::FromScratch` and `cavitation_ml::GradientConfig` take a lifetime parameter, and `Health::sink` and `FitConfig::on_epoch` are `Box<dyn FnMut(..) + Send + 's>`. The callbacks can borrow local state (a sink can push onto a `Vec` the caller reads after the run, without `Rc<RefCell<..>>`), and a `FitConfig` or a `Trainer` can be moved to another thread. A callback that captures something that is not `Send` (an `Rc`, a `Cell`) no longer compiles; borrow the value instead, or use `Arc` and an atomic or a `Mutex`. Code that names one of these types where a lifetime cannot be elided, such as a function with no reference arguments returning `FitConfig`, writes `FitConfig<'static>`; `TrainerHandle` and every `StepControl` are unchanged.
+
 ### Tensors and autograd (`cavitation-core`)
 
 - When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
@@ -20,6 +24,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Data, examples, guide and benchmark
 
 - `cavitation-bench` writes `results.json` under `CARGO_TARGET_DIR` (in its `bench` folder) when that is set, instead of always the workspace's `target/bench`; prints the usage text only for a command-line error, not after a failure while running (which now exits with status 1, not 2); and on aarch64 Linux, whose `/proc/cpuinfo` has no `model name`, names the CPU from its cores' `CPU implementer` and `CPU part` (`ARM Cortex-A76`, with the board's `Model` line when there is one) instead of `unknown`.
+- The README lists all five guide chapters, in the guide's order, and "Coming from PyTorch" explains where a neuron mask goes in one paragraph instead of two that overlapped.
 
 ## v0.2.0 (2026-11-14)
 

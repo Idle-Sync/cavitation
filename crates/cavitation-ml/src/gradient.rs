@@ -55,7 +55,7 @@ use crate::linear::{LinearModel, LinearRegression, Shape, check_alpha, check_val
 /// assert_eq!(GradientConfig::default().batch, usize::MAX);
 /// ```
 #[derive(Debug)]
-pub struct GradientConfig {
+pub struct GradientConfig<'s> {
     /// How many passes over the data.
     pub epochs: usize,
     /// The rows per step; the last batch of an epoch may be smaller. A batch at least as
@@ -78,14 +78,14 @@ pub struct GradientConfig {
     /// least squares is convex, so a tiny gradient here means the fit has converged, and on
     /// noisy data the loss stops at the residual variance instead of falling the 10,000-fold
     /// that would otherwise silence the check. The non-finite and exploding checks stay on.
-    pub health: Health,
+    pub health: Health<'s>,
 }
 
-impl Default for GradientConfig {
+impl Default for GradientConfig<'_> {
     /// 1,000 epochs, every row in one batch (`usize::MAX`), Adam at 0.5 without weight
     /// decay, cosine annealing to 0, shuffle seed 0, initialisation seed 0, and the default
     /// health checks with the vanishing-gradient check off.
-    fn default() -> GradientConfig {
+    fn default() -> Self {
         GradientConfig {
             epochs: 1000,
             batch: usize::MAX,
@@ -453,7 +453,7 @@ mod tests {
     }
 
     /// A quiet default configuration.
-    fn quiet() -> GradientConfig {
+    fn quiet() -> GradientConfig<'static> {
         GradientConfig {
             health: Health::quiet(),
             ..GradientConfig::default()

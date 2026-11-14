@@ -791,7 +791,7 @@ mod tests {
 
     /// The `FitConfig` the `fit` tests use: 3 epochs of batch 3 (3 batches each, the last of
     /// 2 rows), SGD.
-    fn fit_config() -> FitConfig {
+    fn fit_config() -> FitConfig<'static> {
         FitConfig {
             epochs: 3,
             batch: 3,

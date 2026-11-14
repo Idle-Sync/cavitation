@@ -3,8 +3,6 @@
 //!
 //! Run it with `cargo run --release --example digits -p cavitation`.
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Instant;
 
 use cavitation::prelude::*;
@@ -35,13 +33,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // every sample of an epoch: it received no gradient that epoch; a neuron after the first
     // hidden layer can come back when the layers before it change, and "dead" is measured on
     // this data. The warnings are collected here, every epoch's, and summarised at the end;
-    // without a sink only reports that pass a threshold are printed.
-    let warnings: Rc<RefCell<Vec<String>>> = Rc::default();
-    let sink = Rc::clone(&warnings);
+    // without a sink only reports that pass a threshold are printed. The sink borrows the
+    // list, which is read once `fit` has returned.
+    let mut warnings: Vec<String> = Vec::new();
     let health = Health {
-        sink: Some(Box::new(move |w: &Warning| {
-            sink.borrow_mut().push(w.to_string())
-        })),
+        sink: Some(Box::new(|w: &Warning| warnings.push(w.to_string()))),
         ..Health::default()
     };
 
@@ -74,7 +70,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         acc * 100.0,
         test.len()
     );
-    let warnings = warnings.borrow();
+
     match warnings.last() {
         Some(last) => println!("health: {} warnings; last: {last}", warnings.len()),
         None => println!("health: no warnings"),
