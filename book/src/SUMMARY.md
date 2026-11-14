@@ -7,3 +7,4 @@
 - [Backprop by hand](backprop-by-hand.md)
 - [Shrinking a network](shrinking.md)
 - [Regression, exactly and by gradient](regression.md)
+- [Coming from PyTorch](from-pytorch.md)

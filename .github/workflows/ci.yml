@@ -34,10 +34,11 @@ jobs:
           key: ${{ matrix.kernel }}
       - name: Test
         run: cargo test --workspace --release --all-features --no-fail-fast
-      - name: Regression examples
+      - name: Examples
         run: |
           cargo run --release --example linear_regression -p cavitation
           cargo run --release --example logistic_regression -p cavitation
+          cargo run --release --example from_pytorch -p cavitation
       - name: Shrink example
         if: matrix.kernel == 'reference'
         run: cargo run --release --example shrink_digits -p cavitation
