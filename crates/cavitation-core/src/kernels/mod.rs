@@ -32,6 +32,7 @@ pub mod conv;
 pub mod gemm;
 pub mod matvec;
 pub mod pool;
+pub mod pooling;
 pub mod reference;
 #[cfg(target_arch = "x86_64")]
 mod x86;
