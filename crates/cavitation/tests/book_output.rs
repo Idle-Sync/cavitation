@@ -1,5 +1,6 @@
-//! Checks that the output block in the guide chapter "Backprop by hand" is what the `xor`
-//! example prints, so a change to the example that the chapter does not follow fails here.
+//! Checks that the output blocks in the guide chapters are what their examples print: the
+//! `xor` example in "Backprop by hand", and `load_torch_cnn` and `steering_cnn` in "Image
+//! models", so a change to an example that its chapter does not follow fails here.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -12,12 +13,12 @@ fn workspace_root() -> PathBuf {
         .expect("the workspace root exists")
 }
 
-/// The lines of the chapter's "The whole output:" code block.
-fn chapter_output(chapter: &str) -> Vec<String> {
+/// The lines of the chapter's code block after the line `marker`.
+fn chapter_output(chapter: &str, marker: &str) -> Vec<String> {
     let after = chapter
-        .split("The whole output:")
+        .split(marker)
         .nth(1)
-        .expect("the chapter has a 'The whole output:' line");
+        .unwrap_or_else(|| panic!("the chapter has a '{marker}' line"));
     let block = after
         .split("```text\n")
         .nth(1)
@@ -62,7 +63,7 @@ fn xor_chapter_output_matches() {
     let chapter = std::fs::read_to_string(root.join("book/src/backprop-by-hand.md"))
         .expect("the chapter exists")
         .replace("\r\n", "\n");
-    let expected = chapter_output(&chapter);
+    let expected = chapter_output(&chapter, "The whole output:");
     let actual: Vec<&str> = printed.lines().collect();
     for (i, (want, got)) in expected.iter().zip(&actual).enumerate() {
         assert_eq!(want, got, "line {} differs", i + 1);
@@ -73,5 +74,61 @@ fn xor_chapter_output_matches() {
         "the chapter has {} lines, the example printed {}",
         expected.len(),
         actual.len()
+    );
+}
+
+/// Runs `example` at the reference kernel level on one thread, the setting the chapter
+/// "Image models" shows, and compares what it prints with the block after `marker` there,
+/// line for line.
+fn image_chapter_matches(example: &str, marker: &str) {
+    let root = workspace_root();
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let run = Command::new(cargo)
+        .current_dir(&root)
+        .env("CAVITATION_KERNEL", "reference")
+        .env("CAVITATION_THREADS", "1")
+        .args([
+            "run",
+            "--release",
+            "--quiet",
+            "--example",
+            example,
+            "-p",
+            "cavitation",
+        ])
+        .output()
+        .expect("cargo runs");
+    assert!(
+        run.status.success(),
+        "the {example} example failed: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let printed = String::from_utf8(run.stdout).expect("the output is UTF-8");
+    let chapter = std::fs::read_to_string(root.join("book/src/image-models.md"))
+        .expect("the chapter exists")
+        .replace("\r\n", "\n");
+    let expected = chapter_output(&chapter, marker);
+    let actual: Vec<&str> = printed.lines().collect();
+    assert_eq!(
+        expected, actual,
+        "{example}'s output differs from the chapter"
+    );
+}
+
+/// The chapter's `load_torch_cnn` block is what the example prints.
+#[test]
+fn load_torch_cnn_chapter_output_matches() {
+    image_chapter_matches(
+        "load_torch_cnn",
+        "`load_torch_cnn` prints, at the reference kernel level on one thread:",
+    );
+}
+
+/// The chapter's `steering_cnn` block is what the example prints.
+#[test]
+fn steering_cnn_chapter_output_matches() {
+    image_chapter_matches(
+        "steering_cnn",
+        "`steering_cnn` prints, at the reference kernel level on one thread:",
     );
 }
