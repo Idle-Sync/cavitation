@@ -144,8 +144,8 @@ pub enum ActivationKind {
 }
 
 /// `1 / (1 + e^-x)` without overflowing the exponential, one value at a time with std's
-/// `exp`: the scalar sigmoid that SiLU, the derivatives and the GLU gate use (the `Sigmoid`
-/// layer runs the SIMD kernels instead).
+/// `exp`: the scalar sigmoid that the derivatives use (the `Sigmoid` and `Silu` layers and
+/// the GLU gates run the SIMD kernels instead).
 pub(crate) fn sigmoid<T: Real>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
@@ -257,8 +257,9 @@ impl ActivationKind {
                 half * x * (T::ONE + (x * c(FRAC_1_SQRT_2)).erf())
             }
             ActivationKind::Gelu(GeluApprox::Tanh) => {
-                let u = c(SQRT_2_OVER_PI) * (x + c(GELU_CUBIC) * x * x * x);
-                half * x * (T::ONE + u.tanh())
+                let mut v = [x];
+                T::gelu_tanh_in_place(&mut v);
+                v[0]
             }
             ActivationKind::Elu(alpha) => {
                 if x > T::ZERO {
@@ -282,7 +283,11 @@ impl ActivationKind {
                     c(alpha) * (x / c(alpha)).exp_m1()
                 }
             }
-            ActivationKind::Silu => x * sigmoid(x),
+            ActivationKind::Silu => {
+                let mut v = [x];
+                T::silu_in_place(&mut v);
+                v[0]
+            }
             ActivationKind::Mish => x * softplus(x, T::ONE, c(MISH_THRESHOLD)).tanh(),
             ActivationKind::Softplus { beta, threshold } => softplus(x, c(beta), c(threshold)),
             ActivationKind::Softsign => x / (T::ONE + x.abs()),

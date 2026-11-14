@@ -229,6 +229,29 @@ pub trait Real:
     /// assert_eq!(v, [0.5, 0.0, 1.0]);
     /// ```
     fn sigmoid_in_place(values: &mut [Self]);
+    /// Replaces every value `x` with SiLU, `x · σ(x)`: the sigmoid of
+    /// [`sigmoid_in_place`](Self::sigmoid_in_place) times `x`, which for f32 is
+    /// [`kernels::activation::silu_f32`](crate::kernels::activation::silu_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f64, 1.0];
+    /// f64::silu_in_place(&mut v);
+    /// assert_eq!(v[0], 0.0);
+    /// assert!((v[1] - 0.7310585786300049).abs() < 1e-15);
+    /// ```
+    fn silu_in_place(values: &mut [Self]);
+    /// Replaces every value `x` with the tanh form of GELU, `½x · (1 + tanh(u))` with
+    /// `u = √(2/π) · (x + 0.044715 · x³)`, which for f32 is
+    /// [`kernels::activation::gelu_tanh_f32`](crate::kernels::activation::gelu_tanh_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f64, 10.0];
+    /// f64::gelu_tanh_in_place(&mut v);
+    /// assert_eq!(v, [0.0, 10.0]);
+    /// ```
+    fn gelu_tanh_in_place(values: &mut [Self]);
 }
 
 #[cfg(test)]
@@ -239,7 +262,7 @@ thread_local! {
 
 /// Implements `Real` for a primitive float type by forwarding to its inherent methods.
 macro_rules! impl_real {
-    ($t:ident, $erf:path, $gemm:path, $tanh:path, $sigmoid:path) => {
+    ($t:ident, $erf:path, $gemm:path, $tanh:path, $sigmoid:path, $silu:path, $gelu_tanh:path) => {
         impl Real for $t {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
@@ -298,6 +321,12 @@ macro_rules! impl_real {
             fn sigmoid_in_place(values: &mut [Self]) {
                 $sigmoid(values);
             }
+            fn silu_in_place(values: &mut [Self]) {
+                $silu(values);
+            }
+            fn gelu_tanh_in_place(values: &mut [Self]) {
+                $gelu_tanh(values);
+            }
         }
     };
 }
@@ -307,14 +336,18 @@ impl_real!(
     crate::ops::erf_f32,
     crate::kernels::gemm::gemm_f32,
     crate::kernels::activation::tanh_f32,
-    crate::kernels::activation::sigmoid_f32
+    crate::kernels::activation::sigmoid_f32,
+    crate::kernels::activation::silu_f32,
+    crate::kernels::activation::gelu_tanh_f32
 );
 impl_real!(
     f64,
     crate::ops::erf_f64,
     crate::kernels::reference::gemm,
     tanh_each,
-    sigmoid_each
+    sigmoid_each,
+    silu_each,
+    gelu_tanh_each
 );
 
 /// [`Real::tanh`] on each value: the f64 `tanh_in_place`.
@@ -328,6 +361,20 @@ fn tanh_each(values: &mut [f64]) {
 fn sigmoid_each(values: &mut [f64]) {
     for v in values {
         *v = crate::ops::sigmoid_value(*v);
+    }
+}
+
+/// SiLU on each value: the f64 `silu_in_place`.
+fn silu_each(values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::silu_value(*v);
+    }
+}
+
+/// The tanh form of GELU on each value: the f64 `gelu_tanh_in_place`.
+fn gelu_tanh_each(values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::gelu_value(*v, crate::GeluApprox::Tanh);
     }
 }
 
