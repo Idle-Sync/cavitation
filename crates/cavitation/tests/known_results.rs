@@ -3,7 +3,7 @@
 use cavitation_core::{Graph, ParamStore, Reduction, Rng, TensorView};
 use std::path::Path;
 
-use cavitation_datasets::digits;
+use cavitation_datasets::{digits, steering};
 
 use cavitation_nn::shrink::{Ranking, ShrinkConfig, Validation, shrink};
 use cavitation_nn::{
@@ -317,5 +317,33 @@ fn shrink_known_result() {
     assert!(
         within_a_point(&defaults),
         "defaults: test accuracy fell more than 1 point"
+    );
+}
+
+/// The steering example's CNN (`steering::network(params, 0)`), trained with
+/// `steering::recipe(8)` on 2,000 steering images (seed 1), reads the angle of 500 others
+/// (seed 2) within 1.5° on average. Measured: 0.80° on an Intel Celeron N5105 at the
+/// sse4.2 kernel level, through `InferenceModel`; the bound leaves room for the other
+/// kernel levels' rounding.
+#[test]
+fn steering_known_result() {
+    let train = steering::generate(2000, 1);
+    let test = steering::generate(500, 2);
+    let mut params = ParamStore::new();
+    let net = steering::network(&mut params, 0);
+    fit(&net, &mut params, &train, steering::recipe(8)).unwrap();
+    let Targets::Values(angles) = &test.targets else {
+        unreachable!("steering has value targets")
+    };
+    let mut model = cavitation_nn::InferenceModel::compile(&net, &params).unwrap();
+    let out = model.infer_batch(test.x.view());
+    let mae = (out.data().iter().zip(angles.data()))
+        .map(|(&p, &a)| f64::from((p - a).abs()))
+        .sum::<f64>()
+        / test.len() as f64;
+    println!("steering test mean absolute error: {mae:.3}°");
+    assert!(
+        mae < 1.5,
+        "steering mean absolute error {mae}° is not below 1.5°"
     );
 }

@@ -13,6 +13,8 @@
 //!   `scripts/data/get-mnist.sh` downloads.
 //! - [`mulberry32`]: the mulberry32 generator, which shuffles the digits, Concrete and Breast
 //!   Cancer splits (seed 42, the same shuffle for each).
+//! - [`steering`]: seeded synthetic 32 by 32 images of a road edge, with its angle in degrees
+//!   as the target.
 //!
 //! The digits, Concrete and Breast Cancer files are in the repository's `data/` folder, each
 //! with a README giving its source, licence and checksum.
@@ -25,6 +27,7 @@ pub mod mnist;
 pub mod mulberry32;
 #[cfg(test)]
 mod sha256;
+pub mod steering;
 mod tabular;
 
 pub use mulberry32::Mulberry32;
