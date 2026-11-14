@@ -6,6 +6,7 @@
 //! through [`CustomOp`] instead.
 
 mod activation;
+mod conv;
 mod custom;
 mod dropout;
 mod elementwise;
@@ -48,6 +49,9 @@ pub(crate) enum Op<T: Real> {
     Mul(Var, Var),
     /// Matrix product `a · b` of `[m, k]` and `[k, n]`.
     MatMul(Var, Var),
+    /// 2-D convolution: the images, the weight, the bias if any, and where the geometry's
+    /// twelve numbers start in the graph's label buffer.
+    Conv2d(Var, Var, Option<Var>, usize),
     /// Matrix product `a · bᵀ` of `[m, k]` and `[n, k]`.
     MatMulNt(Var, Var),
     /// The input where the condition (broadcast to the input's shape) is non-zero, 0
@@ -152,6 +156,7 @@ impl<T: Real> Op<T> {
             Op::Sub(a, b) => elementwise::binary_backward(Kind::Sub, a, b, out_grad, ctx),
             Op::Mul(a, b) => elementwise::binary_backward(Kind::Mul, a, b, out_grad, ctx),
             Op::MatMul(a, b) => matmul::backward(false, a, b, out_grad, ctx),
+            Op::Conv2d(x, w, b, start) => conv::backward(x, w, b, start, out_grad, ctx),
             Op::MatMulNt(a, b) => matmul::backward(true, a, b, out_grad, ctx),
             Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
             Op::KeepWhere(x, keep) => elementwise::keep_where_backward(x, keep, out_grad, ctx),

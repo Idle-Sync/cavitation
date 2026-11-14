@@ -14,6 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_backward_reference, conv2d_reference};
 use cavitation_core::kernels::{Level, detected, level, set_level, supported};
 use cavitation_core::{Gate, GeluApprox, Graph, ParamStore, Reduction, Tape, Tensor, Var};
 use serde_json::Value;
@@ -201,6 +202,10 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
             tape.dropout_with_mask(v[0], &keep, num(p, "p"))
         }
         "matmul" => tape.matmul(v[0], v[1]),
+        "conv2d" => {
+            let bias = (v.len() == 3).then(|| v[2]);
+            tape.conv2d(v[0], v[1], bias, conv_geom(f))
+        }
         "matmul_nt" => tape.matmul_nt(v[0], v[1]),
         "sum" => tape.sum(v[0]),
         "mean" => tape.mean(v[0]),
@@ -389,6 +394,61 @@ fn matmul_bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         }
     }
     (gemm(k, out), vec![gemm(n, da), gemm(m, db)])
+}
+
+/// The geometry a `conv2d` fixture records: channels, image and kernel sizes, stride,
+/// padding and dilation, each a pair.
+fn conv_geom(f: &Fixture) -> Conv2dGeom {
+    let p = &f.params;
+    let pair = |key: &str| {
+        let v = p[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("conv2d: `{key}` is a pair"));
+        (
+            v[0].as_u64().unwrap() as usize,
+            v[1].as_u64().unwrap() as usize,
+        )
+    };
+    let w = &f.inputs[1].shape;
+    Conv2dGeom::with_options(
+        w[1],
+        w[0],
+        pair("input"),
+        (w[2], w[3]),
+        pair("stride"),
+        pair("padding"),
+        pair("dilation"),
+    )
+    .expect("the fixture's geometry is valid")
+}
+
+/// The bounds for `conv2d`: the GEMM bound for the output (`k = in · kh · kw`, plus the
+/// bias), the input gradient (`k = out · kh · kw`), the weight and bias gradients (`k` =
+/// the batch's output positions), each element's `Σ|terms|` from the direct loops on
+/// absolute values.
+fn conv_bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
+    let g = conv_geom(f);
+    let batch = f.inputs[0].shape[0];
+    let abs = |t: &Tens| t.data.iter().map(|v| v.abs()).collect::<Vec<f64>>();
+    let (x, w) = (abs(&f.inputs[0]), abs(&f.inputs[1]));
+    let b = (f.inputs.len() == 3).then(|| abs(&f.inputs[2]));
+    let up = abs(&f.upstream);
+    let mut out = vec![0.0; batch * g.out_width()];
+    conv2d_reference(&g, batch, &x, &w, b.as_deref(), &mut out);
+    let (mut dx, mut dw, mut db) = (
+        vec![0.0; x.len()],
+        vec![0.0; w.len()],
+        vec![0.0; g.out_channels()],
+    );
+    conv2d_backward_reference(&g, batch, &x, &w, &up, &mut dx, &mut dw, &mut db);
+    let (oh, ow) = g.out_size();
+    let (kh, kw) = g.kernel();
+    let positions = batch * oh * ow;
+    let mut grads = vec![gemm(g.out_channels() * kh * kw, dx), gemm(positions, dw)];
+    if b.is_some() {
+        grads.push(gemm(positions, db));
+    }
+    (gemm(g.kernel_len() + 1, out), grads)
 }
 
 /// The bounds for `sum`, `mean`, `sum_axis` and `mean_axis` of a rank-2 input (and of any
@@ -695,6 +755,7 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         }
         "add" | "sub" | "mul" => binary_bounds(f),
         "matmul" | "matmul_nt" => matmul_bounds(f),
+        "conv2d" => conv_bounds(f),
         "sum" | "mean" | "sum_axis" | "mean_axis" => reduce_bounds(f),
         "softmax" | "log_softmax" => softmax_bounds(f),
         _ => loss_bounds(f),
@@ -773,6 +834,8 @@ const SELECT: &[&str] = &["keep_where"];
 const DROPOUT: &[&str] = &["dropout_with_mask"];
 /// The matrix products.
 const MATMUL: &[&str] = &["matmul", "matmul_nt"];
+/// 2-D convolution.
+const CONV: &[&str] = &["conv2d"];
 /// The reductions.
 const REDUCTIONS: &[&str] = &["sum", "mean", "sum_axis", "mean_axis"];
 /// The activations, `prelu` and `glu`.
@@ -901,6 +964,9 @@ comparison_tests! {
     dropout_matches_torch => DROPOUT,
     /// `matmul` and `matmul_nt` match PyTorch's float64 result within the GEMM bound.
     matmul_matches_torch => MATMUL,
+    /// `conv2d` with stride, padding, dilation, non-square images and kernels, 1 × 1 kernels
+    /// and no bias matches PyTorch's float64 result within the GEMM bound.
+    conv2d_matches_torch => CONV,
     /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
     reductions_match_torch => REDUCTIONS,
     /// Every activation, `prelu` and `glu` match PyTorch.

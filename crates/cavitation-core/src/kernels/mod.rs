@@ -28,6 +28,7 @@ mod aarch64;
 #[cfg(any(test, all(target_vendor = "apple", target_arch = "aarch64")))]
 mod accelerate;
 pub mod activation;
+pub mod conv;
 pub mod gemm;
 pub mod matvec;
 pub mod pool;
