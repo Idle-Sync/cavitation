@@ -526,6 +526,87 @@ pub fn load_with(
     Ok(if options.strict { Vec::new() } else { extra })
 }
 
+/// One tensor of a safetensors file, as [`inspect_file`] reports it.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_nn::TensorInfo;
+/// fn describe(t: &TensorInfo) -> String {
+///     format!("{} {} {:?}", t.name, t.dtype, t.shape)
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TensorInfo {
+    /// The tensor's key in the file, such as `0.weight`.
+    pub name: String,
+    /// The element type as the file names it: `F32`, `F16`, `BF16`, `F64`, `I64`, ...
+    /// [`load`] reads `F32`, `F16`, `BF16` and `F64`.
+    pub dtype: String,
+    /// The dimensions, outermost first: `[outputs, inputs]` for a `Linear`'s weight.
+    pub shape: Vec<usize>,
+}
+
+/// Every tensor in the safetensors file at `path`, with its name, element type and shape,
+/// in the order their data is stored in the file. Nothing is converted and no model is
+/// needed, so this shows what a file holds when a [`load`] fails: a key named differently,
+/// a shape the model does not have, an element type it cannot read.
+///
+/// The whole file is read and its header checked as [`load`] checks it, so a file this
+/// accepts has a valid layout.
+///
+/// # Errors
+///
+/// Returns [`Error::Io`] if the file cannot be read, and [`Error::Format`] if it is not a
+/// valid safetensors file (with the advice to save with safetensors when it is a
+/// `torch.save` file).
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng};
+/// use cavitation_nn::{Linear, Relu, Sequential, inspect_file, save};
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let net = Sequential::new()
+///     .push(Linear::new(&mut params, 4, 8, &mut rng))
+///     .push(Relu)
+///     .push(Linear::new(&mut params, 8, 3, &mut rng));
+/// let path = std::env::temp_dir()
+///     .join(format!("cavitation-doc-inspect-{}.safetensors", std::process::id()));
+/// save(&path, &net, &params)?;
+/// let tensors = inspect_file(&path)?;
+/// let names: Vec<&str> = tensors.iter().map(|t| t.name.as_str()).collect();
+/// assert_eq!(names, ["0.bias", "0.weight", "2.bias", "2.weight"]);
+/// assert_eq!((tensors[1].dtype.as_str(), tensors[1].shape.as_slice()), ("F32", &[8, 4][..]));
+/// std::fs::remove_file(&path).ok();
+/// # Ok::<(), cavitation_core::Error>(())
+/// ```
+pub fn inspect_file(path: impl AsRef<Path>) -> Result<Vec<TensorInfo>, Error> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path).map_err(|source| Error::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    check_not_torch_save(path, &bytes)?;
+    let (_, metadata) = SafeTensors::read_metadata(&bytes).map_err(|e| convert(path, e))?;
+    Ok(metadata
+        .offset_keys()
+        .into_iter()
+        .map(|name| {
+            let info = metadata
+                .info(&name)
+                .expect("offset_keys lists the header's own keys");
+            TensorInfo {
+                dtype: format!("{:?}", info.dtype),
+                shape: info.shape.clone(),
+                name,
+            }
+        })
+        .collect())
+}
+
 /// The little-endian values in `bytes`, of element type `dtype` (F32, F16, BF16 or F64), as
 /// F32: F16 and BF16 widen exactly, F64 rounds to the nearest F32 (ties to even).
 fn read_f32(dtype: Dtype, bytes: &[u8]) -> Vec<f32> {
@@ -588,7 +669,7 @@ mod tests {
     use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize_to_file};
     use serde_json::Value;
 
-    use super::{LoadOptions, load, load_lenient, load_with, save};
+    use super::{LoadOptions, inspect_file, load, load_lenient, load_with, save};
     use crate::{Linear, Prelu, Relu, Sequential};
 
     /// A path in the temporary folder that no other test or process uses.
@@ -1711,5 +1792,53 @@ mod tests {
                 .collect();
             assert_eq!(stored, ours, "{name}");
         }
+    }
+
+    /// `inspect_file` lists every tensor of the PyTorch fixtures with the element type and
+    /// shape the file stores, in data order, for each element type `load` reads.
+    #[test]
+    fn inspect_file_lists_the_fixture_tensors() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+        for (file, dtype) in [
+            ("mlp.safetensors", "F32"),
+            ("mlp-f16.safetensors", "F16"),
+            ("mlp-bf16.safetensors", "BF16"),
+            ("mlp-f64.safetensors", "F64"),
+        ] {
+            let tensors = inspect_file(dir.join(file)).unwrap();
+            let got: Vec<(&str, &str, &[usize])> = tensors
+                .iter()
+                .map(|t| (t.name.as_str(), t.dtype.as_str(), t.shape.as_slice()))
+                .collect();
+            assert_eq!(
+                got,
+                [
+                    ("0.bias", dtype, &[8][..]),
+                    ("0.weight", dtype, &[8, 4][..]),
+                    ("2.bias", dtype, &[3][..]),
+                    ("2.weight", dtype, &[3, 8][..]),
+                ],
+                "{file}"
+            );
+        }
+    }
+
+    /// A missing file is an `Io` error naming it; a `torch.save` zip and a truncated file
+    /// are format errors, the first with the advice to save with safetensors.
+    #[test]
+    fn inspect_file_errors() {
+        let missing = std::env::temp_dir().join("cavitation-inspect-no-such-file.safetensors");
+        assert!(matches!(inspect_file(&missing), Err(Error::Io { path, .. }) if path == missing));
+        let zip = temp_path("inspect-zip");
+        std::fs::write(&zip, b"PK\x03\x04 and more").unwrap();
+        let Err(Error::Format(text)) = inspect_file(&zip) else {
+            panic!("a zip must be a format error");
+        };
+        assert!(text.contains("torch.save"), "{text}");
+        let short = temp_path("inspect-short");
+        std::fs::write(&short, [8, 0, 0, 0, 0, 0, 0, 0, b'{']).unwrap();
+        assert!(matches!(inspect_file(&short), Err(Error::Format(_))));
+        std::fs::remove_file(&zip).ok();
+        std::fs::remove_file(&short).ok();
     }
 }
