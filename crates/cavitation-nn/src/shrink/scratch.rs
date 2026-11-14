@@ -197,6 +197,7 @@ pub fn train_found_size(
     eval: &Dataset,
     scratch: FromScratch,
 ) -> Result<FoundSize, Error> {
+    super::refuse_image_layers(model, "train_found_size")?;
     check_dataset(eval).map_err(|e| match e {
         Error::InvalidData(msg) => {
             Error::InvalidData(format!("train_found_size: the evaluation rows: {msg}"))
