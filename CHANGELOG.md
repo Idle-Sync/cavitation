@@ -7,6 +7,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Tensors and autograd (`cavitation-core`)
 
 - When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
+- `kernels::Level::ALL` lists every kernel level, in the order of their numbers, supported on this CPU or not (a slice, so a later level can be added without changing its type).
+- `Tape::glu`, `softmax` and `log_softmax` on an input whose last axis has width 0, and `softmax_cross_entropy` and `nll` with no classes, now mark a parameter's gradient current in the backward pass, as every other operation does; it was left stale.
 
 ### Layers, training and inference (`cavitation-nn`)
 
