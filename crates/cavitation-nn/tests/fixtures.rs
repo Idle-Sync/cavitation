@@ -657,9 +657,12 @@ fn run_layer(layer: &dyn Layer<f32>, values: &ParamStore, x: &[f32], rows: usize
 /// Each element's bound for layer `layer` of `net` against PyTorch's float64 output on the
 /// same input `x`. A convolution or `Linear` sums `k` terms (the bias one of them): the GEMM
 /// bound `γ(k) · Σ|terms|`, with `Σ|terms|` the layer run on `|x|` with `|parameters|`
-/// (`abs`). A batch norm in evaluation computes `(x − mean) · inv · γ + β` with `inv =
-/// 1 / √(var + eps)`: about six roundings, each relative to `(|x| + |mean|) · inv · |γ| +
-/// |β|`, so `γ(4)` of that, `γ(4) = 12 · 1.19e-7`.
+/// (`abs`). A batch norm in evaluation computes `((x − mean) · inv) · γ + β` in f32, with
+/// `inv = 1 / √(var + eps)` also in f32. With `u = 2⁻²⁴` the unit roundoff, `inv` carries
+/// about `2.5u` relative error (the add's `u` halved by the square root, then the square
+/// root's and the division's), and the subtraction, the two products and the add carry `u`
+/// each, relative to `S = (|x| + |mean|) · inv · |γ| + |β|`: about `6.5u · S` in all. The
+/// bound is `γ(4) · S`, with `γ(4) = 12 · 1.19e-7 = 24u`, over three times that count.
 fn layer_bound(
     net: &Sequential,
     layer: usize,
