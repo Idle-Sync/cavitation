@@ -26,6 +26,12 @@ branch. After writing, the script loads the file back into a new network with
 `load_state_dict(strict=True)` and requires the same outputs. `--only no-bias` writes just
 these two files.
 
+The element-type fixtures go in the same folder: the seeded `Linear(4, 8), ReLU(),
+Linear(8, 3)` state dict made and saved in float16, bfloat16 and float64
+(`mlp-f16.safetensors`, `mlp-bf16.safetensors`, `mlp-f64.safetensors`), and
+`mlp-dtypes.json` with the F32 values PyTorch's `.float()` gives for every tensor of each.
+`--only dtypes` writes just these four files.
+
 `--check-rust-save [PATH]` writes nothing. It checks the other direction: that a file written by the
 library's `save` loads in PyTorch. The Rust test `save_writes_the_file_pytorch_was_checked_against`
 (in `crates/cavitation-nn/src/io.rs`) keeps `from-rust.safetensors` in the same folder equal,
@@ -798,6 +804,7 @@ def main():
     print(f"wrote {len(OPTIM_CASES)} fixtures to {optim_dir} with torch {TORCH_VERSION}", file=sys.stderr)
     write_state_dict(args.out)
     write_no_bias_network(args.out)
+    write_dtype_files(args.out)
 
 
 if __name__ == "__main__":

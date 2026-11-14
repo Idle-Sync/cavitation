@@ -114,7 +114,8 @@ pub fn save(
 /// safetensors file (for example truncated, or a `torch.save` file, which the message says)
 /// or holds an `F64` value beyond the `F32` range (the message names the key),
 /// [`Error::Keys`] for keys that do not fit: the missing, the unexpected, the wrong-shape and
-/// the wrong-type keys are all found in one pass and listed in one error (see
+/// the wrong-type keys are all found in one pass and listed in one error (an `F64` value
+/// out of range is reported on its own, as soon as it is found; see
 /// [`KeyErrors`]), with the file's own first keys when none of the model's keys is there
 /// and a hint when a weight looks transposed.
 ///
@@ -431,16 +432,13 @@ pub fn load_with(
         if tensor.dtype() == Dtype::F64 {
             // A finite F64 too large for F32 would become infinite, so it is refused; an
             // infinity in the file stays one.
-            let too_large = tensor
+            let mut too_large = tensor
                 .data()
                 .as_chunks::<8>()
                 .0
                 .iter()
                 .map(|c| f64::from_le_bytes(*c));
-            if let Some(v) = too_large
-                .into_iter()
-                .find(|v| v.is_finite() && (*v as f32).is_infinite())
-            {
+            if let Some(v) = too_large.find(|v| v.is_finite() && (*v as f32).is_infinite()) {
                 return Err(Error::Format(format!(
                     "{}: key `{name}` holds the F64 value {v:e}, beyond the F32 range",
                     path.display()
