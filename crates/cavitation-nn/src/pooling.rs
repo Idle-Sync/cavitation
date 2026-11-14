@@ -279,12 +279,14 @@ impl AdaptiveAvgPool2d {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidData`] if any count or size is 0.
+    /// [`Error::InvalidData`] if any count or size is 0, or an image's values
+    /// (`channels · height · width`, in or out) overflow `usize`, naming the sizes.
     ///
     /// ```
     /// use cavitation_nn::AdaptiveAvgPool2d;
     /// assert!(AdaptiveAvgPool2d::new(3, (7, 7), (3, 3)).is_ok());
     /// assert!(AdaptiveAvgPool2d::new(3, (7, 7), (0, 3)).is_err());
+    /// assert!(AdaptiveAvgPool2d::new(usize::MAX, (2, 2), (1, 1)).is_err());
     /// ```
     pub fn new(
         channels: usize,
@@ -295,6 +297,13 @@ impl AdaptiveAvgPool2d {
             return Err(Error::InvalidData(format!(
                 "adaptive_avg_pool2d: the sizes must be at least 1, got {channels} channels, \
                  input {input:?} and output {output:?}"
+            )));
+        }
+        let values = |(h, w): (usize, usize)| channels.checked_mul(h)?.checked_mul(w);
+        if values(input).is_none() || values(output).is_none() {
+            return Err(Error::InvalidData(format!(
+                "adaptive_avg_pool2d: {channels} channels of {input:?} pooled to {output:?} \
+                 is more values per image than memory can hold"
             )));
         }
         Ok(AdaptiveAvgPool2d {
@@ -411,5 +420,45 @@ mod tests {
         });
         assert_eq!(seen, want);
         assert_eq!(model.infer_batch(x.view()).data().len(), rows * 3);
+    }
+
+    /// A user-made adaptive pooling form whose input size overflows is refused when the
+    /// model compiles, naming the layer and the sizes, instead of wrapping.
+    #[test]
+    #[should_panic(expected = "every size must be at least 1 and the input and output must fit")]
+    fn compile_refuses_an_overflowing_adaptive_form() {
+        /// An adaptive pooling of `usize::MAX` channels, built by hand.
+        struct Huge;
+        impl Layer<f32> for Huge {
+            /// Returns `"huge"`.
+            fn name(&self) -> &str {
+                "huge"
+            }
+            /// One value per image.
+            fn output_width(&self, _: usize) -> usize {
+                1
+            }
+            /// Passes the input on; only the inference form is under test.
+            fn forward(&self, _: &mut Tape<'_, f32>, x: Var) -> Var {
+                x
+            }
+            /// No parameters.
+            fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+                Vec::new()
+            }
+            /// The overflowing adaptive pooling form.
+            fn inference(&self, _: &ParamValues<f32>) -> Option<InferenceLayer> {
+                Some(InferenceLayer::AdaptiveAvgPool2d {
+                    channels: usize::MAX,
+                    input: (2, 2),
+                    output: (1, 1),
+                })
+            }
+        }
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 2, 4, &mut Rng::seed(0)))
+            .push(Huge);
+        let _ = InferenceModel::compile(&net, &params);
     }
 }

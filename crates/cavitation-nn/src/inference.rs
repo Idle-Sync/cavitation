@@ -1054,15 +1054,21 @@ impl Compiled {
                     input,
                     output,
                 } => {
+                    let fits = channels
+                        .checked_mul(input.0)
+                        .and_then(|v| v.checked_mul(input.1))
+                        .is_some();
                     let out = channels
                         .checked_mul(output.0)
                         .and_then(|v| v.checked_mul(output.1))
-                        .filter(|_| input.0 > 0 && input.1 > 0 && output.0 > 0 && output.1 > 0);
+                        .filter(|_| {
+                            fits && input.0 > 0 && input.1 > 0 && output.0 > 0 && output.1 > 0
+                        });
                     out.unwrap_or_else(|| {
                         panic!(
                             "InferenceModel::compile: layer {i} ({name}) pools {channels} \
                              channels of {input:?} to {output:?}: every size must be at \
-                             least 1 and the output must fit in memory"
+                             least 1 and the input and output must fit in memory"
                         )
                     })
                 }
@@ -1340,9 +1346,12 @@ fn declared_width(form: &InferenceLayer) -> Option<usize> {
         InferenceLayer::MaxPool2d(geom) | InferenceLayer::AvgPool2d { geom, .. } => {
             Some(geom.in_width())
         }
+        // A product that overflows declares nothing here; the step's own check refuses it.
         InferenceLayer::AdaptiveAvgPool2d {
             channels, input, ..
-        } => Some(channels * input.0 * input.1),
+        } => channels
+            .checked_mul(input.0)
+            .and_then(|v| v.checked_mul(input.1)),
         _ => None,
     }
 }
@@ -1710,7 +1719,10 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         | InferenceLayer::AdaptiveAvgPool2d { .. }
         | InferenceLayer::Softmax
         | InferenceLayer::LogSoftmax => {
-            unreachable!("Linear, Conv2d, Glu, Softmax and LogSoftmax steps run on their own")
+            unreachable!(
+                "Linear, Conv2d, MaxPool2d, AvgPool2d, AdaptiveAvgPool2d, Glu, Softmax and \
+                 LogSoftmax steps run on their own"
+            )
         }
     }
 }

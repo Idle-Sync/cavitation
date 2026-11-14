@@ -118,7 +118,8 @@ impl<T: Real> Tape<'_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if a size is 0 or `x` is not `[batch, channels · h · w]`, naming the operation.
+    /// Panics if a size is 0, `channels · h · w` overflows `usize`, or `x` is not
+    /// `[batch, channels · h · w]`, naming the operation.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -137,9 +138,20 @@ impl<T: Real> Tape<'_, T> {
         input: (usize, usize),
         output: (usize, usize),
     ) -> Var {
-        let width = channels * input.0 * input.1;
+        let values = |(h, w): (usize, usize)| {
+            channels
+                .checked_mul(h)
+                .and_then(|v| v.checked_mul(w))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "adaptive_avg_pool2d: {channels} channels of {h} x {w} overflow the \
+                         values per image"
+                    )
+                })
+        };
+        let width = values(input);
         let batch = batch_of("adaptive_avg_pool2d", &self.shape(x), width);
-        let out_w = channels * output.0 * output.1;
+        let out_w = values(output);
         let mut out = self.take_buffer(batch * out_w);
         adaptive_avg_pool2d(batch, channels, input, output, self.data(x), &mut out);
         let start = self.push_labels(&[channels, input.0, input.1, output.0, output.1]);
@@ -316,5 +328,19 @@ mod tests {
         tape.backward(loss, &mut store.grads);
         drop(tape);
         assert_eq!(store.grad(x).data(), &[0.0, 0.0, 0.0, 1.0]);
+    }
+
+    /// A channel count whose image size overflows `usize` is refused by name before any
+    /// buffer is sized from it.
+    #[test]
+    #[should_panic(
+        expected = "adaptive_avg_pool2d: 18446744073709551615 channels of 2 x 2 overflow"
+    )]
+    fn adaptive_pool_overflow_refused() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.input(Tensor::zeros(&[1, 4]).view());
+        tape.adaptive_avg_pool2d(x, usize::MAX, (2, 2), (1, 1));
     }
 }
