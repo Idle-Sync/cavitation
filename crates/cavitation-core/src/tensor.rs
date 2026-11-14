@@ -147,6 +147,22 @@ impl<T: Real> Tensor<T> {
         &mut self.data
     }
 
+    /// Gives up the tensor and returns its elements in row-major order, without copying
+    /// them. With [`from_vec`](Self::from_vec) this lets a tensor grow in place: take the
+    /// `Vec`, push onto it, and wrap it again in the larger shape.
+    ///
+    /// ```
+    /// use cavitation_core::Tensor;
+    /// let t = Tensor::from_vec(vec![1.0f32, 2.0], &[1, 2]).unwrap();
+    /// let mut data = t.into_vec();
+    /// data.extend([3.0, 4.0]);
+    /// let t = Tensor::from_vec(data, &[2, 2]).unwrap();
+    /// assert_eq!(t.get(&[1, 0]), 3.0);
+    /// ```
+    pub fn into_vec(self) -> Vec<T> {
+        self.data
+    }
+
     /// A borrowed read-only view of the whole tensor.
     ///
     /// ```
