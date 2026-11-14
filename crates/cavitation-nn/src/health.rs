@@ -307,9 +307,9 @@ pub enum Warning {
     /// on the layer before it, are not counted. After a `Conv2d` or `BatchNorm2d` (with only
     /// element-wise layers between), each value of the row is one position of one channel,
     /// and a position counts only when its whole channel output 0 everywhere: a live channel
-    /// is often 0 at the positions that see flat input, such as an image's blank border. Sent to the sink every epoch; without a sink,
-    /// printed when the layer's share of dead neurons passes 25%, 50% or 90% for the first
-    /// time. "Dead" is measured per epoch and on the data the epoch ran over: a neuron that is
+    /// is often 0 at the positions that see flat input, such as an image's blank border.
+    /// Sent to the sink every epoch; without a sink, printed when the layer's share of dead
+    /// neurons passes 25%, 50% or 90% for the first time. "Dead" is measured per epoch and on the data the epoch ran over: a neuron that is
     /// silent on every training row of one epoch can fire in a later epoch, once the layers
     /// before it change, or on rows it was not counted on.
     DeadNeurons {
@@ -524,8 +524,8 @@ impl fmt::Display for Warning {
                 }
                 f.write_str(
                     "]; try a lower learning rate, a leaky activation such as LeakyRelu, or a \
-                     positive bias initialisation on the Linear before it (one built with \
-                     Linear::without_bias has no bias: build it with a bias first)",
+                     positive bias initialisation on the Linear or Conv2d before it (one built \
+                     without a bias has none: build it with a bias first)",
                 )
             }
         }
@@ -2710,8 +2710,8 @@ mod tests {
                  gradient reached it, which points at dead ReLUs or a saturated output",
                 "epoch 1: 2 of 4 (50%) neurons of layer 1 output 0 for every sample (dead ReLU): \
                  [0, 3]; try a lower learning rate, a leaky activation such as LeakyRelu, or a \
-                 positive bias initialisation on the Linear before it (one built with \
-                 Linear::without_bias has no bias: build it with a bias first)",
+                 positive bias initialisation on the Linear or Conv2d before it (one built \
+                 without a bias has none: build it with a bias first)",
             ]
         );
     }
