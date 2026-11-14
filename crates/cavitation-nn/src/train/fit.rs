@@ -1339,7 +1339,7 @@ pub trait StepControl {
     /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
     /// let report =
-    ///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 4, seconds: 0.01, validation: None };
+    ///     EpochReport::new(1, 0.5, 4, 0.01);
     /// let mut model = ModelHandle::new(&mut net);
     /// let mut handle = TrainerHandle::new(&mut trainer);
     /// let flow = Nothing.after_epoch(&report, &mut model, &params, &mut handle);
@@ -1545,15 +1545,19 @@ impl LrSchedule {
 
 /// What one epoch of [`fit`] did.
 ///
+/// The struct is `#[non_exhaustive]`, so a later field is not a breaking change: outside
+/// this crate a report is built with [`EpochReport::new`] (for example to test a
+/// [`StepControl`]) and read through its public fields.
+///
 /// # Examples
 ///
 /// ```
 /// use cavitation_nn::EpochReport;
-/// let report =
-///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 100, seconds: 0.01, validation: None };
+/// let report = EpochReport::new(1, 0.5, 100, 0.01);
 /// assert_eq!(report.epoch, 1);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct EpochReport {
     /// The epoch's number, counting from 1.
     pub epoch: usize,
@@ -1596,6 +1600,27 @@ pub struct EpochReport {
     pub validation: Option<Evaluation>,
 }
 
+impl EpochReport {
+    /// A report of epoch `epoch` with its `mean_loss`, `rows` and `seconds`, and no
+    /// validation. Fields added later are set to a default here, so this keeps working
+    /// when the struct grows.
+    ///
+    /// ```
+    /// use cavitation_nn::EpochReport;
+    /// let report = EpochReport::new(3, 0.25, 64, 0.5);
+    /// assert_eq!((report.epoch, report.rows, report.validation), (3, 64, None));
+    /// ```
+    pub fn new(epoch: usize, mean_loss: f64, rows: usize, seconds: f64) -> EpochReport {
+        EpochReport {
+            epoch,
+            mean_loss,
+            rows,
+            seconds,
+            validation: None,
+        }
+    }
+}
+
 /// Every epoch's report from one [`fit`].
 ///
 /// # Examples
@@ -1603,7 +1628,7 @@ pub struct EpochReport {
 /// ```
 /// use cavitation_nn::{EpochReport, History};
 /// let report =
-///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 100, seconds: 0.01, validation: None };
+///     EpochReport::new(1, 0.5, 100, 0.01);
 /// let history = History { epochs: vec![report] };
 /// assert_eq!(history.epochs.len(), 1);
 /// ```
