@@ -648,7 +648,11 @@ pub fn conv2d_scratch(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
 /// column matrix in `cols` times the weight into `prod` (`[out, images · windows]`), then
 /// each value moved to its output image with the bias added. A 1 × 1 kernel with stride 1
 /// and no padding multiplies each image itself instead. The tape and `InferenceModel` both
-/// run this, so they agree bit for bit; `cols` and `prod` hold at least
+/// run this, so they agree bit for bit at every kernel level whose GEMM gives each value
+/// the same bits whatever the product's shape (the library's own kernels); at the Accelerate
+/// level, whose `sgemm` chooses its blocking from the shape, a chunk of another size (one
+/// image against several) can round differently, within the GEMM bound. `cols` and `prod`
+/// hold at least
 /// [`conv2d_scratch`]'s lengths.
 ///
 /// # Panics

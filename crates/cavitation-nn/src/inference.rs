@@ -1424,7 +1424,9 @@ impl Run {
 
     /// One `Conv2d` step from `src` (`rows` input images) into `dst` (`rows` output images),
     /// by [`conv2d_forward`] with the GEMM of this call's level and threads, as the tape
-    /// computes it (so with the tape's bits), for one input as for a batch; `scratch` holds
+    /// computes it: with the tape's bits, for one input as for a batch, except at the
+    /// Accelerate level, where a product of another shape can differ within the GEMM bound
+    /// (see [`conv2d_forward`]); `scratch` holds
     /// the column matrix and the product ([`conv_scratch`]).
     fn conv2d(
         &self,
