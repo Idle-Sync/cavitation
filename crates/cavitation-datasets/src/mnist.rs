@@ -152,7 +152,7 @@ mod tests {
         std::fs::write(path, out).unwrap();
     }
 
-    /// Writes the four files with `train` and `test` images of 2 by 2 pixels.
+    /// Writes the four files with `train` and `test` images of 28 by 28 pixels.
     fn write_set(dir: &Path, train: usize, test: usize) {
         for (prefix, n) in [("train", train), ("t10k", test)] {
             let pixels: Vec<u8> = (0..n * 784).map(|i| (i * 51 % 256) as u8).collect();
