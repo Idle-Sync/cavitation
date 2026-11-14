@@ -272,6 +272,9 @@ pub struct Trainer<'s> {
     /// Whether [`override_learning_rate`](Self::override_learning_rate) has stopped the
     /// learning-rate schedule for the rest of the run.
     schedule_stopped: bool,
+    /// The run's learning-rate schedule, which [`run_epoch`](Self::run_epoch) applies;
+    /// `None` outside [`fit`] and [`fit_controlled`].
+    rates: Option<StepRates>,
 }
 
 impl<'s> Trainer<'s> {
@@ -320,6 +323,7 @@ impl<'s> Trainer<'s> {
             names: model.parameter_names(),
             profiler: Profiler::default(),
             schedule_stopped: false,
+            rates: None,
         }
     }
 
@@ -621,7 +625,7 @@ impl<'s> Trainer<'s> {
 
     /// Sets the optimiser's learning rate to `lr` for every later step, and stops
     /// [`fit_controlled`]'s learning-rate schedule ([`FitConfig::schedule`]) for the rest of
-    /// the run, so that no later epoch sets the rate again. Called between the steps of an
+    /// the run, so that no later step sets the rate again. Called between the steps of an
     /// epoch, it applies from the next step on. Outside a run (a loop of
     /// [`step`](Self::step) calls) it only sets the rate.
     ///
@@ -739,7 +743,17 @@ impl<'s> Trainer<'s> {
         let mut seen = 0usize;
         let mut checked = Ok(());
         let mut stopped = false;
-        for range in batcher.batches() {
+        for (position, range) in batcher.batches().enumerate() {
+            // The per-epoch schedules set the rate at an epoch's first step only, so an
+            // optimiser of your own that moves its rate inside a step keeps its move until
+            // the next epoch, as before the per-step schedules.
+            if let Some(rates) = self.rates
+                && !self.schedule_stopped
+                && (position == 0 || rates.per_step())
+            {
+                let step = (epoch - 1) * rates.steps_per_epoch + position;
+                self.optimizer.set_learning_rate(rates.at(step));
+            }
             // Only a control reads the step's time, so only a controlled run reads the clock.
             let start = matches!(run, Run::Controlled(..)).then(Instant::now);
             let rows = range.len();
@@ -781,6 +795,35 @@ impl<'s> Trainer<'s> {
             whole: seen == data.len(),
             stopped,
         })
+    }
+}
+
+/// The run's learning-rate schedule as [`Trainer::run_epoch`] applies it before each step.
+#[derive(Clone, Copy, Debug)]
+struct StepRates {
+    /// The schedule.
+    schedule: LrSchedule,
+    /// The optimiser's configured rate, the schedule's peak.
+    initial: f64,
+    /// The step positions of one epoch: the batches of the data, the last one smaller.
+    steps_per_epoch: usize,
+    /// The run's epochs.
+    epochs: usize,
+}
+
+impl StepRates {
+    /// The rate of step position `step` of the run, counting from 0.
+    fn at(&self, step: usize) -> f64 {
+        self.schedule
+            .learning_rate(self.initial, step, self.steps_per_epoch, self.epochs)
+    }
+
+    /// Whether the schedule changes the rate within an epoch.
+    fn per_step(&self) -> bool {
+        matches!(
+            self.schedule,
+            LrSchedule::Warmup { .. } | LrSchedule::WarmupCosine { .. }
+        )
     }
 }
 
@@ -1281,8 +1324,8 @@ pub trait StepControl {
     }
 
     /// Runs after each whole epoch, after [`FitConfig::on_epoch`], with the epoch's report.
-    /// A learning rate overridden here applies from the next epoch, and the schedule no
-    /// longer sets it.
+    /// A learning rate overridden here applies from the next step, the first of the next
+    /// epoch, and the schedule no longer sets it.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -1379,19 +1422,31 @@ impl OptimizerConfig {
     }
 }
 
-/// How [`fit`] changes the learning rate from epoch to epoch. The rate the optimiser is
-/// configured with is the rate of the first epoch.
+/// How [`fit`] changes the learning rate from step to step. The rate the optimiser is
+/// configured with is the schedule's peak: the rate of the first epoch, or the rate the
+/// warm-up climbs to.
+///
+/// [`Constant`](Self::Constant) and [`Cosine`](Self::Cosine) set the rate before the first
+/// step of each epoch; [`Warmup`](Self::Warmup) and [`WarmupCosine`](Self::WarmupCosine)
+/// set it before every step. `fit` takes the rate from
+/// [`learning_rate`](Self::learning_rate), counting every step position of the run (a step
+/// left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) still counts), until a
+/// [`StepControl`] overrides the rate.
 ///
 /// # Examples
 ///
 /// ```
 /// use cavitation_nn::{FitConfig, LrSchedule};
-/// let config = FitConfig { schedule: LrSchedule::Cosine { min_lr: 0.0 }, ..FitConfig::default() };
+/// let config = FitConfig {
+///     schedule: LrSchedule::WarmupCosine { warmup_steps: 100, min_lr: 0.0 },
+///     ..FitConfig::default()
+/// };
 /// assert_ne!(config.schedule, LrSchedule::Constant);
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[non_exhaustive]
 pub enum LrSchedule {
-    /// Every epoch trains at the configured rate.
+    /// Every step trains at the configured rate.
     #[default]
     Constant,
     /// Cosine annealing from the configured rate down towards `min_lr`, set once at the
@@ -1402,32 +1457,88 @@ pub enum LrSchedule {
         /// The rate the schedule approaches; the last epoch trains a little above it.
         min_lr: f64,
     },
+    /// A linear warm-up over the first `steps` steps, then the configured rate: step `s`
+    /// (counting from 0) of the warm-up trains at `lr·(s + 1)/steps`, so the first step
+    /// trains at `lr/steps` and step `steps − 1` at `lr`. `steps` of 0 is
+    /// [`Constant`](Self::Constant).
+    Warmup {
+        /// How many steps the warm-up takes.
+        steps: usize,
+    },
+    /// The linear warm-up of [`Warmup`](Self::Warmup) over `warmup_steps` steps, then cosine
+    /// annealing by step from the configured rate towards `min_lr` over the rest of the
+    /// run: step `s ≥ warmup_steps` of `total` trains at
+    /// `min_lr + (lr − min_lr)·(1 + cos(π·t/n))/2` with `t = s − warmup_steps` and
+    /// `n = total − warmup_steps`. With `warmup_steps` of 0 it is cosine annealing by step,
+    /// as PyTorch's `CosineAnnealingLR(optimizer, T_max=total, eta_min=min_lr)` stepped after
+    /// every batch.
+    WarmupCosine {
+        /// How many steps the warm-up takes.
+        warmup_steps: usize,
+        /// The rate the schedule approaches; the last step trains a little above it.
+        min_lr: f64,
+    },
 }
 
 impl LrSchedule {
-    /// The learning rate of epoch `epoch` (counting from 0, the number of epochs already
-    /// trained) of a run of `epochs` epochs whose first epoch trains at `initial`.
+    /// The learning rate of step `step` (counting from 0, the number of step positions
+    /// already run) of a run of `epochs` epochs of `steps_per_epoch` steps each, whose peak
+    /// rate is `initial`. For the per-epoch schedules the step's epoch is
+    /// `step / steps_per_epoch`.
     ///
     /// # Panics
     ///
-    /// Panics if `epochs` is 0.
+    /// Panics if `epochs` or `steps_per_epoch` is 0.
     ///
     /// ```
     /// use cavitation_nn::LrSchedule;
     /// let cosine = LrSchedule::Cosine { min_lr: 0.0 };
-    /// assert_eq!(cosine.learning_rate(1e-3, 0, 4), 1e-3);
-    /// assert_eq!(cosine.learning_rate(1e-3, 2, 4), 5e-4);
-    /// assert_eq!(LrSchedule::Constant.learning_rate(1e-3, 3, 4), 1e-3);
+    /// // Epoch 2 of 4, at its first and last step of 10.
+    /// assert_eq!(cosine.learning_rate(1e-3, 20, 10, 4), 5e-4);
+    /// assert_eq!(cosine.learning_rate(1e-3, 29, 10, 4), 5e-4);
+    /// let warm = LrSchedule::Warmup { steps: 4 };
+    /// assert_eq!(warm.learning_rate(1e-3, 0, 10, 4), 2.5e-4);
+    /// assert_eq!(warm.learning_rate(1e-3, 3, 10, 4), 1e-3);
+    /// let by_step = LrSchedule::WarmupCosine { warmup_steps: 0, min_lr: 0.0 };
+    /// assert_eq!(by_step.learning_rate(1e-3, 20, 10, 4), 5e-4);
+    /// assert_eq!(LrSchedule::Constant.learning_rate(1e-3, 3, 10, 4), 1e-3);
     /// ```
-    pub fn learning_rate(&self, initial: f64, epoch: usize, epochs: usize) -> f64 {
+    pub fn learning_rate(
+        &self,
+        initial: f64,
+        step: usize,
+        steps_per_epoch: usize,
+        epochs: usize,
+    ) -> f64 {
         assert!(epochs > 0, "LrSchedule: a run needs at least one epoch");
+        assert!(
+            steps_per_epoch > 0,
+            "LrSchedule: an epoch needs at least one step"
+        );
+        let cosine = |min_lr: f64, done: usize, total: usize| {
+            // PyTorch's order of operations: π·t first, then the division.
+            let angle = std::f64::consts::PI * done as f64 / total as f64;
+            min_lr + (initial - min_lr) * (1.0 + angle.cos()) / 2.0
+        };
+        let warmup = |steps: usize| initial * (step + 1) as f64 / steps as f64;
         match *self {
             LrSchedule::Constant => initial,
-            LrSchedule::Cosine { min_lr } => {
-                // PyTorch's order of operations: π·e first, then the division.
-                let angle = std::f64::consts::PI * epoch as f64 / epochs as f64;
-                min_lr + (initial - min_lr) * (1.0 + angle.cos()) / 2.0
+            LrSchedule::Cosine { min_lr } => cosine(min_lr, step / steps_per_epoch, epochs),
+            LrSchedule::Warmup { steps } if step < steps => warmup(steps),
+            LrSchedule::Warmup { .. } => initial,
+            LrSchedule::WarmupCosine { warmup_steps, .. } if step < warmup_steps => {
+                warmup(warmup_steps)
             }
+            LrSchedule::WarmupCosine {
+                warmup_steps,
+                min_lr,
+            } => cosine(
+                min_lr,
+                step - warmup_steps,
+                (steps_per_epoch * epochs)
+                    .saturating_sub(warmup_steps)
+                    .max(1),
+            ),
         }
     }
 }
@@ -1551,7 +1662,8 @@ pub struct FitConfig<'s> {
     pub loss: Loss,
     /// The seed that shuffles the rows each epoch; `None` keeps the data's order.
     pub shuffle_seed: Option<u64>,
-    /// How the learning rate changes from epoch to epoch, starting from the optimiser's.
+    /// How the learning rate changes from step to step or epoch to epoch, with the
+    /// optimiser's rate as its peak.
     pub schedule: LrSchedule,
     /// The health checks run on every step and at the end of every epoch.
     pub health: Health<'s>,
@@ -1760,7 +1872,8 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 
 /// Trains `model` on `train` as `config` says and returns each epoch's report.
 ///
-/// Each epoch sets the optimiser's learning rate from `config.schedule`, reshuffles the rows (with
+/// The optimiser's learning rate follows `config.schedule`, set before each step or each
+/// epoch as [`LrSchedule`] says. Each epoch reshuffles the rows (with
 /// `config.shuffle_seed`), takes one [`Trainer::step`] per batch, ends the epoch of the health
 /// checks ([`Trainer::end_epoch`]), measures `config.validation` when there is one
 /// ([`EpochReport::validation`]) and then calls `config.on_epoch`. The validation only reads the
@@ -2000,14 +2113,13 @@ fn run_fit(
         epochs: Vec::with_capacity(config.epochs.min(1024)),
     };
     params.zero_grad();
-    let initial_lr = trainer.optimizer.learning_rate();
+    trainer.rates = Some(StepRates {
+        schedule: config.schedule,
+        initial: trainer.optimizer.learning_rate(),
+        steps_per_epoch: batcher.batches().count(),
+        epochs: config.epochs,
+    });
     for epoch in 1..=config.epochs {
-        if !trainer.schedule_stopped {
-            let lr = config
-                .schedule
-                .learning_rate(initial_lr, epoch - 1, config.epochs);
-            trainer.optimizer.set_learning_rate(lr);
-        }
         let start = Instant::now();
         let end = trainer.run_epoch(&mut run, params, train, &mut batcher, hooks, epoch)?;
         let whole = end.whole;
@@ -2894,13 +3006,17 @@ mod tests {
     #[test]
     fn lr_schedule_rates() {
         let cosine = LrSchedule::Cosine { min_lr: 0.0 };
-        let rates: Vec<f64> = (0..4).map(|e| cosine.learning_rate(1e-3, e, 4)).collect();
+        let rates: Vec<f64> = (0..4)
+            .map(|e| cosine.learning_rate(1e-3, e, 1, 4))
+            .collect();
         assert_eq!(
             rates,
             [1e-3, 8.535533905932737e-4, 5e-4, 1.4644660940672628e-4]
         );
         let floored = LrSchedule::Cosine { min_lr: 0.01 };
-        let rates: Vec<f64> = (0..4).map(|e| floored.learning_rate(0.1, e, 4)).collect();
+        let rates: Vec<f64> = (0..4)
+            .map(|e| floored.learning_rate(0.1, e, 1, 4))
+            .collect();
         assert_eq!(
             rates,
             [
@@ -2911,9 +3027,133 @@ mod tests {
             ]
         );
         for e in 0..4 {
-            assert_eq!(LrSchedule::Constant.learning_rate(0.1, e, 4), 0.1);
+            assert_eq!(LrSchedule::Constant.learning_rate(0.1, e, 1, 4), 0.1);
         }
         assert_eq!(LrSchedule::default(), LrSchedule::Constant);
+    }
+
+    /// The warm-up climbs linearly to the peak and ends on it; the cosine by step then falls
+    /// from the peak over the remaining steps; a cosine by step with no warm-up is the
+    /// per-epoch cosine at one step per epoch; and `Warmup { steps: 0 }` is constant.
+    #[test]
+    fn step_schedule_rates() {
+        let warm = LrSchedule::Warmup { steps: 4 };
+        let rates: Vec<f64> = (0..6).map(|s| warm.learning_rate(0.1, s, 3, 2)).collect();
+        // `lr·(s + 1)/steps` in that order of operations, so step 2 is 0.1·3/4.
+        assert_eq!(
+            rates,
+            [0.1 / 4.0, 0.1 * 2.0 / 4.0, 0.1 * 3.0 / 4.0, 0.1, 0.1, 0.1]
+        );
+        let both = LrSchedule::WarmupCosine {
+            warmup_steps: 2,
+            min_lr: 0.0,
+        };
+        let rates: Vec<f64> = (0..6).map(|s| both.learning_rate(0.1, s, 3, 2)).collect();
+        // Steps 2..6 are 0..4 of a cosine over 4 steps.
+        let cosine = |t: f64| 0.1 * (1.0 + (std::f64::consts::PI * t / 4.0).cos()) / 2.0;
+        assert_eq!(
+            rates,
+            [
+                0.05,
+                0.1,
+                cosine(0.0),
+                cosine(1.0),
+                cosine(2.0),
+                cosine(3.0)
+            ]
+        );
+        let by_step = LrSchedule::WarmupCosine {
+            warmup_steps: 0,
+            min_lr: 0.01,
+        };
+        let by_epoch = LrSchedule::Cosine { min_lr: 0.01 };
+        for e in 0..4 {
+            assert_eq!(
+                by_step.learning_rate(0.1, e, 1, 4),
+                by_epoch.learning_rate(0.1, e, 1, 4)
+            );
+        }
+        assert_eq!(
+            LrSchedule::Warmup { steps: 0 }.learning_rate(0.1, 0, 3, 2),
+            0.1
+        );
+    }
+
+    /// `fit` under a warm-up then a cosine by step trains to the parameters and the epoch
+    /// losses of a manual loop that sets each step's rate from the same schedule and calls
+    /// `Trainer::step`, bit for bit; and its rates really change within an epoch.
+    #[test]
+    fn step_schedule_fit_matches_a_manual_loop() {
+        let data = classes_dataset(10);
+        let schedule = LrSchedule::WarmupCosine {
+            warmup_steps: 2,
+            min_lr: 1e-4,
+        };
+        let (epochs, batch, seed) = (3, 4, 5);
+        let build = |params: &mut ParamStore| {
+            let mut rng = Rng::seed(1);
+            Sequential::new()
+                .push(Linear::new(params, 3, 6, &mut rng))
+                .push(Tanh)
+                .push(Linear::new(params, 6, 10, &mut rng))
+        };
+        let mut fitted = ParamStore::new();
+        let net = build(&mut fitted);
+        let config = FitConfig {
+            epochs,
+            batch,
+            shuffle_seed: Some(seed),
+            schedule,
+            loss: Loss::CrossEntropy,
+            optimizer: OptimizerConfig::Adam {
+                lr: 0.05,
+                weight_decay: 0.0,
+            },
+            health: Health::quiet(),
+            ..FitConfig::default()
+        };
+        let history = fit(&net, &mut fitted, &data, config).unwrap();
+
+        let mut manual = ParamStore::new();
+        let twin = build(&mut manual);
+        let mut trainer = Trainer::new(&twin, Adam::new(0.05), Loss::CrossEntropy, batch);
+        trainer.set_health(Health::quiet());
+        let mut batcher = Batcher::new(data.len(), batch, Some(seed));
+        let mut buffer = Batch::new(&data, batch);
+        let steps_per_epoch = batcher.batches().count();
+        assert_eq!(steps_per_epoch, 3);
+        let mut step = 0;
+        let mut rates = Vec::new();
+        let mut losses = Vec::new();
+        for epoch in 1..=epochs {
+            batcher.epoch();
+            let (mut total, mut rows) = (0.0f64, 0usize);
+            for range in batcher.batches() {
+                let lr = schedule.learning_rate(0.05, step, steps_per_epoch, epochs);
+                trainer.override_learning_rate(lr);
+                rates.push(lr);
+                step += 1;
+                let n = range.len();
+                let view = batcher.gather(&data, range, &mut buffer);
+                let loss = trainer.step(&twin, &mut manual, view).unwrap();
+                total += f64::from(loss) * n as f64;
+                rows += n;
+            }
+            trainer.end_epoch(epoch).unwrap();
+            losses.push((total / rows as f64).to_bits());
+        }
+        assert_eq!(
+            parameter_bits(&net, &fitted),
+            parameter_bits(&twin, &manual)
+        );
+        let fitted_losses: Vec<u64> = history
+            .epochs
+            .iter()
+            .map(|r| r.mean_loss.to_bits())
+            .collect();
+        assert_eq!(fitted_losses, losses);
+        assert_eq!(rates.len(), 9);
+        assert!(rates[0] < rates[1] && rates[1] == 0.05 && rates[3] > rates[4]);
     }
 
     /// The learning rate each epoch of `fit` trains at under `schedule`, starting from SGD at

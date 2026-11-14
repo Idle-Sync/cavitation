@@ -66,7 +66,8 @@ pub struct GradientConfig<'s> {
     /// on top of the regression's own `alpha`; leave it at 0 to minimise the regression's
     /// objective.
     pub optimizer: OptimizerConfig,
-    /// How the learning rate changes from epoch to epoch, starting from the optimiser's.
+    /// How the learning rate changes from step to step or epoch to epoch, with the
+    /// optimiser's rate as its peak.
     pub schedule: LrSchedule,
     /// The seed that shuffles the rows each epoch; `None` keeps the data's order. With a
     /// full batch, shuffling changes only the order of the sums.
@@ -344,17 +345,21 @@ pub(crate) fn train(
         epochs: Vec::with_capacity(config.epochs.min(1024)),
     };
     let initial_lr = optimizer.learning_rate();
+    let steps_per_epoch = batcher.batches().count();
     let mut step = 0u64;
     for epoch in 1..=config.epochs {
-        let lr = config
-            .schedule
-            .learning_rate(initial_lr, epoch - 1, config.epochs);
-        optimizer.set_learning_rate(lr);
         let start = Instant::now();
         batcher.epoch();
         let mut total = 0.0f64;
         let mut trained = 0usize;
         for range in batcher.batches() {
+            let lr = config.schedule.learning_rate(
+                initial_lr,
+                step as usize,
+                steps_per_epoch,
+                config.epochs,
+            );
+            optimizer.set_learning_rate(lr);
             step += 1;
             let batch_rows = range.len();
             let order = &batcher.order()[range.clone()];
