@@ -256,6 +256,11 @@ impl Training {
     /// in `captures`. The caller checks that a client is connected. Returns whether every
     /// publish went through; when the hub's lock refused one, `capture_now` stays set, so
     /// the snapshot is taken again at the next chance.
+    ///
+    /// The waiting events are published first, and while any is still waiting (the hub's
+    /// lock refused it) no snapshot is taken: a snapshot published ahead of an event would
+    /// reach the page before it (a paused run's `stats` before its `paused` status, say).
+    /// The capture then returns `false` with `capture_now` set, and is tried again.
     fn capture(
         &mut self,
         config: &InspectorConfig,
@@ -264,6 +269,11 @@ impl Training {
         params: &ParamStore,
         learning_rate: f64,
     ) -> bool {
+        self.flush(config, hub, model, false);
+        if !self.pending.is_empty() {
+            self.capture_now = true;
+            return false;
+        }
         self.captures += 1;
         if self.rows_since > 0 && self.seconds_since > 0.0 {
             self.samples_per_second = self.rows_since as f64 / self.seconds_since;
@@ -784,14 +794,21 @@ impl StepControl for Inspector {
         t.learning_rate = trainer.learning_rate();
         t.rows_since += info.rows;
         t.seconds_since += info.seconds;
+        t.flush(config, hub, model.model(), false);
         if hub.clients() > 0
             && let Some(profile) = trainer.last_profile()
         {
-            hub.publish_snapshot(Snapshot::Profile, |w| {
-                wire::profile(w, info.step, model.model(), profile);
-            });
+            // Only once no event is waiting, so the profile does not overtake one; a profile
+            // the hub's lock refused (or held back) is asked for again, so the next step's
+            // goes out instead.
+            let published = t.pending.is_empty()
+                && hub.publish_snapshot(Snapshot::Profile, |w| {
+                    wire::profile(w, info.step, model.model(), profile);
+                });
+            if !published {
+                trainer.profile_next_step();
+            }
         }
-        t.flush(config, hub, model.model(), false);
         t.serve(inspector, model, trainer);
         if t.paused {
             t.hold(inspector, model, params, trainer);
@@ -945,6 +962,42 @@ pub fn fit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot never goes out ahead of an event that is still waiting. A step's flush of a
+    /// `paused` status that the hub's lock refused, followed by a capture once the lock is
+    /// free, publishes the status and then the snapshot; a capture while the lock is still
+    /// held publishes nothing and leaves `capture_now` set.
+    #[test]
+    fn no_snapshot_overtakes_a_waiting_event() {
+        use cavitation_core::Rng;
+        use cavitation_nn::Linear;
+        let mut params = ParamStore::new();
+        let model = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+        let config = InspectorConfig::default();
+        let hub = Hub::new(4, 16, Duration::from_secs(1));
+        let mut t = Training::new();
+        t.paused = true;
+        t.say("paused".to_string());
+        {
+            let _held = hub.hold_lock();
+            t.flush(&config, &hub, &model, false);
+            assert_eq!(t.pending.len(), 1, "the refused status waits");
+            assert!(!t.capture(&config, &hub, &model, &params, 0.1));
+            assert!(t.capture_now);
+        }
+        let export = hub.export_json();
+        assert!(export.contains(r#""stats":null"#), "{export}");
+        assert!(export.contains(r#""status":null"#), "{export}");
+        // The lock is free again: the status goes out with the capture, ahead of the stats.
+        assert!(t.capture(&config, &hub, &model, &params, 0.1));
+        assert!(
+            t.pending.is_empty(),
+            "the status was published before the snapshot"
+        );
+        let export = hub.export_json();
+        assert!(export.contains(r#""state":"paused""#), "{export}");
+        assert!(export.contains(r#""paused":true"#), "{export}");
+    }
 
     /// An evaluation is due from exactly `EVALUATION_FACTOR` times its cost on: not at 199
     /// times, yes at 200 and after, and never when the budget does not fit a `Duration`.

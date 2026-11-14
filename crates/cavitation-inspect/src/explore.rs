@@ -164,7 +164,9 @@ impl Drop for Done<'_> {
 /// [`POLL`]: `Cancel` and `Finish` raise [`Watch::stop`] (and `Finish` [`Watch::finish`])
 /// and are acknowledged at once with `cancelling`, and anything else is answered with a
 /// `status` saying that `what` is in progress. `run` reads the flags at its own stopping
-/// points.
+/// points. The commands already queued are answered on this thread before `run` starts,
+/// so a cancel sent before the run began takes effect at its first stopping point, however
+/// late the second thread is scheduled.
 fn watched<R>(
     shared: &Shared,
     what: &str,
@@ -172,29 +174,33 @@ fn watched<R>(
     run: impl FnOnce(&Arc<Watch>) -> R,
 ) -> R {
     let watch = Arc::new(Watch::default());
+    // Answers every command queued now.
+    let answer = |flags: &Watch| {
+        let hub = &shared.hub;
+        while let Some(command) = shared.commands.try_pop() {
+            match command {
+                Command::Cancel | Command::Finish => {
+                    if command == Command::Finish {
+                        flags.finish.store(true, Ordering::Release);
+                    }
+                    if !flags.stop.swap(true, Ordering::AcqRel) {
+                        say(hub, cancelling);
+                    }
+                }
+                _ => say(
+                    hub,
+                    &format!("{what} is in progress: Cancel ends it, or wait for it to end"),
+                ),
+            }
+        }
+    };
+    answer(&watch);
     thread::scope(|s| {
         let flags = Arc::clone(&watch);
         s.spawn(move || {
             let hub = &shared.hub;
             while !flags.done.load(Ordering::Acquire) && !hub.stopping().load(Ordering::Acquire) {
-                while let Some(command) = shared.commands.try_pop() {
-                    match command {
-                        Command::Cancel | Command::Finish => {
-                            if command == Command::Finish {
-                                flags.finish.store(true, Ordering::Release);
-                            }
-                            if !flags.stop.swap(true, Ordering::AcqRel) {
-                                say(hub, cancelling);
-                            }
-                        }
-                        _ => say(
-                            hub,
-                            &format!(
-                                "{what} is in progress: Cancel ends it, or wait for it to end"
-                            ),
-                        ),
-                    }
-                }
+                answer(&flags);
                 thread::sleep(POLL);
             }
         });

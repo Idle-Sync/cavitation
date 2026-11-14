@@ -360,6 +360,11 @@ fn events_arrive_during_training() {
         let mut seen = std::collections::BTreeSet::new();
         let want = ["epoch", "model", "probe", "profile", "stats"];
         let start = Instant::now();
+        // The `finished` status can arrive before the last of the snapshots (the final
+        // flush writes events first), so one read in this loop is kept.
+        let is_finished =
+            |m: &Message| m.name == "status" && m.json.get("state").str() == "finished";
+        let mut finished = None;
         while !want.iter().all(|w| seen.contains(*w)) {
             assert!(start.elapsed() < DEADLINE, "events seen: {seen:?}");
             let m = client.next("the training events");
@@ -368,10 +373,14 @@ fn events_arrive_during_training() {
                 assert_eq!(m.json.get("input_width").num(), 64.0);
                 assert_eq!(m.json.get("layers").arr().len(), 3);
             }
+            if is_finished(&m) {
+                finished = Some(m);
+            }
         }
         let history = run.join().unwrap().unwrap();
         assert_eq!(history.epochs.len(), 2);
-        let finished = client.wait_for("status", |j| j.get("state").str() == "finished");
+        let finished = finished
+            .unwrap_or_else(|| client.wait_for("status", |j| j.get("state").str() == "finished"));
         assert!(!finished.raw.is_empty());
         client.close();
     });

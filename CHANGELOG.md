@@ -4,6 +4,12 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Layers, training and inference (`cavitation-nn`)
+
+- `shrink::ablate` (and `ablate_with`, `ablate_controlled`) runs the layers before each swept `Linear` once, keeping that `Linear`'s input for every row, and then only the layers from the `Linear` on for each of its neurons; the results are bit-identical. Sweeping the second hidden `Linear` of a 64 → 256 → 256 → 10 network over 1,000 rows: 2.67–2.78 s before, 2.22 s after (one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`). The gain grows with the share of the work before the swept layer; the first `Linear`'s input is the data, so its sweep is unchanged. The kept input takes `rows × width` values for the swept layer's input width.
+
+## v0.2.0 (2026-11-14)
+
 ### Breaking changes
 
 - `EpochReport` has a new public field, `rows`, so code that builds an `EpochReport` with a struct literal must set it.
@@ -44,6 +50,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - Explore mode: `Inspector::explore` serves a trained network to the page, which can switch neurons, rank a hidden layer's neurons by ablation, and shrink the network level by level, with `Cancel` ending a run after the step in progress.
 - The neuron panel shows a neuron of a `Linear` without a bias with no bias and its sum as `Σ w·x`; the `neuron` event has a new field, `has_bias`, and `bias` is `null` for such a neuron.
 - `sse::Hub`, `json::JsonWriter` (NaN and infinity as `null`, `<`, `>`, `&`, U+2028 and U+2029 escaped), `commands`, `probe::Probe` and `wire` (every event's fields) are public for programs that build their own view.
+- A snapshot (`stats`, `probe`, `neuron`, `profile`) is no longer sent ahead of an event that is still waiting for the hub: while a `status`, `epoch` or `model` event that the hub's lock refused waits, no snapshot is taken, so a page sees a paused run's `paused` status before its paused `stats`. A `profile` the hub's lock refused is asked for again on the next step instead of being lost. In explore mode, commands sent before a ranking or a shrink run starts are read before its first neuron or level, so a cancel sent early always stops the run at its first stopping point.
 
 ### Layers, training and inference (`cavitation-nn`)
 
@@ -63,7 +70,6 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `Adam` and `AdamW` fold the bias corrections into two scalars per step (`lr / (1 − β₁ᵗ)` and `1 / √(1 − β₂ᵗ)`), as `torch.optim.Adam` does, so each element takes one square root and one division instead of three divisions; results can differ from before in the last bit, and still match `torch.optim` over the ten-step fixtures. Update of one 1,068,810-element parameter on one thread: 14.06 ns per element before, 11.62 after (1.21x; `CAVITATION_THREADS=1 taskset -c 2 cavitation-bench subnormal --steps 700`, the Adam blocks of steps 1 to 700, median of 42 blocks per build, builds alternated, on an Intel Celeron N5105 at kernel level `sse4.2` while the machine was busy, load average 2.6 to 4.5).
 - `Sgd`, `Adam` and `AdamW` hand the chunks of every parameter of a step to the thread pool in one call, instead of one call per parameter, so a network of small parameters uses every thread for its update. The chunks and the order of the statistics' sums are unchanged, so results are bit-identical to before, for any thread count. Update of the digits network's 50,826 parameters at 4 threads: Adam 387–393 µs before, 218–280 after; SGD with momentum 176–182 before, 95–102 after (measured on an Intel Celeron N5105 at kernel level `sse4.2` while the machine was busy, load average about 3, three interleaved runs of 101 rounds; at 1 thread both versions take the same time).
 - `InferenceModel::infer_batch` (and `infer_batch_observed`) run a batch of one row through `infer`'s matvec path on the calling thread, giving `infer`'s output bit for bit; it was the GEMM's, which can differ in the last bits on some kernel levels. One row through a 4 → 32 → 32 → 1 tanh network: 3.76 µs before, 0.88 after, against 0.85 for `infer`; with ReLU 3.27 before, 0.38 after, against 0.35 (`CAVITATION_THREADS=1`, pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`, load average about 2.5). New `InferenceModel::infer_rows(inputs, rows)` runs rows laid out in a plain `&[f32]`, without building a tensor, with `infer_batch`'s outputs.
-- `shrink::ablate` (and `ablate_with`, `ablate_controlled`) runs the layers before each swept `Linear` once, keeping that `Linear`'s input for every row, and then only the layers from the `Linear` on for each of its neurons; the results are bit-identical. Sweeping the second hidden `Linear` of a 64 → 256 → 256 → 10 network over 1,000 rows: 2.67–2.78 s before, 2.22 s after (one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`). The gain grows with the share of the work before the swept layer; the first `Linear`'s input is the data, so its sweep is unchanged. The kept input takes `rows × width` values for the swept layer's input width.
 
 ### Data, examples, guide and benchmark
 
