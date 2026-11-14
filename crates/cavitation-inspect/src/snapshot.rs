@@ -853,7 +853,7 @@ impl StepControl for Inspector {
     /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
     /// let report =
-    ///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 4, seconds: 0.01, validation: None };
+    ///     EpochReport::new(1, 0.5, 4, 0.01);
     /// let flow = inspector.after_epoch(
     ///     &report,
     ///     &mut ModelHandle::new(&mut net),
