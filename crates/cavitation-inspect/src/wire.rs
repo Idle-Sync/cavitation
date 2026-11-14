@@ -66,8 +66,11 @@
 //! # `epoch`
 //!
 //! - `epoch` (integer), `epochs` (integer): the epoch that ended, and the run's total.
-//! - `mean_loss` (number): the mean training loss over the epoch's rows.
-//! - `rows` (integer): the rows the epoch trained on.
+//! - `mean_loss` (number or `null`): the mean training loss over the epoch's rows; `null`
+//!   when it is not finite (a NaN loss under `OnNonFinite::Warn`, say) or the epoch trained
+//!   on no rows (every step it ran left out under `OnNonFinite::Skip`).
+//! - `rows` (integer): the rows the epoch trained on; steps left out under
+//!   `OnNonFinite::Skip` do not count.
 //! - `seconds` (number): the epoch's wall-clock time, pauses included.
 //! - `evaluation` (object or `null`): the held-out evaluation on the first `eval_rows` probe
 //!   rows, or `null` when it was skipped (no client was connected, or the time since the
