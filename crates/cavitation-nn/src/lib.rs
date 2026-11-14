@@ -8,7 +8,8 @@
 //!
 //! - Layers: the [`Layer`] trait, [`Linear`], a layer for every built-in activation,
 //!   [`Activation`] and [`ActivationLayer`] for your own, and [`Sequential`] to chain them.
-//! - Optimisers: [`Sgd`], [`Adam`] and [`AdamW`] behind the [`Optimizer`] trait.
+//! - Optimisers: [`Sgd`], [`Adam`], [`AdamW`], [`RmsProp`] and [`Adagrad`] behind the
+//!   [`Optimizer`] trait.
 //! - Training: [`Dataset`] and [`Batcher`], [`Trainer`] for one step at a time, and [`fit`]
 //!   for whole runs, with the [`Health`] checks on every step; [`Evaluator`] and [`evaluate`]
 //!   for the loss and accuracy or R² on held-out data, and [`Dataset::split_at`] to hold it
@@ -90,7 +91,7 @@ pub use io::{LoadOptions, TensorInfo, inspect_file, load, load_lenient, load_wit
 pub use layer::Layer;
 pub use linear::Linear;
 pub use mask::NeuronMask;
-pub use optim::{Adam, AdamW, GradStats, Optimizer, Sgd};
+pub use optim::{Adagrad, Adam, AdamW, GradStats, Optimizer, RmsProp, Sgd};
 pub use sequential::{Sequential, Trace};
 pub use train::{
     Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,

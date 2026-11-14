@@ -144,8 +144,8 @@ pub enum ActivationKind {
 }
 
 /// `1 / (1 + e^-x)` without overflowing the exponential, one value at a time with std's
-/// `exp`: the scalar sigmoid that the derivatives and the GLU gates use (the `Sigmoid` and
-/// `Silu` layers run the SIMD kernels instead).
+/// `exp`: the scalar sigmoid that the derivatives use (the `Sigmoid` and `Silu` layers and
+/// the GLU gates run the SIMD kernels instead).
 pub(crate) fn sigmoid<T: Real>(x: T) -> T {
     if x >= T::ZERO {
         T::ONE / (T::ONE + (-x).exp())
@@ -153,14 +153,6 @@ pub(crate) fn sigmoid<T: Real>(x: T) -> T {
         let e = x.exp();
         e / (T::ONE + e)
     }
-}
-
-/// The tanh form of GELU, one value at a time with std's `tanh`: the scalar form the GLU's
-/// GELU gate uses, as the tape's GLU does (the `Gelu` layer runs the tanh kernel).
-pub(crate) fn gelu_tanh_scalar<T: Real>(x: T) -> T {
-    let c = T::from_f64;
-    let u = c(SQRT_2_OVER_PI) * (x + c(GELU_CUBIC) * x * x * x);
-    c(0.5) * x * (T::ONE + u.tanh())
 }
 
 /// NaN of the element type.
