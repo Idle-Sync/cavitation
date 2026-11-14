@@ -29,9 +29,9 @@ pub enum GeluApprox {
 }
 
 /// `√(2/π)`, the scale inside the tanh form of GELU.
-const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
+pub(crate) const SQRT_2_OVER_PI: f64 = 0.797_884_560_802_865_4;
 /// The cubic coefficient inside the tanh form of GELU.
-const GELU_CUBIC: f64 = 0.044715;
+pub(crate) const GELU_CUBIC: f64 = 0.044715;
 /// `1/√2`.
 const FRAC_1_SQRT_2: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// `1/√(2π)`, the standard normal density at 0.
@@ -60,7 +60,7 @@ pub(super) fn relu_derivative<T: Real>(x: T) -> T {
 }
 
 /// `x · σ(x)`.
-pub(super) fn silu_value<T: Real>(x: T) -> T {
+pub(crate) fn silu_value<T: Real>(x: T) -> T {
     x * sigmoid_value(x)
 }
 
@@ -200,7 +200,7 @@ fn prelu_channel(i: usize, slopes: usize) -> usize {
 }
 
 /// GELU of `x` in the given form.
-pub(super) fn gelu_value<T: Real>(x: T, approx: GeluApprox) -> T {
+pub(crate) fn gelu_value<T: Real>(x: T, approx: GeluApprox) -> T {
     let half = T::from_f64(0.5);
     match approx {
         GeluApprox::Exact => half * x * (T::ONE + (x * T::from_f64(FRAC_1_SQRT_2)).erf()),
@@ -323,7 +323,10 @@ impl<T: Real> Tape<'_, T> {
     }
 
     /// Records GELU of every element, in the exact form (with `erf`) or the tanh
-    /// approximation; see [`GeluApprox`].
+    /// approximation; see [`GeluApprox`]. In f32 the tanh form's value runs the tanh's SIMD
+    /// kernel of the current level
+    /// ([`kernels::activation::gelu_tanh_f32`](crate::kernels::activation::gelu_tanh_f32),
+    /// with its bound); the derivative uses std's `tanh`.
     ///
     /// # Panics
     ///
@@ -340,7 +343,10 @@ impl<T: Real> Tape<'_, T> {
     /// assert!((tape.value(y).data()[0] - 0.8413447460685429).abs() < 1e-15);
     /// ```
     pub fn gelu(&mut self, x: Var, approx: GeluApprox) -> Var {
-        self.map(Op::Gelu(x, approx), x, |v| gelu_value(v, approx))
+        match approx {
+            GeluApprox::Exact => self.map(Op::Gelu(x, approx), x, |v| gelu_value(v, approx)),
+            GeluApprox::Tanh => self.map_slice(Op::Gelu(x, approx), x, T::gelu_tanh_in_place),
+        }
     }
 
     /// Records ELU: `x` where `x > 0`, `alpha · (eˣ - 1)` elsewhere. PyTorch's default `alpha`
@@ -413,6 +419,9 @@ impl<T: Real> Tape<'_, T> {
     }
 
     /// Records SiLU (Swish): `x · σ(x)`. The derivative is `σ(x) · (1 + x · (1 - σ(x)))`.
+    /// In f32 the value runs the sigmoid's SIMD kernel of the current level
+    /// ([`kernels::activation::silu_f32`](crate::kernels::activation::silu_f32), within 7
+    /// ulp); the derivative uses the scalar sigmoid.
     ///
     /// # Panics
     ///
@@ -429,7 +438,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0, 2000.0]);
     /// ```
     pub fn silu(&mut self, x: Var) -> Var {
-        self.map(Op::Silu(x), x, silu_value)
+        self.map_slice(Op::Silu(x), x, T::silu_in_place)
     }
 
     /// Records Mish: `x · tanh(softplus(x))`, with softplus at PyTorch's defaults (`beta` 1,

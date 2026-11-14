@@ -451,6 +451,124 @@ pub fn elu_f32_with(level: Level, alpha: f32, values: &mut [f32]) {
     }
 }
 
+/// Values per block of [`silu_f32_with`] and [`gelu_tanh_f32_with`]: the sigmoid or tanh of
+/// a block goes into a buffer on the stack, so the in-place forms allocate nothing.
+const BLOCK: usize = 64;
+
+/// Replaces every value `x` with SiLU, `x · σ(x)`, its sigmoid from [`sigmoid_f32`] with the
+/// kernel for the current [`level`](super::level). Each result is `x` times a sigmoid within
+/// 3 ulp, rounded once. The sigmoid's 3 ulp are up to `3 · 2⁻²³` relative and an ulp of the
+/// product can be as small as `2⁻²⁴` relative, so the bound is 7 ulp of the correctly
+/// rounded SiLU (6 from the sigmoid, one more for the product's rounding) while `σ(x)` is a normal
+/// `f32` (`x` above about −87.3). Below that the sigmoid is subnormal and its 3 ulp are
+/// absolute, so the result is within `3 · 2⁻¹⁴⁹ · |x|` plus 1 ulp. A value's result depends
+/// only on the value and the level.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::silu_f32;
+/// let mut v = [0.0f32, 2.0, f32::NEG_INFINITY];
+/// silu_f32(&mut v);
+/// assert_eq!(v[0], 0.0);
+/// assert!((v[1] - 1.761_594_2).abs() <= 4.0 * f32::EPSILON * 2.0);
+/// assert!(v[2].is_nan()); // -∞ · 0
+/// ```
+pub fn silu_f32(values: &mut [f32]) {
+    silu_f32_with(super::level(), values);
+}
+
+/// [`silu_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::silu_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [1.0f32];
+/// silu_f32_with(Level::Reference, &mut v);
+/// assert!((v[0] - 0.731_058_6).abs() <= 4.0 * f32::EPSILON);
+/// ```
+pub fn silu_f32_with(level: Level, values: &mut [f32]) {
+    let mut s = [0.0f32; BLOCK];
+    for block in values.chunks_mut(BLOCK) {
+        let s = &mut s[..block.len()];
+        s.copy_from_slice(block);
+        sigmoid_f32_with(level, s);
+        for (x, &s) in block.iter_mut().zip(s.iter()) {
+            *x *= s;
+        }
+    }
+}
+
+/// Replaces every value `x` with the tanh form of GELU, `½x · (1 + tanh(u))` with
+/// `u = √(2/π) · (x + 0.044715 · x³)`, its tanh from [`tanh_f32`] with the kernel for the
+/// current [`level`](super::level). Each result is within `|x| · 2⁻²¹` plus 2 ulp of the
+/// value from `f64` arithmetic: the tanh's error of at most 3 ulp, scaled by `½|x|`, is
+/// absolute, so for large negative `x`, where `1 + tanh(u)` cancels, the result has few
+/// correct digits, as the scalar `f32` formula has. A value's result depends only on the
+/// value and the level.
+///
+/// # Panics
+///
+/// Panics on first use, as [`level`](super::level) does, if `CAVITATION_KERNEL` is invalid.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::gelu_tanh_f32;
+/// let mut v = [0.0f32, 1.0, 10.0];
+/// gelu_tanh_f32(&mut v);
+/// assert_eq!(v[0], 0.0);
+/// assert!((v[1] - 0.841_192).abs() <= 1e-6);
+/// assert_eq!(v[2], 10.0);
+/// ```
+pub fn gelu_tanh_f32(values: &mut [f32]) {
+    gelu_tanh_f32_with(super::level(), values);
+}
+
+/// [`gelu_tanh_f32`] with the kernel level given explicitly.
+///
+/// # Panics
+///
+/// Panics if this CPU cannot run `level`, naming the level and the detected features.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::kernels::activation::gelu_tanh_f32_with;
+/// use cavitation_core::kernels::Level;
+/// let mut v = [-1.0f32];
+/// gelu_tanh_f32_with(Level::Reference, &mut v);
+/// assert!((v[0] + 0.158_808).abs() <= 1e-6);
+/// ```
+pub fn gelu_tanh_f32_with(level: Level, values: &mut [f32]) {
+    // The operations of the scalar formula, in its order, with `f32` constants.
+    let (scale, cubic) = (
+        crate::ops::SQRT_2_OVER_PI as f32,
+        crate::ops::GELU_CUBIC as f32,
+    );
+    let mut t = [0.0f32; BLOCK];
+    for block in values.chunks_mut(BLOCK) {
+        let t = &mut t[..block.len()];
+        for (u, &x) in t.iter_mut().zip(block.iter()) {
+            *u = scale * (x + cubic * x * x * x);
+        }
+        tanh_f32_with(level, t);
+        for (x, &t) in block.iter_mut().zip(t.iter()) {
+            *x = 0.5 * *x * (1.0 + t);
+        }
+    }
+}
+
 /// Runs `func` over `values` with the kernel for `level`.
 ///
 /// # Panics
@@ -612,6 +730,80 @@ mod tests {
             assert!(t <= 3, "{level}: tanh is {t} ulp off at {tx:e}");
             let (s, sx) = worst(level, Func::Sigmoid, &xs, sigmoid_exact);
             assert!(s <= 3, "{level}: sigmoid is {s} ulp off at {sx:e}");
+        }
+    }
+
+    /// SiLU is within 7 ulp of the correctly rounded result (where the sigmoid is subnormal,
+    /// within `3 · 2⁻¹⁴⁹ · |x|` plus 1 ulp), and the tanh form of GELU
+    /// within `|x| · 2⁻²¹` plus 2 ulp of the `f64` result, at every level, over the sweep
+    /// and the edge values; both give NaN exactly where the `f64` formula does.
+    #[test]
+    fn silu_and_gelu_tanh_within_their_bounds() {
+        let mut xs = sweep(1009);
+        xs.extend(edges());
+        let ulp = |v: f32| v.abs().next_up() - v.abs();
+        for level in levels() {
+            let mut silu = xs.clone();
+            silu_f32_with(level, &mut silu);
+            let mut gelu = xs.clone();
+            gelu_tanh_f32_with(level, &mut gelu);
+            for (i, &x) in xs.iter().enumerate() {
+                let w = x as f64;
+                let s = if w >= 0.0 {
+                    1.0 / (1.0 + (-w).exp())
+                } else {
+                    w.exp() / (1.0 + w.exp())
+                };
+                let want = (w * s) as f32;
+                let got = silu[i];
+                assert_eq!(
+                    got.is_nan(),
+                    want.is_nan(),
+                    "{level}: silu({x:e}) is {got:e}"
+                );
+                if !want.is_nan() && s < f64::from(f32::MIN_POSITIVE) {
+                    let limit = 3.0 * 2f64.powi(-149) * w.abs() + f64::from(ulp(want));
+                    let err = (f64::from(got) - w * s).abs();
+                    assert!(err <= limit, "{level}: silu({x:e}) is {got:e}");
+                } else if !want.is_nan() {
+                    let u = ulps(got, want);
+                    assert!(u <= 7, "{level}: silu({x:e}) is {u} ulp off: {got:e}");
+                }
+                let u = (2.0f64 / std::f64::consts::PI).sqrt() * (w + 0.044715 * w * w * w);
+                let want = 0.5 * w * (1.0 + u.tanh());
+                let got = gelu[i];
+                assert_eq!(
+                    got.is_nan(),
+                    want.is_nan(),
+                    "{level}: gelu({x:e}) is {got:e}"
+                );
+                if !want.is_nan() && want.is_finite() {
+                    let limit = w.abs() * 2f64.powi(-21) + 2.0 * f64::from(ulp(want as f32));
+                    let err = (f64::from(got) - want).abs();
+                    assert!(
+                        err <= limit,
+                        "{level}: gelu({x:e}) is {got:e}, want {want:e}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A value's SiLU and GELU do not depend on where it falls in the slice: 150 values (two
+    /// full blocks and a part) give the bits of one value at a time.
+    #[test]
+    fn silu_and_gelu_tanh_do_not_depend_on_the_block() {
+        let xs: Vec<f32> = (0..150).map(|i| -6.0 + 0.08 * i as f32).collect();
+        for level in levels() {
+            for f in [silu_f32_with, gelu_tanh_f32_with] {
+                let mut all = xs.clone();
+                f(level, &mut all);
+                for (i, &x) in xs.iter().enumerate() {
+                    let mut one = [x];
+                    f(level, &mut one);
+                    assert_eq!(one[0].to_bits(), all[i].to_bits(), "{level}: {x}");
+                }
+            }
         }
     }
 
