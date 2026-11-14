@@ -6,9 +6,11 @@
 //! any value smaller than the type's smallest normal number stored as 0: left to decay, they
 //! would pass through the subnormal range, where each update runs many times slower.
 //!
-//! Each parameter is updated in chunks of [`CHUNK`] elements, split over the kernel thread
-//! pool ([`threads`]), with the gradient's sum of squares kept in [`LANES`] partial sums per
-//! chunk and the chunks combined in order. Every element gets exactly the arithmetic of the
+//! Each parameter is updated in chunks of [`CHUNK`] elements, and the chunks of every
+//! parameter of a step go to the kernel thread pool ([`threads`]) in one call, so a network
+//! of many small parameters still keeps every thread busy. Each chunk keeps the gradient's
+//! sum of squares in [`LANES`] partial sums, and a parameter's chunks are combined in
+//! order. Every element gets exactly the arithmetic of the
 //! plain loop, so the parameters and the optimiser's state are bit-identical to it and the
 //! same for any thread count; only the order of the statistics' sums differs from the plain
 //! loop, and it too is the same for any thread count. At [`Level::Reference`] the plain
@@ -113,7 +115,7 @@ impl Lanes {
 
 /// Runs `f` on every element of one chunk, in order: `f` gets the element of each mutable
 /// slice and the gradient value in `f64`, and the gradient goes into the chunk's
-/// statistics. All slices have the gradient's length (checked by [`pool::run_chunks`]).
+/// statistics. All slices have the gradient's length (checked by [`Parts::push`]).
 /// The elements go in blocks of [`LANES`], each block's lanes written out with fixed
 /// indices so the compiler can work on a block's lanes in vector registers.
 #[inline(always)]
@@ -142,34 +144,158 @@ fn sweep<T: Real, const M: usize>(
     lanes.finish()
 }
 
-/// The update of one chunk: the chunk's parts of the `M` mutable slices and of the gradient
-/// in, its statistics out.
-type ChunkUpdate<'a, T, const M: usize> = dyn Fn([&mut [T]; M], &[T]) -> ChunkStats + Sync + 'a;
+/// One parameter of a chunked step: raw pointers to its `M` mutable buffers (the value
+/// first) and to its gradient, all `len` elements long, the index of its first chunk among
+/// the step's chunks, and the per-parameter constants `c` its chunks are updated with. A
+/// parameter left out of the step (no gradient) is a part of length 0, with no chunks; its
+/// pointers are never read.
+#[derive(Clone, Copy)]
+struct Part<T, C, const M: usize> {
+    /// The parameter, for its statistics.
+    id: ParamId,
+    /// The mutable buffers, the value first.
+    muts: [*mut T; M],
+    /// The gradient.
+    grads: *const T,
+    /// The length of every buffer.
+    len: usize,
+    /// The index of the parameter's first chunk among the step's chunks.
+    first_chunk: usize,
+    /// The constants the parameter's chunks are updated with.
+    c: C,
+}
 
-/// Updates one parameter in chunks of [`CHUNK`] on up to `threads` threads, `chunk`
-/// updating one chunk of the `M` mutable slices (the value first) from its gradient, and
-/// returns the parameter's gradient sum of squares (the chunks' sums added in order) and
-/// whether it was all finite. `partials` holds one slot per chunk; it grows only when a
-/// parameter has more chunks than any before it (the first step).
-fn chunked<T: Real, const M: usize>(
-    threads: usize,
-    muts: [&mut [T]; M],
-    grads: &[T],
-    partials: &mut Vec<ChunkStats>,
-    chunk: &ChunkUpdate<'_, T, M>,
-) -> (f64, bool) {
-    let chunks = grads.len().div_ceil(CHUNK);
-    if partials.len() < chunks {
-        partials.resize(chunks, ChunkStats::default());
+/// The parts of one chunked step. The list is cleared and filled at the start of a step
+/// and cleared again when the step returns, so its pointers are only read during the step
+/// that took them (a step that panics may leave some behind, which the next step clears
+/// before reading any); it keeps its capacity, so steps after the first allocate nothing.
+struct Parts<T, C, const M: usize>(Vec<Part<T, C, M>>);
+
+impl<T, C, const M: usize> Parts<T, C, M> {
+    /// An empty list.
+    fn new() -> Self {
+        Parts(Vec::new())
     }
-    pool::run_chunks(threads, CHUNK, muts, grads, partials, &|m, g, out| {
-        *out = chunk(m, g);
+
+    /// Adds parameter `id` with its `M` mutable buffers and its gradient (`None`: left out
+    /// of the step, a part with no chunks), all of the gradient's length.
+    fn push(&mut self, id: ParamId, muts: [&mut [T]; M], grads: Option<&[T]>, c: C) {
+        let first_chunk = self
+            .0
+            .last()
+            .map_or(0, |p| p.first_chunk + p.len.div_ceil(CHUNK));
+        let len = grads.map_or(0, <[T]>::len);
+        for (k, m) in muts.iter().enumerate() {
+            assert!(
+                grads.is_none() || m.len() == len,
+                "optimiser buffer {k} has {} elements, the gradient {len}",
+                m.len()
+            );
+        }
+        self.0.push(Part {
+            id,
+            muts: muts.map(<[T]>::as_mut_ptr),
+            grads: grads.map_or(std::ptr::null(), <[T]>::as_ptr),
+            len,
+            first_chunk,
+            c,
+        });
+    }
+
+    /// The number of chunks of all parts.
+    fn chunks(&self) -> usize {
+        self.0
+            .last()
+            .map_or(0, |p| p.first_chunk + p.len.div_ceil(CHUNK))
+    }
+}
+
+impl<T, C, const M: usize> Clone for Parts<T, C, M> {
+    /// An empty list: between steps there is nothing to copy.
+    fn clone(&self) -> Self {
+        Parts::new()
+    }
+}
+
+impl<T, C, const M: usize> std::fmt::Debug for Parts<T, C, M> {
+    /// The number of parts (0 between steps).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Parts({})", self.0.len())
+    }
+}
+
+// SAFETY: a part's pointers are only read during the step that took them (every step
+// clears the list before filling it); during a step the list is used only by the thread
+// that filled it and, through `run_parts`, by tasks that each form slices of disjoint
+// chunks while the buffers are borrowed for the step.
+unsafe impl<T: Send, C: Send, const M: usize> Send for Parts<T, C, M> {}
+
+/// A shared reference that tasks on several threads may use: the parts of a step and the
+/// chunk statistics' slots.
+struct ForTasks<P>(P);
+
+// SAFETY: `run_parts` uses it only to read parts that do not change during the call and to
+// form references to disjoint buffer chunks and statistics slots, one task per chunk,
+// while the buffers are borrowed for the step; sending those to another thread is sound
+// when `T: Send`.
+unsafe impl<P> Sync for ForTasks<P> {}
+
+/// The update of one chunk: the parameter's constants and the chunk's parts of its `M`
+/// mutable buffers and of its gradient in, the chunk's statistics out.
+type ChunkUpdate<'a, T, C, const M: usize> =
+    dyn Fn(&C, [&mut [T]; M], &[T]) -> ChunkStats + Sync + 'a;
+
+/// Updates every part in chunks of [`CHUNK`] (chunk `i` of a part covers its elements
+/// `i · CHUNK` onward) through one [`pool::run`] on up to `threads` threads, `chunk`
+/// updating one chunk, then pushes each part's gradient sum of squares (its chunks' sums
+/// added in order) and finiteness onto `stats`, in the order of the parts, and clears
+/// `parts`. The chunks of a parameter and the order its sums are added in depend only on
+/// its length, so the results are the same for any thread count and the same as updating
+/// one parameter at a time. `partials` holds one slot per chunk; the optimisers size it on
+/// their first step for every parameter's chunks, so it never grows after that.
+fn run_parts<T: Real, C: Sync, const M: usize>(
+    threads: usize,
+    parts: &mut Parts<T, C, M>,
+    partials: &mut Vec<ChunkStats>,
+    stats: &mut GradStats,
+    chunk: &ChunkUpdate<'_, T, C, M>,
+) {
+    let total = parts.chunks();
+    if partials.len() < total {
+        partials.resize(total, ChunkStats::default());
+    }
+    let list = ForTasks(&parts.0[..]);
+    let slots = ForTasks(partials.as_mut_ptr());
+    pool::run(threads, total, &|t: pool::Task| {
+        let list = &list;
+        let slots = &slots;
+        // The last part that starts at or before this chunk; parts of length 0 start where
+        // the next part does, so this is the part that holds the chunk.
+        let p = &list.0[list.0.partition_point(|p| p.first_chunk <= t.index) - 1];
+        let start = (t.index - p.first_chunk) * CHUNK;
+        let n = CHUNK.min(p.len - start);
+        let muts = p.muts.map(|ptr| {
+            // SAFETY: each buffer holds `p.len` elements and `start + n <= p.len`; the
+            // buffers are borrowed mutably for the step, distinct parameters' buffers do
+            // not overlap, and `pool::run` gives each chunk index to one task only, so no
+            // two slices in use overlap.
+            unsafe { std::slice::from_raw_parts_mut(ptr.add(start), n) }
+        });
+        // SAFETY: as above, for the gradient, which is only read.
+        let grads = unsafe { std::slice::from_raw_parts(p.grads.add(start), n) };
+        // SAFETY: `t.index < total <= partials.len()`, and only this task uses this slot.
+        unsafe { *slots.0.add(t.index) = chunk(&p.c, muts, grads) };
     });
-    partials[..chunks]
-        .iter()
-        .fold((0.0, true), |(sum, finite), c| {
-            (sum + c.sum_squares, finite & c.finite)
-        })
+    for p in &parts.0 {
+        let first = p.first_chunk;
+        let (sum, finite) = partials[first..first + p.len.div_ceil(CHUNK)]
+            .iter()
+            .fold((0.0, true), |(sum, finite), c| {
+                (sum + c.sum_squares, finite & c.finite)
+            });
+        stats.push(p.id, sum, finite);
+    }
+    parts.0.clear();
 }
 
 /// What the optimiser saw in the gradients during a step: for every parameter the sum of the
@@ -452,6 +578,12 @@ impl Sizes {
         }
         false
     }
+
+    /// The number of chunks of [`CHUNK`] in a step that updates every parameter: the most
+    /// [`run_parts`] needs statistics slots for.
+    fn chunks(&self) -> usize {
+        self.lens.iter().map(|n| n.div_ceil(CHUNK)).sum()
+    }
 }
 
 /// Stochastic gradient descent with optional momentum and weight decay, with PyTorch's
@@ -494,8 +626,13 @@ pub struct Sgd<T: Real = f32> {
     started: Vec<bool>,
     /// The statistics of the last `step`.
     stats: GradStats,
-    /// One slot per chunk of the largest parameter, for the chunks' statistics.
+    /// One slot per chunk of a step, for the chunks' statistics.
     partials: Vec<ChunkStats>,
+    /// The parameters of a chunked step without momentum (empty between steps).
+    plain: Parts<T, (), 1>,
+    /// The parameters of a chunked step with momentum, each with whether it is the
+    /// parameter's first update (empty between steps).
+    with_momentum: Parts<T, bool, 2>,
 }
 
 impl<T: Real> Sgd<T> {
@@ -515,6 +652,8 @@ impl<T: Real> Sgd<T> {
             started: Vec::new(),
             stats: GradStats::new(),
             partials: Vec::new(),
+            plain: Parts::new(),
+            with_momentum: Parts::new(),
         }
     }
 
@@ -564,12 +703,18 @@ impl<T: Real> Sgd<T> {
 
     /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
     fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
-        if self.sizes.prepare("Sgd", params) && self.momentum != 0.0 {
-            self.buffers = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
-            self.started = vec![false; self.buffers.len()];
+        if self.sizes.prepare("Sgd", params) {
+            self.partials = vec![ChunkStats::default(); self.sizes.chunks()];
+            if self.momentum != 0.0 {
+                self.buffers = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
+                self.started = vec![false; self.buffers.len()];
+            }
         }
         stats.reset(params.len());
         let (lr, mu, wd) = (self.lr, self.momentum, self.weight_decay);
+        if let Path::Chunked(threads) = path {
+            return self.update_chunked(threads, params, stats);
+        }
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
             let Some(grad) = grad else {
                 // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
@@ -584,41 +729,68 @@ impl<T: Real> Sgd<T> {
             } else {
                 (&mut [][..], false)
             };
-            let (sum, finite) = match path {
-                Path::Reference => sgd_reference(lr, mu, wd, first, values, buffer, grads),
-                Path::Chunked(threads) => {
-                    let parts = &mut self.partials;
-                    match (mu != 0.0, wd != 0.0, first) {
-                        (false, false, _) => chunked(threads, [values], grads, parts, &|[v], g| {
-                            sgd_chunk::<T, false>(lr, wd, v, g)
-                        }),
-                        (false, true, _) => chunked(threads, [values], grads, parts, &|[v], g| {
-                            sgd_chunk::<T, true>(lr, wd, v, g)
-                        }),
-                        (true, false, true) => {
-                            chunked(threads, [values, buffer], grads, parts, &|[v, b], g| {
-                                sgd_momentum_chunk::<T, false, true>(lr, mu, wd, v, b, g)
-                            })
-                        }
-                        (true, false, false) => {
-                            chunked(threads, [values, buffer], grads, parts, &|[v, b], g| {
-                                sgd_momentum_chunk::<T, false, false>(lr, mu, wd, v, b, g)
-                            })
-                        }
-                        (true, true, true) => {
-                            chunked(threads, [values, buffer], grads, parts, &|[v, b], g| {
-                                sgd_momentum_chunk::<T, true, true>(lr, mu, wd, v, b, g)
-                            })
-                        }
-                        (true, true, false) => {
-                            chunked(threads, [values, buffer], grads, parts, &|[v, b], g| {
-                                sgd_momentum_chunk::<T, true, false>(lr, mu, wd, v, b, g)
-                            })
-                        }
-                    }
-                }
-            };
+            let (sum, finite) = sgd_reference(lr, mu, wd, first, values, buffer, grads);
             stats.push(id, sum, finite);
+        }
+    }
+
+    /// One step in chunks of every parameter at once, on up to `threads` threads: the
+    /// arithmetic of [`sgd_reference`] per element.
+    fn update_chunked(
+        &mut self,
+        threads: usize,
+        params: &mut ParamStore<T>,
+        stats: &mut GradStats,
+    ) {
+        let (lr, mu, wd) = (self.lr, self.momentum, self.weight_decay);
+        // A step that panicked may have left parts behind.
+        self.plain.0.clear();
+        self.with_momentum.0.clear();
+        let parts = &mut self.partials;
+        if mu == 0.0 {
+            for (id, value, grad) in params.iter_mut() {
+                // A parameter with no gradient since `zero_grad` is skipped, as PyTorch
+                // skips `grad is None`: a part with no chunks.
+                let grads = grad.as_ref().map(|g| g.data());
+                self.plain.push(id, [value.data_mut()], grads, ());
+            }
+            let list = &mut self.plain;
+            if wd == 0.0 {
+                run_parts(threads, list, parts, stats, &|_, [v], g| {
+                    sgd_chunk::<T, false>(lr, wd, v, g)
+                });
+            } else {
+                run_parts(threads, list, parts, stats, &|_, [v], g| {
+                    sgd_chunk::<T, true>(lr, wd, v, g)
+                });
+            }
+            return;
+        }
+        for (k, (id, value, grad)) in params.iter_mut().enumerate() {
+            let grads = grad.as_ref().map(|g| g.data());
+            // Only an update starts the buffer; a skipped parameter keeps its state.
+            let first = grads.is_some() && !std::mem::replace(&mut self.started[k], true);
+            let buffer = &mut self.buffers[k][..];
+            self.with_momentum
+                .push(id, [value.data_mut(), buffer], grads, first);
+        }
+        let list = &mut self.with_momentum;
+        if wd == 0.0 {
+            run_parts(threads, list, parts, stats, &|&first, [v, b], g| {
+                if first {
+                    sgd_momentum_chunk::<T, false, true>(lr, mu, wd, v, b, g)
+                } else {
+                    sgd_momentum_chunk::<T, false, false>(lr, mu, wd, v, b, g)
+                }
+            });
+        } else {
+            run_parts(threads, list, parts, stats, &|&first, [v, b], g| {
+                if first {
+                    sgd_momentum_chunk::<T, true, true>(lr, mu, wd, v, b, g)
+                } else {
+                    sgd_momentum_chunk::<T, true, false>(lr, mu, wd, v, b, g)
+                }
+            });
         }
     }
 }
@@ -753,8 +925,11 @@ struct AdamCore<T: Real> {
     v: Vec<Vec<T>>,
     /// The statistics of the last `step`.
     stats: GradStats,
-    /// One slot per chunk of the largest parameter, for the chunks' statistics.
+    /// One slot per chunk of a step, for the chunks' statistics.
     partials: Vec<ChunkStats>,
+    /// The parameters of a chunked step, each with its step's constants (empty between
+    /// steps).
+    parts: Parts<T, AdamStep, 3>,
 }
 
 impl<T: Real> AdamCore<T> {
@@ -772,6 +947,7 @@ impl<T: Real> AdamCore<T> {
             v: Vec::new(),
             stats: GradStats::new(),
             partials: Vec::new(),
+            parts: Parts::new(),
         }
     }
 
@@ -809,57 +985,72 @@ impl<T: Real> AdamCore<T> {
             self.m = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
             self.v = self.sizes.lens.iter().map(|&n| vec![T::ZERO; n]).collect();
             self.steps = vec![0; self.m.len()];
+            self.partials = vec![ChunkStats::default(); self.sizes.chunks()];
         }
         stats.reset(params.len());
-        let (lr, b1, b2, eps, wd) = (self.lr, self.beta1, self.beta2, self.eps, self.weight_decay);
+        // A step that panicked may have left parts behind.
+        self.parts.0.clear();
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
             let Some(grad) = grad else {
-                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
-                stats.push(id, 0.0, true);
+                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`
+                // (in a chunked step, a part with no chunks).
+                match path {
+                    Path::Reference => stats.push(id, 0.0, true),
+                    Path::Chunked(_) => {
+                        self.parts
+                            .push(id, [&mut [], &mut [], &mut []], None, AdamStep::default())
+                    }
+                }
                 continue;
             };
             self.steps[k] += 1;
-            let c = AdamStep {
-                lr,
-                b1,
-                b2,
-                eps,
-                wd,
-                correction1: 1.0 - b1.powi(self.steps[k]),
-                correction2: 1.0 - b2.powi(self.steps[k]),
-                shrink: 1.0 - lr * wd,
-            };
-            let c = &c;
+            let c = self.constants(self.steps[k]);
             let values = value.data_mut();
             let grads = grad.data();
             let (m, v) = (&mut self.m[k][..], &mut self.v[k][..]);
-            let (sum, finite) = match path {
-                Path::Reference => adam_reference(c, decoupled, values, m, v, grads),
-                Path::Chunked(threads) => {
-                    let parts = &mut self.partials;
-                    let muts = [values, m, v];
-                    match (decoupled, wd != 0.0) {
-                        (true, _) => chunked(threads, muts, grads, parts, &|[p, m, v], g| {
-                            adam_chunk::<T, true, false>(c, p, m, v, g)
-                        }),
-                        (false, true) => chunked(threads, muts, grads, parts, &|[p, m, v], g| {
-                            adam_chunk::<T, false, true>(c, p, m, v, g)
-                        }),
-                        (false, false) => chunked(threads, muts, grads, parts, &|[p, m, v], g| {
-                            adam_chunk::<T, false, false>(c, p, m, v, g)
-                        }),
-                    }
+            match path {
+                Path::Reference => {
+                    let (sum, finite) = adam_reference(&c, decoupled, values, m, v, grads);
+                    stats.push(id, sum, finite);
                 }
-            };
-            stats.push(id, sum, finite);
+                Path::Chunked(_) => self.parts.push(id, [values, m, v], Some(grads), c),
+            }
+        }
+        let Path::Chunked(threads) = path else {
+            return;
+        };
+        let (list, parts) = (&mut self.parts, &mut self.partials);
+        match (decoupled, self.weight_decay != 0.0) {
+            (true, _) => run_parts(threads, list, parts, stats, &|c, [p, m, v], g| {
+                adam_chunk::<T, true, false>(c, p, m, v, g)
+            }),
+            (false, true) => run_parts(threads, list, parts, stats, &|c, [p, m, v], g| {
+                adam_chunk::<T, false, true>(c, p, m, v, g)
+            }),
+            (false, false) => run_parts(threads, list, parts, stats, &|c, [p, m, v], g| {
+                adam_chunk::<T, false, false>(c, p, m, v, g)
+            }),
+        }
+    }
+
+    /// The constants of a parameter's update number `t` (from 1).
+    fn constants(&self, t: i32) -> AdamStep {
+        let (lr, b1, b2, wd) = (self.lr, self.beta1, self.beta2, self.weight_decay);
+        AdamStep {
+            b1,
+            b2,
+            eps: self.eps,
+            wd,
+            step_size: lr / (1.0 - b1.powi(t)),
+            inv_sqrt_correction2: 1.0 / (1.0 - b2.powi(t)).sqrt(),
+            shrink: 1.0 - lr * wd,
         }
     }
 }
 
-/// The constants of one Adam or AdamW step.
+/// The constants of one Adam or AdamW step (all 0 for a parameter left out of a step).
+#[derive(Clone, Copy, Debug, Default)]
 struct AdamStep {
-    /// The learning rate.
-    lr: f64,
     /// The decay rate of the first moment.
     b1: f64,
     /// The decay rate of the second moment.
@@ -868,10 +1059,10 @@ struct AdamStep {
     eps: f64,
     /// The weight decay.
     wd: f64,
-    /// The first moment's bias correction, `1 − β₁ᵗ`.
-    correction1: f64,
-    /// The second moment's bias correction, `1 − β₂ᵗ`.
-    correction2: f64,
+    /// The learning rate over the first moment's bias correction, `lr / (1 − β₁ᵗ)`.
+    step_size: f64,
+    /// One over the square root of the second moment's bias correction, `1 / √(1 − β₂ᵗ)`.
+    inv_sqrt_correction2: f64,
     /// AdamW's decay factor, `1 − lr·wd`.
     shrink: f64,
 }
@@ -903,9 +1094,7 @@ fn adam_reference<T: Real>(
         let vi = c.b2 * v[i].to_f64() + (1.0 - c.b2) * g * g;
         m[i] = store_state(mi);
         v[i] = store_state(vi);
-        let m_hat = mi / c.correction1;
-        let v_hat = vi / c.correction2;
-        values[i] = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
+        values[i] = T::from_f64(adam_update(c, p, mi, vi));
     }
     (sum, finite)
 }
@@ -931,10 +1120,18 @@ fn adam_chunk<T: Real, const DECOUPLED: bool, const WD: bool>(
         let vi = c.b2 * v.to_f64() + (1.0 - c.b2) * g * g;
         *m = store_state(mi);
         *v = store_state(vi);
-        let m_hat = mi / c.correction1;
-        let v_hat = vi / c.correction2;
-        *value = T::from_f64(p - c.lr * m_hat / (v_hat.sqrt() + c.eps));
+        *value = T::from_f64(adam_update(c, p, mi, vi));
     })
+}
+
+/// The updated parameter from its value `p` and its new moments `m` and `v`:
+/// `p − step_size · m / (√v / √(1 − β₂ᵗ) + eps)`, the bias corrections folded into two
+/// scalars as `torch.optim.Adam` folds them, so each element takes one square root and
+/// one division. (PyTorch divides `√v` by `√(1 − β₂ᵗ)`; this multiplies by its inverse,
+/// which can differ in the last bit.)
+#[inline(always)]
+fn adam_update(c: &AdamStep, p: f64, m: f64, v: f64) -> f64 {
+    p - c.step_size * m / (v.sqrt() * c.inv_sqrt_correction2 + c.eps)
 }
 
 /// Adam (Kingma and Ba, 2015) with PyTorch's `torch.optim.Adam` semantics: bias-corrected
@@ -1535,6 +1732,68 @@ mod tests {
                 })
                 .collect();
             assert!(norms[0] == norms[1] && norms[0] == norms[2], "{name}");
+        }
+    }
+
+    /// With parameters left out anywhere in the store (the first, two in the middle, the
+    /// last, the first and a middle one), a chunked step on 1, 2 and 4 threads gives the
+    /// reference loop's values and optimiser state bit for bit, and its statistics within
+    /// 1e-12 relative, with a zero norm for every parameter left out. Runs alone in a child
+    /// process, so the 2- and 4-thread runs really use the pool's workers.
+    #[test]
+    fn chunked_update_with_skipped_parameters_matches_the_reference() {
+        let out = crate::test_child::run_alone("optim::tests::chunked_skips_child", &[]);
+        crate::test_child::assert_passed(&out);
+    }
+
+    /// The body of `chunked_update_with_skipped_parameters_matches_the_reference`, run in a
+    /// child process after checking that the pool runs tasks on its workers.
+    #[test]
+    #[ignore = "run in a child process by chunked_update_with_skipped_parameters_matches_the_reference"]
+    fn chunked_skips_child() {
+        crate::test_child::assert_pool_runs_on_workers();
+        let skips: [&[usize]; 4] = [&[0], &[1, 2], &[3], &[0, 2]];
+        // Gradients for every parameter of the store except those in `skip`.
+        let grads = |store: &mut ParamStore, ids: &[ParamId], step: u32, skip: &[usize]| {
+            store.zero_grad();
+            for (k, &id) in ids.iter().enumerate().filter(|(k, _)| !skip.contains(k)) {
+                let n = store.value(id).data().len();
+                set_grad(store, id, &sequence(n, 100 * step + k as u32, &[]));
+            }
+        };
+        for (name, make) in chunk_configs() {
+            let (mut reference, ids) = chunk_store();
+            let mut ref_opt = make();
+            let mut ref_stats = GradStats::new();
+            let mut runs: Vec<_> = [1, 2, 4]
+                .into_iter()
+                .map(|threads| {
+                    let (store, ids) = chunk_store();
+                    (threads, store, ids, make(), GradStats::new())
+                })
+                .collect();
+            for (step, skip) in (1..).zip(skips) {
+                grads(&mut reference, &ids, step, skip);
+                ref_opt.step(&mut reference, &mut ref_stats, Path::Reference);
+                for (threads, store, own, opt, stats) in &mut runs {
+                    grads(store, own, step, skip);
+                    opt.step(store, stats, Path::Chunked(*threads));
+                    let at = format!("{name}, step {step}, {threads} threads");
+                    assert!(
+                        value_bits(store, own) == value_bits(&reference, &ids),
+                        "{at}: values"
+                    );
+                    assert!(opt.state_bits() == ref_opt.state_bits(), "{at}: state");
+                    for (k, (&id, &ref_id)) in own.iter().zip(&ids).enumerate() {
+                        let (a, b) = (stats.norm(id), ref_stats.norm(ref_id));
+                        assert!(
+                            a == b || (a - b).abs() <= 1e-12 * b.abs(),
+                            "{at}: norm {a} vs reference {b}"
+                        );
+                        assert!(!skip.contains(&k) || a == 0.0, "{at}: skipped norm {a}");
+                    }
+                }
+            }
         }
     }
 
