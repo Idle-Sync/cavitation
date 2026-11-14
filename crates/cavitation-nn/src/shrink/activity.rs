@@ -76,7 +76,7 @@ pub struct LayerActivity {
 /// let mut params = ParamStore::new();
 /// let layer = Linear::new(&mut params, 1, 2, &mut Rng::seed(0));
 /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[1.0, -1.0]);
-/// params.value_mut(layer.bias()).data_mut().copy_from_slice(&[0.0, 0.0]);
+/// params.value_mut(layer.bias().unwrap()).data_mut().copy_from_slice(&[0.0, 0.0]);
 /// let net = Sequential::new().push(layer).push(Relu);
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![-1.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),

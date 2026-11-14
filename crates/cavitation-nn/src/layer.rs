@@ -128,7 +128,7 @@ pub trait Layer<T: Real>: Send + Sync {
     /// use cavitation_core::{ParamStore, Rng};
     /// use cavitation_nn::{Layer, Linear};
     /// let layer = Linear::new(&mut ParamStore::new(), 2, 3, &mut Rng::seed(0));
-    /// assert_eq!(Layer::<f32>::parameter(&layer, "bias"), Some(layer.bias()));
+    /// assert_eq!(Layer::<f32>::parameter(&layer, "bias"), layer.bias());
     /// assert_eq!(Layer::<f32>::parameter(&layer, "scale"), None);
     /// ```
     fn parameter(&self, local: &str) -> Option<ParamId> {
@@ -258,7 +258,9 @@ pub trait Layer<T: Real>: Send + Sync {
     /// let mut params = ParamStore::new();
     /// let layer = Linear::new(&mut params, 4, 2, &mut Rng::seed(0));
     /// match Layer::<f32>::inference(&layer, &params.values) {
-    ///     Some(InferenceLayer::Linear { inputs, outputs, .. }) => assert_eq!((inputs, outputs), (4, 2)),
+    ///     Some(InferenceLayer::Linear { inputs, outputs, .. }) => {
+    ///         assert_eq!((inputs, outputs), (4, 2))
+    ///     }
     ///     _ => unreachable!(),
     /// }
     /// ```

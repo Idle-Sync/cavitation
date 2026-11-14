@@ -66,13 +66,17 @@
 //! # `epoch`
 //!
 //! - `epoch` (integer), `epochs` (integer): the epoch that ended, and the run's total.
-//! - `mean_loss` (number): the mean training loss over the epoch's rows.
-//! - `rows` (integer): the rows the epoch trained on.
+//! - `mean_loss` (number or `null`): the mean training loss over the epoch's rows; `null`
+//!   when it is not finite (a NaN loss under `OnNonFinite::Warn`, say) or the epoch trained
+//!   on no rows (every step it ran left out under `OnNonFinite::Skip`).
+//! - `rows` (integer): the rows the epoch trained on; steps left out under
+//!   `OnNonFinite::Skip` do not count.
 //! - `seconds` (number): the epoch's wall-clock time, pauses included.
 //! - `evaluation` (object or `null`): the held-out evaluation on the first `eval_rows` probe
 //!   rows, or `null` when it was skipped (no client was connected, or the time since the
-//!   last evaluation was under 100 times that evaluation's own cost; the last epoch always
-//!   has one while a client is connected):
+//!   last evaluation was under [`EVALUATION_FACTOR`](crate::EVALUATION_FACTOR), 200, times
+//!   that evaluation's own cost; the last epoch always has one while a client is
+//!   connected):
 //!   - `rows` (integer): the rows measured.
 //!   - `loss` (number): their mean loss, as training defines it.
 //!   - `accuracy` (number or `null`): the share classified right, for class targets.
@@ -107,8 +111,10 @@
 //! - `on` (boolean): whether it is switched on.
 //! - `a`, `z`, `df`, `grad_a`, `grad_z` (number or `null`): its values in the chosen layer,
 //!   as in `probe`.
-//! - `pre_activation` (number or `null`): `bias + Σ weight·x`, before any mask.
+//! - `pre_activation` (number or `null`): `bias + Σ weight·x` (`Σ weight·x` for a `Linear`
+//!   without a bias), before any mask.
 //! - `bias` (number or `null`).
+//! - `has_bias` (boolean): whether its `Linear` has a bias; `false` without a `Linear`.
 //! - `weights` (array of numbers): its incoming weights, one per input of its `Linear`.
 //! - `outgoing_norm` (number or `null`): the Euclidean norm of its weights in the next
 //!   `Linear`.
@@ -517,7 +523,8 @@ pub struct EpochEvaluation<'a> {
 /// use cavitation_inspect::json::JsonWriter;
 /// use cavitation_inspect::wire;
 /// use cavitation_nn::EpochReport;
-/// let report = EpochReport { epoch: 1, mean_loss: 0.5, rows: 64, seconds: 0.01 };
+/// let report =
+///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 64, seconds: 0.01, validation: None };
 /// let mut w = JsonWriter::new();
 /// wire::epoch(&mut w, &report, 3, None);
 /// assert!(w.as_str().ends_with(r#""evaluation":null}"#));
@@ -641,6 +648,7 @@ pub fn probe(w: &mut JsonWriter, step: u64, probe: &Probe, model: &Sequential) {
 /// let mut w = JsonWriter::new();
 /// wire::neuron(&mut w, 1, &probe, probe.last_neuron());
 /// assert!(w.as_str().contains(r#""layer":1,"neuron":0,"linear":0,"on":true"#));
+/// assert!(w.as_str().contains(r#""has_bias":true"#));
 /// # Ok::<(), cavitation_core::Error>(())
 /// ```
 pub fn neuron(w: &mut JsonWriter, step: u64, probe: &Probe, neuron: &NeuronValues) {
@@ -673,6 +681,7 @@ pub fn neuron(w: &mut JsonWriter, step: u64, probe: &Probe, neuron: &NeuronValue
     number_or_null(w, neuron.pre_activation().map(f64::from));
     w.key("bias");
     number_or_null(w, neuron.bias().map(f64::from));
+    w.key("has_bias").bool(neuron.bias().is_some());
     w.key("weights").f32s(neuron.weights()).key("outgoing_norm");
     number_or_null(w, neuron.outgoing_norm().map(f64::from));
     w.key("top_inputs").begin_array();

@@ -214,7 +214,10 @@ impl fmt::Debug for Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let inspector = Inspector::start(config).unwrap();
     /// assert!(format!("{inspector:?}").contains("127.0.0.1"));
     /// ```
@@ -326,7 +329,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let inspector = Inspector::start(config).unwrap();
     /// let url = inspector.url();
     /// assert!(!url.contains(":0/"));
@@ -340,7 +346,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let inspector = Inspector::start(config).unwrap();
     /// assert_ne!(inspector.address().port(), 0);
     /// ```
@@ -352,7 +361,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let inspector = Inspector::start(config).unwrap();
     /// assert_eq!(inspector.config().max_clients, 8);
     /// ```
@@ -364,7 +376,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// assert_eq!(Inspector::start(config).unwrap().clients(), 0);
     /// ```
     pub fn clients(&self) -> usize {
@@ -376,7 +391,10 @@ impl Inspector {
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
     /// use cavitation_inspect::sse::Snapshot;
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let inspector = Inspector::start(config).unwrap();
     /// assert!(inspector.hub().publish_snapshot(Snapshot::Stats, |w| { w.uint(1); }));
     /// ```
@@ -389,7 +407,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// assert!(Inspector::start(config).unwrap().try_command().is_none());
     /// ```
     pub fn try_command(&self) -> Option<Command> {
@@ -402,7 +423,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// assert_eq!(Inspector::start(config).unwrap().snapshots_taken(), 0);
     /// ```
     pub fn snapshots_taken(&self) -> u64 {
@@ -425,7 +449,10 @@ impl Inspector {
     ///
     /// ```
     /// use cavitation_inspect::{Inspector, InspectorConfig};
-    /// let config = InspectorConfig { address: "127.0.0.1:0".parse().unwrap(), ..Default::default() };
+    /// let config = InspectorConfig {
+    ///     address: "127.0.0.1:0".parse().unwrap(),
+    ///     ..Default::default()
+    /// };
     /// let inspector = Inspector::start(config)?;
     /// let path = std::env::temp_dir().join(format!("inspector-doc-{}.html", std::process::id()));
     /// inspector.export_html(&path)?;

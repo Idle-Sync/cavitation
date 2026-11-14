@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, Graph, ParamId, ParamStore, Reduction, Tape, TensorView, Var};
 
-use super::{Batch, BatchView, Batcher, Dataset, Flow, Targets, TargetsView};
+use super::{
+    Batch, BatchView, Batcher, Dataset, Evaluation, Evaluator, Flow, Targets, TargetsView,
+};
 use crate::{
     Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, NeuronMask, Optimizer, Sequential,
     Sgd, StepInputs, Trace,
@@ -165,7 +167,9 @@ impl Loss {
 ///
 /// ```
 /// use cavitation_core::{Error, ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
+/// use cavitation_nn::{
+///     Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer,
+/// };
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
 ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
@@ -191,8 +195,10 @@ impl Loss {
 /// The same step written out by hand, the way to train with a loss [`Loss`] does not list:
 /// open a tape on the parameter values, add the batch as an input, run the model (traced,
 /// for the health checks), record the loss, run `backward` into the gradients, run the
-/// [`HealthMonitor`]'s tape checks, drop the tape, step the optimiser, run the monitor's
-/// gradient checks on the optimiser's statistics and mark the gradients stale; at the end
+/// [`HealthMonitor`]'s tape checks, drop the tape, ask the monitor whether to apply the
+/// update (under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) it checks the gradients
+/// first), step the optimiser, run the monitor's gradient checks on the optimiser's
+/// statistics and mark the gradients stale; at the end
 /// of each epoch, end the monitor's epoch. The tape borrows `params.values` while
 /// `backward` writes `params.grads`; borrowing the two fields separately is what lets this
 /// compile.
@@ -221,11 +227,17 @@ impl Loss {
 ///         let loss = tape.l1(out, target, Reduction::Sum);
 ///         let value = tape.value(loss).data()[0];
 ///         tape.backward(loss, &mut params.grads);
-///         let inputs = StepInputs { x: x.view(), targets: TargetsView::Values(y.view()), rows: None };
+///         let inputs = StepInputs {
+///             x: x.view(),
+///             targets: TargetsView::Values(y.view()),
+///             rows: None,
+///         };
 ///         monitor.after_backward(step, value, &tape, &trace, &net, inputs)?;
 ///         drop(tape);
-///         optimizer.step(&mut params);
-///         monitor.after_update(step, optimizer.last_stats(), &names)?;
+///         if monitor.before_update(step, value, &params, &names) {
+///             optimizer.step(&mut params);
+///             monitor.after_update(step, optimizer.last_stats(), &names)?;
+///         }
 ///         params.zero_grad();
 ///         monitor.end_epoch(epoch)?;
 ///     }
@@ -248,6 +260,9 @@ pub struct Trainer {
     batch: Option<Batch<f32>>,
     /// The number of steps taken.
     steps: u64,
+    /// The number of those steps whose update was left out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip).
+    skipped: u64,
     /// The health checks run on every step.
     health: HealthMonitor,
     /// The model's parameter names, for the health checks' messages.
@@ -300,6 +315,7 @@ impl Trainer {
             batch_size: batch,
             batch: None,
             steps: 0,
+            skipped: 0,
             health: HealthMonitor::new(Health::default()).with_loss(loss),
             names: model.parameter_names(),
             profiler: Profiler::default(),
@@ -361,9 +377,15 @@ impl Trainer {
     /// inputs or value targets (with no dataset row, as `step` does not know one), or says that the
     /// inputs were finite and the values overflowed. A NaN or infinite loss skips the optimiser
     /// step, so the parameters stay as they were; a NaN or infinite gradient with a finite loss is
-    /// found after the update has applied it. The step is counted and the gradients are marked
-    /// stale either way. [`fit`] stops at this error. Under
-    /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not.
+    /// found after the update has applied it, so the parameters then hold the NaN. The step is
+    /// counted and the gradients are marked stale either way. [`fit`] stops at this error. Under
+    /// [`OnNonFinite::Warn`](crate::OnNonFinite) the step returns its loss, NaN or not, and the
+    /// update is applied. Under [`OnNonFinite::Skip`](crate::OnNonFinite) the step returns its
+    /// loss too, but a step whose loss or gradient is NaN or infinite leaves the parameters and
+    /// the optimiser's state as they were; it is counted in [`steps`](Self::steps) and in
+    /// [`skipped_steps`](Self::skipped_steps). Its hooks have run, and a profile asked for
+    /// with [`profile_next_step`](Self::profile_next_step) carries over to the next step that
+    /// trains.
     ///
     /// [`Warning::NonFinite`]: crate::Warning::NonFinite
     ///
@@ -376,7 +398,9 @@ impl Trainer {
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng, Tensor};
-    /// use cavitation_nn::{Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer};
+    /// use cavitation_nn::{
+    ///     Batch, Batcher, Dataset, Linear, Loss, Sequential, Sgd, Targets, Trainer,
+    /// };
     /// let data = Dataset { x: Tensor::zeros(&[3, 2]), targets: Targets::Classes(vec![0, 1, 1]) };
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
@@ -416,7 +440,10 @@ impl Trainer {
     /// use cavitation_nn::{
     ///     Batch, Batcher, Dataset, Hooks, Linear, Loss, Sequential, Sgd, Targets, Tanh, Trainer,
     /// };
-    /// let data = Dataset { x: Tensor::full(&[2, 2], 0.5f32), targets: Targets::Classes(vec![0, 1]) };
+    /// let data = Dataset {
+    ///     x: Tensor::full(&[2, 2], 0.5f32),
+    ///     targets: Targets::Classes(vec![0, 1]),
+    /// };
     /// let mut params = ParamStore::new();
     /// let mut rng = Rng::seed(0);
     /// let net = Sequential::new()
@@ -441,12 +468,14 @@ impl Trainer {
         hooks: &mut Hooks<'_>,
     ) -> Result<f32, Error> {
         let (value, checked) = self.checked_step(model, params, batch, None, hooks);
-        checked.map(|()| value)
+        checked.map(|_| value)
     }
 
     /// The step behind [`step_with_hooks`](Self::step_with_hooks): returns the batch's loss
-    /// and the health checks' verdict. When the tape checks fail the optimiser step is
-    /// skipped; the gradients are marked stale and the step is counted either way.
+    /// and the health checks' verdict, `Ok(true)` when the update was applied and `Ok(false)`
+    /// when [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) left it out. When the tape checks
+    /// fail, or the update is left out, the optimiser step does not run; the gradients are
+    /// marked stale and the step is counted either way.
     ///
     /// A step that was asked for a profile ([`profile_next_step`](Self::profile_next_step))
     /// times its parts into the profile's buffers; any other step reads no clock and only
@@ -458,7 +487,7 @@ impl Trainer {
         batch: BatchView<'_, f32>,
         rows: Option<&[usize]>,
         hooks: &mut Hooks<'_>,
-    ) -> (f32, Result<(), Error>) {
+    ) -> (f32, Result<bool, Error>) {
         self.loss.check_targets(batch.targets);
         hooks.check_layers(model);
         let step = self.steps + 1;
@@ -506,7 +535,8 @@ impl Trainer {
                     .after_backward(step, value, &tape, &self.trace, model, inputs);
             (value, checked)
         };
-        if checked.is_ok() {
+        let apply = checked.is_ok() && self.health.before_update(step, value, params, &self.names);
+        if apply {
             let update_start = profiling.then(Instant::now);
             self.optimizer.step(params);
             if let Some(update_start) = update_start {
@@ -518,13 +548,21 @@ impl Trainer {
         } else if profiling {
             self.profiler.profile.optimizer = Duration::ZERO;
         }
+        let skipped = checked.is_ok() && !apply;
+        if skipped {
+            self.skipped += 1;
+            // The step that was asked for a profile did not train: ask the next one.
+            self.profiler.asked |= profiling;
+        }
         params.zero_grad();
         self.steps = step;
-        if let Some(start) = start {
+        if let Some(start) = start
+            && !skipped
+        {
             self.profiler.profile.total = start.elapsed();
             self.profiler.valid = true;
         }
-        (value, checked)
+        (value, checked.map(|()| apply))
     }
 
     /// Asks the next step to record a [`StepProfile`]: each layer's forward and backward
@@ -646,11 +684,38 @@ impl Trainer {
         self.steps
     }
 
+    /// How many of the steps taken so far left their update out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip), because their loss or a gradient was
+    /// NaN or infinite. Always 0 under the other policies.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{
+    ///     Batch, Batcher, Dataset, Health, Linear, Loss, OnNonFinite, Sequential, Sgd, Targets,
+    ///     Trainer,
+    /// };
+    /// let x = Tensor::from_vec(vec![f32::NAN, 1.0], &[2, 1]).unwrap();
+    /// let data = Dataset { x, targets: Targets::Values(Tensor::zeros(&[2, 1])) };
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 2);
+    /// trainer.set_health(Health { on_non_finite: OnNonFinite::Skip, ..Health::quiet() });
+    /// let mut batch = Batch::new(&data, 2);
+    /// let view = Batcher::new(2, 2, None).gather(&data, 0..2, &mut batch);
+    /// assert!(trainer.step(&net, &mut params, view).unwrap().is_nan());
+    /// assert_eq!((trainer.steps(), trainer.skipped_steps()), (1, 1));
+    /// ```
+    pub fn skipped_steps(&self) -> u64 {
+        self.skipped
+    }
+
     /// Runs epoch `epoch` over `data` in the batches of `batcher` (reshuffled first), running
     /// `hooks` and the health checks on every step and, for a controlled run, the control
     /// after every step. Returns the mean loss over the rows the epoch trained on (each
-    /// batch's loss weighted by its row count), how many rows that was, and whether the
-    /// control stopped the run.
+    /// batch's loss weighted by its row count; a step left out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) trained on none), how many rows that
+    /// was, whether every batch ran, and whether the control stopped the run. The control
+    /// does not run after a step that was left out.
     ///
     /// # Errors
     ///
@@ -671,6 +736,7 @@ impl Trainer {
         batcher.epoch();
         let mut total = 0.0f64;
         let mut trained = 0usize;
+        let mut seen = 0usize;
         let mut checked = Ok(());
         let mut stopped = false;
         for range in batcher.batches() {
@@ -681,12 +747,17 @@ impl Trainer {
             let rows_of_batch = &batcher.order()[range];
             let (loss, step_checked) =
                 self.checked_step(run.model(), params, view, Some(rows_of_batch), hooks);
+            seen += rows;
+            match step_checked {
+                Err(err) => {
+                    checked = Err(err);
+                    break;
+                }
+                Ok(false) => continue,
+                Ok(true) => {}
+            }
             total += f64::from(loss) * rows as f64;
             trained += rows;
-            if step_checked.is_err() {
-                checked = step_checked;
-                break;
-            }
             if let (Run::Controlled(model, control), Some(start)) = (&mut *run, start) {
                 let info = StepInfo {
                     step: self.steps,
@@ -707,6 +778,7 @@ impl Trainer {
         checked.map(|()| EpochEnd {
             mean_loss: total / trained as f64,
             rows: trained,
+            whole: seen == data.len(),
             stopped,
         })
     }
@@ -715,11 +787,15 @@ impl Trainer {
 /// How an epoch of [`Trainer::run_epoch`] ended without an error.
 #[derive(Debug)]
 struct EpochEnd {
-    /// The mean loss over the rows the epoch trained on.
+    /// The mean loss over the rows the epoch trained on; NaN when it trained on none.
     mean_loss: f64,
-    /// The rows the epoch trained on: all of the data's, unless the control stopped the run
-    /// before the epoch's last step.
+    /// The rows the epoch trained on: all of the data's, less the rows of steps left out
+    /// under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) and of the steps after a
+    /// control stopped the run.
     rows: usize,
+    /// Whether every batch of the epoch ran, trained or left out: false only when the
+    /// control stopped the run before the epoch's last step.
+    whole: bool,
     /// Whether the control stopped the run during the epoch.
     stopped: bool,
 }
@@ -1065,6 +1141,23 @@ impl<'a> TrainerHandle<'a> {
     pub fn steps(&self) -> u64 {
         self.trainer.steps()
     }
+
+    /// How many of those steps were left out under
+    /// [`OnNonFinite::Skip`](crate::OnNonFinite::Skip), as [`Trainer::skipped_steps`] gives.
+    /// The control does not run after a skipped step, so a jump in [`StepInfo::step`] is the
+    /// other sign of one.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_nn::{Linear, Loss, Sequential, Sgd, Trainer, TrainerHandle};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
+    /// assert_eq!(TrainerHandle::new(&mut trainer).skipped_steps(), 0);
+    /// ```
+    pub fn skipped_steps(&self) -> u64 {
+        self.trainer.skipped_steps()
+    }
 }
 
 /// What runs between the steps of [`fit_controlled`]: after each step and after each epoch,
@@ -1116,7 +1209,8 @@ impl<'a> TrainerHandle<'a> {
 /// assert!(history.epochs.len() < 10_000);
 /// ```
 pub trait StepControl {
-    /// Runs after each step that the health checks passed, before the next step. Changes to
+    /// Runs after each step that the health checks passed, before the next step; not after
+    /// a step left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip). Changes to
     /// the masks through `model` apply from the next step, and so does a learning rate
     /// overridden through `trainer`.
     ///
@@ -1163,7 +1257,8 @@ pub trait StepControl {
     /// let mut params = ParamStore::new();
     /// let mut net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
     /// let mut trainer = Trainer::new(&net, Sgd::new(0.1), Loss::Mse, 4);
-    /// let report = EpochReport { epoch: 1, mean_loss: 0.5, rows: 4, seconds: 0.01 };
+    /// let report =
+    ///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 4, seconds: 0.01, validation: None };
     /// let mut model = ModelHandle::new(&mut net);
     /// let mut handle = TrainerHandle::new(&mut trainer);
     /// let flow = Nothing.after_epoch(&report, &mut model, &params, &mut handle);
@@ -1304,14 +1399,19 @@ impl LrSchedule {
 /// # Examples
 ///
 /// ```
-/// let report = cavitation_nn::EpochReport { epoch: 1, mean_loss: 0.5, rows: 100, seconds: 0.01 };
+/// use cavitation_nn::EpochReport;
+/// let report =
+///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 100, seconds: 0.01, validation: None };
 /// assert_eq!(report.epoch, 1);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EpochReport {
     /// The epoch's number, counting from 1.
     pub epoch: usize,
-    /// The mean loss over the epoch's rows: each batch's loss weighted by its row count.
+    /// The mean loss over the epoch's rows: each batch's loss weighted by its row count. A
+    /// step left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) does not count;
+    /// an epoch in which every step was left out gets no report, as it ends the run with
+    /// [`Error::NonFinite`].
     ///
     /// A PyTorch loop that averages the batch means gives a slightly different figure when the
     /// last batch is short, because it counts that batch as much as a full one. This loop
@@ -1327,17 +1427,24 @@ pub struct EpochReport {
     /// mean_loss = total / rows
     /// ```
     pub mean_loss: f64,
-    /// The rows the epoch trained on: every row of the data, except for the last epoch of a
-    /// [`fit_controlled`] run that its control stopped before the epoch's last step, where it
-    /// is the rows of the steps that ran (`mean_loss` is then their mean).
+    /// The rows the epoch trained on: every row of the data, less the rows of each step left
+    /// out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip), and for the last epoch of a
+    /// [`fit_controlled`] run that its control stopped before the epoch's last step, only the
+    /// rows of the steps that ran (`mean_loss` is then their mean).
     pub rows: usize,
     /// The epoch's wall-clock time in seconds, from before its first batch to after its
     /// end-of-epoch health checks: every step with its hooks and health checks and, under
     /// [`fit_controlled`], every [`StepControl::after_step`] call, including any time a
     /// control spends pausing the run. It does not include [`FitConfig::on_epoch`] or
     /// [`StepControl::after_epoch`]. Summing [`StepInfo::seconds`] over the epoch gives the
-    /// training time without the control's.
+    /// training time without the control's. It does not include the validation either.
     pub seconds: f64,
+    /// The evaluation of [`FitConfig::validation`] after the epoch's updates, with the run's
+    /// loss, at the run's batch size: what [`evaluate`](crate::evaluate) measures on the
+    /// model and parameters as the epoch left them, neuron masks included. `None` when the
+    /// run has no validation set, and for the last epoch of a [`fit_controlled`] run that its
+    /// control stopped before the epoch's last step.
+    pub validation: Option<Evaluation>,
 }
 
 /// Every epoch's report from one [`fit`].
@@ -1346,7 +1453,8 @@ pub struct EpochReport {
 ///
 /// ```
 /// use cavitation_nn::{EpochReport, History};
-/// let report = EpochReport { epoch: 1, mean_loss: 0.5, rows: 100, seconds: 0.01 };
+/// let report =
+///     EpochReport { epoch: 1, mean_loss: 0.5, rows: 100, seconds: 0.01, validation: None };
 /// let history = History { epochs: vec![report] };
 /// assert_eq!(history.epochs.len(), 1);
 /// ```
@@ -1360,7 +1468,7 @@ pub struct History {
 ///
 /// The default is 10 epochs in batches of 32, Adam at a constant learning rate of 1e-3
 /// without weight decay, cross-entropy, shuffled with seed 0, the default [`Health`] checks,
-/// and no callback.
+/// no validation set and no callback.
 ///
 /// # Examples
 ///
@@ -1390,11 +1498,21 @@ pub struct FitConfig {
     // The boxed callback is the plainest type for this field; an alias would only hide it.
     #[allow(clippy::type_complexity)]
     pub on_epoch: Option<Box<dyn FnMut(&EpochReport, &Sequential, &ParamStore) + 'static>>,
+    /// A held-out set measured after every whole epoch, recorded in
+    /// [`EpochReport::validation`] before `on_epoch` runs: the loss with
+    /// [`loss`](Self::loss), and the accuracy (class targets) or R² (value targets), `batch`
+    /// rows at a time. One [`Evaluator`] is made before training and kept for the run; after
+    /// each epoch it copies in the new parameter values and the model's neuron masks (which
+    /// a [`StepControl`] may have changed), in place, so from the second epoch on the
+    /// validation allocates nothing for a model that compiles to an [`InferenceModel`]. A
+    /// model with a layer that has no inference form is measured on the tape and copies its
+    /// parameter values each epoch.
+    pub validation: Option<Dataset>,
 }
 
 impl Default for FitConfig {
     /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, the
-    /// default health checks, no callback.
+    /// default health checks, no callback, no validation set.
     fn default() -> FitConfig {
         FitConfig {
             epochs: 10,
@@ -1408,12 +1526,14 @@ impl Default for FitConfig {
             schedule: LrSchedule::Constant,
             health: Health::default(),
             on_epoch: None,
+            validation: None,
         }
     }
 }
 
 impl fmt::Debug for FitConfig {
-    /// Writes every setting; the callback shows only whether there is one.
+    /// Writes every setting; the callback shows only whether there is one, and the
+    /// validation set only its rows and features.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FitConfig")
             .field("epochs", &self.epochs)
@@ -1424,6 +1544,10 @@ impl fmt::Debug for FitConfig {
             .field("schedule", &self.schedule)
             .field("health", &self.health)
             .field("on_epoch", &self.on_epoch.as_ref().map(|_| "FnMut"))
+            .field(
+                "validation",
+                &self.validation.as_ref().map(|v| (v.len(), v.features())),
+            )
             .finish()
     }
 }
@@ -1575,7 +1699,9 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 ///
 /// Each epoch sets the optimiser's learning rate from `config.schedule`, reshuffles the rows (with
 /// `config.shuffle_seed`), takes one [`Trainer::step`] per batch, ends the epoch of the health
-/// checks ([`Trainer::end_epoch`]) and then calls `config.on_epoch`. The same seeds give
+/// checks ([`Trainer::end_epoch`]), measures `config.validation` when there is one
+/// ([`EpochReport::validation`]) and then calls `config.on_epoch`. The validation only reads the
+/// parameters, so it does not change what the run trains to. The same seeds give
 /// bit-identical parameters on every run on the same machine and kernel level, for any thread
 /// count.
 ///
@@ -1590,14 +1716,19 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// as wide as the first layer that names an input width expects (layers that do not, such as
 /// activations, may come before it; the message then gives the width that reaches the layer), or if
 /// any input or value target is NaN or infinite (the message names the row, the column and the
-/// value). Each message names the tensors with their shapes, such as "the inputs are [8, 5]". Two
-/// layers that disagree on a width are a model error, not a data error: the checks that need the
-/// output width are skipped and the first forward pass panics naming both layers. During training,
+/// value). Each message names the tensors with their shapes, such as "the inputs are [8, 5]".
+/// `config.validation` goes through the same checks, before training, and a message about it
+/// starts with `validation: `. Two layers that disagree on a width are a model error, not a data
+/// error: the checks that need the output width are skipped and the first forward pass panics
+/// naming both layers. During training,
 /// with `config.health.on_non_finite` set to [`OnNonFinite::Stop`](crate::OnNonFinite) (the
 /// default), returns [`Error::NonFinite`] at the first step whose loss or gradient is NaN or
 /// infinite, naming the step and `"loss"` or the parameter (for example `"0.weight"`), after
 /// sending the matching warning to the health sink. A non-finite loss stops before the optimiser
-/// step; a non-finite gradient with a finite loss is found after the update applied it.
+/// step; a non-finite gradient with a finite loss is found after the update applied it. With
+/// [`OnNonFinite::Skip`](crate::OnNonFinite), such a step is left out instead and training
+/// continues (see [`EpochReport::rows`]), but an epoch in which every step was left out ends
+/// the run with [`Error::NonFinite`] naming the epoch, since the parameters did not change.
 ///
 /// # Panics
 ///
@@ -1608,7 +1739,9 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Dataset, FitConfig, Linear, Loss, OptimizerConfig, Sequential, Targets, fit};
+/// use cavitation_nn::{
+///     Dataset, FitConfig, Linear, Loss, OptimizerConfig, Sequential, Targets, fit,
+/// };
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
 ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
@@ -1648,7 +1781,9 @@ pub fn fit(
 ///
 /// ```
 /// use cavitation_core::{ParamStore, Rng, Tensor};
-/// use cavitation_nn::{Dataset, FitConfig, Hooks, Linear, Loss, Sequential, Targets, fit_with_hooks};
+/// use cavitation_nn::{
+///     Dataset, FitConfig, Hooks, Linear, Loss, Sequential, Targets, fit_with_hooks,
+/// };
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
 ///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
@@ -1775,12 +1910,27 @@ fn run_fit(
     check_dataset(train)?;
     check_model_and_loss(run.model(), config.loss, train)?;
     check_finite(train)?;
+    let validation_set = config.validation.take();
+    if let Some(held_out) = &validation_set {
+        let named = |e: Error| match e {
+            Error::InvalidData(msg) => Error::InvalidData(format!("validation: {msg}")),
+            other => other,
+        };
+        check_dataset(held_out).map_err(named)?;
+        check_model_and_loss(run.model(), config.loss, held_out).map_err(named)?;
+        check_finite(held_out).map_err(named)?;
+    }
     let mut trainer = Trainer::with_boxed(
         run.model(),
         config.optimizer.build(),
         config.loss,
         config.batch,
     );
+    // Made after the trainer, which panics on a batch size of 0 before this could return
+    // its error for it.
+    let mut evaluator = (validation_set.is_some())
+        .then(|| Evaluator::new(run.model(), params, config.loss, config.batch))
+        .transpose()?;
     trainer.set_health(config.health);
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut history = History {
@@ -1797,16 +1947,24 @@ fn run_fit(
         }
         let start = Instant::now();
         let end = trainer.run_epoch(&mut run, params, train, &mut batcher, hooks, epoch)?;
-        // Every row trained unless the control stopped the run before the epoch's last step.
-        let whole = end.rows == train.len();
+        let whole = end.whole;
         if whole {
             trainer.end_epoch(epoch)?;
         }
+        let seconds = start.elapsed().as_secs_f64();
+        let validation = match (&mut evaluator, &validation_set) {
+            (Some(evaluator), Some(held_out)) if whole => {
+                evaluator.refresh(run.model(), params)?;
+                Some(evaluator.evaluate(held_out)?)
+            }
+            _ => None,
+        };
         let report = EpochReport {
             epoch,
             mean_loss: end.mean_loss,
             rows: end.rows,
-            seconds: start.elapsed().as_secs_f64(),
+            seconds,
+            validation,
         };
         if whole && let Some(on_epoch) = config.on_epoch.as_mut() {
             on_epoch(&report, run.model(), params);
@@ -2025,6 +2183,7 @@ mod tests {
             schedule: LrSchedule::Constant,
             health: Health::default(),
             on_epoch: None,
+            validation: None,
         };
         let history = fit(&net, &mut params, &data, config).unwrap();
         assert_eq!(history.epochs.len(), 2000);
@@ -2708,7 +2867,7 @@ mod tests {
         };
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let net = Sequential::new().push(layer);
         let distances = Arc::new(Mutex::new(vec![1.0f64]));
         let sink = Arc::clone(&distances);
@@ -3160,7 +3319,7 @@ mod tests {
         };
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let mut net = Sequential::new().push(layer);
         let config = FitConfig {
             epochs: 4,
@@ -3361,7 +3520,10 @@ mod tests {
             let mut params = ParamStore::new();
             let mut rng = Rng::seed(22);
             let first = Linear::new(&mut params, 4, 16, &mut rng);
-            params.value_mut(first.bias()).data_mut().fill(-100.0);
+            params
+                .value_mut(first.bias().unwrap())
+                .data_mut()
+                .fill(-100.0);
             let mut net = Sequential::new()
                 .push(first)
                 .push(crate::Relu)
@@ -3584,7 +3746,7 @@ mod tests {
         };
         let mut params = ParamStore::new();
         let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-        let bias = layer.bias();
+        let bias = layer.bias().unwrap();
         let mut net = Sequential::new().push(layer);
         let config = FitConfig {
             epochs: 2,
@@ -3662,5 +3824,313 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(losses(&plain), losses(&controlled));
+    }
+
+    /// The held-out set of the validation tests: 40 rows of the control tests' problem, from
+    /// another seed.
+    fn validation_set() -> Dataset<f32> {
+        synthetic_classes(40, 4, 2, 23)
+    }
+
+    /// The bits of an evaluation's loss, accuracy and R², to compare two evaluations exactly.
+    fn evaluation_bits(e: &Evaluation) -> (u64, Option<u64>, Option<u64>) {
+        (
+            e.loss.to_bits(),
+            e.accuracy.map(f64::to_bits),
+            e.r2.map(f64::to_bits),
+        )
+    }
+
+    /// `fit` with a validation set records one validation loss and accuracy per epoch, and
+    /// each is bit for bit what `evaluate` measures (the same loss, at the run's batch size)
+    /// on the parameters as that epoch left them, read in `on_epoch`. The figures change as
+    /// the run trains, so each epoch reads its own parameters.
+    #[test]
+    fn validation_matches_evaluate_each_epoch() {
+        let (data, mut params, net) = control_setup();
+        let validation = validation_set();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (record, held_out) = (Arc::clone(&seen), validation.clone());
+        let config = FitConfig {
+            validation: Some(validation),
+            on_epoch: Some(Box::new(move |report, model, params| {
+                let manual =
+                    crate::evaluate(model, params, &held_out, Loss::CrossEntropy, 16).unwrap();
+                record.lock().unwrap().push((report.validation, manual));
+            })),
+            ..control_config(5)
+        };
+        let history = fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(history.epochs.len(), 5);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 5);
+        for (report, (in_callback, manual)) in history.epochs.iter().zip(seen.iter()) {
+            let recorded = report.validation.expect("every epoch has a validation");
+            assert!(recorded.accuracy.is_some() && recorded.r2.is_none());
+            assert_eq!(evaluation_bits(&recorded), evaluation_bits(manual));
+            assert_eq!(
+                in_callback.map(|e| evaluation_bits(&e)),
+                Some(evaluation_bits(manual))
+            );
+        }
+        let first = history.epochs[0].validation.unwrap().loss;
+        let last = history.epochs[4].validation.unwrap().loss;
+        assert_ne!(first.to_bits(), last.to_bits());
+    }
+
+    /// With value targets the validation has a loss and R² and no accuracy, bit for bit
+    /// `evaluate`'s on the trained parameters after the last epoch.
+    #[test]
+    fn validation_with_value_targets() {
+        let mut rng = Rng::seed(31);
+        let rows = |n: usize, rng: &mut Rng| {
+            let x: Vec<f32> = (0..2 * n).map(|_| rng.range(-1.0, 1.0) as f32).collect();
+            let y: Vec<f32> = x.chunks(2).map(|r| 2.0 * r[0] - r[1] + 0.5).collect();
+            Dataset {
+                x: Tensor::from_vec(x, &[n, 2]).unwrap(),
+                targets: Targets::Values(Tensor::from_vec(y, &[n, 1]).unwrap()),
+            }
+        };
+        let (data, validation) = (rows(48, &mut rng), rows(20, &mut rng));
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(3)));
+        let config = FitConfig {
+            epochs: 3,
+            batch: 8,
+            loss: Loss::Mse,
+            validation: Some(validation.clone()),
+            ..FitConfig::default()
+        };
+        let history = fit(&net, &mut params, &data, config).unwrap();
+        let last = history.epochs[2].validation.unwrap();
+        assert!(last.accuracy.is_none() && last.r2.is_some());
+        let manual = crate::evaluate(&net, &params, &validation, Loss::Mse, 8).unwrap();
+        assert_eq!(evaluation_bits(&last), evaluation_bits(&manual));
+    }
+
+    /// The validation measures the run's loss, not the default cross-entropy: with
+    /// `Loss::Nll` on class targets, after a `LogSoftmax` and on raw scores, each epoch's
+    /// validation is bit for bit `evaluate` with `Loss::Nll`. On raw scores cross-entropy
+    /// gives a different loss, so an evaluator built with the wrong loss fails here. (After a
+    /// `LogSoftmax` cross-entropy equals NLL in exact arithmetic, as log-softmax of
+    /// log-probabilities gives them back, which is why the raw-score case is there.)
+    #[test]
+    fn validation_uses_the_runs_class_loss() {
+        let data = synthetic_classes(64, 4, 2, 21);
+        let validation = validation_set();
+        for log_softmax in [true, false] {
+            let mut params = ParamStore::new();
+            let mut net = small_classifier(&mut params, 4, 2, 22);
+            if log_softmax {
+                net = net.push(crate::LogSoftmax);
+            }
+            let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let (record, held_out) = (Arc::clone(&seen), validation.clone());
+            let config = FitConfig {
+                loss: Loss::Nll,
+                validation: Some(validation.clone()),
+                on_epoch: Some(Box::new(move |report, model, params| {
+                    let nll = crate::evaluate(model, params, &held_out, Loss::Nll, 16).unwrap();
+                    let ce =
+                        crate::evaluate(model, params, &held_out, Loss::CrossEntropy, 16).unwrap();
+                    record.lock().unwrap().push((report.validation, nll, ce));
+                })),
+                ..control_config(3)
+            };
+            let history = fit(&net, &mut params, &data, config).unwrap();
+            assert_eq!(history.epochs.len(), 3);
+            for (recorded, nll, ce) in seen.lock().unwrap().iter() {
+                let recorded = recorded.expect("every epoch has a validation");
+                assert!(recorded.accuracy.is_some());
+                assert_eq!(evaluation_bits(&recorded), evaluation_bits(nll));
+                if !log_softmax {
+                    assert!(
+                        (recorded.loss - ce.loss).abs() > 1e-3,
+                        "{recorded:?} {ce:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Without a validation set (the default) no epoch has a validation.
+    #[test]
+    fn no_validation_by_default() {
+        let (data, mut params, net) = control_setup();
+        let history = fit(&net, &mut params, &data, control_config(2)).unwrap();
+        assert!(history.epochs.iter().all(|r| r.validation.is_none()));
+    }
+
+    /// A validation set that does not suit the model or the loss is `InvalidData` before
+    /// training, naming `validation`: rows of the wrong width, targets of the wrong kind, a
+    /// label the model has no output for, a NaN input. The parameters stay as they were.
+    #[test]
+    fn unsuitable_validation_is_invalid_data() {
+        let (data, mut params, net) = control_setup();
+        let before = parameter_bits(&net, &params);
+        let cases = [
+            Dataset {
+                x: Tensor::zeros(&[5, 3]),
+                targets: Targets::Classes(vec![0; 5]),
+            },
+            Dataset {
+                x: Tensor::zeros(&[5, 4]),
+                targets: Targets::Values(Tensor::zeros(&[5, 2])),
+            },
+            Dataset {
+                x: Tensor::zeros(&[5, 4]),
+                targets: Targets::Classes(vec![0, 1, 2, 0, 1]),
+            },
+            Dataset {
+                x: Tensor::from_vec(vec![f32::NAN; 20], &[5, 4]).unwrap(),
+                targets: Targets::Classes(vec![0; 5]),
+            },
+            Dataset {
+                x: Tensor::zeros(&[0, 4]),
+                targets: Targets::Classes(Vec::new()),
+            },
+        ];
+        for validation in cases {
+            let config = FitConfig {
+                validation: Some(validation),
+                ..control_config(2)
+            };
+            match fit(&net, &mut params, &data, config) {
+                Err(Error::InvalidData(msg)) => assert!(msg.starts_with("validation: "), "{msg}"),
+                other => panic!("expected InvalidData, got {other:?}"),
+            }
+            assert_eq!(parameter_bits(&net, &params), before);
+        }
+    }
+
+    /// Under `fit_controlled` the validation follows the masks the control changes: it
+    /// switches neurons of the first `Linear` off and on between steps (adding the mask at
+    /// step 2, changing its values at steps 6 and 10, clearing it at step 14 and adding it
+    /// again at step 18), and every epoch's validation is bit for bit `evaluate`'s on the
+    /// model as the epoch left it, masks included, read in `after_epoch`.
+    #[test]
+    fn validation_follows_masks_under_control() {
+        /// Changes the first `Linear`'s neurons and compares each epoch's validation with
+        /// `evaluate`.
+        struct Masking {
+            /// The held-out set.
+            validation: Dataset<f32>,
+            /// Each epoch's recorded and manual evaluations, and whether a mask was on.
+            seen: Vec<(Evaluation, Evaluation, bool)>,
+        }
+
+        impl StepControl for Masking {
+            fn after_step(
+                &mut self,
+                info: &StepInfo,
+                model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                _trainer: &mut TrainerHandle<'_>,
+            ) -> Flow {
+                match info.step {
+                    2 | 18 => model.set_neuron(0, 3, false),
+                    6 => model.set_neuron(0, 5, false),
+                    10 => model.set_neuron(0, 3, true),
+                    14 => model.clear_neuron_mask(0),
+                    _ => {}
+                }
+                Flow::Continue
+            }
+
+            fn after_epoch(
+                &mut self,
+                report: &EpochReport,
+                model: &mut ModelHandle<'_>,
+                params: &ParamStore,
+                _trainer: &mut TrainerHandle<'_>,
+            ) -> Flow {
+                let net = model.model();
+                let manual =
+                    crate::evaluate(net, params, &self.validation, Loss::CrossEntropy, 16).unwrap();
+                let masked = net.neuron_mask(0).is_some();
+                self.seen.push((report.validation.unwrap(), manual, masked));
+                Flow::Continue
+            }
+        }
+
+        let (data, mut params, mut net) = control_setup();
+        let validation = validation_set();
+        let mut control = Masking {
+            validation: validation.clone(),
+            seen: Vec::new(),
+        };
+        let config = FitConfig {
+            validation: Some(validation.clone()),
+            ..control_config(5)
+        };
+        fit_controlled(
+            &mut net,
+            &mut params,
+            &data,
+            config,
+            &mut Hooks::new(),
+            &mut control,
+        )
+        .unwrap();
+        assert_eq!(control.seen.len(), 5);
+        let masked: Vec<bool> = control.seen.iter().map(|s| s.2).collect();
+        assert_eq!(masked, [true, true, true, false, true]);
+        for (epoch, (recorded, manual, _)) in control.seen.iter().enumerate() {
+            assert_eq!(
+                evaluation_bits(recorded),
+                evaluation_bits(manual),
+                "epoch {}",
+                epoch + 1
+            );
+        }
+        // The mask matters: the model without it measures differently.
+        let mut unmasked = net.clone();
+        unmasked.clear_neuron_mask(0);
+        let plain =
+            crate::evaluate(&unmasked, &params, &validation, Loss::CrossEntropy, 16).unwrap();
+        assert_ne!(evaluation_bits(&plain), evaluation_bits(&control.seen[4].0));
+    }
+
+    /// A control that stops the run part-way through an epoch leaves that epoch's report
+    /// without a validation (the epoch did not end); the whole epochs before it have one.
+    #[test]
+    fn partial_epoch_has_no_validation() {
+        /// Stops after step 6, the second step of epoch 2.
+        struct StopAtSix;
+
+        impl StepControl for StopAtSix {
+            fn after_step(
+                &mut self,
+                info: &StepInfo,
+                _model: &mut ModelHandle<'_>,
+                _params: &ParamStore,
+                _trainer: &mut TrainerHandle<'_>,
+            ) -> Flow {
+                if info.step == 6 {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                }
+            }
+        }
+
+        let (data, mut params, mut net) = control_setup();
+        let config = FitConfig {
+            validation: Some(validation_set()),
+            ..control_config(3)
+        };
+        let history = fit_controlled(
+            &mut net,
+            &mut params,
+            &data,
+            config,
+            &mut Hooks::new(),
+            &mut StopAtSix,
+        )
+        .unwrap();
+        assert_eq!(history.epochs.len(), 2);
+        assert!(history.epochs[0].validation.is_some());
+        assert_eq!(history.epochs[1].rows, 32);
+        assert!(history.epochs[1].validation.is_none());
     }
 }

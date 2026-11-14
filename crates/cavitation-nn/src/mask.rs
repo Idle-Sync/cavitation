@@ -405,7 +405,7 @@ mod tests {
             )
         };
         let first = constant(&mut params, 3, 4);
-        let (weight, bias) = (first.weight(), first.bias());
+        let (weight, bias) = (first.weight(), first.bias().unwrap());
         let second = constant(&mut params, 4, 2);
         let mut net = Sequential::new().push(first).push(Relu).push(second);
         let mut mask = NeuronMask::all_on(4);

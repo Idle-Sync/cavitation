@@ -589,7 +589,8 @@ impl LinearModel {
 
     /// Reads a model back from a network of exactly one [`Linear`] layer, such as
     /// [`to_sequential`](Self::to_sequential) builds or a loaded PyTorch `nn.Linear`: `coef`
-    /// is its weight and `intercept` its bias, widened exactly to `f64`.
+    /// is its weight and `intercept` its bias, widened exactly to `f64`. A `Linear` without a
+    /// bias (an `nn.Linear(..., bias=False)`) gives an intercept of 0 for every output.
     ///
     /// # Errors
     ///
@@ -645,7 +646,10 @@ impl LinearModel {
         let weight = params.value(linear.weight());
         Ok(LinearModel {
             coef: Tensor::from_vec(widen(weight), weight.shape().dims())?,
-            intercept: widen(params.value(linear.bias())),
+            intercept: match linear.bias() {
+                Some(bias) => widen(params.value(bias)),
+                None => vec![0.0; linear.outputs()],
+            },
         })
     }
 }
@@ -1010,6 +1014,20 @@ mod tests {
         for (&a, &b) in back.coef.data().iter().zip(model.coef.data()) {
             assert_eq!(a, f64::from(b as f32));
         }
+    }
+
+    /// A `Linear` without a bias, such as a loaded `nn.Linear(..., bias=False)`, reads back
+    /// as a model whose intercept is 0 for every output, which predicts what the layer does.
+    #[test]
+    fn from_sequential_without_bias_has_zero_intercept() {
+        let mut params = ParamStore::new();
+        let weight = Tensor::from_vec(vec![2.0f32, -1.0, 0.5, 3.0], &[2, 2]).unwrap();
+        let net = Sequential::new().push(Linear::from_weight(&mut params, weight).unwrap());
+        let model = LinearModel::from_sequential(&net, &params).unwrap();
+        assert_eq!(model.coef.data(), &[2.0, -1.0, 0.5, 3.0]);
+        assert_eq!(model.intercept, [0.0, 0.0]);
+        let x = Tensor::from_vec(vec![1.0f32, 2.0], &[1, 2]).unwrap();
+        assert_eq!(model.predict(x.view()).data(), &[0.0, 6.5]);
     }
 
     /// `from_sequential` refuses a model that is not one `Linear`, and one with a neuron

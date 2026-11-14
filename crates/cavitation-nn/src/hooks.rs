@@ -120,7 +120,12 @@ struct Entry<'h, T: Real> {
 ///     let d = e.local_derivative.unwrap().data();
 ///     live.push(d.iter().filter(|&&v| v > 0.0).count() as f32 / d.len() as f32);
 /// });
-/// let config = FitConfig { epochs: 3, batch: 2, loss: Loss::CrossEntropy, ..FitConfig::default() };
+/// let config = FitConfig {
+///     epochs: 3,
+///     batch: 2,
+///     loss: Loss::CrossEntropy,
+///     ..FitConfig::default()
+/// };
 /// fit_with_hooks(&net, &mut params, &data, config, &mut hooks).unwrap();
 /// drop(hooks);
 /// assert_eq!(live.len(), 3);
@@ -503,7 +508,7 @@ mod tests {
             .data_mut()
             .copy_from_slice(&[0.5, -0.25, 0.75, 1.0]);
         params
-            .value_mut(linear.bias())
+            .value_mut(linear.bias().unwrap())
             .data_mut()
             .copy_from_slice(&[0.1, -0.2]);
         let net = Sequential::new_generic().push(linear).push(Tanh);

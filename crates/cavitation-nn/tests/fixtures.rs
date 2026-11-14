@@ -5,14 +5,16 @@
 //! within `2 * (k + 2) * 1.19e-7 * sum|terms| + 1e-30`, with `k` the length of the sum and
 //! `sum|terms|` the sum of the absolute values of the terms, computed here in f64 from the
 //! fixture's inputs. The optimisers are compared with `torch.optim` from the fixtures in
-//! `tests/fixtures/optim/`, on both update paths.
+//! `tests/fixtures/optim/`, on both update paths. A network whose first `Linear` has no bias
+//! is loaded from PyTorch's `state_dict` in `tests/fixtures/state-dict/` and compared on its
+//! output and its parameter gradients, with the same bound carried through the layers.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
 
 use cavitation_core::kernels::{Level, level, set_level, supported};
 use cavitation_core::{Graph, ParamId, ParamStore, Rng, Tensor};
-use cavitation_nn::{Adam, AdamW, Layer, Linear, Optimizer, Sgd};
+use cavitation_nn::{Adam, AdamW, Init, Layer, Linear, Optimizer, Relu, Sequential, Sgd, load};
 use serde_json::Value;
 
 /// A tensor read from a fixture: its shape and its values as f64.
@@ -92,7 +94,7 @@ fn check_at_current_level() {
     let mut params = ParamStore::new();
     let layer = Linear::new(&mut params, n_in, n_out, &mut Rng::seed(0));
     *params.value_mut(layer.weight()) = to_tensor(w);
-    *params.value_mut(layer.bias()) = to_tensor(b);
+    *params.value_mut(layer.bias().unwrap()) = to_tensor(b);
     // The input is registered as a parameter so that it receives a gradient.
     let x_id = params.add(to_tensor(x));
 
@@ -147,7 +149,7 @@ fn check_at_current_level() {
     );
     compare(
         "gradient of bias",
-        params.grad(layer.bias()).data(),
+        params.grad(layer.bias().unwrap()).data(),
         &grads64[2],
         batch,
         &db_sums,
@@ -186,6 +188,205 @@ fn linear_matches_pytorch() {
     for l in ALL_LEVELS.into_iter().filter(|&l| supported(l)) {
         set_level(l).expect("a supported level can be set");
         check_at_current_level();
+    }
+}
+
+/// The GEMM bound's factor for a sum of `k` terms, `2 · (k + 2) · 1.19e-7`.
+fn gamma(k: usize) -> f64 {
+    2.0 * (k as f64 + 2.0) * 1.19e-7
+}
+
+/// Compares `ours` with PyTorch's float64 values within `bound`, element by element.
+fn compare_within(what: &str, ours: &[f32], torch64: &Tens, bound: &[f64]) {
+    assert_eq!(ours.len(), torch64.data.len(), "{what}: element count");
+    for (i, ((&o, &t), &b)) in ours.iter().zip(&torch64.data).zip(bound).enumerate() {
+        let diff = (f64::from(o) - t).abs();
+        assert!(
+            diff <= b + 1e-30,
+            "no-bias network at level {}: {what}, element {i}: ours {o:e}, torch {t:e}, difference {diff:e} > {b:e}",
+            level()
+        );
+    }
+}
+
+/// Loads PyTorch's `Linear(4, 8, bias=False), ReLU, Linear(8, 3)` into the same network
+/// built with [`Linear::without_bias`], runs forward and backward of `sum(output ·
+/// upstream)` and compares the output and the gradients of `0.weight`, `2.weight` and
+/// `2.bias` with PyTorch's float64 results.
+///
+/// Each bound is the GEMM bound of its own sum, `γ(k) · Σ|terms|` with `γ(k) = 2 · (k + 2)
+/// · 1.19e-7`, plus the error carried in: the hidden pre-activation `z = x W₁ᵀ` (4 terms,
+/// no bias) is within `e₁ = γ(4) Σ|x||W₁|`, and every `z` is further than `e₁` from 0 (the
+/// test checks), so both sides take the same ReLU branch and `h = relu(z)` is within `e₁`
+/// too. Then the output (`k = 9`, the bias one term) adds `Σ |W₂| e₁`; `∂/∂W₂ = upᵀ h`
+/// (`k = 5` rows) adds `Σ |up| e₁`; `∂/∂b₂` sums the upstream over the rows; the hidden
+/// gradient `g = up W₂` (`k = 3`) is within `γ(3) Σ|up||W₂|`, which `∂/∂W₁ = gᵀ x` carries
+/// through `|x|`.
+fn check_no_bias_network_at_current_level() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/state-dict");
+    let text = std::fs::read_to_string(dir.join("mlp-no-bias-io.json")).expect("read fixture");
+    let v: Value = serde_json::from_str(&text).expect("valid JSON");
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(0);
+    let net = Sequential::new()
+        .push(Linear::without_bias(
+            &mut params,
+            4,
+            8,
+            Init::XavierUniform,
+            &mut rng,
+        ))
+        .push(Relu)
+        .push(Linear::new(&mut params, 8, 3, &mut rng));
+    let names: Vec<String> = net.parameter_names().into_iter().map(|(n, _)| n).collect();
+    let keys: Vec<&str> = (v["keys"].as_array().expect("keys").iter())
+        .map(|k| k.as_str().expect("key"))
+        .collect();
+    assert_eq!(names, keys);
+    load(dir.join("mlp-no-bias.safetensors"), &net, &mut params).expect("load");
+
+    let (x, up) = (parse_tensor(&v["input"]), parse_tensor(&v["upstream"]));
+    let (rows, n_in, hidden, n_out) = (5, 4, 8, 3);
+    assert_eq!(
+        (x.shape.as_slice(), up.shape.as_slice()),
+        (&[rows, n_in][..], &[rows, n_out][..])
+    );
+    let (first, last) = (net.linear(0).unwrap(), net.linear(2).unwrap());
+    let (w1_id, w2_id) = (first.weight(), last.weight());
+    let b2_id = last.bias().expect("the output layer has a bias");
+    assert_eq!(first.bias(), None);
+
+    let mut graph = Graph::new();
+    let output;
+    {
+        let mut tape = graph.tape(&params.values);
+        let xv = tape.input(to_tensor(&x).view());
+        let y = net.forward(&mut tape, xv);
+        output = tape.value(y).data().to_vec();
+        let u = tape.input(to_tensor(&up).view());
+        let weighted = tape.mul(y, u);
+        let loss = tape.sum(weighted);
+        tape.backward(loss, &mut params.grads);
+    }
+
+    let wide = |id: ParamId| -> Vec<f64> {
+        params
+            .value(id)
+            .data()
+            .iter()
+            .map(|&w| f64::from(w))
+            .collect()
+    };
+    let (w1, w2, b2) = (wide(w1_id), wide(w2_id), wide(b2_id));
+    let (x, up) = (&x.data, &up.data);
+    // The hidden layer, exactly, and its error bound.
+    let mut z = vec![0.0f64; rows * hidden];
+    let mut e1 = vec![0.0f64; rows * hidden];
+    for r in 0..rows {
+        for p in 0..hidden {
+            let (mut sum, mut abs) = (0.0, 0.0);
+            for q in 0..n_in {
+                sum += x[r * n_in + q] * w1[p * n_in + q];
+                abs += (x[r * n_in + q] * w1[p * n_in + q]).abs();
+            }
+            z[r * hidden + p] = sum;
+            e1[r * hidden + p] = gamma(n_in) * abs;
+            assert!(
+                sum.abs() > e1[r * hidden + p],
+                "row {r}, neuron {p} is at the kink"
+            );
+        }
+    }
+    let h: Vec<f64> = z.iter().map(|&v| v.max(0.0)).collect();
+    let on = |i: usize| z[i] > 0.0;
+
+    let mut out_bound = vec![0.0f64; rows * n_out];
+    for r in 0..rows {
+        for j in 0..n_out {
+            let (mut abs, mut carried) = (b2[j].abs(), 0.0);
+            for p in 0..hidden {
+                abs += (h[r * hidden + p] * w2[j * hidden + p]).abs();
+                carried += w2[j * hidden + p].abs() * e1[r * hidden + p];
+            }
+            out_bound[r * n_out + j] = gamma(hidden + 1) * abs + carried;
+        }
+    }
+    let mut b2_bound = vec![0.0f64; n_out];
+    let mut w2_bound = vec![0.0f64; n_out * hidden];
+    for j in 0..n_out {
+        b2_bound[j] = gamma(rows) * (0..rows).map(|r| up[r * n_out + j].abs()).sum::<f64>();
+        for p in 0..hidden {
+            let (mut abs, mut carried) = (0.0, 0.0);
+            for r in 0..rows {
+                abs += (up[r * n_out + j] * h[r * hidden + p]).abs();
+                carried += up[r * n_out + j].abs() * e1[r * hidden + p];
+            }
+            w2_bound[j * hidden + p] = gamma(rows) * abs + carried;
+        }
+    }
+    // The hidden gradient, through the ReLU, and its error bound.
+    let mut g = vec![0.0f64; rows * hidden];
+    let mut eg = vec![0.0f64; rows * hidden];
+    for r in 0..rows {
+        for p in 0..hidden {
+            if !on(r * hidden + p) {
+                continue;
+            }
+            let (mut sum, mut abs) = (0.0, 0.0);
+            for j in 0..n_out {
+                sum += up[r * n_out + j] * w2[j * hidden + p];
+                abs += (up[r * n_out + j] * w2[j * hidden + p]).abs();
+            }
+            g[r * hidden + p] = sum;
+            eg[r * hidden + p] = gamma(n_out) * abs;
+        }
+    }
+    let mut w1_bound = vec![0.0f64; hidden * n_in];
+    for p in 0..hidden {
+        for q in 0..n_in {
+            let (mut abs, mut carried) = (0.0, 0.0);
+            for r in 0..rows {
+                abs += (g[r * hidden + p] * x[r * n_in + q]).abs();
+                carried += eg[r * hidden + p] * x[r * n_in + q].abs();
+            }
+            w1_bound[p * n_in + q] = gamma(rows) * abs + carried;
+        }
+    }
+
+    let grads64 = &v["grads_f64"];
+    compare_within(
+        "output",
+        &output,
+        &parse_tensor(&v["output_f64"]),
+        &out_bound,
+    );
+    let checks = [
+        ("0.weight", w1_id, &w1_bound),
+        ("2.weight", w2_id, &w2_bound),
+        ("2.bias", b2_id, &b2_bound),
+    ];
+    for (name, id, bound) in checks {
+        let torch = parse_tensor(&grads64[name]);
+        assert_eq!(torch.shape, params.grad(id).shape().dims(), "{name}: shape");
+        compare_within(
+            &format!("gradient of {name}"),
+            params.grad(id).data(),
+            &torch,
+            bound,
+        );
+    }
+}
+
+/// A network whose first `Linear` has no bias, loaded from PyTorch's `state_dict` of
+/// `nn.Sequential(nn.Linear(4, 8, bias=False), nn.ReLU(), nn.Linear(8, 3))`, matches
+/// PyTorch's output and parameter gradients on every kernel level this CPU supports.
+#[test]
+fn no_bias_network_matches_pytorch() {
+    let _lock = LEVEL_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _restore = RestoreLevel(level());
+    for l in ALL_LEVELS.into_iter().filter(|&l| supported(l)) {
+        set_level(l).expect("a supported level can be set");
+        check_no_bias_network_at_current_level();
     }
 }
 

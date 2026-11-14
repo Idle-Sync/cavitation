@@ -93,7 +93,7 @@ enum Reload {
 /// let mut params = ParamStore::new();
 /// let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
 /// params.value_mut(layer.weight()).data_mut()[0] = 2.0;
-/// params.value_mut(layer.bias()).data_mut()[0] = 1.0;
+/// params.value_mut(layer.bias().unwrap()).data_mut()[0] = 1.0;
 /// let net = Sequential::new().push(layer);
 /// let data = Dataset {
 ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0], &[3, 1]).unwrap(),
@@ -215,7 +215,9 @@ impl Evaluator {
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng, Tensor};
-    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, NeuronMask, Relu, Sequential, Targets};
+    /// use cavitation_nn::{
+    ///     Dataset, Evaluator, Linear, Loss, NeuronMask, Relu, Sequential, Targets,
+    /// };
     /// let mut params = ParamStore::new();
     /// let mut rng = Rng::seed(0);
     /// let net = Sequential::new()
@@ -226,11 +228,12 @@ impl Evaluator {
     ///     x: Tensor::from_vec(vec![1.0f32, -1.0, 0.5, 2.0], &[2, 2]).unwrap(),
     ///     targets: Targets::Values(Tensor::zeros(&[2, 1])),
     /// };
-    /// let mut evaluator = Evaluator::with_neuron_masks(&net, &params, Loss::Mse, 2, &[0]).unwrap();
+    /// let mut evaluator =
+    ///     Evaluator::with_neuron_masks(&net, &params, Loss::Mse, 2, &[0]).unwrap();
     /// evaluator.set_neuron_mask(0, &NeuronMask::all_off(4)).unwrap();
     /// // With every hidden neuron off the output is the last bias, the same for each row.
     /// let off = evaluator.evaluate(&data).unwrap();
-    /// let bias = params.value(net.linear(2).unwrap().bias()).data()[0] as f64;
+    /// let bias = params.value(net.linear(2).unwrap().bias().unwrap()).data()[0] as f64;
     /// assert!((off.loss - bias * bias).abs() < 1e-6);
     /// ```
     pub fn with_neuron_masks(
@@ -294,9 +297,12 @@ impl Evaluator {
     /// moves there with its values, and the model is compiled afresh so that no mask is
     /// left on the old layer.
     ///
-    /// `refresh` allocates, even in place: it builds the new weights before copying them
-    /// in. Only [`evaluate`](Self::evaluate) and [`misclassified`](Self::misclassified) are
-    /// free of allocations in steady state.
+    /// When `model` has the very layers the evaluator was last made or refreshed with (the
+    /// model itself, or a clone of it, with only parameter values and mask values changed
+    /// since, as during [`fit`](crate::fit)), the model compiles, no clone shares its
+    /// weights and no mask was added or removed, `refresh` copies the new values in place
+    /// and allocates nothing. Otherwise it allocates: it builds the new weights before
+    /// copying them in, and on the tape it copies the parameter values afresh.
     ///
     /// # Errors
     ///
@@ -313,7 +319,7 @@ impl Evaluator {
     /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
     /// let mut params = ParamStore::new();
     /// let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
-    /// let (w, b) = (layer.weight(), layer.bias());
+    /// let (w, b) = (layer.weight(), layer.bias().unwrap());
     /// let net = Sequential::new().push(layer);
     /// let data = Dataset {
     ///     x: Tensor::from_vec(vec![1.0f32, 2.0], &[2, 1]).unwrap(),
@@ -332,6 +338,9 @@ impl Evaluator {
     /// The work of [`refresh`](Self::refresh), saying which way it went.
     fn reload(&mut self, model: &Sequential, params: &ParamStore) -> Result<Reload, Error> {
         check_layers(model)?;
+        if self.reload_in_place(model, params) {
+            return Ok(Reload::InPlace);
+        }
         // The evaluator's own copy of `model`: each listed `Linear` without a neuron mask
         // in `model` gets the mask in use now (or every neuron on, if its width changed).
         let mut copy = model.clone();
@@ -397,6 +406,42 @@ impl Evaluator {
         }
         self.model = copy;
         Ok(reload)
+    }
+
+    /// The work of [`refresh`](Self::refresh) without allocating, when `model` has the same
+    /// layers as the evaluator's copy and the masks sit where they did: copies the new
+    /// weights into the compiled model and each of `model`'s mask values into the compiled
+    /// model and the copy, as [`reload`](Self::reload) would. A mask added by
+    /// [`with_neuron_masks`](Self::with_neuron_masks) on a `Linear` that `model` does not
+    /// mask keeps its values. Returns `false`, changing nothing, when it cannot: the layers
+    /// differ, a mask was added, removed or changed width, the model runs on the tape, or
+    /// the compiled model refuses ([`InferenceModel::refresh_in_place`]).
+    fn reload_in_place(&mut self, model: &Sequential, params: &ParamStore) -> bool {
+        if !self.model.same_layers(model) {
+            return false;
+        }
+        for i in 0..model.len() {
+            let carried = (self.linears.iter())
+                .any(|&l| model.neuron_layer(l) == i && model.neuron_mask(l).is_none());
+            match (model.mask(i), self.model.mask(i)) {
+                (Some(new), Some(old)) if new.width() == old.width() => {}
+                (None, Some(_)) if carried => {}
+                (None, None) if !carried => {}
+                _ => return false,
+            }
+        }
+        let Engine::Compiled(compiled) = &mut self.engine else {
+            return false;
+        };
+        if !compiled.refresh_in_place(model, params) {
+            return false;
+        }
+        for i in 0..model.len() {
+            if let Some(mask) = model.mask(i) {
+                self.model.copy_mask(i, mask);
+            }
+        }
+        true
     }
 
     /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
@@ -474,9 +519,9 @@ impl Evaluator {
     /// for each output, `1 - Σ(y - ŷ)² / Σ(y - ȳ)²` in `f64` over every row, then the mean
     /// over the outputs; an output whose targets do not vary scores 1 when it is predicted
     /// exactly and 0 otherwise. With one row every output has zero variance, so R² is 1 or
-    /// 0, where scikit-learn returns NaN. R² is computed on the model's outputs as they are, so for a
-    /// loss on raw scores (such as [`Loss::BinaryCrossEntropyWithLogits`]) it compares
-    /// scores with targets.
+    /// 0, where scikit-learn returns NaN. R² is computed on the model's outputs as they are, so for
+    /// a loss on raw scores (such as [`Loss::BinaryCrossEntropyWithLogits`]) it compares scores
+    /// with targets.
     ///
     /// # Errors
     ///
@@ -497,7 +542,10 @@ impl Evaluator {
     /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
-    /// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0, 1, 0, 1]) };
+    /// let data = Dataset {
+    ///     x: Tensor::zeros(&[4, 2]),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 1]),
+    /// };
     /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 3).unwrap();
     /// let e = evaluator.evaluate(&data).unwrap();
     /// // Zero inputs and a zero bias give equal scores: every row predicts class 0, and the
@@ -588,7 +636,10 @@ impl Evaluator {
     /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
-    /// let data = Dataset { x: Tensor::zeros(&[4, 2]), targets: Targets::Classes(vec![0, 1, 0, 1]) };
+    /// let data = Dataset {
+    ///     x: Tensor::zeros(&[4, 2]),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 1]),
+    /// };
     /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 3).unwrap();
     /// let mut wrong = Vec::new();
     /// evaluator.misclassified(&data, &mut wrong).unwrap();

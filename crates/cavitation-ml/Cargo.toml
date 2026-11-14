@@ -13,9 +13,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-cavitation-core = { path = "../cavitation-core", version = "0.1.0" }
+cavitation-core = { path = "../cavitation-core", version = "0.2.0" }
 # `Dataset`, `Linear`, `Sequential` and the training pieces the gradient path runs on.
-cavitation-nn = { path = "../cavitation-nn", version = "0.1.0" }
+cavitation-nn = { path = "../cavitation-nn", version = "0.2.0" }
 
 [dev-dependencies]
 # Reads the scikit-learn fixtures in tests/fixtures/sklearn (JSON); `float_roundtrip` reads

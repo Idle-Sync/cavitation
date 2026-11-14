@@ -275,10 +275,11 @@ impl Standardizer {
     /// # Errors
     ///
     /// `Error::InvalidData`, and `params` unchanged, if the model has no layers, its layer 0
-    /// is not a `Linear` (the message names its kind), the `Linear`'s input width differs from
-    /// the standardiser's, its parameters in `params` do not have the shapes the `Linear`
-    /// declares, or a folded value is not finite (for example after a fit on non-finite
-    /// data).
+    /// is not a `Linear` (the message names its kind), the `Linear` has no bias (the fold
+    /// writes `b − W' μ` into one; build the layer with a bias), the `Linear`'s input width
+    /// differs from the standardiser's, its parameters in `params` do not have the shapes
+    /// the `Linear` declares, or a folded value is not finite (for example after a fit on
+    /// non-finite data).
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -287,7 +288,7 @@ impl Standardizer {
     /// let weight = Tensor::from_vec(vec![2.0f32], &[1, 1]).unwrap();
     /// let bias = Tensor::from_vec(vec![1.0f32], &[1]).unwrap();
     /// let layer = Linear::from_values(&mut params, weight, bias).unwrap();
-    /// let (w, b) = (layer.weight(), layer.bias());
+    /// let (w, b) = (layer.weight(), layer.bias().unwrap());
     /// let net = Sequential::new().push(layer);
     /// // z = (x - 10) / 4, so 2z + 1 = 0.5x - 4.
     /// Standardizer::from_parts(vec![10.0], vec![4.0]).fold_into_input(&net, &mut params).unwrap();
@@ -300,6 +301,7 @@ impl Standardizer {
         params: &mut ParamStore,
     ) -> Result<(), Error> {
         let first = Self::linear_at(model, 0, "fold_into_input")?;
+        Self::needs_bias(first, 0, "fold_into_input")?;
         let (outputs, width) = (first.outputs(), self.width());
         if first.inputs() != width {
             return Err(Error::InvalidData(format!(
@@ -340,8 +342,8 @@ impl Standardizer {
     ///
     /// `Error::InvalidData`, and `params` unchanged, as for
     /// [`fold_into_input`](Self::fold_into_input), with the last layer in place of layer 0 and
-    /// its output width in place of its input width; also if the last layer has a mask with
-    /// any neuron off.
+    /// its output width in place of its input width (and `σ b + μ` the bias it needs); also
+    /// if the last layer has a mask with any neuron off.
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Tensor};
@@ -350,7 +352,7 @@ impl Standardizer {
     /// let weight = Tensor::from_vec(vec![2.0f32], &[1, 1]).unwrap();
     /// let bias = Tensor::from_vec(vec![1.0f32], &[1]).unwrap();
     /// let layer = Linear::from_values(&mut params, weight, bias).unwrap();
-    /// let (w, b) = (layer.weight(), layer.bias());
+    /// let (w, b) = (layer.weight(), layer.bias().unwrap());
     /// let net = Sequential::new().push(layer);
     /// // y = 4 (2h + 1) + 10 = 8h + 14.
     /// let s = Standardizer::from_parts(vec![10.0], vec![4.0]);
@@ -373,6 +375,7 @@ impl Standardizer {
             )));
         }
         let at = model.len() - 1;
+        Self::needs_bias(last, at, "fold_into_output")?;
         if let Some(mask) = model.mask(at).filter(|m| m.count_on() < m.width()) {
             return Err(Error::InvalidData(format!(
                 "Standardizer::fold_into_output: layer {at} has {} of {} neurons switched off; \
@@ -444,14 +447,29 @@ impl Standardizer {
         })
     }
 
+    /// `InvalidData` naming layer `at` and the caller `what` if `linear` has no bias, which
+    /// both folds must write.
+    fn needs_bias(linear: &crate::Linear, at: usize, what: &str) -> Result<(), Error> {
+        match linear.bias() {
+            Some(_) => Ok(()),
+            None => Err(Error::InvalidData(format!(
+                "Standardizer::{what}: the linear layer {at} has no bias, and the fold must \
+                 write the shifted bias into one; build that layer with a bias (Linear::new or \
+                 Linear::with_init) to fold the standardiser into it"
+            ))),
+        }
+    }
+
     /// A copy of `linear`'s weight and bias from `params`, or `InvalidData` if their shapes
-    /// are not `[outputs, inputs]` and `[outputs]`.
+    /// are not `[outputs, inputs]` and `[outputs]`. The caller has checked with
+    /// [`needs_bias`](Self::needs_bias) that the layer has a bias.
     fn parameters(
         linear: &crate::Linear,
         params: &ParamStore,
         what: &str,
     ) -> Result<(Vec<f32>, Vec<f32>), Error> {
-        let (w, b) = (params.value(linear.weight()), params.value(linear.bias()));
+        let bias = linear.bias().expect("the fold checked the bias");
+        let (w, b) = (params.value(linear.weight()), params.value(bias));
         if w.shape().dims() != [linear.outputs(), linear.inputs()]
             || b.shape().dims() != [linear.outputs()]
         {
@@ -487,7 +505,7 @@ impl Standardizer {
             .data_mut()
             .copy_from_slice(&weight);
         params
-            .value_mut(linear.bias())
+            .value_mut(linear.bias().expect("parameters checked the bias"))
             .data_mut()
             .copy_from_slice(&bias);
         Ok(())
@@ -627,9 +645,9 @@ mod tests {
             .push(Linear::new(&mut params, hidden, 1, &mut rng));
         let first = net.linear(0).unwrap().clone();
         // Give the bias a value so that it takes part.
-        params.value_mut(first.bias()).data_mut().fill(0.3);
+        params.value_mut(first.bias().unwrap()).data_mut().fill(0.3);
         let weight = params.value(first.weight()).data().to_vec();
-        let bias = params.value(first.bias()).data().to_vec();
+        let bias = params.value(first.bias().unwrap()).data().to_vec();
 
         let mut z = x.clone();
         s.transform(&mut z);
@@ -648,7 +666,7 @@ mod tests {
             .data_mut()
             .copy_from_slice(&weight);
         original
-            .value_mut(first.bias())
+            .value_mut(first.bias().unwrap())
             .data_mut()
             .copy_from_slice(&bias);
         let reference = run(&twin, &original, &z);
@@ -686,7 +704,7 @@ mod tests {
             .push(Relu)
             .push(Linear::new(&mut params, hidden, outputs, &mut rng));
         let last = net.linear(2).unwrap().clone();
-        params.value_mut(last.bias()).data_mut().fill(-0.2);
+        params.value_mut(last.bias().unwrap()).data_mut().fill(-0.2);
         let s = Standardizer::from_parts(vec![500.0, -40.0, 3.0], vec![25.0, 0.5, 9.0]);
         let x = Tensor::from_vec(
             (0..rows * 2).map(|_| rng.normal() as f32).collect(),
@@ -699,7 +717,7 @@ mod tests {
             .push(Relu);
         let hidden_out = run(&prefix, &params, &x);
         let weight = params.value(last.weight()).data().to_vec();
-        let bias = params.value(last.bias()).data().to_vec();
+        let bias = params.value(last.bias().unwrap()).data().to_vec();
         let mut expected = Tensor::from_vec(run(&net, &params, &x), &[rows, outputs]).unwrap();
         s.inverse_transform(&mut expected);
 
@@ -800,5 +818,48 @@ mod tests {
         assert!(bad.fold_into_input(&net, &mut params).is_err());
         let w = net.linear(0).unwrap().weight();
         assert_eq!(params.value(w), before.value(w));
+    }
+
+    /// Both folds refuse a `Linear` without a bias with `InvalidData` that says so and
+    /// names the layer, and write nothing: each fold must write a bias.
+    #[test]
+    fn folds_refuse_a_linear_without_a_bias() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(9);
+        let net = Sequential::new()
+            .push(Linear::without_bias(
+                &mut params,
+                2,
+                3,
+                crate::Init::XavierUniform,
+                &mut rng,
+            ))
+            .push(Relu)
+            .push(Linear::without_bias(
+                &mut params,
+                3,
+                2,
+                crate::Init::XavierUniform,
+                &mut rng,
+            ));
+        let before = params.clone();
+        let s = Standardizer::from_parts(vec![10.0, -3.0], vec![4.0, 0.5]);
+        let Err(Error::InvalidData(msg)) = s.fold_into_input(&net, &mut params) else {
+            panic!("expected InvalidData");
+        };
+        assert!(
+            msg.contains("fold_into_input") && msg.contains("layer 0") && msg.contains("no bias"),
+            "{msg}"
+        );
+        let Err(Error::InvalidData(msg)) = s.fold_into_output(&net, &mut params) else {
+            panic!("expected InvalidData");
+        };
+        assert!(
+            msg.contains("fold_into_output") && msg.contains("layer 2") && msg.contains("no bias"),
+            "{msg}"
+        );
+        for (_, id) in net.parameter_names() {
+            assert_eq!(params.value(id), before.value(id));
+        }
     }
 }

@@ -34,12 +34,12 @@ use crate::{Activation, ActivationKind, NeuronMask, Sequential};
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub enum InferenceLayer {
-    /// A fully connected layer, `y = x · w_t + bias`.
+    /// A fully connected layer, `y = x · w_t + bias`, or `y = x · w_t` without a bias.
     Linear {
         /// The weight, transposed: `inputs` rows of `outputs` values, row-major.
         w_t: Vec<f32>,
-        /// The bias, `outputs` values.
-        bias: Vec<f32>,
+        /// The bias, `outputs` values, or `None` for a layer without one.
+        bias: Option<Vec<f32>>,
         /// The number of input columns.
         inputs: usize,
         /// The number of output columns.
@@ -83,6 +83,9 @@ enum Op {
 struct Step {
     /// What the step computes.
     op: Op,
+    /// The index of the [`Sequential`] layer the step comes from: the layer whose inference
+    /// form it holds, or the layer whose output it masks.
+    layer: usize,
     /// For a `Linear` step, whether a ReLU that followed it is fused into it.
     relu: bool,
     /// The width of each row the step reads.
@@ -344,6 +347,9 @@ impl InferenceModel {
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
     ) -> Result<bool, Error> {
+        if self.refresh_in_place(model, params) {
+            return Ok(true);
+        }
         let extra: Vec<usize> = (self.shared.extra.iter())
             .copied()
             .filter(|&l| l < model.len())
@@ -379,6 +385,74 @@ impl InferenceModel {
         }
         self.shared = Arc::new(fresh);
         Ok(false)
+    }
+
+    /// Copies the weights of `model` and `params` into this compiled model in place, and the
+    /// values of each mask `model` has into its mask step, without allocating: what
+    /// [`refresh`](Self::refresh) does when the layout stays the same, for a model whose
+    /// layers have not changed since it was compiled (only their parameter values and mask
+    /// values). A mask step added by [`compile_with_masks`](Self::compile_with_masks) keeps
+    /// its values, as in `refresh`.
+    ///
+    /// Returns `false`, changing nothing, when it cannot do that: a clone shares the
+    /// weights, a mask was added or removed or changed width, a layer is not the kind or
+    /// width it was, or a layer with parameters is neither a [`Linear`](crate::Linear) nor a
+    /// [`Prelu`](crate::Prelu) (a layer of your own, whose values only its
+    /// [`inference`](crate::Layer::inference) can give). [`refresh`](Self::refresh) then
+    /// compiles afresh.
+    ///
+    /// Each parameter-free layer is checked by comparing its inference form with the
+    /// compiled one; the built-in forms of those layers hold no heap data, so the check
+    /// allocates nothing.
+    pub(crate) fn refresh_in_place(
+        &mut self,
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+    ) -> bool {
+        let Some(compiled) = Arc::get_mut(&mut self.shared) else {
+            return false;
+        };
+        if !compiled.fits_in_place(model, params, &self.masks) {
+            return false;
+        }
+        let values = &params.values;
+        for step in &mut compiled.steps {
+            match &mut step.op {
+                Op::Layer(InferenceLayer::Linear {
+                    w_t,
+                    bias,
+                    inputs,
+                    outputs,
+                }) => {
+                    let linear = model.linear(step.layer).expect("checked by fits_in_place");
+                    let w = values.get(linear.weight()).data();
+                    for (i, row) in w_t.chunks_exact_mut(*outputs).enumerate() {
+                        for (j, v) in row.iter_mut().enumerate() {
+                            *v = w[j * *inputs + i];
+                        }
+                    }
+                    if let (Some(bias), Some(id)) = (bias.as_mut(), linear.bias()) {
+                        bias.copy_from_slice(values.get(id).data());
+                    }
+                }
+                Op::Layer(InferenceLayer::Prelu(slopes)) => {
+                    let prelu = model
+                        .layer(step.layer)
+                        .as_prelu()
+                        .expect("checked by fits_in_place");
+                    slopes.copy_from_slice(values.get(prelu.weight()).data());
+                }
+                Op::Mask { slot } => {
+                    if let Some(mask) = model.mask(step.layer) {
+                        for (j, k) in self.masks[*slot].iter_mut().enumerate() {
+                            *k = if mask.is_on(j) { 1.0 } else { 0.0 };
+                        }
+                    }
+                }
+                Op::Layer(_) => {}
+            }
+        }
+        true
     }
 
     /// Whether this model and `other` share their compiled steps, the weights (one is a
@@ -454,7 +528,10 @@ impl InferenceModel {
     /// let mut model = InferenceModel::compile_with_neuron_masks(&net, &params, &[0]).unwrap();
     /// model.set_neuron_mask(0, &NeuronMask::from_off(2, &[1])).unwrap();
     /// assert_eq!(model.infer(&[1.0]), &[1.0, 0.0]);
-    /// assert!(matches!(model.set_neuron_mask(1, &NeuronMask::all_on(2)), Err(Error::InvalidData(_))));
+    /// assert!(matches!(
+    ///     model.set_neuron_mask(1, &NeuronMask::all_on(2)),
+    ///     Err(Error::InvalidData(_))
+    /// ));
     /// ```
     pub fn set_neuron_mask(&mut self, linear: usize, mask: &NeuronMask) -> Result<(), Error> {
         let Some(&(_, layer)) = self.shared.neurons.iter().find(|(l, _)| *l == linear) else {
@@ -536,7 +613,7 @@ impl InferenceModel {
     /// let mut params = ParamStore::new();
     /// let layer = Linear::new(&mut params, 2, 1, &mut Rng::seed(0));
     /// params.value_mut(layer.weight()).data_mut().copy_from_slice(&[2.0, -1.0]);
-    /// params.value_mut(layer.bias()).data_mut()[0] = 0.5;
+    /// params.value_mut(layer.bias().unwrap()).data_mut()[0] = 0.5;
     /// let net = Sequential::new().push(layer);
     /// let mut model = InferenceModel::compile(&net, &params).unwrap();
     /// assert_eq!(model.infer(&[3.0, 1.0]), &[5.5]);
@@ -716,12 +793,12 @@ impl Compiled {
                     inputs,
                     outputs,
                 } => {
+                    let biases = bias.as_ref().map_or(*outputs, Vec::len);
                     assert!(
-                        w_t.len() == inputs * outputs && bias.len() == *outputs,
+                        w_t.len() == inputs * outputs && biases == *outputs,
                         "InferenceModel::compile: layer {i} ({name}) is {inputs} -> {outputs} \
-                         but has {} weights and {} biases",
+                         but has {} weights and {biases} biases",
                         w_t.len(),
-                        bias.len()
                     );
                     *outputs
                 }
@@ -765,6 +842,7 @@ impl Compiled {
                 }
                 _ => steps.push(Step {
                     op: Op::Layer(form),
+                    layer: i,
                     relu: false,
                     inputs: width,
                     outputs: produced,
@@ -788,6 +866,7 @@ impl Compiled {
                 };
                 steps.push(Step {
                     op: Op::Mask { slot: masks.len() },
+                    layer: i,
                     relu: false,
                     inputs: produced,
                     outputs: produced,
@@ -815,12 +894,97 @@ impl Compiled {
         Ok((compiled, masks))
     }
 
+    /// Whether [`InferenceModel::refresh_in_place`] can copy the values of `model` and
+    /// `params` into these steps: the steps cover `model`'s layers one for one (a fused
+    /// ReLU covering its layer), each `Linear` and `Prelu` step's layer is still one with the
+    /// same widths and parameters of the compiled sizes, every other layer still has the
+    /// compiled inference form (a form with values of its own, from a layer of your own,
+    /// does not fit), the mask steps sit on the layers `model` masks plus the added ones,
+    /// and each of `model`'s masks has the width of its step's keep values in `masks`.
+    /// Allocates nothing for built-in layers.
+    fn fits_in_place(
+        &self,
+        model: &Sequential<f32>,
+        params: &ParamStore<f32>,
+        masks: &[Vec<f32>],
+    ) -> bool {
+        let values = &params.values;
+        let mut covered = 0;
+        for step in &self.steps {
+            let Op::Layer(form) = &step.op else {
+                continue;
+            };
+            if step.layer != covered || step.layer >= model.len() {
+                return false;
+            }
+            let layer = model.layer(step.layer);
+            let fits = match form {
+                InferenceLayer::Linear {
+                    inputs,
+                    outputs,
+                    bias,
+                    ..
+                } => model.linear(step.layer).is_some_and(|linear| {
+                    linear.inputs() == *inputs
+                        && linear.outputs() == *outputs
+                        && values.get(linear.weight()).shape().dims() == [*outputs, *inputs]
+                        // A bias must be present in both or in neither, with the same width.
+                        && match (bias, linear.bias()) {
+                            (Some(_), Some(id)) => values.get(id).shape().dims() == [*outputs],
+                            (None, None) => true,
+                            _ => false,
+                        }
+                }),
+                InferenceLayer::Prelu(slopes) => layer
+                    .as_prelu()
+                    .is_some_and(|prelu| values.get(prelu.weight()).data().len() == slopes.len()),
+                InferenceLayer::Mask(_) => false,
+                other => {
+                    layer.as_linear().is_none()
+                        && layer.as_prelu().is_none()
+                        && layer.inference(values).as_ref() == Some(other)
+                }
+            };
+            if !fits {
+                return false;
+            }
+            covered = step.layer + 1;
+            if step.relu {
+                let relu = InferenceLayer::Activation(ActivationKind::Relu);
+                if covered >= model.len() || model.layer(covered).inference(values) != Some(relu) {
+                    return false;
+                }
+                covered += 1;
+            }
+        }
+        if covered != model.len() {
+            return false;
+        }
+        let mut slots = self.mask_layers.iter().zip(masks);
+        for i in 0..model.len() {
+            let mask = model.mask(i);
+            if mask.is_none() && !self.extra.contains(&i) {
+                continue;
+            }
+            match slots.next() {
+                Some((&layer, keep))
+                    if layer == i && mask.is_none_or(|m| m.width() == keep.len()) => {}
+                _ => return false,
+            }
+        }
+        slots.next().is_none()
+    }
+
     /// Whether `other` has the same steps as `self`, in the same order, with the same
     /// widths, fused ReLUs, parameter counts, completed layers and mask positions, so that
     /// its values can replace these in place.
     fn same_layout(&self, other: &Compiled) -> bool {
         let params = |op: &Op| match op {
-            Op::Layer(InferenceLayer::Linear { w_t, bias, .. }) => (w_t.len(), bias.len()),
+            // A bias-free layer counts 0 biases, which no layer with a bias has (its
+            // outputs are positive), so one never takes the place of the other.
+            Op::Layer(InferenceLayer::Linear { w_t, bias, .. }) => {
+                (w_t.len(), bias.as_ref().map_or(0, Vec::len))
+            }
             Op::Layer(InferenceLayer::Prelu(v) | InferenceLayer::Mask(v)) => (v.len(), 0),
             Op::Mask { slot } => (*slot, 0),
             Op::Layer(_) => (0, 0),
@@ -837,6 +1001,7 @@ impl Compiled {
             && self.steps.len() == other.steps.len()
             && self.steps.iter().zip(&other.steps).all(|(a, b)| {
                 kind(&a.op) == kind(&b.op)
+                    && a.layer == b.layer
                     && a.relu == b.relu
                     && a.inputs == b.inputs
                     && a.outputs == b.outputs
@@ -940,7 +1105,7 @@ impl Run {
                         Some(_) => (b1, b0),
                     };
                     self.linear(
-                        (w_t, bias, *inputs, *outputs, step.relu),
+                        (w_t, bias.as_deref(), *inputs, *outputs, step.relu),
                         &src[..n_in],
                         &mut dst[..n_out],
                     );
@@ -1005,17 +1170,18 @@ impl Run {
 
     /// One `Linear` step, `(w_t, bias, inputs, outputs, relu)`, from `src` (`rows` rows of
     /// `inputs`) into `dst` (`rows` rows of `outputs`): the matvec for one input, else the
-    /// GEMM followed by the bias and the fused ReLU, row by row.
+    /// GEMM followed by the bias (none for a layer without one) and the fused ReLU, row by
+    /// row.
     fn linear(
         &self,
-        (w_t, bias, inputs, outputs, relu): (&[f32], &[f32], usize, usize, bool),
+        (w_t, bias, inputs, outputs, relu): (&[f32], Option<&[f32]>, usize, usize, bool),
         src: &[f32],
         dst: &mut [f32],
     ) {
         let w = MatRef::new(w_t, inputs, outputs, outputs, 1)
             .expect("compile checked that w_t holds inputs × outputs values");
         if !self.batched {
-            matvec_f32_with(self.level, w, src, Some(bias), relu, dst);
+            matvec_f32_with(self.level, w, src, bias, relu, dst);
             return;
         }
         let rows = self.rows;
@@ -1025,16 +1191,27 @@ impl Run {
         if outputs == 0 {
             return;
         }
-        for row in dst.chunks_exact_mut(outputs) {
-            if relu {
-                for (o, &b) in row.iter_mut().zip(bias) {
-                    *o = relu_value(*o + b);
-                }
-            } else {
-                for (o, &b) in row.iter_mut().zip(bias) {
-                    *o += b;
+        match (bias, relu) {
+            (Some(bias), true) => {
+                for row in dst.chunks_exact_mut(outputs) {
+                    for (o, &b) in row.iter_mut().zip(bias) {
+                        *o = relu_value(*o + b);
+                    }
                 }
             }
+            (Some(bias), false) => {
+                for row in dst.chunks_exact_mut(outputs) {
+                    for (o, &b) in row.iter_mut().zip(bias) {
+                        *o += b;
+                    }
+                }
+            }
+            (None, true) => {
+                for o in dst.iter_mut() {
+                    *o = relu_value(*o);
+                }
+            }
+            (None, false) => {}
         }
     }
 }
@@ -1140,7 +1317,7 @@ pub(crate) mod tests {
                 Init::Zeros,
                 &mut rng,
             );
-            for b in params.value_mut(l.bias()).data_mut() {
+            for b in params.value_mut(l.bias().unwrap()).data_mut() {
                 *b = rng.range(-0.1, 0.1) as f32;
             }
             l
@@ -1188,9 +1365,14 @@ pub(crate) mod tests {
             let layer = net.layer(i);
             if layer.name() == "linear" {
                 let ids = layer.parameters();
-                let (w, b) = (params.value(ids[0].1), params.value(ids[1].1));
+                let w = params.value(ids[0].1);
                 let (outputs, k) = (w.shape().dims()[0], w.shape().dims()[1]);
-                let (w, b) = (w.data(), b.data());
+                // A layer without a bias adds nothing to the sum: its `|bⱼ|` is 0.
+                let zeros = vec![0.0f32; outputs];
+                let b = ids
+                    .get(1)
+                    .map_or(&zeros[..], |&(_, id)| params.value(id).data());
+                let w = w.data();
                 let h = tape.value(trace.input(i));
                 let h = h.data();
                 let mut next = vec![0.0f64; rows * outputs];
@@ -1277,6 +1459,50 @@ pub(crate) mod tests {
             let got = model.infer(row);
             let at = r * 10..(r + 1) * 10;
             assert_within(got, &want[at.clone()], &bound[at], &format!("input {r}"));
+        }
+    }
+
+    /// A network whose `Linear`s have no bias (a 64 → 256 one before a fused ReLU and the
+    /// 128 → 10 output) beside one that has (256 → 128) gives the tape's outputs within the
+    /// bound, one input at a time and in batches of 1, 7 and 128 rows: the compiled steps
+    /// skip the bias add, with and without the fused ReLU.
+    #[test]
+    fn layers_without_a_bias_match_tape() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(21);
+        let mut bare = |params: &mut ParamStore, inputs, outputs| {
+            Linear::without_bias(params, inputs, outputs, Init::HeUniform, &mut rng)
+        };
+        let first = bare(&mut params, 64, 256);
+        let middle = Linear::new(&mut params, 256, 128, &mut Rng::seed(22));
+        for b in params.value_mut(middle.bias().unwrap()).data_mut() {
+            *b = 0.05;
+        }
+        let last = bare(&mut params, 128, 10);
+        let net = Sequential::new()
+            .push(first)
+            .push(Relu)
+            .push(middle)
+            .push(Relu)
+            .push(last);
+        let x = inputs(360, 64, 23);
+        let (want, bound) = tape_with_bounds(&net, &params, &x, 360);
+        let mut model = InferenceModel::compile(&net, &params).unwrap();
+        for (r, row) in x.as_chunks::<64>().0.iter().enumerate() {
+            let at = r * 10..(r + 1) * 10;
+            let got = model.infer(row);
+            assert_within(got, &want[at.clone()], &bound[at], &format!("input {r}"));
+        }
+        for batch in [1usize, 7, 128] {
+            for start in (0..360).step_by(batch) {
+                let end = (start + batch).min(360);
+                let view =
+                    TensorView::from_slice(&x[start * 64..end * 64], &[end - start, 64]).unwrap();
+                let got = model.infer_batch(view);
+                let at = start * 10..end * 10;
+                let what = format!("batch {batch}, rows {start}..{end}");
+                assert_within(got.data(), &want[at.clone()], &bound[at], &what);
+            }
         }
     }
 
@@ -1642,7 +1868,7 @@ pub(crate) mod tests {
             .data_mut()
             .copy_from_slice(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
         params
-            .value_mut(lin.bias())
+            .value_mut(lin.bias().unwrap())
             .data_mut()
             .copy_from_slice(&[0.5, 0.0, -0.5]);
         match Layer::<f32>::inference(&lin, &params.values) {
@@ -1653,7 +1879,7 @@ pub(crate) mod tests {
                 outputs,
             }) => {
                 assert_eq!(w_t, [1.0, 3.0, 5.0, 2.0, 4.0, 6.0]);
-                assert_eq!(bias, [0.5, 0.0, -0.5]);
+                assert_eq!(bias, Some(vec![0.5, 0.0, -0.5]));
                 assert_eq!((inputs, outputs), (2, 3));
             }
             other => panic!("expected a Linear form, got {other:?}"),
@@ -1678,7 +1904,7 @@ pub(crate) mod tests {
                 Init::Zeros,
                 &mut rng,
             );
-            for b in params.value_mut(l.bias()).data_mut() {
+            for b in params.value_mut(l.bias().unwrap()).data_mut() {
                 *b = rng.range(-0.1, 0.1) as f32;
             }
             l
@@ -1889,6 +2115,145 @@ pub(crate) mod tests {
         assert!(got.chunks(10).all(|row| row[7].to_bits() == 0));
         assert_same(copy.infer_batch(view).data(), &copy_before, "the clone");
         model.set_mask(1, &NeuronMask::all_on(32)).unwrap();
+    }
+
+    /// `refresh_in_place` updates a `Linear` without a bias in place, bit for bit a fresh
+    /// compile, and returns `false` when the compiled layer and the current one disagree on
+    /// having a bias (either way round), after which `refresh` gives the new network's
+    /// outputs. A `fits_in_place` that ignored the bias would take the in-place path there
+    /// and keep a missing or stale bias.
+    #[test]
+    fn refresh_in_place_without_a_bias() {
+        // A 5 → 6 → ReLU → 3 network whose first `Linear` has a bias exactly when `biased`
+        // is true; the output layer always has one. Biases are non-zero, so a dropped or
+        // stale bias changes the outputs.
+        let build = |biased: bool, seed: u64| {
+            let mut params = ParamStore::new();
+            let mut rng = Rng::seed(seed);
+            let first = if biased {
+                Linear::new(&mut params, 5, 6, &mut rng)
+            } else {
+                Linear::without_bias(&mut params, 5, 6, Init::HeUniform, &mut rng)
+            };
+            let last = Linear::new(&mut params, 6, 3, &mut rng);
+            for id in [first.bias(), last.bias()].into_iter().flatten() {
+                for b in params.value_mut(id).data_mut() {
+                    *b = rng.range(0.1, 0.3) as f32;
+                }
+            }
+            let net = Sequential::new().push(first).push(Relu).push(last);
+            (net, params)
+        };
+        let x = inputs(9, 5, 43);
+        let view = TensorView::from_slice(&x, &[9, 5]).unwrap();
+        let fresh = |net: &Sequential, params: &ParamStore| {
+            let mut model = InferenceModel::compile(net, params).unwrap();
+            model.infer_batch(view).data().to_vec()
+        };
+
+        // (a) Bias-free to bias-free, new values: in place, bit for bit a fresh compile.
+        let (bare, mut bare_params) = build(false, 44);
+        let mut model = InferenceModel::compile(&bare, &bare_params).unwrap();
+        let before = model.infer_batch(view).data().to_vec();
+        for (_, id) in bare.parameter_names() {
+            for v in bare_params.value_mut(id).data_mut() {
+                *v = *v * 0.75 + 0.01;
+            }
+        }
+        assert!(model.refresh_in_place(&bare, &bare_params));
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &fresh(&bare, &bare_params), "bias-free, in place");
+        assert_ne!(got, before);
+
+        // (b) Compiled bias-free, now a same-width layer with a bias: not in place, and
+        // `refresh` gives that network's outputs.
+        let (biased, biased_params) = build(true, 45);
+        assert!(!model.refresh_in_place(&biased, &biased_params));
+        model.refresh(&biased, &biased_params).unwrap();
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &fresh(&biased, &biased_params), "bias added");
+
+        // (c) The reverse: compiled with a bias, now without one.
+        let mut model = InferenceModel::compile(&biased, &biased_params).unwrap();
+        assert!(!model.refresh_in_place(&bare, &bare_params));
+        model.refresh(&bare, &bare_params).unwrap();
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &fresh(&bare, &bare_params), "bias removed");
+    }
+
+    /// `refresh_in_place` copies new weights, PReLU slopes and mask values into the
+    /// compiled model, giving bit for bit the outputs of compiling afresh (a `Linear` fused
+    /// with a ReLU, a per-channel PReLU, a model mask and a mask step `compile_with_masks`
+    /// added, whose values it keeps). It changes nothing and returns `false` when a clone
+    /// shares the weights, when a mask is added or removed, and when the layers differ.
+    #[test]
+    fn refresh_in_place_matches_compile() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(41);
+        let prelu = Prelu::new(&mut params, 6);
+        let slopes = prelu.weight();
+        let mut net = Sequential::new()
+            .push(Linear::new(&mut params, 5, 6, &mut rng))
+            .push(prelu)
+            .push(Linear::new(&mut params, 6, 7, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 7, 3, &mut rng));
+        net.set_mask(1, NeuronMask::from_off(6, &[2]));
+        let x = inputs(9, 5, 42);
+        let view = TensorView::from_slice(&x, &[9, 5]).unwrap();
+        let added = NeuronMask::from_off(7, &[4]);
+        let mut model = InferenceModel::compile_with_masks(&net, &params, &[3]).unwrap();
+        model.set_mask(3, &added).unwrap();
+        let want = |net: &Sequential, params: &ParamStore| {
+            let mut masked = net.clone();
+            masked.set_mask(3, added.clone());
+            InferenceModel::compile(&masked, params)
+                .unwrap()
+                .infer_batch(view)
+                .data()
+                .to_vec()
+        };
+        let before = model.infer_batch(view).data().to_vec();
+
+        for (_, id) in net.parameter_names() {
+            for v in params.value_mut(id).data_mut() {
+                *v = *v * 0.75 + 0.01;
+            }
+        }
+        params.value_mut(slopes).data_mut()[4] = -0.5;
+        net.set_mask(1, NeuronMask::from_off(6, &[0, 5]));
+        assert!(model.refresh_in_place(&net, &params));
+        let got = model.infer_batch(view).data().to_vec();
+        assert_same(&got, &want(&net, &params), "in place");
+        assert_ne!(got, before);
+
+        let copy = model.clone();
+        params.value_mut(slopes).data_mut()[0] = 0.5;
+        assert!(!model.refresh_in_place(&net, &params));
+        assert_same(model.infer_batch(view).data(), &got, "shared, unchanged");
+        drop(copy);
+
+        let mut unmasked = net.clone();
+        unmasked.clear_mask(1);
+        assert!(!model.refresh_in_place(&unmasked, &params));
+        let mut more = net.clone();
+        more.set_mask(2, NeuronMask::all_on(7));
+        assert!(!model.refresh_in_place(&more, &params));
+        let mut other = ParamStore::new();
+        let tanh = Sequential::new()
+            .push(Linear::new(&mut other, 5, 6, &mut rng))
+            .push(Tanh)
+            .push(Linear::new(&mut other, 6, 7, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut other, 7, 3, &mut rng));
+        assert!(!model.refresh_in_place(&tanh, &other));
+        assert_same(model.infer_batch(view).data(), &got, "refused, unchanged");
+        assert!(model.refresh_in_place(&net, &params));
+        assert_same(
+            model.infer_batch(view).data(),
+            &want(&net, &params),
+            "again",
+        );
     }
 
     /// Linear(3 → 4) → Sigmoid → Linear(4 → 2), with weights from `Rng::seed(seed)`.

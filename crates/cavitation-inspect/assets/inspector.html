@@ -583,12 +583,14 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       row.appendChild(b);
       contrib.appendChild(row);
     });
+    // A neuron of a Linear without a bias has has_bias false: its sum is Σ w·x alone.
+    const hasBias = N.linear === null || N.has_bias !== false;
     const bias = el('div', 'muted');
     bias.appendChild(el('span', null, 'bias'));
-    bias.appendChild(el('span', null, fmt(N.bias, 3)));
+    bias.appendChild(el('span', null, hasBias ? fmt(N.bias, 3) : 'none'));
     contrib.appendChild(bias);
     const total = el('div', 'muted');
-    total.appendChild(el('span', null, 'bias + Σ w·x'));
+    total.appendChild(el('span', null, hasBias ? 'bias + Σ w·x' : 'Σ w·x'));
     total.appendChild(el('span', null, fmt(N.pre_activation, 3)));
     contrib.appendChild(total);
   }
