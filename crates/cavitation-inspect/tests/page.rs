@@ -222,13 +222,7 @@ fn publish_run(inspector: &Inspector, title: &str) {
         paused: false,
     };
     assert!(hub.publish_snapshot(Snapshot::Stats, |w| wire::stats(w, &stats)));
-    let report = EpochReport {
-        epoch: 1,
-        mean_loss: 0.5,
-        rows: 8,
-        seconds: 0.01,
-        validation: None,
-    };
+    let report = EpochReport::new(1, 0.5, 8, 0.01);
     assert!(hub.publish_event(Event::Epoch, |w| wire::epoch(w, &report, 3, None), true));
     assert!(hub.publish_event(
         Event::Status,

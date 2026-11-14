@@ -871,6 +871,50 @@ fn width_one_output_probe() {
     client.close();
 }
 
+/// With a validation set, every `epoch` event carries the run's own validation, the very
+/// loss and accuracy `fit` put in that epoch's report; without one, `validation` is null.
+#[test]
+fn epoch_event_carries_the_validation() {
+    let (train, held_out) = digits(320, 29).split_at(256);
+    let mut params = ParamStore::new();
+    let mut model = network(&mut params, 16);
+    let mut inspector = Inspector::start(inspector_config()).unwrap();
+    let (addr, token) = endpoint(&inspector);
+    let client = Client::open(addr, &token);
+    wait_clients(&inspector, 1);
+    let config = FitConfig {
+        validation: Some(held_out),
+        ..fit_config(2)
+    };
+    let history =
+        cavitation_inspect::fit(&mut model, &mut params, &train, config, &mut inspector).unwrap();
+    let events = client.until_finished();
+    let epochs: Vec<&Message> = events.iter().filter(|m| m.name == "epoch").collect();
+    assert_eq!(epochs.len(), 2);
+    for (event, report) in epochs.iter().zip(&history.epochs) {
+        let want = report.validation.expect("every whole epoch is validated");
+        let got = event.json.get("validation");
+        assert_eq!(got.get("loss").num(), want.loss);
+        assert_eq!(got.get("accuracy").num(), want.accuracy.unwrap());
+        assert!(got.get("r2").is_null());
+    }
+
+    let mut params = ParamStore::new();
+    let mut model = network(&mut params, 16);
+    cavitation_inspect::fit(
+        &mut model,
+        &mut params,
+        &train,
+        fit_config(1),
+        &mut inspector,
+    )
+    .unwrap();
+    let events = client.until_finished();
+    let epoch = find(&events, "epoch");
+    assert!(epoch.json.get("validation").is_null());
+    client.close();
+}
+
 /// One inspector serves two runs whose parameters live in different stores: the second run
 /// probes its own store (the probe is rebuilt for each run) instead of panicking.
 #[test]
