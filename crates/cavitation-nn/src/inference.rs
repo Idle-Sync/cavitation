@@ -18,7 +18,7 @@ use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
-use cavitation_core::{Error, Gate, ParamStore, TensorView, log_softmax_row, softmax_row};
+use cavitation_core::{Error, Gate, ParamStore, Real, TensorView, log_softmax_row, softmax_row};
 
 use crate::{Activation, ActivationKind, NeuronMask, Sequential};
 
@@ -1322,7 +1322,7 @@ impl Run {
             (Some(bias), true) => {
                 for row in dst.chunks_exact_mut(outputs) {
                     for (o, &b) in row.iter_mut().zip(bias) {
-                        *o = relu_value(*o + b);
+                        *o = Real::relu(*o + b);
                     }
                 }
             }
@@ -1335,7 +1335,7 @@ impl Run {
             }
             (None, true) => {
                 for o in dst.iter_mut() {
-                    *o = relu_value(*o);
+                    *o = Real::relu(*o);
                 }
             }
             (None, false) => {}
@@ -1368,11 +1368,6 @@ fn apply_mask(keep: &[f32], data: &mut [f32], width: usize) {
     }
 }
 
-/// ReLU as the ReLU layer computes it: 0 at or below 0, `v` above, NaN stays NaN.
-fn relu_value(v: f32) -> f32 {
-    if v <= 0.0 { 0.0 } else { v }
-}
-
 /// The value of a gated linear unit's gate at `x`, as the tape computes it: its sigmoid gate
 /// is the scalar sigmoid, not the SIMD kernel of the `Sigmoid` layer.
 fn gate_value(gate: Gate, x: f32) -> f32 {
@@ -1391,7 +1386,7 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
     match form {
         InferenceLayer::Activation(ActivationKind::Relu) => {
             for v in data.iter_mut() {
-                *v = relu_value(*v);
+                *v = Real::relu(*v);
             }
         }
         InferenceLayer::Activation(ActivationKind::Tanh) => tanh_f32_with(level, data),
