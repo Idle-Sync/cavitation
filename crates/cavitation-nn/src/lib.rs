@@ -95,6 +95,6 @@ pub use sequential::{Sequential, Trace};
 pub use train::{
     Batch, BatchView, Batcher, Dataset, EpochReport, Evaluation, Evaluator, FitConfig, Flow,
     History, Loss, LrSchedule, ModelHandle, OptimizerConfig, Standardizer, StepControl, StepInfo,
-    StepProfile, Targets, TargetsView, Trainer, TrainerHandle, accuracy, evaluate, fit,
-    fit_controlled, fit_with_hooks,
+    StepLog, StepProfile, StepRecord, Targets, TargetsView, Trainer, TrainerHandle, accuracy,
+    evaluate, fit, fit_controlled, fit_with_hooks,
 };

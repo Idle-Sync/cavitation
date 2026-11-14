@@ -2,13 +2,15 @@
 //! ([`Trainer`]), [`fit`], [`fit_controlled`] with its [`StepControl`], and [`accuracy`] (in
 //! `fit`), held-out measurement
 //! ([`Evaluator`] and [`evaluate`], in `evaluate`), [`Standardizer`], which standardises
-//! inputs or targets and folds that into a network (in `standardize`), and [`Flow`], which a
-//! progress callback returns to go on or stop.
+//! inputs or targets and folds that into a network (in `standardize`), [`StepLog`], a
+//! [`StepControl`] that records every step (in `step_log`), and [`Flow`], which a progress
+//! callback returns to go on or stop.
 
 mod data;
 mod evaluate;
 mod fit;
 mod standardize;
+mod step_log;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
 pub use evaluate::{Evaluation, Evaluator, evaluate};
@@ -18,6 +20,7 @@ pub use fit::{
 };
 pub(crate) use fit::{check_dataset, check_widths};
 pub use standardize::Standardizer;
+pub use step_log::{StepLog, StepRecord};
 
 /// What a progress callback returns: go on with the run, or stop it there. The
 /// [`shrink`](crate::shrink::shrink()) tool's `on_step` callback returns one after each step.
