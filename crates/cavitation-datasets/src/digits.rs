@@ -1,9 +1,13 @@
-//! The scikit-learn digits data set: 1,797 8 by 8 images, split into train and test.
+//! The scikit-learn digits data set: 1,797 8 by 8 images, split into train and test, and
+//! the known result's network and training recipe on it, which the known-result tests, the
+//! shrink example and the shrink benchmark share.
 
 use std::path::PathBuf;
 
-use cavitation_core::{Error, Tensor};
-use cavitation_nn::{Dataset, Targets};
+use cavitation_core::{Error, ParamStore, Rng, Tensor};
+use cavitation_nn::{
+    Dataset, FitConfig, Health, Init, Linear, OptimizerConfig, Relu, Sequential, Targets,
+};
 
 use crate::Mulberry32;
 
@@ -113,6 +117,73 @@ pub fn load() -> Result<(Dataset, Dataset), Error> {
         })
     };
     Ok((build(&order[..TRAIN_ROWS])?, build(&order[TRAIN_ROWS..])?))
+}
+
+/// The training rows the shrink runs train on: the first 1,149 of the 1,437 training digits.
+/// The other 288 are held out as their validation set.
+///
+/// ```
+/// let (train, _) = cavitation_datasets::digits::load().unwrap();
+/// let (fit_rows, held_out) = train.split_at(cavitation_datasets::digits::FIT_ROWS);
+/// assert_eq!((fit_rows.len(), held_out.len()), (1149, 288));
+/// ```
+pub const FIT_ROWS: usize = 1149;
+
+/// The known result's network for the digits, `64 → hidden[0] → hidden[1] → 10` with ReLU
+/// between the `Linear`s, He uniform weights and zero biases drawn from `Rng::seed(seed)` in
+/// layer order. The known result is `network(params, [256, 128], 1)`.
+///
+/// ```
+/// use cavitation_core::ParamStore;
+/// let mut params = ParamStore::new();
+/// let net = cavitation_datasets::digits::network(&mut params, [256, 128], 1);
+/// let count: usize = net
+///     .parameter_names()
+///     .iter()
+///     .map(|(_, id)| params.value(*id).data().len())
+///     .sum();
+/// assert_eq!((net.len(), count), (5, 50_826));
+/// ```
+pub fn network(params: &mut ParamStore, hidden: [usize; 2], seed: u64) -> Sequential {
+    let mut rng = Rng::seed(seed);
+    let mut he = |inputs, outputs| {
+        Linear::with_init(
+            params,
+            inputs,
+            outputs,
+            Init::HeUniform,
+            Init::Zeros,
+            &mut rng,
+        )
+    };
+    Sequential::new()
+        .push(he(PIXELS, hidden[0]))
+        .push(Relu)
+        .push(he(hidden[0], hidden[1]))
+        .push(Relu)
+        .push(he(hidden[1], 10))
+}
+
+/// The known result's training recipe for `epochs` epochs (20 in the known result): Adam at
+/// learning rate 0.002, batch 32, cross-entropy, shuffle seed 7, a constant rate, quiet
+/// health checks, no callback and no validation set.
+///
+/// ```
+/// let config = cavitation_datasets::digits::recipe(20);
+/// assert_eq!((config.epochs, config.batch, config.shuffle_seed), (20, 32, Some(7)));
+/// ```
+pub fn recipe(epochs: usize) -> FitConfig<'static> {
+    FitConfig {
+        epochs,
+        batch: 32,
+        optimizer: OptimizerConfig::Adam {
+            lr: 0.002,
+            weight_decay: 0.0,
+        },
+        shuffle_seed: Some(7),
+        health: Health::quiet(),
+        ..FitConfig::default()
+    }
 }
 
 #[cfg(test)]

@@ -908,7 +908,7 @@ pub fn small_once() -> Result<SmallRun, String> {
 
 /// The training rows the `shrink` run trains on: the first 1,149 of the 1,437 training
 /// digits. The other 288 are its validation set.
-pub const SHRINK_FIT_ROWS: usize = 1149;
+pub const SHRINK_FIT_ROWS: usize = digits::FIT_ROWS;
 
 /// Timed rounds of the `shrink` run's latency comparison.
 pub const SHRINK_ROUNDS: usize = 301;
@@ -933,9 +933,10 @@ pub struct ShrinkStart {
     pub test: Dataset,
 }
 
-/// Trains the 64 → 256 → 128 → 10 ReLU network as the digits known result does (He uniform
-/// weights, zero biases, `Rng::seed(1)`, Adam lr 0.002, batch 32, 20 epochs, shuffle seed
-/// 7), on the first [`SHRINK_FIT_ROWS`] training rows, with quiet health checks.
+/// Trains the 64 → 256 → 128 → 10 ReLU network as the digits known result does
+/// ([`digits::network`] with seed 1, [`digits::recipe`] for 20 epochs: He uniform weights,
+/// zero biases, Adam lr 0.002, batch 32, shuffle seed 7, quiet health checks), on the first
+/// [`SHRINK_FIT_ROWS`] training rows.
 ///
 /// # Errors
 ///
@@ -944,36 +945,8 @@ pub fn shrink_start() -> Result<ShrinkStart, String> {
     let (train, test) = digits::load().map_err(|e| e.to_string())?;
     let (fit_rows, validation) = train.split_at(SHRINK_FIT_ROWS);
     let mut params = ParamStore::new();
-    let mut rng = Rng::seed(1);
-    let mut net = Sequential::new();
-    for (i, pair) in DIGITS_NET.windows(2).enumerate() {
-        net = net.push(Linear::with_init(
-            &mut params,
-            pair[0],
-            pair[1],
-            Init::HeUniform,
-            Init::Zeros,
-            &mut rng,
-        ));
-        if i + 2 < DIGITS_NET.len() {
-            net = net.push(Relu);
-        }
-    }
-    let config = FitConfig {
-        epochs: 20,
-        batch: 32,
-        optimizer: OptimizerConfig::Adam {
-            lr: 0.002,
-            weight_decay: 0.0,
-        },
-        loss: Loss::CrossEntropy,
-        shuffle_seed: Some(7),
-        schedule: LrSchedule::Constant,
-        health: Health::quiet(),
-        on_epoch: None,
-        validation: None,
-    };
-    fit(&net, &mut params, &fit_rows, config).map_err(|e| e.to_string())?;
+    let net = digits::network(&mut params, [DIGITS_NET[1], DIGITS_NET[2]], 1);
+    fit(&net, &mut params, &fit_rows, digits::recipe(20)).map_err(|e| e.to_string())?;
     Ok(ShrinkStart {
         net,
         params,
