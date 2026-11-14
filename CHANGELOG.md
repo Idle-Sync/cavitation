@@ -57,6 +57,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- The v0.3 CIFAR network (four convolution, batch-norm and ReLU blocks, pooling, dropout, two `Linear`s) is in the determinism test, which requires the same parameters and batch-norm buffers bit for bit after 20 training steps at 1, 2, 3 and 4 threads and from run to run, and in the no-alloc test, which requires its training step and its compiled batch call to allocate nothing after warm-up.
 - `cavitation-bench conv [--batch N]` times the four convolutions of the CIFAR-10 CNN benchmark network, forward and forward with backward, at the current kernel level and thread count; `scripts/bench/torch_conv.py` times the same in PyTorch.
 - The inspector's `epoch` event carries the run's validation (`EpochReport::validation`: loss, and accuracy or R²) as `validation`, `null` without a validation set, and the page shows it under the accuracy and loss beside the probe evaluation.
 - The digits known result's network, training recipe and training-row count live in `cavitation_datasets::digits` (`network`, `recipe`, `FIT_ROWS`), which the known-result tests, the `shrink_digits` example and `cavitation-bench shrink` all use, instead of three copies that nothing checked against each other. The trained network and every figure are unchanged.

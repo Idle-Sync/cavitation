@@ -3,6 +3,8 @@
 //! This target has no test harness: `main` runs each scenario in turn on the main thread, so
 //! nothing else allocates while a scenario is being counted.
 
+mod common;
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -352,6 +354,49 @@ fn conv_training_and_inference() -> usize {
     assert!(sink.is_finite() && sink > 0.0);
     let mut model = InferenceModel::compile(&net, &params).unwrap();
     let rows = TensorView::from_slice(&data.x.data()[..128 * 64], &[128, 64]).unwrap();
+    let mut total = model.infer_batch(rows).data().iter().sum::<f32>();
+    let before = allocations();
+    for _ in 0..3 {
+        total += model.infer_batch(rows).data().iter().sum::<f32>();
+    }
+    made += allocations() - before;
+    assert!(total.is_finite());
+    made
+}
+
+/// The v0.3 CIFAR network of `common` on 96 seeded rows of 3 × 32 × 32 images, trained with
+/// `Trainer::step` and Adam at batch 32 (3 steps an epoch, batch norm and dropout in
+/// training mode): two warm-up epochs, then the allocations of a third; then `infer_batch`
+/// on the compiled model for 32 rows, after one warm-up call.
+fn cifar_training_and_inference() -> usize {
+    let n = 96;
+    let mut rng = Rng::seed(8);
+    let x: Vec<f32> = (0..n * 3072).map(|_| rng.uniform_f32()).collect();
+    let data = Dataset {
+        x: Tensor::from_vec(x, &[n, 3072]).unwrap(),
+        targets: Targets::Classes((0..n).map(|_| rng.below(10) as usize).collect()),
+    };
+    let mut params = ParamStore::new();
+    let net = common::cifar_cnn(&mut params, &mut Rng::seed(9));
+    let mut trainer = Trainer::new(&net, Adam::new(1e-3), Loss::CrossEntropy, 32);
+    let mut batcher = Batcher::new(n, 32, Some(3));
+    let mut batch = Batch::new(&data, 32);
+    let mut sink = 0.0f32;
+    let mut before = 0;
+    for epoch in 0..3 {
+        if epoch == 2 {
+            before = allocations();
+        }
+        batcher.epoch();
+        for range in batcher.batches() {
+            let view = batcher.gather(&data, range, &mut batch);
+            sink += trainer.step(&net, &mut params, view).unwrap();
+        }
+    }
+    let mut made = allocations() - before;
+    assert!(sink.is_finite() && sink > 0.0);
+    let mut model = InferenceModel::compile(&net, &params).unwrap();
+    let rows = TensorView::from_slice(&data.x.data()[..32 * 3072], &[32, 3072]).unwrap();
     let mut total = model.infer_batch(rows).data().iter().sum::<f32>();
     let before = allocations();
     for _ in 0..3 {
@@ -1414,13 +1459,14 @@ fn fit_validation_tape_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 28] = [
+    let scenarios: [Scenario; 29] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
         ("training_step", training_step),
         ("dropout_training_step", dropout_training_step),
         ("conv_training_and_inference", conv_training_and_inference),
+        ("cifar_training_and_inference", cifar_training_and_inference),
         ("manual_loop", manual_loop),
         ("no_hooks_no_cost", no_hooks_no_cost),
         ("masked_training_step", masked_training_step),
