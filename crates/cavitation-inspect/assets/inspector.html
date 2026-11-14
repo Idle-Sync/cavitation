@@ -103,7 +103,7 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
   <section class="perf" aria-label="Performance">
     <div><span class="k">Samples / s</span><span class="big" id="tSps">–</span><span class="sub">training steps only</span></div>
     <div><span class="k">GFLOPS</span><span class="big" id="tGf">–</span><span class="sub" id="tGfSub">Linear layers</span></div>
-    <div><span class="k" id="tAccK">Accuracy</span><span class="big" id="tAcc">–</span><span class="sub" id="tAccSub">held-out rows</span></div>
+    <div><span class="k" id="tAccK">Accuracy</span><span class="big" id="tAcc">–</span><span class="sub" id="tAccSub">evaluated rows</span></div>
     <div><span class="k">Loss</span><span class="big" id="tLoss">–</span><span class="sub" id="tLossSub">last batch</span></div>
     <div><span class="k">Epoch</span><span class="big" id="tEp">–</span><span class="sub" id="tEpSub">–</span></div>
     <div><span class="k">Steps</span><span class="big" id="tSteps">–</span><span class="sub" id="tStepsSub">–</span></div>
@@ -821,8 +821,10 @@ label.ctl{display:flex;flex-direction:column;gap:3px}
       // In explore mode the evaluation is the training run's last, made before any switch
       // or shrink.
       const shrunk = S.network && ok(S.network.parameters);
-      setText('tAccSub', int(ev.rows) + ' held-out rows' + (S.explored ? ' · from training' + (shrunk ? ', before shrinking' : '') : ''));
-      setText('tLossSub', 'last batch · held-out ' + fmt(ev.loss, 4));
+      // Without a probe set the evaluated rows are training rows, not held out.
+      const kind = S.model && S.model.probe_is_training ? 'training' : 'held-out';
+      setText('tAccSub', int(ev.rows) + ' ' + kind + ' rows' + (S.explored ? ' · from training' + (shrunk ? ', before shrinking' : '') : ''));
+      setText('tLossSub', 'last batch · ' + kind + ' ' + fmt(ev.loss, 4));
     }
   }
   function state() {

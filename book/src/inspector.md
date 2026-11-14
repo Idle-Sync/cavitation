@@ -36,7 +36,7 @@ The configuration names what the page should show:
 - `probe`: the rows the page can run through the network one at a time. Here they are the 360 test digits. Without it the page uses the first training rows, and says so.
 - `input_image`: `Some((8, 8))` draws each input, and each first-layer neuron's incoming weights, as an 8×8 picture.
 - `class_names` and `title` label the outputs and the page.
-- `eval_rows` (1,000 by default): how many probe rows the held-out evaluation measures at the end of an epoch. Here all 360 test digits.
+- `eval_rows` (1,000 by default): how many probe rows the evaluation measures at the end of an epoch. Here all 360 test digits. The evaluation is held out only when `probe` is given; without it the rows are training rows, and the page labels the accuracy and loss as training figures (the `model` event's `probe_is_training`).
 - `snapshot_hz` (4 by default): how many times a second the page is sent new values.
 - `address`: another port, or `127.0.0.1:0` to let the system pick a free one, which `url` then reports.
 
@@ -54,10 +54,10 @@ The top band is the run's speed and progress:
 
 - **samples/s**: training rows per second, counted over the training steps only, so the inspector's own work between steps and any pause are left out.
 - **GFLOPS**: that rate times the floating-point operations of one training row in the `Linear` layers.
-- **accuracy** and **loss**: the last held-out evaluation, and the last batch's loss beside the held-out loss.
+- **accuracy** and **loss**: the last evaluation on the probe rows (held out here, since `probe` is given), and the last batch's loss beside the evaluation's loss.
 - **epoch** and **steps**, with the learning rate.
 
-The held-out evaluation runs at the end of an epoch, only while a page is connected, and only when the time since the last one is at least 200 times what that one took (`EVALUATION_FACTOR`), so it takes at most about 0.5% of the run. The last epoch always gets one, and when training ends the page gets one last snapshot, so it shows the final step and epoch. Here the evaluation rows are the test digits, which is fine for watching; to choose anything by them (when to stop, how far to shrink) you would hold out other rows instead, as the chapter on shrinking explains.
+The evaluation runs at the end of an epoch, only while a page is connected, and only when the time since the last one is at least 200 times what that one took (`EVALUATION_FACTOR`), so it takes at most about 0.5% of the run. The last epoch always gets one, and when training ends the page gets one last snapshot, so it shows the final step and epoch. Here the evaluation rows are the test digits, which is fine for watching; to choose anything by them (when to stop, how far to shrink) you would hold out other rows instead, as the chapter on shrinking explains.
 
 The **controls** pause and resume the run and set the learning rate. A new rate replaces the schedule for the rest of the run. A paused run resumes by itself after 30 seconds with no page connected, so a closed tab never leaves your program waiting.
 

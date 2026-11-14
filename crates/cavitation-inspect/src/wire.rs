@@ -31,7 +31,7 @@
 //! - `probe_rows` (integer): how many rows the page can probe.
 //! - `probe_is_training` (boolean): whether the probe rows are training rows (no separate
 //!   probe set was given), so the page labels them as such.
-//! - `eval_rows` (integer): how many of the probe rows the held-out evaluation uses.
+//! - `eval_rows` (integer): how many of the probe rows the evaluation uses.
 //! - `parameters` (integer): the number of parameter values.
 //! - `flops_per_sample` (integer): the floating-point operations one training sample takes
 //!   in the `Linear` layers: for each `Linear` of `in` inputs and `out` outputs,
@@ -72,8 +72,9 @@
 //! - `rows` (integer): the rows the epoch trained on; steps left out under
 //!   `OnNonFinite::Skip` do not count.
 //! - `seconds` (number): the epoch's wall-clock time, pauses included.
-//! - `evaluation` (object or `null`): the held-out evaluation on the first `eval_rows` probe
-//!   rows, or `null` when it was skipped (no client was connected, or the time since the
+//! - `evaluation` (object or `null`): the evaluation on the first `eval_rows` probe rows,
+//!   which are held out only when a probe set was given (see `probe_is_training` in the
+//!   `model` event), or `null` when it was skipped (no client was connected, or the time since the
 //!   last evaluation was under [`EVALUATION_FACTOR`](crate::EVALUATION_FACTOR), 200, times
 //!   that evaluation's own cost; the last epoch always has one while a client is
 //!   connected):
@@ -490,7 +491,8 @@ pub fn stats(w: &mut JsonWriter, s: &Stats) {
         .end_object();
 }
 
-/// A held-out evaluation as the `epoch` event reports it.
+/// The evaluation on the probe rows as the `epoch` event reports it: held out only when a
+/// probe set was given ([`ModelInfo::probe_is_training`] is `false`).
 ///
 /// # Examples
 ///
