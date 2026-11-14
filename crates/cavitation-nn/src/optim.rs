@@ -754,16 +754,14 @@ impl<T: Real> Sgd<T> {
                 let grads = grad.as_ref().map(|g| g.data());
                 self.plain.push(id, [value.data_mut()], grads, ());
             }
-            let list = &mut self.plain;
-            if wd == 0.0 {
-                run_parts(threads, list, parts, stats, &|_, [v], g| {
-                    sgd_chunk::<T, false>(lr, wd, v, g)
-                });
-            } else {
-                run_parts(threads, list, parts, stats, &|_, [v], g| {
+            let decay = wd != 0.0;
+            run_parts(threads, &mut self.plain, parts, stats, &|_, [v], g| {
+                if decay {
                     sgd_chunk::<T, true>(lr, wd, v, g)
-                });
-            }
+                } else {
+                    sgd_chunk::<T, false>(lr, wd, v, g)
+                }
+            });
             return;
         }
         for (k, (id, value, grad)) in params.iter_mut().enumerate() {
@@ -774,24 +772,20 @@ impl<T: Real> Sgd<T> {
             self.with_momentum
                 .push(id, [value.data_mut(), buffer], grads, first);
         }
-        let list = &mut self.with_momentum;
-        if wd == 0.0 {
-            run_parts(threads, list, parts, stats, &|&first, [v, b], g| {
-                if first {
-                    sgd_momentum_chunk::<T, false, true>(lr, mu, wd, v, b, g)
-                } else {
-                    sgd_momentum_chunk::<T, false, false>(lr, mu, wd, v, b, g)
-                }
-            });
-        } else {
-            run_parts(threads, list, parts, stats, &|&first, [v, b], g| {
-                if first {
-                    sgd_momentum_chunk::<T, true, true>(lr, mu, wd, v, b, g)
-                } else {
-                    sgd_momentum_chunk::<T, true, false>(lr, mu, wd, v, b, g)
-                }
-            });
-        }
+        let decay = wd != 0.0;
+        // Each chunk picks the loop made for its case, so no element tests the settings.
+        run_parts(
+            threads,
+            &mut self.with_momentum,
+            parts,
+            stats,
+            &|&first, [v, b], g| match (decay, first) {
+                (false, false) => sgd_momentum_chunk::<T, false, false>(lr, mu, wd, v, b, g),
+                (false, true) => sgd_momentum_chunk::<T, false, true>(lr, mu, wd, v, b, g),
+                (true, false) => sgd_momentum_chunk::<T, true, false>(lr, mu, wd, v, b, g),
+                (true, true) => sgd_momentum_chunk::<T, true, true>(lr, mu, wd, v, b, g),
+            },
+        );
     }
 }
 
