@@ -54,6 +54,17 @@ enum Engine {
     Tape(ParamValues<f32>),
 }
 
+/// The input of one `Linear` for every row of a data set, from [`Evaluator::prefix`].
+#[derive(Debug)]
+pub(crate) struct Prefix {
+    /// The compiled step the `Linear` begins.
+    step: usize,
+    /// The `Linear`'s input width.
+    width: usize,
+    /// `rows · width` values, row after row.
+    values: Vec<f32>,
+}
+
 /// What [`Evaluator::reload`] did, for the tests.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Reload {
@@ -554,6 +565,46 @@ impl Evaluator {
     /// assert!((e.loss - 2f64.ln()).abs() < 1e-6);
     /// ```
     pub fn evaluate(&mut self, data: &Dataset) -> Result<Evaluation, Error> {
+        self.evaluate_from(data, None)
+    }
+
+    /// The input of the `Linear` at layer `linear` for every row of `data`, run `batch`
+    /// rows at a time as [`evaluate`](Self::evaluate) runs them, kept so that
+    /// [`evaluate_from`](Self::evaluate_from) can start there: `None` on the tape engine,
+    /// or when that layer is not a `Linear` a step of the compiled model begins with, or is
+    /// the first layer (its input is the data). It holds `rows · width` values for the
+    /// `Linear`'s input width. The data must have passed [`evaluate`](Self::evaluate)'s
+    /// checks, and the masks of the layers before `linear` must stay as they are while it
+    /// is used.
+    pub(crate) fn prefix(&mut self, data: &Dataset, linear: usize) -> Option<Prefix> {
+        let Engine::Compiled(compiled) = &mut self.engine else {
+            return None;
+        };
+        let step = compiled.linear_step(linear).filter(|&k| k > 0)?;
+        let (rows, features) = (data.len(), data.features());
+        let width = compiled.step_inputs(step);
+        let mut values = Vec::with_capacity(rows * width);
+        for start in (0..rows).step_by(self.batch) {
+            let end = (start + self.batch).min(rows);
+            let x = &data.x.data()[start * features..end * features];
+            values.extend_from_slice(compiled.infer_steps(0..step, x, end - start));
+        }
+        Some(Prefix {
+            step,
+            width,
+            values,
+        })
+    }
+
+    /// [`evaluate`](Self::evaluate), starting from `prefix` (from [`prefix`](Self::prefix)
+    /// on the same data, or `None` to run the whole model): only the steps from the
+    /// prefix's `Linear` on run, on its kept inputs, and the result is `evaluate`'s, bit for
+    /// bit, since every batch's rows go through the same steps in the same way.
+    pub(crate) fn evaluate_from(
+        &mut self,
+        data: &Dataset,
+        prefix: Option<&Prefix>,
+    ) -> Result<Evaluation, Error> {
         check_dataset(data)?;
         check_model_and_loss(&self.model, self.loss, data)?;
         let mut means = mem::take(&mut self.means);
@@ -565,7 +616,7 @@ impl Evaluator {
             ss_res.resize(means.len(), 0.0);
         }
         let mut correct = 0usize;
-        let ran = self.run(data, true, |start, out, targets| {
+        let ran = self.run(data, true, prefix, |start, out, targets| {
             let width = out.shape().dims()[1];
             match targets {
                 TargetsView::Classes(labels) => {
@@ -655,7 +706,7 @@ impl Evaluator {
             ));
         }
         check_widths(&self.model, data)?;
-        self.run(data, false, |start, outputs, targets| {
+        self.run(data, false, None, |start, outputs, targets| {
             let width = outputs.shape().dims()[1];
             if let TargetsView::Classes(labels) = targets {
                 for (i, (row, &label)) in outputs
@@ -678,11 +729,13 @@ impl Evaluator {
     /// Runs the model over `data` in order, `batch` rows at a time, calling `visit` with
     /// each batch's first row, its outputs and its targets, then (when `with_loss`)
     /// recording the batch's loss. Returns the row-weighted mean loss (0 without the loss),
-    /// or the first error `visit` returns.
+    /// or the first error `visit` returns. With a `prefix` (compiled engine only), each
+    /// batch starts from its kept inputs at the prefix's step.
     fn run(
         &mut self,
         data: &Dataset,
         with_loss: bool,
+        prefix: Option<&Prefix>,
         mut visit: impl FnMut(usize, TensorView<'_, f32>, TargetsView<'_, f32>) -> Result<(), Error>,
     ) -> Result<f64, Error> {
         let (rows, features) = (data.len(), data.features());
@@ -716,7 +769,16 @@ impl Evaluator {
             };
             let value = match engine {
                 Engine::Compiled(compiled) => {
-                    let out = compiled.infer_batch(x);
+                    let out = match prefix {
+                        Some(p) => {
+                            let (steps, width) = (compiled.steps(), compiled.output_width());
+                            let kept = &p.values[start * p.width..end * p.width];
+                            let out = compiled.infer_steps(p.step..steps, kept, n);
+                            TensorView::from_slice(out, &[n, width])
+                                .expect("the last step's output holds n × output_width values")
+                        }
+                        None => compiled.infer_batch(x),
+                    };
                     visit(start, out, targets)?;
                     if !with_loss {
                         continue;
@@ -880,7 +942,7 @@ mod tests {
 
     use super::*;
     use crate::inference::tests::layer_bounds;
-    use crate::{Activation, ActivationLayer, Linear, LogSoftmax, Sigmoid, Tanh};
+    use crate::{Activation, ActivationLayer, Linear, LogSoftmax, Relu, Sigmoid, Tanh};
     use cavitation_core::{Rng, Tensor};
 
     /// Every [`Loss`], with settings for the ones that take them.
@@ -940,6 +1002,65 @@ mod tests {
             _ => {}
         }
         (net, params, Dataset { x, targets })
+    }
+
+    /// Evaluating from a kept prefix gives `evaluate`'s loss, accuracy and R² bit for bit:
+    /// for a 6 → 8 → 5 → 4 network with a neuron mask on its first `Linear` and one on the
+    /// second (the swept one, changed between evaluations), class and value targets,
+    /// batches of 7 over 22 rows (so the last batch has one row, which runs the matvec),
+    /// and on the tape engine, where there is no prefix.
+    #[test]
+    fn evaluate_from_a_prefix_matches_evaluate() {
+        for loss in [Loss::CrossEntropy, Loss::Mse] {
+            let (small, mut params, data) = case(loss, 22, 9);
+            let mut rng = Rng::seed(4);
+            let first = small.linear(0).unwrap().clone();
+            let middle = Linear::new(&mut params, 8, 5, &mut rng);
+            let last = Linear::new(&mut params, 5, 4, &mut rng);
+            let mut net = Sequential::new()
+                .push(first)
+                .push(Tanh)
+                .push(middle)
+                .push(Relu)
+                .push(last);
+            net.set_neuron_mask(0, NeuronMask::from_off(8, &[3]));
+            let mut evaluator = Evaluator::with_neuron_masks(&net, &params, loss, 7, &[2]).unwrap();
+            let base = evaluator.evaluate(&data).unwrap();
+            let prefix = evaluator.prefix(&data, 2).expect("layer 2 begins a step");
+            assert!(
+                evaluator.prefix(&data, 0).is_none(),
+                "the first layer's input is the data"
+            );
+            assert!(
+                evaluator.prefix(&data, 1).is_none(),
+                "layer 1 is not a Linear"
+            );
+            let bits = |e: &Evaluation| {
+                (
+                    e.loss.to_bits(),
+                    e.accuracy.map(f64::to_bits),
+                    e.r2.map(f64::to_bits),
+                )
+            };
+            assert_eq!(
+                bits(&evaluator.evaluate_from(&data, Some(&prefix)).unwrap()),
+                bits(&base)
+            );
+            for neuron in 0..5 {
+                evaluator
+                    .set_neuron_mask(2, &NeuronMask::from_off(5, &[neuron]))
+                    .unwrap();
+                let whole = evaluator.evaluate(&data).unwrap();
+                let from = evaluator.evaluate_from(&data, Some(&prefix)).unwrap();
+                assert_eq!(bits(&from), bits(&whole), "{loss:?}, neuron {neuron}");
+            }
+        }
+        let (_, own, params, data) = both_engines();
+        let mut tape = Evaluator::new(&own, &params, Loss::CrossEntropy, 7).unwrap();
+        assert!(
+            tape.prefix(&data, 2).is_none(),
+            "no prefix on the tape engine"
+        );
     }
 
     /// The loss of `net` on `data` recorded on the tape for each batch of `batch` rows in
