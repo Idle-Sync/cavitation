@@ -60,6 +60,10 @@ pub struct LayerActivity {
 ///
 /// # Errors
 ///
+/// Returns [`Error::Unsupported`], naming the layer, if the model has an image layer
+/// (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or `AdaptiveAvgPool2d`): the shrink
+/// tools work on the neurons of dense networks.
+///
 /// Returns [`Error::InvalidData`] if `batch` is 0, if `data.x` is not a matrix with at
 /// least one row, if its width is not the model's input width, or if an entry of
 /// `linears` is not the index of a `Linear` layer (the message names it).
@@ -96,6 +100,7 @@ pub fn activity(
     linears: &[usize],
     batch: usize,
 ) -> Result<Vec<LayerActivity>, Error> {
+    super::refuse_image_layers(model, "activity")?;
     if batch == 0 {
         return Err(Error::InvalidData(
             "activity: the batch size is 0".to_string(),
