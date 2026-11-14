@@ -1375,6 +1375,54 @@ fn fit_validation_cnn_steady_state() -> usize {
     AFTER.load(Ordering::Relaxed)
 }
 
+/// `fit` for 6 epochs on 1,000 of the centred rows at batch 128 with `Health::quiet()`
+/// (the dead-ReLU report on, sent to a sink that drops it), on the 50k network with half of
+/// its first layer's biases at −100: those 128 ReLU neurons output 0 for every sample, so
+/// each epoch reports them. From the third epoch on, nothing is allocated, the report
+/// included (its list of dead neurons is lent and taken back).
+fn dead_report_steady_state() -> usize {
+    let (train, _) = synthetic_centred_1437().split_at(1000);
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let first = net
+        .linear(0)
+        .expect("layer 0 is a Linear")
+        .bias()
+        .expect("it has a bias");
+    for b in params.value_mut(first).data_mut().iter_mut().step_by(2) {
+        *b = -100.0;
+    }
+    static REPORTS: AtomicUsize = AtomicUsize::new(0);
+    static AT_2: AtomicUsize = AtomicUsize::new(0);
+    static AFTER: AtomicUsize = AtomicUsize::new(0);
+    let config = cavitation_nn::FitConfig {
+        epochs: 6,
+        batch: 128,
+        health: Health {
+            sink: Some(Box::new(|w: &Warning| {
+                if matches!(w, Warning::DeadNeurons { .. }) {
+                    REPORTS.fetch_add(1, Ordering::Relaxed);
+                }
+            })),
+            ..Health::default()
+        },
+        on_epoch: Some(Box::new(|report, _, _| {
+            if report.epoch == 2 {
+                AT_2.store(allocations(), Ordering::Relaxed);
+            } else if report.epoch > 2 {
+                AFTER.store(
+                    allocations() - AT_2.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+            }
+        })),
+        ..cavitation_nn::FitConfig::default()
+    };
+    cavitation_nn::fit(&net, &mut params, &train, config).unwrap();
+    assert_eq!(REPORTS.load(Ordering::Relaxed), 6, "one report per epoch");
+    AFTER.load(Ordering::Relaxed)
+}
+
 /// Trains the 50k network with its ReLUs written as an activation of your own, so that its
 /// validation runs on the tape, for 6 epochs on 1,000 of the centred rows at batch 128
 /// with the other 437 as the validation set: every epoch's refresh copies the parameter
@@ -1414,7 +1462,7 @@ fn fit_validation_tape_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 28] = [
+    let scenarios: [Scenario; 29] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1453,6 +1501,7 @@ fn main() -> ExitCode {
         ),
         ("profiled_step_reuses_buffers", profiled_step_reuses_buffers),
         ("fit_validation_steady_state", fit_validation_steady_state),
+        ("dead_report_steady_state", dead_report_steady_state),
         (
             "fit_validation_cnn_steady_state",
             fit_validation_cnn_steady_state,

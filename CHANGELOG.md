@@ -38,6 +38,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Layers, training and inference (`cavitation-nn`)
 
+- The end-of-epoch dead-neuron report reuses one list of dead neurons, lent to each `Warning::DeadNeurons` and taken back after it is sent, so a long `fit` whose report fires every epoch no longer allocates after warm-up (a `no_alloc` scenario checks it: 24 allocations over epochs 3–6 before, 0 now).
 - The dead-ReLU report reads a ReLU after a `Conv2d` or `BatchNorm2d` (through element-wise layers) by channel: a position counts as dead only when its whole channel output 0 for every sample of the epoch. Before, each position was a neuron of its own, and a live channel's positions that see only flat input, such as an image's blank border, were reported dead. `Warning::DeadNeurons` still lists positions, now the positions of dead channels. The steering recipe keeps the report on.
 - `Dropout`, PyTorch's `nn.Dropout`: random masks while training, seeded by `FitConfig::dropout_seed`, the step and the order of the dropout layers on the tape, so a run gives the same masks on every machine and for any thread count; it passes its input through in evaluation and at inference. `Dropout::new` refuses a drop probability outside `[0, 1)`.
 - `Flatten` and `Identity`, PyTorch's `nn.Flatten` and `nn.Identity`, which pass their input through, so a PyTorch `nn.Sequential` that uses them keeps its layer numbers and its state dict loads by key.
