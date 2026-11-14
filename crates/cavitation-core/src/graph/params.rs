@@ -85,12 +85,29 @@ fn check_shapes(index: usize, value: &Shape, grad: &Shape) {
 /// store.values.get_mut(p).data_mut()[0] = 3.0;
 /// assert_eq!(store.values.get(p).data(), &[3.0, 1.0]);
 /// ```
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ParamValues<T: Real = f32> {
     /// The id of the store these values belong to.
     store: u32,
     /// One tensor per parameter, in the order they were added.
     tensors: Vec<Tensor<T>>,
+}
+
+impl<T: Real> Clone for ParamValues<T> {
+    /// A copy of every value, for the same store.
+    fn clone(&self) -> Self {
+        ParamValues {
+            store: self.store,
+            tensors: self.tensors.clone(),
+        }
+    }
+
+    /// Makes these values a copy of `source`, reusing each tensor's buffer when it is large
+    /// enough: copying the values of the same parameters again allocates nothing.
+    fn clone_from(&mut self, source: &Self) {
+        self.store = source.store;
+        self.tensors.clone_from(&source.tensors);
+    }
 }
 
 impl<T: Real> ParamValues<T> {
@@ -718,5 +735,25 @@ mod tests {
         store.grads.accumulate(p).0.data_mut().fill(1.0);
         assert_eq!(store.iter_mut().count(), 1);
         assert_eq!(store.value(p).data()[0], 4.0);
+    }
+
+    /// `clone_from` between the values of stores with the same parameters copies every value
+    /// into the buffers the target already has.
+    #[test]
+    fn values_clone_from_reuses_the_buffers() {
+        let mut store = ParamStore::new();
+        let a = store.add(Tensor::full(&[3], 1.0f32));
+        let b = store.add(Tensor::full(&[2, 2], 2.0f32));
+        let mut copy = store.values.clone();
+        let buffers = [copy.get(a).data().as_ptr(), copy.get(b).data().as_ptr()];
+        store.values.get_mut(a).data_mut()[1] = 7.0;
+        store.values.get_mut(b).data_mut()[3] = -1.0;
+        copy.clone_from(&store.values);
+        assert_eq!(copy.get(a).data(), &[1.0, 7.0, 1.0]);
+        assert_eq!(copy.get(b).data(), &[2.0, 2.0, 2.0, -1.0]);
+        assert_eq!(
+            [copy.get(a).data().as_ptr(), copy.get(b).data().as_ptr()],
+            buffers
+        );
     }
 }

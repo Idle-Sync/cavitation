@@ -419,13 +419,12 @@ pub(crate) fn train(
             }
         }
         monitor.end_epoch(epoch)?;
-        history.epochs.push(EpochReport {
+        history.epochs.push(EpochReport::new(
             epoch,
-            mean_loss: total / trained as f64,
-            rows: trained,
-            seconds: start.elapsed().as_secs_f64(),
-            validation: None,
-        });
+            total / trained as f64,
+            trained,
+            start.elapsed().as_secs_f64(),
+        ));
     }
     if !setup.fit_intercept {
         params.value_mut(bias).data_mut().fill(0.0);

@@ -16,8 +16,8 @@
 //!   pause, resume, ...), queued for the training side to read between steps.
 //! - [`fit`]: training under the inspector. Between steps it carries out the page's
 //!   commands and, while a client is connected, captures snapshots at most `snapshot_hz`
-//!   times a second; at epoch ends it runs a held-out evaluation when the time budget
-//!   allows.
+//!   times a second; at epoch ends it evaluates the network on the probe rows when the
+//!   time budget allows (held out only when a probe set is given).
 //! - [`Inspector::explore`]: explore mode, after training. The page switches the trained
 //!   network's neurons, ranks a hidden layer's neurons by what switching each off costs,
 //!   and shrinks the network with the shrink tool, level by level, until it says it is done.
