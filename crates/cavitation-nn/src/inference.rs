@@ -14,11 +14,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
+use cavitation_core::kernels::activation::{
+    gelu_tanh_f32_with, sigmoid_f32_with, silu_f32_with, tanh_f32_with,
+};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
-use cavitation_core::{Error, Gate, ParamStore, TensorView, log_softmax_row, softmax_row};
+use cavitation_core::{
+    Error, Gate, GeluApprox, ParamStore, TensorView, log_softmax_row, softmax_row,
+};
 
 use crate::{Activation, ActivationKind, NeuronMask, Sequential};
 
@@ -1373,14 +1377,16 @@ fn relu_value(v: f32) -> f32 {
     if v <= 0.0 { 0.0 } else { v }
 }
 
-/// The value of a gated linear unit's gate at `x`, as the tape computes it: its sigmoid gate
-/// is the scalar sigmoid, not the SIMD kernel of the `Sigmoid` layer.
+/// The value of a gated linear unit's gate at `x`, as the tape computes it: its sigmoid,
+/// SiLU and tanh-GELU gates are the scalar forms, not the SIMD kernels of the `Sigmoid`,
+/// `Silu` and `Gelu` layers.
 fn gate_value(gate: Gate, x: f32) -> f32 {
     let kind = match gate {
         Gate::Sigmoid => return crate::activation::sigmoid(x),
+        Gate::Silu => return x * crate::activation::sigmoid(x),
+        Gate::Gelu(GeluApprox::Tanh) => return crate::activation::gelu_tanh_scalar(x),
         Gate::Gelu(approx) => ActivationKind::Gelu(approx),
         Gate::Relu => ActivationKind::Relu,
-        Gate::Silu => ActivationKind::Silu,
     };
     Activation::<f32>::f(&kind, x)
 }
@@ -1396,6 +1402,10 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
         }
         InferenceLayer::Activation(ActivationKind::Tanh) => tanh_f32_with(level, data),
         InferenceLayer::Activation(ActivationKind::Sigmoid) => sigmoid_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Silu) => silu_f32_with(level, data),
+        InferenceLayer::Activation(ActivationKind::Gelu(GeluApprox::Tanh)) => {
+            gelu_tanh_f32_with(level, data)
+        }
         InferenceLayer::Activation(kind) => {
             for v in data.iter_mut() {
                 *v = Activation::<f32>::f(kind, *v);
