@@ -11,8 +11,8 @@ use super::{
     Batch, BatchView, Batcher, Dataset, Evaluation, Evaluator, Flow, Targets, TargetsView,
 };
 use crate::{
-    Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, NeuronMask, Optimizer, Sequential,
-    Sgd, StepInputs, Trace,
+    Adagrad, Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, NeuronMask, Optimizer,
+    RmsProp, Sequential, Sgd, StepInputs, Trace,
 };
 
 /// The loss [`Trainer`] and [`fit`] minimise, always averaged over the batch.
@@ -1391,10 +1391,35 @@ pub enum OptimizerConfig {
         /// The decoupled weight decay.
         weight_decay: f64,
     },
+    /// [`RmsProp`], with momentum and weight decay (0 turns either off), and eps 1e-8.
+    RmsProp {
+        /// The learning rate.
+        lr: f64,
+        /// The decay rate of the squared-gradient average (PyTorch's default is 0.99).
+        alpha: f64,
+        /// The momentum factor.
+        momentum: f64,
+        /// The weight decay added to the gradient.
+        weight_decay: f64,
+    },
+    /// [`Adagrad`], with sums starting at 0 and eps 1e-10.
+    Adagrad {
+        /// The learning rate.
+        lr: f64,
+        /// The rate's decay per update.
+        lr_decay: f64,
+        /// The weight decay added to the gradient.
+        weight_decay: f64,
+    },
 }
 
 impl OptimizerConfig {
-    /// Builds the optimiser, with the default betas and epsilon for Adam and AdamW.
+    /// Builds the optimiser, with the default betas and epsilon for Adam and AdamW and the
+    /// default epsilons for RMSprop and Adagrad.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`RmsProp::with_alpha`] does for an `alpha` outside `[0, 1]`.
     ///
     /// ```
     /// use cavitation_nn::OptimizerConfig;
@@ -1418,6 +1443,26 @@ impl OptimizerConfig {
             OptimizerConfig::AdamW { lr, weight_decay } => {
                 Box::new(AdamW::new(lr).with_weight_decay(weight_decay))
             }
+            OptimizerConfig::RmsProp {
+                lr,
+                alpha,
+                momentum,
+                weight_decay,
+            } => Box::new(
+                RmsProp::new(lr)
+                    .with_alpha(alpha)
+                    .with_momentum(momentum)
+                    .with_weight_decay(weight_decay),
+            ),
+            OptimizerConfig::Adagrad {
+                lr,
+                lr_decay,
+                weight_decay,
+            } => Box::new(
+                Adagrad::new(lr)
+                    .with_lr_decay(lr_decay)
+                    .with_weight_decay(weight_decay),
+            ),
         }
     }
 }
@@ -3365,9 +3410,20 @@ mod tests {
                 lr: 0.001,
                 weight_decay: 0.01,
             },
+            OptimizerConfig::RmsProp {
+                lr: 0.002,
+                alpha: 0.99,
+                momentum: 0.9,
+                weight_decay: 0.0,
+            },
+            OptimizerConfig::Adagrad {
+                lr: 0.05,
+                lr_decay: 0.0,
+                weight_decay: 1e-4,
+            },
         ];
         let lrs: Vec<f64> = configs.iter().map(|c| c.build().learning_rate()).collect();
-        assert_eq!(lrs, [0.1, 0.01, 0.001]);
+        assert_eq!(lrs, [0.1, 0.01, 0.001, 0.002, 0.05]);
     }
 
     /// Every loss that cannot be negative on valid inputs says so, and `KlDiv`, which can be

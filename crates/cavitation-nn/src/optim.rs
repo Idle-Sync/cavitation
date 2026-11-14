@@ -1378,6 +1378,629 @@ impl<T: Real> Optimizer<T> for AdamW<T> {
     }
 }
 
+/// RMSprop (Hinton's lecture notes, 2012) with PyTorch's `torch.optim.RMSprop` semantics,
+/// uncentred: a running average of the squared gradient, `v ← α·v + (1 − α)·g²`, divides
+/// each step, `p ← p − lr·g / (√v + eps)`, with weight decay added to the gradient as
+/// `wd·p` and, with momentum `μ`, a buffer `b ← μ·b + g / (√v + eps)` that the step takes
+/// instead, `p ← p − lr·b`. The average and the buffer start at 0. Defaults as PyTorch's:
+/// α 0.99, eps 1e-8, no momentum, no weight decay.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{ParamStore, Tensor};
+/// use cavitation_nn::{Optimizer, RmsProp};
+/// let mut store = ParamStore::new();
+/// let p = store.add(Tensor::full(&[1], 1.0f32));
+/// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+/// RmsProp::new(0.01).step(&mut store);
+/// // v = 0.01·4, so the step is 0.01·2 / 0.2 = 0.1.
+/// assert!((store.value(p).data()[0] - 0.9).abs() < 1e-6);
+/// ```
+#[derive(Clone, Debug)]
+pub struct RmsProp<T: Real = f32> {
+    /// The learning rate.
+    lr: f64,
+    /// The decay rate of the squared-gradient average.
+    alpha: f64,
+    /// Added to the square root of the average, outside the root.
+    eps: f64,
+    /// The momentum factor; 0 disables the buffer.
+    momentum: f64,
+    /// The weight decay added to the gradient.
+    weight_decay: f64,
+    /// The sizes seen on the first step.
+    sizes: Sizes,
+    /// The squared-gradient average of each parameter.
+    square_avg: Vec<Vec<T>>,
+    /// The momentum buffer of each parameter (empty without momentum).
+    buffers: Vec<Vec<T>>,
+    /// Whether each parameter has been updated: its state means something only then.
+    started: Vec<bool>,
+    /// The statistics of the last `step`.
+    stats: GradStats,
+    /// One slot per chunk of a step, for the chunks' statistics.
+    partials: Vec<ChunkStats>,
+    /// The parameters of a chunked step without momentum (empty between steps).
+    plain: Parts<T, (), 2>,
+    /// The parameters of a chunked step with momentum (empty between steps).
+    with_momentum: Parts<T, (), 3>,
+}
+
+impl<T: Real> RmsProp<T> {
+    /// RMSprop with learning rate `lr`, α 0.99, eps 1e-8, no momentum and no weight decay.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::RmsProp = cavitation_nn::RmsProp::new(0.01);
+    /// # let _ = opt;
+    /// ```
+    pub fn new(lr: f64) -> RmsProp<T> {
+        RmsProp {
+            lr,
+            alpha: 0.99,
+            eps: 1e-8,
+            momentum: 0.0,
+            weight_decay: 0.0,
+            sizes: Sizes::default(),
+            square_avg: Vec::new(),
+            buffers: Vec::new(),
+            started: Vec::new(),
+            stats: GradStats::new(),
+            partials: Vec::new(),
+            plain: Parts::new(),
+            with_momentum: Parts::new(),
+        }
+    }
+
+    /// Sets the decay rate α of the squared-gradient average.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `alpha` is in `[0, 1]`.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::RmsProp = cavitation_nn::RmsProp::new(0.01).with_alpha(0.9);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_alpha(mut self, alpha: f64) -> RmsProp<T> {
+        assert!(
+            (0.0..=1.0).contains(&alpha),
+            "RmsProp alpha must be in [0, 1], got {alpha}"
+        );
+        self.alpha = alpha;
+        self
+    }
+
+    /// Sets the constant added to the square root of the average.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::RmsProp = cavitation_nn::RmsProp::new(0.01).with_eps(1e-6);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_eps(mut self, eps: f64) -> RmsProp<T> {
+        self.eps = eps;
+        self
+    }
+
+    /// Sets the momentum factor μ.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::RmsProp = cavitation_nn::RmsProp::new(0.01).with_momentum(0.9);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_momentum(mut self, momentum: f64) -> RmsProp<T> {
+        self.momentum = momentum;
+        self
+    }
+
+    /// Sets the weight decay, added to the gradient as `wd·p`.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::RmsProp = cavitation_nn::RmsProp::new(0.01).with_weight_decay(1e-4);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_weight_decay(mut self, weight_decay: f64) -> RmsProp<T> {
+        self.weight_decay = weight_decay;
+        self
+    }
+
+    /// The squared-gradient average of parameter `id`, or `None` until it has been updated
+    /// once. The ids are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Optimizer, RmsProp};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = RmsProp::new(0.01);
+    /// assert!(opt.square_avg(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// assert!((opt.square_avg(p).unwrap()[0] - 0.04).abs() < 1e-7);
+    /// ```
+    pub fn square_avg(&self, id: ParamId) -> Option<&[T]> {
+        let k = id.position();
+        (*self.started.get(k)?).then(|| &self.square_avg[k][..])
+    }
+
+    /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
+    fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
+        if self.sizes.prepare("RmsProp", params) {
+            let zeros = |lens: &[usize]| lens.iter().map(|&n| vec![T::ZERO; n]).collect();
+            self.square_avg = zeros(&self.sizes.lens);
+            if self.momentum != 0.0 {
+                self.buffers = zeros(&self.sizes.lens);
+            }
+            self.started = vec![false; self.square_avg.len()];
+            self.partials = vec![ChunkStats::default(); self.sizes.chunks()];
+        }
+        stats.reset(params.len());
+        let c = RmsStep {
+            lr: self.lr,
+            alpha: self.alpha,
+            eps: self.eps,
+            mu: self.momentum,
+            wd: self.weight_decay,
+        };
+        let momentum = self.momentum != 0.0;
+        // A step that panicked may have left parts behind.
+        self.plain.0.clear();
+        self.with_momentum.0.clear();
+        for (k, (id, value, grad)) in params.iter_mut().enumerate() {
+            let grads = grad.as_ref().map(|g| g.data());
+            if grads.is_some() {
+                self.started[k] = true;
+            }
+            let avg = &mut self.square_avg[k][..];
+            let buffer: &mut [T] = if momentum {
+                &mut self.buffers[k][..]
+            } else {
+                &mut []
+            };
+            match (path, grads) {
+                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`.
+                (Path::Reference, None) => stats.push(id, 0.0, true),
+                (Path::Reference, Some(g)) => {
+                    let (sum, finite) = rms_reference(&c, value.data_mut(), avg, buffer, g);
+                    stats.push(id, sum, finite);
+                }
+                (Path::Chunked(_), g) if momentum => {
+                    let muts = match g {
+                        Some(_) => [value.data_mut(), avg, buffer],
+                        None => [&mut [][..], &mut [], &mut []],
+                    };
+                    self.with_momentum.push(id, muts, g, ());
+                }
+                (Path::Chunked(_), g) => {
+                    let muts = match g {
+                        Some(_) => [value.data_mut(), avg],
+                        None => [&mut [][..], &mut []],
+                    };
+                    self.plain.push(id, muts, g, ());
+                }
+            }
+        }
+        let Path::Chunked(threads) = path else {
+            return;
+        };
+        let parts = &mut self.partials;
+        let decay = c.wd != 0.0;
+        if momentum {
+            run_parts(
+                threads,
+                &mut self.with_momentum,
+                parts,
+                stats,
+                &|_, [p, v, b], g| {
+                    if decay {
+                        rms_chunk::<T, true, true>(&c, p, v, b, g)
+                    } else {
+                        rms_chunk::<T, false, true>(&c, p, v, b, g)
+                    }
+                },
+            );
+        } else {
+            run_parts(threads, &mut self.plain, parts, stats, &|_, [p, v], g| {
+                if decay {
+                    rms_chunk::<T, true, false>(&c, p, v, &mut [], g)
+                } else {
+                    rms_chunk::<T, false, false>(&c, p, v, &mut [], g)
+                }
+            });
+        }
+    }
+}
+
+/// The settings of one RMSprop step.
+#[derive(Clone, Copy, Debug)]
+struct RmsStep {
+    /// The learning rate.
+    lr: f64,
+    /// The decay rate of the squared-gradient average.
+    alpha: f64,
+    /// Added to the square root of the average.
+    eps: f64,
+    /// The momentum factor.
+    mu: f64,
+    /// The weight decay.
+    wd: f64,
+}
+
+/// One element of RMSprop: from the value `p`, the gradient `g` (weight decay already
+/// added) and the old average `v` (and buffer `b` with momentum), the new value, average
+/// and buffer.
+#[inline(always)]
+fn rms_element(c: &RmsStep, momentum: bool, p: f64, g: f64, v: f64, b: f64) -> (f64, f64, f64) {
+    let v = c.alpha * v + (1.0 - c.alpha) * g * g;
+    let ratio = g / (v.sqrt() + c.eps);
+    if momentum {
+        let b = c.mu * b + ratio;
+        (p - c.lr * b, v, b)
+    } else {
+        (p - c.lr * ratio, v, b)
+    }
+}
+
+/// The plain RMSprop loop over one parameter, element by element on the calling thread:
+/// the reference for [`rms_chunk`]. `buffer` is the momentum buffer (empty without
+/// momentum). Returns the gradient's sum of squares and whether it was all finite.
+fn rms_reference<T: Real>(
+    c: &RmsStep,
+    values: &mut [T],
+    avg: &mut [T],
+    buffer: &mut [T],
+    grads: &[T],
+) -> (f64, bool) {
+    let momentum = c.mu != 0.0;
+    let (mut sum, mut finite) = (0.0f64, true);
+    for i in 0..values.len() {
+        let raw = grads[i].to_f64();
+        sum += raw * raw;
+        finite &= raw.is_finite();
+        let p = values[i].to_f64();
+        let mut g = raw;
+        if c.wd != 0.0 {
+            g += c.wd * p;
+        }
+        let b = if momentum { buffer[i].to_f64() } else { 0.0 };
+        let (p, v, b) = rms_element(c, momentum, p, g, avg[i].to_f64(), b);
+        avg[i] = store_state(v);
+        if momentum {
+            buffer[i] = store_state(b);
+        }
+        values[i] = T::from_f64(p);
+    }
+    (sum, finite)
+}
+
+/// One chunk of RMSprop, with weight decay when `WD` and the momentum buffer `buffer` when
+/// `MOMENTUM` (empty otherwise): the arithmetic of [`rms_reference`] per element.
+fn rms_chunk<T: Real, const WD: bool, const MOMENTUM: bool>(
+    c: &RmsStep,
+    values: &mut [T],
+    avg: &mut [T],
+    buffer: &mut [T],
+    grads: &[T],
+) -> ChunkStats {
+    let element = |p: &mut T, v: &mut T, b: Option<&mut T>, raw: f64| {
+        let x = p.to_f64();
+        let mut g = raw;
+        if WD {
+            g += c.wd * x;
+        }
+        let old_b = b.as_ref().map_or(0.0, |b| b.to_f64());
+        let (x, nv, nb) = rms_element(c, MOMENTUM, x, g, v.to_f64(), old_b);
+        *v = store_state(nv);
+        if let Some(b) = b {
+            *b = store_state(nb);
+        }
+        *p = T::from_f64(x);
+    };
+    if MOMENTUM {
+        sweep([values, avg, buffer], grads, |[p, v, b], raw| {
+            element(p, v, Some(b), raw)
+        })
+    } else {
+        sweep([values, avg], grads, |[p, v], raw| element(p, v, None, raw))
+    }
+}
+
+impl<T: Real> Optimizer<T> for RmsProp<T> {
+    fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats) {
+        self.update(params, stats, Path::current());
+    }
+
+    fn step(&mut self, params: &mut ParamStore<T>) {
+        let mut stats = std::mem::take(&mut self.stats);
+        self.step_with_stats(params, &mut stats);
+        self.stats = stats;
+    }
+
+    fn last_stats(&self) -> &GradStats {
+        &self.stats
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+}
+
+/// Adagrad (Duchi, Hazan and Singer, 2011) with PyTorch's `torch.optim.Adagrad` semantics:
+/// a running sum of squared gradients, `s ← s + g²`, divides each step,
+/// `p ← p − lr_t·g / (√s + eps)`, with weight decay added to the gradient as `wd·p` and the
+/// rate decayed per update, `lr_t = lr / (1 + (t − 1)·lr_decay)` for a parameter's update
+/// `t` (from 1; a step that skips the parameter does not count). The sum starts at
+/// `initial_accumulator`. Defaults as PyTorch's: no rate decay, no weight decay, a sum
+/// starting at 0, eps 1e-10.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{ParamStore, Tensor};
+/// use cavitation_nn::{Adagrad, Optimizer};
+/// let mut store = ParamStore::new();
+/// let p = store.add(Tensor::full(&[1], 1.0f32));
+/// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+/// Adagrad::new(0.1).step(&mut store);
+/// // s = 4, so the first step is 0.1·2 / 2 = 0.1.
+/// assert!((store.value(p).data()[0] - 0.9).abs() < 1e-6);
+/// ```
+#[derive(Clone, Debug)]
+pub struct Adagrad<T: Real = f32> {
+    /// The learning rate.
+    lr: f64,
+    /// The rate's decay per update.
+    lr_decay: f64,
+    /// The weight decay added to the gradient.
+    weight_decay: f64,
+    /// The value every sum starts at.
+    initial_accumulator: f64,
+    /// Added to the square root of the sum, outside the root.
+    eps: f64,
+    /// The updates each parameter has had so far, for its rate decay.
+    steps: Vec<u64>,
+    /// The sizes seen on the first step.
+    sizes: Sizes,
+    /// The sum of squared gradients of each parameter.
+    sums: Vec<Vec<T>>,
+    /// The statistics of the last `step`.
+    stats: GradStats,
+    /// One slot per chunk of a step, for the chunks' statistics.
+    partials: Vec<ChunkStats>,
+    /// The parameters of a chunked step, each with its decayed rate (empty between steps).
+    parts: Parts<T, f64, 2>,
+}
+
+impl<T: Real> Adagrad<T> {
+    /// Adagrad with learning rate `lr`, no rate decay, no weight decay, sums starting at 0
+    /// and eps 1e-10.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::Adagrad = cavitation_nn::Adagrad::new(0.01);
+    /// # let _ = opt;
+    /// ```
+    pub fn new(lr: f64) -> Adagrad<T> {
+        Adagrad {
+            lr,
+            lr_decay: 0.0,
+            weight_decay: 0.0,
+            initial_accumulator: 0.0,
+            eps: 1e-10,
+            steps: Vec::new(),
+            sizes: Sizes::default(),
+            sums: Vec::new(),
+            stats: GradStats::new(),
+            partials: Vec::new(),
+            parts: Parts::new(),
+        }
+    }
+
+    /// Sets the rate's decay per update.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::Adagrad = cavitation_nn::Adagrad::new(0.01).with_lr_decay(0.1);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_lr_decay(mut self, lr_decay: f64) -> Adagrad<T> {
+        self.lr_decay = lr_decay;
+        self
+    }
+
+    /// Sets the weight decay, added to the gradient as `wd·p`.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::Adagrad = cavitation_nn::Adagrad::new(0.01).with_weight_decay(1e-4);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_weight_decay(mut self, weight_decay: f64) -> Adagrad<T> {
+        self.weight_decay = weight_decay;
+        self
+    }
+
+    /// Sets the value every sum starts at (PyTorch's `initial_accumulator_value`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `value` is negative or not finite.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::Adagrad = cavitation_nn::Adagrad::new(0.01).with_initial_accumulator(0.1);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_initial_accumulator(mut self, value: f64) -> Adagrad<T> {
+        assert!(
+            value.is_finite() && value >= 0.0,
+            "Adagrad initial_accumulator must be finite and at least 0, got {value}"
+        );
+        self.initial_accumulator = value;
+        self
+    }
+
+    /// Sets the constant added to the square root of the sum.
+    ///
+    /// ```
+    /// let opt: cavitation_nn::Adagrad = cavitation_nn::Adagrad::new(0.01).with_eps(1e-8);
+    /// # let _ = opt;
+    /// ```
+    pub fn with_eps(mut self, eps: f64) -> Adagrad<T> {
+        self.eps = eps;
+        self
+    }
+
+    /// The sum of squared gradients of parameter `id`, or `None` until it has been updated
+    /// once. The ids are those of the store the optimiser steps.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Tensor};
+    /// use cavitation_nn::{Adagrad, Optimizer};
+    /// let mut store = ParamStore::new();
+    /// let p = store.add(Tensor::full(&[1], 1.0f32));
+    /// let mut opt = Adagrad::new(0.1);
+    /// assert!(opt.sum(p).is_none());
+    /// store.grads.accumulate(p).0.data_mut()[0] = 2.0;
+    /// opt.step(&mut store);
+    /// assert_eq!(opt.sum(p), Some(&[4.0f32][..]));
+    /// ```
+    pub fn sum(&self, id: ParamId) -> Option<&[T]> {
+        let k = id.position();
+        (*self.steps.get(k)? > 0).then(|| &self.sums[k][..])
+    }
+
+    /// One step on `path`: [`Optimizer::step_with_stats`] with the loops chosen explicitly.
+    fn update(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats, path: Path) {
+        if self.sizes.prepare("Adagrad", params) {
+            let start = store_state::<T>(self.initial_accumulator);
+            self.sums = self.sizes.lens.iter().map(|&n| vec![start; n]).collect();
+            self.steps = vec![0; self.sums.len()];
+            self.partials = vec![ChunkStats::default(); self.sizes.chunks()];
+        }
+        stats.reset(params.len());
+        let (wd, eps) = (self.weight_decay, self.eps);
+        // A step that panicked may have left parts behind.
+        self.parts.0.clear();
+        for (k, (id, value, grad)) in params.iter_mut().enumerate() {
+            let Some(grad) = grad else {
+                // No gradient since `zero_grad`: skipped, as PyTorch skips `grad is None`
+                // (in a chunked step, a part with no chunks).
+                match path {
+                    Path::Reference => stats.push(id, 0.0, true),
+                    Path::Chunked(_) => self.parts.push(id, [&mut [], &mut []], None, 0.0),
+                }
+                continue;
+            };
+            self.steps[k] += 1;
+            let rate = self.lr / (1.0 + (self.steps[k] - 1) as f64 * self.lr_decay);
+            let (values, sums) = (value.data_mut(), &mut self.sums[k][..]);
+            match path {
+                Path::Reference => {
+                    let (sum, finite) = adagrad_reference(rate, wd, eps, values, sums, grad.data());
+                    stats.push(id, sum, finite);
+                }
+                Path::Chunked(_) => self.parts.push(id, [values, sums], Some(grad.data()), rate),
+            }
+        }
+        let Path::Chunked(threads) = path else {
+            return;
+        };
+        let (list, parts) = (&mut self.parts, &mut self.partials);
+        if wd != 0.0 {
+            run_parts(threads, list, parts, stats, &|&rate, [p, s], g| {
+                adagrad_chunk::<T, true>(rate, wd, eps, p, s, g)
+            });
+        } else {
+            run_parts(threads, list, parts, stats, &|&rate, [p, s], g| {
+                adagrad_chunk::<T, false>(rate, wd, eps, p, s, g)
+            });
+        }
+    }
+}
+
+/// One element of Adagrad: from the value `p`, the gradient `g` (weight decay already
+/// added) and the old sum `s`, the new value and sum.
+#[inline(always)]
+fn adagrad_element(rate: f64, eps: f64, p: f64, g: f64, s: f64) -> (f64, f64) {
+    let s = s + g * g;
+    (p - rate * g / (s.sqrt() + eps), s)
+}
+
+/// The plain Adagrad loop over one parameter, element by element on the calling thread,
+/// at the parameter's decayed rate `rate`: the reference for [`adagrad_chunk`]. Returns the
+/// gradient's sum of squares and whether it was all finite.
+fn adagrad_reference<T: Real>(
+    rate: f64,
+    wd: f64,
+    eps: f64,
+    values: &mut [T],
+    sums: &mut [T],
+    grads: &[T],
+) -> (f64, bool) {
+    let (mut sum, mut finite) = (0.0f64, true);
+    for i in 0..values.len() {
+        let raw = grads[i].to_f64();
+        sum += raw * raw;
+        finite &= raw.is_finite();
+        let p = values[i].to_f64();
+        let mut g = raw;
+        if wd != 0.0 {
+            g += wd * p;
+        }
+        let (p, s) = adagrad_element(rate, eps, p, g, sums[i].to_f64());
+        sums[i] = store_state(s);
+        values[i] = T::from_f64(p);
+    }
+    (sum, finite)
+}
+
+/// One chunk of Adagrad, with weight decay when `WD`: the arithmetic of
+/// [`adagrad_reference`] per element.
+fn adagrad_chunk<T: Real, const WD: bool>(
+    rate: f64,
+    wd: f64,
+    eps: f64,
+    values: &mut [T],
+    sums: &mut [T],
+    grads: &[T],
+) -> ChunkStats {
+    sweep([values, sums], grads, |[value, s], raw| {
+        let p = value.to_f64();
+        let mut g = raw;
+        if WD {
+            g += wd * p;
+        }
+        let (p, ns) = adagrad_element(rate, eps, p, g, s.to_f64());
+        *s = store_state(ns);
+        *value = T::from_f64(p);
+    })
+}
+
+impl<T: Real> Optimizer<T> for Adagrad<T> {
+    fn step_with_stats(&mut self, params: &mut ParamStore<T>, stats: &mut GradStats) {
+        self.update(params, stats, Path::current());
+    }
+
+    fn step(&mut self, params: &mut ParamStore<T>) {
+        let mut stats = std::mem::take(&mut self.stats);
+        self.step_with_stats(params, &mut stats);
+        self.stats = stats;
+    }
+
+    fn last_stats(&self) -> &GradStats {
+        &self.stats
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_learning_rate(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+}
+
 /// Tests for the optimisers.
 #[cfg(test)]
 mod tests {
@@ -1579,19 +2202,54 @@ mod tests {
                 "adamw no decay",
                 Box::new(|| Either::Adam(AdamCore::new(0.01, 0.0), true)),
             ),
+            ("rmsprop", Box::new(|| Either::Rms(RmsProp::new(0.01)))),
+            (
+                "rmsprop wd",
+                Box::new(|| Either::Rms(RmsProp::new(0.01).with_weight_decay(0.01))),
+            ),
+            (
+                "rmsprop momentum",
+                Box::new(|| Either::Rms(RmsProp::new(0.01).with_momentum(0.9))),
+            ),
+            (
+                "rmsprop momentum wd",
+                Box::new(|| {
+                    Either::Rms(
+                        RmsProp::new(0.01)
+                            .with_momentum(0.9)
+                            .with_weight_decay(0.01),
+                    )
+                }),
+            ),
+            ("adagrad", Box::new(|| Either::Adagrad(Adagrad::new(0.1)))),
+            (
+                "adagrad decay wd start",
+                Box::new(|| {
+                    Either::Adagrad(
+                        Adagrad::new(0.1)
+                            .with_lr_decay(0.05)
+                            .with_weight_decay(0.01)
+                            .with_initial_accumulator(0.1),
+                    )
+                }),
+            ),
         ]
     }
 
     /// Builds a fresh optimiser for one of the chunked-update tests.
     type MakeOptimizer = Box<dyn Fn() -> Either>;
 
-    /// An SGD or an Adam core, so the tests can call either update with an explicit path and
+    /// An SGD, an Adam core, an RMSprop or an Adagrad, so the tests can call any update with an explicit path and
     /// read its state.
     enum Either {
         /// SGD.
         Sgd(Sgd),
         /// Adam (false) or AdamW (true).
         Adam(AdamCore<f32>, bool),
+        /// RMSprop.
+        Rms(RmsProp),
+        /// Adagrad.
+        Adagrad(Adagrad),
     }
 
     impl Either {
@@ -1600,6 +2258,8 @@ mod tests {
             match self {
                 Either::Sgd(o) => o.update(store, stats, path),
                 Either::Adam(o, decoupled) => o.step("Adam", *decoupled, store, stats, path),
+                Either::Rms(o) => o.update(store, stats, path),
+                Either::Adagrad(o) => o.update(store, stats, path),
             }
         }
 
@@ -1609,6 +2269,10 @@ mod tests {
             match self {
                 Either::Sgd(o) => o.buffers.get(k).map(bits).into_iter().collect(),
                 Either::Adam(o, _) => vec![bits(&o.m[k]), bits(&o.v[k])],
+                Either::Rms(o) => std::iter::once(bits(&o.square_avg[k]))
+                    .chain(o.buffers.get(k).map(bits))
+                    .collect(),
+                Either::Adagrad(o) => vec![bits(&o.sums[k])],
             }
         }
 
@@ -1622,6 +2286,8 @@ mod tests {
             match self {
                 Either::Sgd(o) => bits(&o.buffers),
                 Either::Adam(o, _) => [bits(&o.m), bits(&o.v)].concat(),
+                Either::Rms(o) => [bits(&o.square_avg), bits(&o.buffers)].concat(),
+                Either::Adagrad(o) => bits(&o.sums),
             }
         }
     }
@@ -1814,6 +2480,8 @@ mod tests {
                 let b_start = value_bits(&store, &[b]);
                 let mut opt = make();
                 let mut stats = GradStats::new();
+                // The state `b` starts with: zeros, or Adagrad's initial accumulator.
+                let mut b_state = None;
                 for step in 1..=3 {
                     store.zero_grad();
                     set_grad(&mut store, a, &sequence(40, 10 + step, &[]));
@@ -1823,8 +2491,12 @@ mod tests {
                         b_start,
                         "{at}, step {step}: value"
                     );
+                    let state = opt.state_of(1);
+                    let start = b_state.get_or_insert_with(|| state.clone());
                     assert!(
-                        opt.state_of(1).iter().flatten().all(|&x| x == 0),
+                        state == *start
+                            && (matches!(opt, Either::Adagrad(_))
+                                || state.iter().flatten().all(|&x| x == 0)),
                         "{at}, step {step}: b's state was written"
                     );
                     assert_eq!(stats.norm(b), 0.0, "{at}");
