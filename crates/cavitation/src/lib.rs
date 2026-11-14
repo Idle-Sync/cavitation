@@ -211,9 +211,9 @@ pub mod prelude {
         LogSoftmax, Loss, LrSchedule, Mish, ModelHandle, NeuronMask, OnNonFinite, Optimizer,
         OptimizerConfig, Prelu, Relu, Relu6, RmsProp, Selu, Sequential, Sgd, Sigmoid, Silu,
         Softmax, Softplus, Softsign, Standardizer, StepControl, StepInfo, StepInputs, StepLog,
-        StepProfile, StepRecord, Tanh, Targets, TargetsView, Trace, Trainer, TrainerHandle,
-        Warning, WarningKind, accuracy, evaluate, fit, fit_controlled, fit_with_hooks, load,
-        load_lenient, load_with, save,
+        StepProfile, StepRecord, Tanh, Targets, TargetsView, TensorInfo, Trace, Trainer,
+        TrainerHandle, Warning, WarningKind, accuracy, evaluate, fit, fit_controlled,
+        fit_with_hooks, inspect_file, load, load_lenient, load_with, save,
     };
 }
 

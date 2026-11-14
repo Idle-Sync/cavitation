@@ -10,7 +10,9 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use cavitation_core::kernels::activation::{sigmoid_f32_with, tanh_f32_with};
+use cavitation_core::kernels::activation::{
+    gelu_tanh_f32_with, sigmoid_f32_with, silu_f32_with, tanh_f32_with,
+};
 use cavitation_core::kernels::gemm::{gemm_f32_with, threads_used};
 use cavitation_core::kernels::{Level, MatMut, MatRef};
 use cavitation_core::{ParamStore, Rng, Tensor};
@@ -1340,10 +1342,11 @@ pub struct ActivationCase {
     pub run: SliceFn,
 }
 
-/// The `activation` run's cases: `tanh` and the sigmoid, each as the plain scalar loop the
-/// library ran before the SIMD kernels (std's `f32::tanh`; the overflow-free
-/// `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`), then through the kernels at
-/// every level in `levels`.
+/// The `activation` run's cases: `tanh`, the sigmoid, SiLU and the tanh form of GELU, each
+/// as the plain scalar loop the library ran before the SIMD kernels (std's `f32::tanh`; the
+/// overflow-free `1 / (1 + e^-x)` or `e^x / (1 + e^x)` with std's `f32::exp`; `x` times
+/// that sigmoid; GELU's formula with std's `f32::tanh`), then through the kernels at every
+/// level in `levels`.
 pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
     let mut cases = vec![ActivationCase {
         name: "tanh scalar std".to_string(),
@@ -1376,6 +1379,41 @@ pub fn activation_cases(levels: &[Level]) -> Vec<ActivationCase> {
         cases.push(ActivationCase {
             name: format!("sigmoid {level}"),
             run: Box::new(move |v: &mut [f32]| sigmoid_f32_with(level, v)),
+        });
+    }
+    cases.push(ActivationCase {
+        name: "silu scalar std".to_string(),
+        run: Box::new(|v: &mut [f32]| {
+            for x in v {
+                let s = if *x >= 0.0 {
+                    1.0 / (1.0 + (-*x).exp())
+                } else {
+                    let e = x.exp();
+                    e / (1.0 + e)
+                };
+                *x *= s;
+            }
+        }),
+    });
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("silu {level}"),
+            run: Box::new(move |v: &mut [f32]| silu_f32_with(level, v)),
+        });
+    }
+    cases.push(ActivationCase {
+        name: "gelu-tanh scalar std".to_string(),
+        run: Box::new(|v: &mut [f32]| {
+            for x in v {
+                let u = 0.797_884_6f32 * (*x + 0.044715 * *x * *x * *x);
+                *x = 0.5 * *x * (1.0 + u.tanh());
+            }
+        }),
+    });
+    for &level in levels {
+        cases.push(ActivationCase {
+            name: format!("gelu-tanh {level}"),
+            run: Box::new(move |v: &mut [f32]| gelu_tanh_f32_with(level, v)),
         });
     }
     cases
