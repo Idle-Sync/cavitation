@@ -549,7 +549,8 @@ pub struct TensorInfo {
 }
 
 /// Every tensor in the safetensors file at `path`, with its name, element type and shape,
-/// in the order their data is stored in the file. Nothing is converted and no model is
+/// in the order their data is stored in the file (tensors with no elements, which take no
+/// room, by name among those at the same place). Nothing is converted and no model is
 /// needed, so this shows what a file holds when a [`load`] fails: a key named differently,
 /// a shape the model does not have, an element type it cannot read.
 ///
@@ -591,20 +592,22 @@ pub fn inspect_file(path: impl AsRef<Path>) -> Result<Vec<TensorInfo>, Error> {
     })?;
     check_not_torch_save(path, &bytes)?;
     let (_, metadata) = SafeTensors::read_metadata(&bytes).map_err(|e| convert(path, e))?;
-    Ok(metadata
-        .offset_keys()
+    let mut tensors: Vec<(usize, TensorInfo)> = metadata
+        .tensors()
         .into_iter()
-        .map(|name| {
-            let info = metadata
-                .info(&name)
-                .expect("offset_keys lists the header's own keys");
-            TensorInfo {
-                dtype: format!("{:?}", info.dtype),
+        .map(|(name, info)| {
+            let tensor = TensorInfo {
+                dtype: info.dtype.to_string(),
                 shape: info.shape.clone(),
                 name,
-            }
+            };
+            (info.data_offsets.0, tensor)
         })
-        .collect())
+        .collect();
+    // Tensors with no elements share an offset with their neighbour; the name breaks the
+    // tie so that the order never depends on the header's hash order.
+    tensors.sort_by(|(a, x), (b, y)| a.cmp(b).then_with(|| x.name.cmp(&y.name)));
+    Ok(tensors.into_iter().map(|(_, tensor)| tensor).collect())
 }
 
 /// The little-endian values in `bytes`, of element type `dtype` (F32, F16, BF16 or F64), as
@@ -1821,6 +1824,34 @@ mod tests {
                 "{file}"
             );
         }
+    }
+
+    /// The order is the data's, not the names': safetensors stores the 8-byte `F64`
+    /// tensor `z` before the `F32` tensor `a`, and an empty tensor sorts by name among the
+    /// tensors at its offset.
+    #[test]
+    fn inspect_file_keeps_data_order() {
+        let path = temp_path("inspect-order");
+        let (f32_bytes, f64_bytes) = (vec![0u8; 8], vec![0u8; 16]);
+        let views = vec![
+            (
+                "a",
+                TensorView::new(Dtype::F32, vec![2], &f32_bytes).unwrap(),
+            ),
+            (
+                "z",
+                TensorView::new(Dtype::F64, vec![2], &f64_bytes).unwrap(),
+            ),
+            ("m", TensorView::new(Dtype::F32, vec![0], &[]).unwrap()),
+        ];
+        serialize_to_file(views, None, &path).unwrap();
+        let tensors = inspect_file(&path).unwrap();
+        let got: Vec<(&str, &str)> = tensors
+            .iter()
+            .map(|t| (t.name.as_str(), t.dtype.as_str()))
+            .collect();
+        assert_eq!(got, [("z", "F64"), ("a", "F32"), ("m", "F32")]);
+        std::fs::remove_file(&path).ok();
     }
 
     /// A missing file is an `Io` error naming it; a `torch.save` zip and a truncated file
