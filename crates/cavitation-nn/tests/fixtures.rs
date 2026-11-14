@@ -455,6 +455,9 @@ fn optimizer_for(v: &Value) -> Box<dyn Optimizer<f32>> {
             if let Some(w) = wd {
                 o = o.with_weight_decay(w);
             }
+            if let Some(c) = p["centered"].as_bool() {
+                o = o.with_centered(c);
+            }
             Box::new(o)
         }
         "Adagrad" => {
@@ -500,7 +503,7 @@ fn check_optimizers(at: Level) {
         .map(|e| e.expect("entry").path())
         .collect();
     names.sort();
-    assert_eq!(names.len(), 11, "expected eleven optimiser fixtures");
+    assert_eq!(names.len(), 13, "expected thirteen optimiser fixtures");
     for path in names {
         let case = format!("{} at {at}", path.file_stem().unwrap().to_string_lossy());
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
