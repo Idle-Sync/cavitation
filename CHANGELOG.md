@@ -10,12 +10,14 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Tensors and autograd (`cavitation-core`)
 
+- `Tensor::into_vec` gives up a tensor and returns its elements without copying them, so a tensor can grow in place through `from_vec`.
 - When the thread pool cannot start a worker thread, it frees the memory it had set aside for that worker instead of keeping it for the rest of the process.
 - `kernels::Level::ALL` lists every kernel level, in the order of their numbers, supported on this CPU or not (a slice, so a later level can be added without changing its type).
 - `Tape::glu`, `softmax` and `log_softmax` on an input whose last axis has width 0, and `softmax_cross_entropy` and `nll` with no classes, now mark a parameter's gradient current in the backward pass, as every other operation does; it was left stale.
 
 ### Layers, training and inference (`cavitation-nn`)
 
+- `Dataset::extend` appends another data set's rows and targets after the existing ones without copying those, so collecting data in rounds costs time in proportion to the rows added. It panics, leaving the data unchanged, when the feature counts, the target kinds or the output counts differ.
 - `load`, `load_lenient` and `load_with` read `F16`, `BF16` and `F64` safetensors files as well as `F32` ones: half precision widens to `F32` exactly (subnormals, infinities and NaN payloads included), and `F64` rounds to the nearest `F32`, as PyTorch's `.float()` does, with a finite value beyond the `F32` range refused as `Error::Format` naming its key. Checked bit for bit against state dicts written by PyTorch in each type. `save` still writes `F32`.
 - `StepLog`, a `StepControl` for `fit_controlled` that keeps one `StepRecord` per training step: its number, epoch, loss, rows and wall-clock seconds, and with `StepLog::with_update_times` the optimiser's update time from the step's profile (every step after the first recorded one is then profiled). `reserve` sizes its list once. A run without it is unchanged. Both are in the `cavitation` prelude.
 - `shrink::ablate` (and `ablate_with`, `ablate_controlled`) runs the layers before each swept `Linear` once, keeping that `Linear`'s input for every row, and then only the layers from the `Linear` on for each of its neurons; the results are bit-identical. Sweeping the second hidden `Linear` of a 64 → 256 → 256 → 10 network over 1,000 rows: 2.67–2.78 s before, 2.22 s after (one thread pinned to one core, on an Intel Celeron N5105 at kernel level `sse4.2`). The gain grows with the share of the work before the swept layer; the first `Linear`'s input is the data, so its sweep is unchanged. The kept input takes `rows × width` values for the swept layer's input width.

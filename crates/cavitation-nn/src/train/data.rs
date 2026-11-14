@@ -183,6 +183,97 @@ impl<T: Real> Dataset<T> {
         Dataset { x, targets }
     }
 
+    /// Appends the rows of `more`, with their targets, after the rows already here.
+    ///
+    /// The existing rows are not copied: the storage grows the way a `Vec` does, so
+    /// adding rows in rounds costs time in proportion to the rows added, not to the size
+    /// of the whole data set. `more` may have no rows.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the shapes, if `x` or value targets of either data set are not
+    /// matrices, if the targets of either do not have one entry per row, if the feature
+    /// counts differ, if one has class targets and the other value targets, or if the
+    /// value targets have different output counts. Nothing is appended when it panics.
+    ///
+    /// ```
+    /// use cavitation_core::Tensor;
+    /// use cavitation_nn::{Dataset, Targets};
+    /// let mut data = Dataset {
+    ///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[2, 2]).unwrap(),
+    ///     targets: Targets::Classes(vec![0, 1]),
+    /// };
+    /// let round = Dataset {
+    ///     x: Tensor::from_vec(vec![4.0f32, 5.0], &[1, 2]).unwrap(),
+    ///     targets: Targets::Classes(vec![1]),
+    /// };
+    /// data.extend(&round);
+    /// assert_eq!(data.len(), 3);
+    /// assert_eq!(data.x.data(), &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
+    /// assert_eq!(data.targets, Targets::Classes(vec![0, 1, 1]));
+    /// ```
+    pub fn extend(&mut self, more: &Dataset<T>) {
+        let (n, features) = self.matrix_dims();
+        let (added, more_features) = more.matrix_dims();
+        assert_eq!(
+            features, more_features,
+            "Dataset::extend: the data has {features} features, the rows to add {more_features}"
+        );
+        let own_outputs = self.target_outputs("the data", n);
+        let more_outputs = more.target_outputs("the rows to add", added);
+        match (own_outputs, more_outputs) {
+            (Some(a), Some(b)) => assert_eq!(
+                a, b,
+                "Dataset::extend: the data has {a} target outputs, the rows to add {b}"
+            ),
+            (None, None) => {}
+            _ => panic!(
+                "Dataset::extend: one of the data sets has class targets and the other value \
+                 targets"
+            ),
+        }
+        self.x = grow(
+            std::mem::replace(&mut self.x, Tensor::zeros_generic(&[0])),
+            more.x.data(),
+            &[n + added, features],
+        );
+        match (&mut self.targets, &more.targets) {
+            (Targets::Classes(labels), Targets::Classes(new)) => labels.extend_from_slice(new),
+            (Targets::Values(t), Targets::Values(new)) => {
+                let outputs = own_outputs.expect("value targets have an output count");
+                *t = grow(
+                    std::mem::replace(t, Tensor::zeros_generic(&[0])),
+                    new.data(),
+                    &[n + added, outputs],
+                );
+            }
+            _ => unreachable!("the target kinds were checked to match"),
+        }
+    }
+
+    /// The output count of value targets (`None` for class targets), after checking that
+    /// the targets have one entry per row of the `rows` rows; `who` names the data set in
+    /// the panic message.
+    fn target_outputs(&self, who: &str, rows: usize) -> Option<usize> {
+        match &self.targets {
+            Targets::Classes(labels) => {
+                assert_eq!(
+                    labels.len(),
+                    rows,
+                    "Dataset::extend: {who} has {rows} rows but {} labels",
+                    labels.len()
+                );
+                None
+            }
+            Targets::Values(t) => match t.shape().dims() {
+                &[r, outputs] if r == rows => Some(outputs),
+                dims => panic!(
+                    "Dataset::extend: {who} has {rows} rows but value targets of shape {dims:?}"
+                ),
+            },
+        }
+    }
+
     /// The `(rows, features)` of `x`, panicking if it is not a matrix.
     fn matrix_dims(&self) -> (usize, usize) {
         match self.x.shape().dims() {
@@ -190,6 +281,13 @@ impl<T: Real> Dataset<T> {
             dims => panic!("Dataset: x must have shape [rows, features], found {dims:?}"),
         }
     }
+}
+
+/// `t` with `more` appended to its elements, reshaped to `shape`, reusing `t`'s storage.
+fn grow<T: Real>(t: Tensor<T>, more: &[T], shape: &[usize]) -> Tensor<T> {
+    let mut data = t.into_vec();
+    data.extend_from_slice(more);
+    Tensor::from_vec(data, shape).expect("whole rows were appended, so the shape fits")
 }
 
 /// A batch's worth of targets, borrowed from a [`Batch`].
@@ -618,6 +716,109 @@ pub(super) mod tests {
             middle.targets,
             Targets::Values(Tensor::from_vec(vec![20.0, 30.0, 40.0, 50.0], &[2, 2]).unwrap())
         );
+    }
+
+    /// `extend` keeps the existing rows and appends the new ones with their targets, class
+    /// or value, in rounds; adding no rows, or adding to no rows, works too; and the
+    /// result equals the data set built in one piece.
+    #[test]
+    fn extend_appends_rows_and_targets() {
+        let whole = classes_dataset(25);
+        let mut grown = whole.subset(0..0);
+        for start in (0..25).step_by(10) {
+            grown.extend(&whole.subset(start..(start + 10).min(25)));
+        }
+        grown.extend(&whole.subset(25..25));
+        assert_eq!(grown, whole);
+
+        let values = |rows: Range<usize>| Dataset {
+            x: Tensor::from_vec(
+                rows.clone().flat_map(|i| [i as f64, -(i as f64)]).collect(),
+                &[rows.len(), 2],
+            )
+            .unwrap(),
+            targets: Targets::Values(
+                Tensor::from_vec(
+                    rows.clone().flat_map(|i| [i as f64 * 10.0; 3]).collect(),
+                    &[rows.len(), 3],
+                )
+                .unwrap(),
+            ),
+        };
+        let mut data = values(0..4);
+        data.extend(&values(4..7));
+        assert_eq!(data, values(0..7));
+    }
+
+    /// Adding rows reuses the storage the data already has instead of copying it, once
+    /// there is room.
+    #[test]
+    fn extend_reuses_the_storage() {
+        let mut x = Vec::with_capacity(3 * 104);
+        x.extend_from_slice(classes_dataset(4).x.data());
+        let before = x.as_ptr();
+        let mut data = Dataset {
+            x: Tensor::from_vec(x, &[4, 3]).unwrap(),
+            targets: Targets::Classes(vec![0; 4]),
+        };
+        data.extend(&classes_dataset(100));
+        assert_eq!(data.x.data().as_ptr(), before);
+        assert_eq!(data.len(), 104);
+    }
+
+    /// Mismatched data sets panic, naming what differs, and leave the data unchanged.
+    #[test]
+    fn extend_rejects_mismatches() {
+        let set = |x: &[usize], targets: Targets<f32>| Dataset {
+            x: Tensor::zeros(x),
+            targets,
+        };
+        let values = |dims: &[usize]| Targets::Values(Tensor::zeros(dims));
+        let classes = |n: usize| Targets::Classes(vec![0; n]);
+        let cases = [
+            (
+                classes_dataset(3),
+                set(&[1, 2], classes(1)),
+                "the data has 3 features, the rows to add 2",
+            ),
+            (
+                classes_dataset(3),
+                set(&[1, 3], values(&[1, 1])),
+                "one of the data sets has class targets and the other value targets",
+            ),
+            (
+                classes_dataset(3),
+                set(&[2, 3], classes(1)),
+                "the rows to add has 2 rows but 1 labels",
+            ),
+            (
+                set(&[1, 3], values(&[1, 2])),
+                set(&[1, 3], values(&[1, 1])),
+                "the data has 2 target outputs, the rows to add 1",
+            ),
+            (
+                set(&[2, 3], values(&[1, 2])),
+                set(&[1, 3], values(&[1, 2])),
+                "the data has 2 rows but value targets of shape [1, 2]",
+            ),
+            (
+                set(&[3], classes(3)),
+                set(&[1, 3], classes(1)),
+                "x must have shape [rows, features], found [3]",
+            ),
+        ];
+        for (base, more, message) in cases {
+            let mut data = base.clone();
+            let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| data.extend(&more)))
+                .unwrap_err();
+            let text = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(text.contains(message), "{text:?} lacks {message:?}");
+            assert_eq!(data, base);
+        }
     }
 
     /// Splitting past the row count panics naming both.
