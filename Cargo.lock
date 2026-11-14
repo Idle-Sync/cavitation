@@ -31,6 +31,7 @@ version = "0.2.0"
 dependencies = [
  "cavitation-core",
  "cavitation-datasets",
+ "cavitation-inspect",
  "cavitation-nn",
 ]
 

@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|inspect|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -41,9 +41,31 @@
 //!   on one test digit for the full network, the full network with the first run's masks,
 //!   and the first run's network compacted: 20,000 warm-up calls each, then 301 interleaved
 //!   rounds of 1,000 calls of each, and prints the medians and the speed-ups.
+//! - `inspect [--rounds N]` (default 8, a multiple of 4) measures what the inspector costs
+//!   on the `digits` training (the 50k network, SGD lr 0.01, batch 128, 100 epochs per run,
+//!   timed around the `fit` call) with the 360 test digits as the probe set and the default
+//!   `eval_rows` and `snapshot_hz`. It first trains, untimed, for at least 30 s in every mode
+//!   in turn, past the package power-limit window, so every round runs at the same power
+//!   limit. Each round runs four modes, starting one mode later every round: off
+//!   (`cavitation_nn::fit`), off again (the A/A pair), on with one client reading `/events`
+//!   on its own thread, and on with one client connected and not reading (both
+//!   `cavitation_inspect::fit`). It prints every round's times and ratios (off's time over
+//!   the mode's: 1 is no cost, 0.98 is 2% slower), the median ratios, the off/off spread (the
+//!   median over rounds of `|1 − off / off again|`: how far a typical round strays from 1,
+//!   the machine's noise) and whether each passes.
 //!
 //! The baseline is run with `python3` from `PATH`; `--python <path>` or the
-//! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy).
+//! `CAVITATION_BENCH_PYTHON` variable names another interpreter (it needs numpy). Both sides
+//! of a training comparison time the same steps (see [`runs::TRAIN_TIMED_STEPS`]). The
+//! baseline reports the BLAS numpy runs on (library, version, OpenBLAS core, threads), which
+//! is printed beside numpy's numbers.
+//!
+//! With `--numpy-best` (on `mnist`, `cifar`, `digits`, `latency` and `all`), numpy is also
+//! timed at one BLAS thread, and, when OpenBLAS runs kernels older than the CPU can (an
+//! SSE4.2 CPU on `Katmai`, say), at the newest core the CPU's features allow (`Nehalem` for
+//! SSE4.2, `Sandybridge` for AVX, `Haswell` for AVX2 with FMA) with the default thread count
+//! and with one thread; each setting goes to the child as environment variables. The
+//! comparison quotes the fastest setting, with the default one beside it.
 
 mod machine;
 mod numpy;
@@ -57,16 +79,17 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|info> [options]\n\
-    \x20 mnist   [--batch 32|128] [--adam] [--python PATH]\n\
-    \x20 cifar   [--batch 32|128] [--steps N] [--python PATH]\n\
-    \x20 digits  [--python PATH]\n\
-    \x20 latency [--python PATH]\n\
-    \x20 all     [--python PATH]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|subnormal|small|shrink|inspect|info> [options]\n\
+    \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
+    \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
+    \x20 digits  [--python PATH] [--numpy-best]\n\
+    \x20 latency [--python PATH] [--numpy-best]\n\
+    \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 shrink\n\
+    \x20 inspect [--rounds N]\n\
     \x20 info";
 
 /// Entry point of the benchmark runner.
@@ -85,6 +108,7 @@ fn main() -> ExitCode {
         "gemm" => gemm(rest),
         "subnormal" => subnormal(rest),
         "small" => small(rest),
+        "inspect" => inspect(rest),
         "shrink" => {
             if rest.is_empty() {
                 shrink()
@@ -98,9 +122,9 @@ fn main() -> ExitCode {
                 info();
             }
             for run in plan(command, &o)? {
-                rows.push(execute(run, &o.python)?);
+                rows.push(execute(run, &o)?);
             }
-            report(&rows)
+            report(&rows, o.numpy_best)
         }),
         _ => Err(format!("unknown command `{command}`")),
     };
@@ -134,6 +158,9 @@ struct Options {
     steps: Option<usize>,
     /// The Python interpreter that runs the baseline.
     python: String,
+    /// `--numpy-best`: also time numpy at the other BLAS settings and compare against the
+    /// fastest.
+    numpy_best: bool,
 }
 
 impl Options {
@@ -149,6 +176,7 @@ impl Options {
             adam: false,
             steps: None,
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
+            numpy_best: false,
         };
         let mut rest = args.iter();
         while let Some(arg) = rest.next() {
@@ -169,6 +197,7 @@ impl Options {
                         })?);
                 }
                 "--adam" => o.adam = true,
+                "--numpy-best" => o.numpy_best = true,
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
                 other => return Err(format!("unknown argument `{other}`")),
             }
@@ -250,25 +279,26 @@ fn plan(command: &str, o: &Options) -> Result<Vec<Run>, String> {
 }
 
 /// Runs one comparison.
-fn execute(run: Run, python: &str) -> Result<Comparison, String> {
+fn execute(run: Run, o: &Options) -> Result<Comparison, String> {
     match run {
         Run::Train(spec) => {
             eprintln!("{}: cavitation, then numpy", spec.name);
-            runs::compare_training(&spec, python)
+            runs::compare_training(&spec, &o.python, o.numpy_best)
         }
         Run::Latency => {
             eprintln!("latency: cavitation, then numpy");
-            runs::compare_latency(python)
+            runs::compare_latency(&o.python, o.numpy_best)
         }
     }
 }
 
 /// Prints the table of cavitation against numpy and writes `target/bench/results.json`.
+/// With `numpy_best`, numpy's column is its fastest setting and the default one is beside it.
 ///
 /// # Errors
 ///
 /// Returns a message if the results file cannot be written.
-fn report(rows: &[Comparison]) -> Result<(), String> {
+fn report(rows: &[Comparison], numpy_best: bool) -> Result<(), String> {
     let load = machine::load_average();
     println!(
         "kernel {}, {} threads, load average at the end {load}",
@@ -277,32 +307,70 @@ fn report(rows: &[Comparison]) -> Result<(), String> {
     );
     if let Some(first) = rows.first() {
         println!(
-            "numpy {}, BLAS threads: {}",
-            first.numpy_version, first.blas_threads
+            "numpy {}; BLAS at numpy's default settings: {}",
+            first.numpy_version, first.blas_default
         );
     }
-    println!(
-        "{:<28} {:>12} {:>12} {:>10}  unit",
-        "run", "cavitation", "numpy", "ratio"
-    );
-    for row in rows {
+    if numpy_best {
         println!(
-            "{:<28} {:>12.2} {:>12.2} {:>9.2}x  {}",
-            row.name,
-            row.value(runs::median(&row.ours)),
-            row.value(runs::median(&row.numpy)),
-            row.ratio(),
-            row.unit_label()
+            "{:<28} {:>12} {:>12} {:>9} {:>14} {:>9}  unit",
+            "run", "cavitation", "numpy best", "ratio", "numpy default", "ratio"
+        );
+        for row in rows {
+            println!(
+                "{:<28} {:>12.2} {:>12.2} {:>8.2}x {:>14.2} {:>8.2}x  {}",
+                row.name,
+                row.value(runs::median(&row.ours)),
+                row.value(runs::median(&row.numpy)),
+                row.ratio(),
+                row.value(runs::median(&row.numpy_default)),
+                row.default_ratio(),
+                row.unit_label()
+            );
+        }
+        println!(
+            "ratio = numpy time over cavitation time; medians of the timed epochs or rounds; \
+             numpy best = the fastest numpy setting tried."
+        );
+        for row in rows {
+            println!(
+                "{}: numpy best at {} (BLAS: {}); tried: {}",
+                row.name,
+                row.numpy_setting,
+                row.blas,
+                row.tried_summary()
+            );
+        }
+    } else {
+        println!(
+            "{:<28} {:>12} {:>12} {:>10}  unit",
+            "run", "cavitation", "numpy", "ratio"
+        );
+        for row in rows {
+            println!(
+                "{:<28} {:>12.2} {:>12.2} {:>9.2}x  {}",
+                row.name,
+                row.value(runs::median(&row.ours)),
+                row.value(runs::median(&row.numpy)),
+                row.ratio(),
+                row.unit_label()
+            );
+        }
+        println!(
+            "ratio = numpy time over cavitation time; medians of the timed epochs or rounds; \
+             numpy at its default settings (--numpy-best also tries others)."
         );
     }
-    println!("ratio = numpy time over cavitation time; medians of the timed epochs or rounds.");
     for row in rows {
         println!("{}: {}; {}", row.name, row.detail, row.timing_note);
     }
     for row in rows.iter().filter(|r| !r.health.is_empty()) {
-        println!("{}: {}", row.name, row.health);
+        let numpy = row
+            .numpy_warnings
+            .map_or(String::new(), |n| format!("; numpy's checks: {n} warnings"));
+        println!("{}: {}{numpy}", row.name, row.health);
     }
-    write_results(rows, &load)
+    write_results(rows, &load, numpy_best)
 }
 
 /// The JSON text of a list of numbers.
@@ -316,7 +384,7 @@ fn json_list(values: &[f64]) -> String {
 /// # Errors
 ///
 /// Returns a message if the directory or file cannot be written.
-fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
+fn write_results(rows: &[Comparison], load: &str, numpy_best: bool) -> Result<(), String> {
     let machine = machine::detect();
     let escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let runs: Vec<String> = rows
@@ -325,7 +393,9 @@ fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
             format!(
                 "    {{\"name\": \"{}\", \"detail\": \"{}\", \"health\": \"{}\", \"timing\": \"{}\", \"unit\": \"{}\", \
                  \"cavitation\": {:e}, \"numpy\": {:e}, \"ratio\": {:e},\n     \
-                 \"cavitation_seconds\": {}, \"numpy_seconds\": {}}}",
+                 \"numpy_setting\": \"{}\", \"blas\": \"{}\", \"numpy_default\": {:e}, \"default_ratio\": {:e},\n     \
+                 \"numpy_tried\": \"{}\",\n     \
+                 \"cavitation_seconds\": {}, \"numpy_seconds\": {}, \"numpy_default_seconds\": {}}}",
                 escape(&r.name),
                 escape(&r.detail),
                 escape(&r.health),
@@ -334,21 +404,27 @@ fn write_results(rows: &[Comparison], load: &str) -> Result<(), String> {
                 r.value(runs::median(&r.ours)),
                 r.value(runs::median(&r.numpy)),
                 r.ratio(),
+                escape(&r.numpy_setting),
+                escape(&r.blas),
+                r.value(runs::median(&r.numpy_default)),
+                r.default_ratio(),
+                escape(&r.tried_summary()),
                 json_list(&r.ours),
-                json_list(&r.numpy)
+                json_list(&r.numpy),
+                json_list(&r.numpy_default)
             )
         })
         .collect();
     let text = format!(
         "{{\n  \"cpu\": \"{}\",\n  \"logical_cores\": {},\n  \"kernel\": \"{}\",\n  \
-         \"threads\": {},\n  \"rustc\": \"{}\",\n  \"numpy_version\": \"{}\",\n  \"blas_threads\": \"{}\",\n  \"load_average\": \"{}\",\n  \"runs\": [\n{}\n  ]\n}}\n",
+         \"threads\": {},\n  \"rustc\": \"{}\",\n  \"numpy_version\": \"{}\",\n  \"blas_default\": \"{}\",\n  \"numpy_best\": {numpy_best},\n  \"load_average\": \"{}\",\n  \"runs\": [\n{}\n  ]\n}}\n",
         escape(&machine.cpu_model),
         machine.logical_cores,
         level(),
         threads(),
         escape(&machine::rustc_version()),
         escape(rows.first().map_or("", |r| &r.numpy_version)),
-        escape(rows.first().map_or("", |r| &r.blas_threads)),
+        escape(rows.first().map_or("", |r| &r.blas_default)),
         load,
         runs.join(",\n")
     );
@@ -570,6 +646,188 @@ fn parse_small_line(line: &str) -> Option<runs::SmallRun> {
         }),
         _ => None,
     }
+}
+
+/// Runs the `inspect` subcommand with its arguments (after `inspect`): the four modes in
+/// rotating order for the rounds asked, then the medians and the criteria.
+///
+/// # Errors
+///
+/// Returns a message for an unknown argument, a `--rounds` that is not a positive multiple
+/// of 4, a run that fails, or runs that ended on different losses.
+fn inspect(args: &[String]) -> Result<(), String> {
+    use runs::InspectMode;
+    let mut rounds = runs::INSPECT_ROUNDS;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--rounds" => {
+                let v = rest.next().ok_or("--rounds needs a value")?;
+                rounds = v
+                    .parse()
+                    .ok()
+                    .filter(|&n: &usize| n > 0 && n % 4 == 0)
+                    .ok_or_else(|| {
+                        format!(
+                            "--rounds must be a positive multiple of 4, so every mode runs in \
+                             every position equally often; got `{v}`"
+                        )
+                    })?;
+            }
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+    }
+    let whole = std::time::Instant::now();
+    let cpu_start = machine::process_cpu_seconds();
+    let machine = machine::detect();
+    println!(
+        "inspect: {} ({} logical cores), kernel {}, {} threads, {}",
+        machine.cpu_model,
+        machine.logical_cores,
+        level(),
+        threads(),
+        machine::rustc_version()
+    );
+    println!("load average at the start {}", machine::load_average());
+    let data = runs::inspect_data()?;
+    println!(
+        "training: the digits benchmark, {} network (ReLU, He normal from seed 1), SGD lr 0.01, \
+         batch 128, {} rows in order, Health::quiet(), {} epochs per run, timed around fit",
+        runs::DIGITS_NET.map(|w| w.to_string()).join(","),
+        data.train.len(),
+        runs::INSPECT_EPOCHS
+    );
+    println!(
+        "inspector: probe set the {} test digits, eval_rows {} ({} used), snapshot_hz {}, \
+         a new inspector and client for each run, connected before the clock starts",
+        data.test.len(),
+        cavitation_inspect::InspectorConfig::default().eval_rows,
+        cavitation_inspect::InspectorConfig::default()
+            .eval_rows
+            .min(data.test.len()),
+        cavitation_inspect::InspectorConfig::default().snapshot_hz
+    );
+    let warm = std::time::Instant::now();
+    let mut warm_runs = 0;
+    while warm.elapsed() < runs::INSPECT_WARMUP || warm_runs < InspectMode::ALL.len() {
+        let mode = InspectMode::ALL[warm_runs % InspectMode::ALL.len()];
+        runs::inspect_once(mode, &data, runs::INSPECT_EPOCHS)?;
+        warm_runs += 1;
+    }
+    println!(
+        "warm-up: {warm_runs} untimed runs, the modes in turn, {:.1} s (at least {} s, past the \
+         power-limit window)",
+        warm.elapsed().as_secs_f64(),
+        runs::INSPECT_WARMUP.as_secs()
+    );
+    let samples = (data.train.len() * runs::INSPECT_EPOCHS) as f64;
+    let mut seconds = [const { Vec::new() }; 4];
+    let mut loss_bits = None;
+    let timed = std::time::Instant::now();
+    for round in 0..rounds {
+        let order: Vec<InspectMode> = (0..4).map(|k| InspectMode::ALL[(round + k) % 4]).collect();
+        let mut parts = Vec::new();
+        let mut notes = Vec::new();
+        for &mode in &order {
+            let run = runs::inspect_once(mode, &data, runs::INSPECT_EPOCHS)?;
+            if *loss_bits.get_or_insert(run.loss_bits) != run.loss_bits {
+                return Err(format!(
+                    "round {}: {} ended on another loss",
+                    round + 1,
+                    mode.name()
+                ));
+            }
+            seconds[mode as usize].push(run.seconds);
+            parts.push(format!(
+                "{} {:.4} s ({:.0} samples/s)",
+                mode.name(),
+                run.seconds,
+                samples / run.seconds
+            ));
+            if mode.inspected() {
+                notes.push(format!(
+                    "{}: {} snapshots, {} client at the end",
+                    mode.name(),
+                    run.snapshots,
+                    run.clients_at_end
+                ));
+            }
+        }
+        let off = seconds[0][round];
+        let ratios: Vec<String> = InspectMode::ALL[1..]
+            .iter()
+            .map(|&m| format!("{} {:.4}", m.name(), off / seconds[m as usize][round]))
+            .collect();
+        println!("round {}: {}", round + 1, parts.join(", "));
+        println!(
+            "  ratio to off: {}; {}",
+            ratios.join(", "),
+            notes.join("; ")
+        );
+    }
+    let timed_seconds = timed.elapsed().as_secs_f64();
+    let ratio = |m: InspectMode| -> Vec<f64> {
+        seconds[0]
+            .iter()
+            .zip(&seconds[m as usize])
+            .map(|(off, t)| off / t)
+            .collect()
+    };
+    println!("ratio = off's time over the mode's time in the same round (below 1 is slower)");
+    for mode in InspectMode::ALL {
+        let t = &seconds[mode as usize];
+        println!(
+            "median {}: {:.4} s ({:.0} samples/s)",
+            mode.name(),
+            runs::median(t),
+            samples / runs::median(t)
+        );
+    }
+    let aa = ratio(InspectMode::OffAgain);
+    let spread = runs::aa_spread(&aa);
+    let (lo, hi) = aa
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &r| {
+            (lo.min(r), hi.max(r))
+        });
+    println!(
+        "off / off again: median ratio {:.4}; spread (median over rounds of |1 - ratio|) \
+         {:.2}%; rounds {lo:.4} to {hi:.4}",
+        runs::median(&aa),
+        spread * 100.0
+    );
+    let verdict = |ok: bool| if ok { "met" } else { "not met" };
+    let mut worst = f64::INFINITY;
+    for mode in [InspectMode::Reading, InspectMode::Connected] {
+        let r = ratio(mode);
+        let m = runs::median(&r);
+        worst = worst.min(m);
+        let (lo, hi) = r
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &x| {
+                (lo.min(x), hi.max(x))
+            });
+        println!(
+            "{}: median ratio {m:.4} ({:+.2}% time; rounds {lo:.4} to {hi:.4}); at least 0.98: {}",
+            mode.name(),
+            (1.0 / m - 1.0) * 100.0,
+            verdict(m >= 0.98)
+        );
+    }
+    println!("off/off spread at most 1%: {}", verdict(spread <= 0.01));
+    println!(
+        "worse \"on\" mode: median ratio {worst:.4}, {:.2}% slower than off",
+        (1.0 - worst) * 100.0
+    );
+    println!(
+        "rounds {timed_seconds:.1} s; whole run {:.1} s",
+        whole.elapsed().as_secs_f64()
+    );
+    if let (Some(a), Some(b)) = (cpu_start, machine::process_cpu_seconds()) {
+        println!("cpu time of this process {:.1} s", b - a);
+    }
+    println!("load average at the end {}", machine::load_average());
+    Ok(())
 }
 
 /// The hidden neurons of the digits network: 256 + 128.
@@ -878,5 +1136,20 @@ mod tests {
         );
         assert_eq!(specs("mnist", &["--batch", "32"]).unwrap()[0].batch, 32);
         assert!(specs("all", &[]).unwrap().iter().all(|s| s.data != "cifar"));
+    }
+
+    /// `--numpy-best` is off unless given, and parses on every compared command.
+    #[test]
+    fn numpy_best_option_parses() {
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            Options::parse(&args).unwrap()
+        };
+        assert!(!parse(&[]).numpy_best);
+        let o = parse(&["--numpy-best", "--python", "py"]);
+        assert!(o.numpy_best && o.python == "py");
+        for command in ["mnist", "cifar", "digits", "latency", "all"] {
+            assert!(plan(command, &o).is_ok());
+        }
     }
 }

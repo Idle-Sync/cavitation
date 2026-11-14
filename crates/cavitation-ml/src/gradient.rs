@@ -157,7 +157,10 @@ impl LinearRegression {
     /// problem has many minimisers, and gradient descent finds one of them), and if
     /// `config.batch` is 0. During training, with `config.health.on_non_finite` set to
     /// [`OnNonFinite::Stop`](cavitation_nn::OnNonFinite) (the default), [`Error::NonFinite`]
-    /// at the first step whose loss or gradient is NaN or infinite.
+    /// at the first step whose loss or gradient is NaN or infinite; with
+    /// [`OnNonFinite::Skip`](cavitation_nn::OnNonFinite::Skip) such a step is left out
+    /// instead, as [`fit`](cavitation_nn::fit) leaves it out, and an epoch in which every
+    /// step was left out ends the fit with [`Error::NonFinite`] naming the epoch.
     ///
     /// # Examples
     ///
@@ -287,7 +290,10 @@ pub(crate) struct Setup {
 /// `config.optimizer` in batches of `config.batch` rows, minimising per step the mean of
 /// `setup.loss` over the batch plus `setup.penalty · ‖W‖²`, with the [`HealthMonitor`]
 /// checks of `config.health` on every step. Returns the network, its parameters and each
-/// epoch's report (the row-weighted mean of the step losses, penalty included).
+/// epoch's report (the row-weighted mean of the step losses, penalty included). A step left
+/// out under [`OnNonFinite::Skip`](cavitation_nn::OnNonFinite::Skip) changes nothing and
+/// counts toward neither the mean nor the report's rows, as in [`fit`](cavitation_nn::fit);
+/// an epoch in which every step was left out is the monitor's `end_epoch` error.
 ///
 /// `data`'s targets must suit `setup.loss`: values for [`StepLoss::Mse`] and
 /// [`StepLoss::BceWithLogits`] (`[rows, outputs]`), class labels below `setup.outputs` for
@@ -346,12 +352,13 @@ pub(crate) fn train(
         let start = Instant::now();
         batcher.epoch();
         let mut total = 0.0f64;
+        let mut trained = 0usize;
         for range in batcher.batches() {
             step += 1;
-            let batch_rows = range.len() as f64;
+            let batch_rows = range.len();
             let order = &batcher.order()[range.clone()];
             let view = batcher.gather(data, range.clone(), &mut batch);
-            let checked = {
+            let (value, checked) = {
                 let mut tape = graph.tape(&params.values);
                 let x = tape.input(view.x);
                 let out = model.forward_traced(&mut tape, x, &mut trace);
@@ -377,30 +384,39 @@ pub(crate) fn train(
                     loss = tape.add(loss, term);
                 }
                 let value = tape.value(loss).data()[0];
-                total += f64::from(value) * batch_rows;
                 tape.backward(loss, &mut params.grads);
                 let inputs = StepInputs {
                     x: view.x,
                     targets: view.targets,
                     rows: Some(order),
                 };
-                monitor.after_backward(step, value, &tape, &trace, &model, inputs)
+                let checked = monitor.after_backward(step, value, &tape, &trace, &model, inputs);
+                (value, checked)
             };
+            // `Ok(false)`: `OnNonFinite::Skip` left this step out.
             let checked = checked.and_then(|()| {
+                if !monitor.before_update(step, value, &params, &names) {
+                    return Ok(false);
+                }
                 optimizer.step(&mut params);
-                monitor.after_update(step, optimizer.last_stats(), &names)
+                monitor
+                    .after_update(step, optimizer.last_stats(), &names)
+                    .map(|()| true)
             });
             params.zero_grad();
             if !setup.fit_intercept {
                 params.value_mut(bias).data_mut().fill(0.0);
             }
-            checked?;
+            if checked? {
+                total += f64::from(value) * batch_rows as f64;
+                trained += batch_rows;
+            }
         }
         monitor.end_epoch(epoch)?;
         history.epochs.push(EpochReport {
             epoch,
-            mean_loss: total / rows as f64,
-            rows,
+            mean_loss: total / trained as f64,
+            rows: trained,
             seconds: start.elapsed().as_secs_f64(),
         });
     }
@@ -416,7 +432,7 @@ mod tests {
     //! is tested in `tests/gradient_path.rs`.
 
     use cavitation_core::{Rng, Tensor};
-    use cavitation_nn::{Health, Targets};
+    use cavitation_nn::{Health, OnNonFinite, Targets};
 
     use super::*;
 
@@ -440,6 +456,40 @@ mod tests {
             health: Health::quiet(),
             ..GradientConfig::default()
         }
+    }
+
+    /// Targets of ±1e20 overflow every step's squared error to infinity: `Stop` ends the fit
+    /// with `Error::NonFinite` at step 1, and `Skip` leaves every step of the first epoch out
+    /// and then ends the fit with `Error::NonFinite` naming that epoch. (A finite loss with a
+    /// NaN gradient goes through the same `before_update` call; the `cavitation-nn` tests
+    /// cover it.)
+    #[test]
+    fn skip_ends_a_fit_whose_whole_epoch_was_left_out() {
+        let mut d = data(20);
+        let Targets::Values(y) = &mut d.targets else {
+            unreachable!("value targets")
+        };
+        for (i, v) in y.data_mut().iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 1e20 } else { -1e20 };
+        }
+        let r = LinearRegression::default();
+        let err = r.fit_gradient(&d, quiet()).unwrap_err();
+        assert!(matches!(err, Error::NonFinite { .. }), "{err:?}");
+        let skip = GradientConfig {
+            epochs: 3,
+            health: Health {
+                on_non_finite: OnNonFinite::Skip,
+                ..Health::quiet()
+            },
+            ..GradientConfig::default()
+        };
+        let err = r.fit_gradient(&d, skip).unwrap_err();
+        // The default is full batch: one step per epoch.
+        assert!(
+            matches!(&err, Error::NonFinite { step: 1, location, .. } if location == "epoch 1"),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("every step of epoch 1"), "{err}");
     }
 
     /// Without an intercept the bias stays exactly 0, and the weights match the exact path.

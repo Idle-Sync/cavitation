@@ -66,7 +66,10 @@ static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 /// use cavitation_nn::{Dataset, Loss, Targets};
 /// let held_out = Dataset { x: Tensor::zeros(&[300, 4]), targets: Targets::Classes(vec![0; 300]) };
 /// let config = ExploreConfig {
-///     train: Some(Dataset { x: Tensor::zeros(&[100, 4]), targets: Targets::Classes(vec![0; 100]) }),
+///     train: Some(Dataset {
+///         x: Tensor::zeros(&[100, 4]),
+///         targets: Targets::Classes(vec![0; 100]),
+///     }),
 ///     shrink: Some(Box::new(move || ShrinkConfig {
 ///         validation: Some(Validation::Given(held_out.clone())),
 ///         ..ShrinkConfig::default()

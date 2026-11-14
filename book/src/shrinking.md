@@ -69,6 +69,8 @@ No single neuron is worth more than three validation rows, and 318 of the 384 ch
 
 Each step removes, from each hidden layer, neurons up to the next level: 10%, 20%, … 70% of the layer's width, then 75%, 80%, … 95%, where the cliff usually is and finer steps pay. Within a layer it removes first the neurons that never fire on the training rows, then those with the smallest outgoing weights (the norm of the neuron's column in the next layer's weight: a neuron the next layer barely listens to). Then it retrains for 3 epochs with a fresh Adam at 1e-3 and measures the network on the validation set. The ranking is computed again at every step, on the network as the last retraining left it.
 
+A removed neuron takes its average output with it: the next layer loses not only what the neuron says about each row but the constant it adds on average, and the retraining has to make that up. With `ShrinkConfig { fold_means: true, .. }` each removed neuron's mean output on the training rows is added into the next layer's bias before retraining (`b[i] += W[i, j] · mean_j`), measured on the network with the earlier layers of the step already shrunk. For a neuron whose output never changes the fold is exact, and the network's outputs stay as they were. It is off by default; it is for runs that retrain little or not at all, where nothing else makes up the lost average.
+
 A step *meets* the criterion when its validation accuracy is no more than 1 point below the unpruned network's. The run keeps the latest step that met it, not the step before the first miss, because on a few hundred rows one unlucky row can dip below the line and a later step recover; it ends after two misses in a row or at the last level. With fewer validation rows than the threshold can resolve (one row worth more than half a point here, so fewer than 200 rows), `ShrinkReport::warnings` says so.
 
 This is the curve of that run, with the test accuracy of every step's network beside it, from `cavitation-bench shrink` (run 2, `ShrinkConfig::default()`), measured on an Intel Celeron N5105 (4 cores) at kernel level `sse4.2`:
@@ -133,6 +135,14 @@ and the ticket is the final masks on those weights:
 ```rust,ignore
 {{#include ../../crates/cavitation/examples/shrink_digits.rs:lottery}}
 ```
+
+The second needs no starting point saved. `shrink::train_found_size` takes the pruned network as `shrink` left it, builds the network `compact` would make of it with every weight started again (here as the example's `network` starts them: He uniform weights, zero biases, seed 1), trains it with the `FitConfig` you give, and measures both networks on the rows you give, with the recipe's loss:
+
+```rust,ignore
+{{#include ../../crates/cavitation/examples/shrink_digits.rs:scratch}}
+```
+
+`found.pruned` and `found.scratch` are the two networks' `Evaluation`s, and `found.model` and `found.params` the fresh network, trained. Measure on rows neither network was chosen or trained on, the test digits here: the size was picked on the validation rows, which flatter the pruned network.
 
 Measured on an Intel Celeron N5105 (4 cores) at kernel level `sse4.2`, rustc 1.99.1, with `cargo run --release --example shrink_digits -p cavitation -- --ablate --lottery` (the accuracies are the same on every run there):
 

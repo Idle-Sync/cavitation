@@ -258,7 +258,9 @@ pub trait Layer<T: Real>: Send + Sync {
     /// let mut params = ParamStore::new();
     /// let layer = Linear::new(&mut params, 4, 2, &mut Rng::seed(0));
     /// match Layer::<f32>::inference(&layer, &params.values) {
-    ///     Some(InferenceLayer::Linear { inputs, outputs, .. }) => assert_eq!((inputs, outputs), (4, 2)),
+    ///     Some(InferenceLayer::Linear { inputs, outputs, .. }) => {
+    ///         assert_eq!((inputs, outputs), (4, 2))
+    ///     }
     ///     _ => unreachable!(),
     /// }
     /// ```
