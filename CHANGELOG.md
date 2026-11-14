@@ -55,6 +55,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- A synthetic steering data set, `cavitation_datasets::steering`: `generate(n, seed)` gives seeded 1 × 32 × 32 grey images of a road edge leaning up to 30° either way, with the angle in degrees as the target, and `network` and `recipe` give a small CNN and its training recipe. The `steering_cnn` example trains it and prints the test mean absolute error each epoch (0.80° after 8 epochs, measured on an Intel Celeron N5105), and a known-result test requires it below 1.5°.
 - `cavitation-bench conv [--batch N]` times the four convolutions of the CIFAR-10 CNN benchmark network, forward and forward with backward, at the current kernel level and thread count; `scripts/bench/torch_conv.py` times the same in PyTorch.
 - The inspector's `epoch` event carries the run's validation (`EpochReport::validation`: loss, and accuracy or R²) as `validation`, `null` without a validation set, and the page shows it under the accuracy and loss beside the probe evaluation.
 - The digits known result's network, training recipe and training-row count live in `cavitation_datasets::digits` (`network`, `recipe`, `FIT_ROWS`), which the known-result tests, the `shrink_digits` example and `cavitation-bench shrink` all use, instead of three copies that nothing checked against each other. The trained network and every figure are unchanged.
