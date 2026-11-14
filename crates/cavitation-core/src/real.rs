@@ -265,6 +265,72 @@ pub trait Real:
     /// assert_eq!(v, [0.0, 10.0]);
     /// ```
     fn gelu_tanh_in_place(values: &mut [Self]);
+    /// Replaces every value `x` with softplus at `beta` and `threshold`, as
+    /// [`Tape::softplus`](crate::Tape::softplus) defines it: `x` where `beta · x` is above
+    /// `threshold`, `ln(1 + e^(beta·x)) / beta` elsewhere. For f32 this is
+    /// [`kernels::activation::softplus_beta_f32`](crate::kernels::activation::softplus_beta_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f64, 30.0];
+    /// f64::softplus_in_place(&mut v, 1.0, 20.0);
+    /// assert_eq!(v, [std::f64::consts::LN_2, 30.0]);
+    /// ```
+    fn softplus_in_place(values: &mut [Self], beta: Self, threshold: Self);
+    /// Replaces every value `x` with log-sigmoid, `ln σ(x) = min(x, 0) − ln(1 + e^(−|x|))`,
+    /// which for f32 is
+    /// [`kernels::activation::log_sigmoid_f32`](crate::kernels::activation::log_sigmoid_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [-1000.0f64, 1000.0];
+    /// f64::log_sigmoid_in_place(&mut v);
+    /// assert_eq!(v, [-1000.0, 0.0]);
+    /// ```
+    fn log_sigmoid_in_place(values: &mut [Self]);
+    /// Replaces every value `x` with Mish, `x · tanh(softplus(x))` with softplus at `beta` 1
+    /// and threshold 20, which for f32 is
+    /// [`kernels::activation::mish_f32`](crate::kernels::activation::mish_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f64, 100.0];
+    /// f64::mish_in_place(&mut v);
+    /// assert_eq!(v, [0.0, 100.0]);
+    /// ```
+    fn mish_in_place(values: &mut [Self]);
+    /// Replaces every value `x` with ELU: `x` above 0, `alpha · (e^x − 1)` at or below, which
+    /// for f32 is [`kernels::activation::elu_f32`](crate::kernels::activation::elu_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [2.0f64, -1e-10];
+    /// f64::elu_in_place(&mut v, 1.0);
+    /// assert_eq!(v[0], 2.0);
+    /// assert!((v[1] + 1e-10).abs() < 1e-20);
+    /// ```
+    fn elu_in_place(values: &mut [Self], alpha: Self);
+    /// Replaces every value `x` with SELU, `scale · elu(x, alpha)` with PyTorch's constants,
+    /// which for f32 is [`kernels::activation::selu_f32`](crate::kernels::activation::selu_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [0.0f64, 1.0];
+    /// f64::selu_in_place(&mut v);
+    /// assert_eq!(v, [0.0, 1.0507009873554805]);
+    /// ```
+    fn selu_in_place(values: &mut [Self]);
+    /// Replaces every value `x` with CELU: `x` above 0, `alpha · (e^(x/alpha) − 1)` at or
+    /// below, which for f32 is
+    /// [`kernels::activation::celu_f32`](crate::kernels::activation::celu_f32).
+    ///
+    /// ```
+    /// use cavitation_core::Real;
+    /// let mut v = [2.0f64, 0.0];
+    /// f64::celu_in_place(&mut v, 1.0);
+    /// assert_eq!(v, [2.0, 0.0]);
+    /// ```
+    fn celu_in_place(values: &mut [Self], alpha: Self);
 }
 
 #[cfg(test)]
@@ -275,7 +341,8 @@ thread_local! {
 
 /// Implements `Real` for a primitive float type by forwarding to its inherent methods.
 macro_rules! impl_real {
-    ($t:ident, $erf:path, $gemm:path, $tanh:path, $sigmoid:path, $silu:path, $gelu_tanh:path) => {
+    ($t:ident, $erf:path, $gemm:path, $tanh:path, $sigmoid:path, $silu:path, $gelu_tanh:path,
+     $softplus:path, $log_sigmoid:path, $mish:path, $elu:path, $selu:path, $celu:path) => {
         impl Real for $t {
             const ZERO: Self = 0.0;
             const ONE: Self = 1.0;
@@ -340,6 +407,24 @@ macro_rules! impl_real {
             fn gelu_tanh_in_place(values: &mut [Self]) {
                 $gelu_tanh(values);
             }
+            fn softplus_in_place(values: &mut [Self], beta: Self, threshold: Self) {
+                $softplus(beta, threshold, values);
+            }
+            fn log_sigmoid_in_place(values: &mut [Self]) {
+                $log_sigmoid(values);
+            }
+            fn mish_in_place(values: &mut [Self]) {
+                $mish(values);
+            }
+            fn elu_in_place(values: &mut [Self], alpha: Self) {
+                $elu(alpha, values);
+            }
+            fn selu_in_place(values: &mut [Self]) {
+                $selu(values);
+            }
+            fn celu_in_place(values: &mut [Self], alpha: Self) {
+                $celu(alpha, values);
+            }
         }
     };
 }
@@ -351,7 +436,13 @@ impl_real!(
     crate::kernels::activation::tanh_f32,
     crate::kernels::activation::sigmoid_f32,
     crate::kernels::activation::silu_f32,
-    crate::kernels::activation::gelu_tanh_f32
+    crate::kernels::activation::gelu_tanh_f32,
+    crate::kernels::activation::softplus_beta_f32,
+    crate::kernels::activation::log_sigmoid_f32,
+    crate::kernels::activation::mish_f32,
+    crate::kernels::activation::elu_f32,
+    crate::kernels::activation::selu_f32,
+    crate::kernels::activation::celu_f32
 );
 impl_real!(
     f64,
@@ -360,7 +451,13 @@ impl_real!(
     tanh_each,
     sigmoid_each,
     silu_each,
-    gelu_tanh_each
+    gelu_tanh_each,
+    softplus_each,
+    log_sigmoid_each,
+    mish_each,
+    elu_each,
+    selu_each,
+    celu_each
 );
 
 /// [`Real::tanh`] on each value: the f64 `tanh_in_place`.
@@ -388,6 +485,48 @@ fn silu_each(values: &mut [f64]) {
 fn gelu_tanh_each(values: &mut [f64]) {
     for v in values {
         *v = crate::ops::gelu_value(*v, crate::GeluApprox::Tanh);
+    }
+}
+
+/// Softplus at `beta` and `threshold` on each value: the f64 `softplus_in_place`.
+fn softplus_each(beta: f64, threshold: f64, values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::softplus_value(*v, beta, threshold);
+    }
+}
+
+/// Log-sigmoid on each value: the f64 `log_sigmoid_in_place`.
+fn log_sigmoid_each(values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::log_sigmoid_value(*v);
+    }
+}
+
+/// Mish on each value: the f64 `mish_in_place`.
+fn mish_each(values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::mish_value(*v);
+    }
+}
+
+/// ELU at `alpha` on each value: the f64 `elu_in_place`.
+fn elu_each(alpha: f64, values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::elu_value(*v, alpha);
+    }
+}
+
+/// SELU on each value: the f64 `selu_in_place`.
+fn selu_each(values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::SELU_SCALE * crate::ops::elu_value(*v, crate::ops::SELU_ALPHA);
+    }
+}
+
+/// CELU at `alpha` on each value: the f64 `celu_in_place`.
+fn celu_each(alpha: f64, values: &mut [f64]) {
+    for v in values {
+        *v = crate::ops::celu_value(*v, alpha);
     }
 }
 

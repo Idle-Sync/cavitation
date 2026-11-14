@@ -79,7 +79,7 @@ The activations that take a parameter default to PyTorch's values, so `LeakyRelu
 
 `Prelu` names its slopes `weight`, as PyTorch does, so a PyTorch `state_dict` with PReLU slopes loads into it.
 
-The formulas match; the last bits of a value need not. In f32, `Tanh` and `Sigmoid` run SIMD kernels whose results are within 3 ulp of the correctly rounded value, a relative error of at most about 3.6e-7. PyTorch's CPU kernels make their own approximations, so a transferred network's outputs agree to rounding, not bit for bit.
+The formulas match; the last bits of a value need not. In f32, `Tanh` and `Sigmoid` run SIMD kernels whose results are within 3 ulp of the correctly rounded value, a relative error of at most about 3.6e-7, and `Silu`, `Gelu` (tanh form), `Softplus`, `LogSigmoid`, `Mish`, `Elu`, `Selu` and `Celu` are built on the same kernels, each within the bound its kernel's docs in `cavitation_core::kernels::activation` state (13 ulp for Mish, the loosest). PyTorch's CPU kernels make their own approximations, so a transferred network's outputs agree to rounding, not bit for bit.
 
 ## Where Cavitation differs on purpose
 

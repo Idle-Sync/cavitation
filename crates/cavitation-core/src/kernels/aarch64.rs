@@ -11,7 +11,8 @@ use std::arch::aarch64::{
 
 use super::MatRef;
 use super::activation::{
-    EXP_MIN, EXP_P, EXPM1_MIN, Func, LN2_HI, LN2_LO, LOG_P, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
+    EXP_MIN, EXP_P, EXPM1_MIN, EXPM1_TINY, Func, LN2_HI, LN2_LO, LOG_P, LOG2E, SIGN, TANH_Q,
+    TANH_SMALL, split,
 };
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
 use super::matvec::Job;
@@ -352,6 +353,8 @@ fn softplus_neon(x: float32x4_t) -> float32x4_t {
 fn elu_neon(alpha: float32x4_t, x: float32x4_t) -> float32x4_t {
     let zero = vdupq_n_f32(0.0);
     let neg = vmulq_f32(alpha, expm1_neg_neon(vminq_f32(x, zero)));
+    let tiny = vcltq_f32(vabsq_f32(x), vdupq_n_f32(EXPM1_TINY));
+    let neg = vbslq_f32(tiny, vmulq_f32(alpha, x), neg);
     let r = vbslq_f32(vcgtq_f32(x, zero), x, neg);
     vbslq_f32(vceqq_f32(x, x), r, x)
 }

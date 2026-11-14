@@ -20,7 +20,8 @@ use std::arch::x86_64::{
 
 use super::MatRef;
 use super::activation::{
-    EXP_MIN, EXP_P, EXPM1_MIN, Func, LN2_HI, LN2_LO, LOG_P, LOG2E, SIGN, TANH_Q, TANH_SMALL, split,
+    EXP_MIN, EXP_P, EXPM1_MIN, EXPM1_TINY, Func, LN2_HI, LN2_LO, LOG_P, LOG2E, SIGN, TANH_Q,
+    TANH_SMALL, split,
 };
 use super::gemm::{Dest, Kernel, pack_a, pack_b};
 use super::matvec::Job;
@@ -707,6 +708,9 @@ fn softplus_sse(x: __m128) -> __m128 {
 #[target_feature(enable = "sse4.2")]
 fn elu_sse(alpha: __m128, x: __m128) -> __m128 {
     let neg = _mm_mul_ps(alpha, expm1_neg_sse(_mm_min_ps(x, _mm_setzero_ps())));
+    let sign = _mm_castsi128_ps(_mm_set1_epi32(SIGN as i32));
+    let tiny = _mm_cmplt_ps(_mm_andnot_ps(sign, x), _mm_set1_ps(EXPM1_TINY));
+    let neg = _mm_blendv_ps(neg, _mm_mul_ps(alpha, x), tiny);
     let r = _mm_blendv_ps(neg, x, _mm_cmpgt_ps(x, _mm_setzero_ps()));
     _mm_blendv_ps(r, x, _mm_cmpunord_ps(x, x))
 }
@@ -896,6 +900,9 @@ fn softplus_avx2(x: __m256) -> __m256 {
 fn elu_avx2(alpha: __m256, x: __m256) -> __m256 {
     let zero = _mm256_setzero_ps();
     let neg = _mm256_mul_ps(alpha, expm1_neg_avx2(_mm256_min_ps(x, zero)));
+    let sign = _mm256_castsi256_ps(_mm256_set1_epi32(SIGN as i32));
+    let tiny = _mm256_cmp_ps::<_CMP_LT_OQ>(_mm256_andnot_ps(sign, x), _mm256_set1_ps(EXPM1_TINY));
+    let neg = _mm256_blendv_ps(neg, _mm256_mul_ps(alpha, x), tiny);
     let r = _mm256_blendv_ps(neg, x, _mm256_cmp_ps::<_CMP_GT_OQ>(x, zero));
     _mm256_blendv_ps(r, x, _mm256_cmp_ps::<_CMP_UNORD_Q>(x, x))
 }

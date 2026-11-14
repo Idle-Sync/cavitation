@@ -71,9 +71,9 @@ pub(super) fn silu_derivative<T: Real>(x: T) -> T {
 }
 
 /// SELU's scale, `1.0507009873554804934...`.
-const SELU_SCALE: f64 = 1.050_700_987_355_480_5;
+pub(crate) const SELU_SCALE: f64 = 1.050_700_987_355_480_5;
 /// SELU's alpha, `1.6732632423543772848...`.
-const SELU_ALPHA: f64 = 1.673_263_242_354_377_2;
+pub(crate) const SELU_ALPHA: f64 = 1.673_263_242_354_377_2;
 
 /// NaN of the element type.
 fn nan<T: Real>() -> T {
@@ -82,13 +82,13 @@ fn nan<T: Real>() -> T {
 
 /// ELU: `x` above 0, `alpha · (eˣ - 1)` elsewhere, with `eˣ - 1` from `exp_m1` so tiny
 /// negative inputs keep their precision and `-0.0` keeps its sign.
-fn elu_value<T: Real>(x: T, alpha: T) -> T {
+pub(crate) fn elu_value<T: Real>(x: T, alpha: T) -> T {
     if x > T::ZERO { x } else { alpha * x.exp_m1() }
 }
 
 /// CELU: `x` above 0, `alpha · (e^(x/alpha) - 1)` elsewhere, with the difference from
 /// `exp_m1`.
-fn celu_value<T: Real>(x: T, alpha: T) -> T {
+pub(crate) fn celu_value<T: Real>(x: T, alpha: T) -> T {
     if x > T::ZERO {
         x
     } else {
@@ -97,7 +97,7 @@ fn celu_value<T: Real>(x: T, alpha: T) -> T {
 }
 
 /// Softplus `ln(1 + e^(beta·x)) / beta`, or `x` itself once `beta·x` passes `threshold`.
-fn softplus_value<T: Real>(x: T, beta: T, threshold: T) -> T {
+pub(crate) fn softplus_value<T: Real>(x: T, beta: T, threshold: T) -> T {
     let z = beta * x;
     if z > threshold {
         x
@@ -117,7 +117,7 @@ fn softplus_derivative<T: Real>(x: T, beta: T, threshold: T) -> T {
 }
 
 /// Mish `x · tanh(softplus(x))`, with softplus at PyTorch's defaults (beta 1, threshold 20).
-fn mish_value<T: Real>(x: T) -> T {
+pub(crate) fn mish_value<T: Real>(x: T) -> T {
     x * softplus_value(x, T::ONE, T::from_f64(20.0)).tanh()
 }
 
@@ -190,7 +190,7 @@ fn hardswish_derivative<T: Real>(x: T) -> T {
 }
 
 /// `log σ(x) = min(x, 0) - ln(1 + e^-|x|)`, which never overflows.
-fn log_sigmoid_value<T: Real>(x: T) -> T {
+pub(crate) fn log_sigmoid_value<T: Real>(x: T) -> T {
     x.min(T::ZERO) - (-x.abs()).exp().ln_1p()
 }
 
@@ -353,6 +353,9 @@ impl<T: Real> Tape<'_, T> {
     /// is 1. The derivative is 1 for `x > 0` and `alpha · eˣ` elsewhere (so `alpha` at exactly 0).
     /// The backward pass recomputes `eˣ` from the input: reading it off the output as `y + alpha`
     /// would cancel most digits for large negative `x`.
+    /// In f32 the value runs the SIMD kernel of the current level
+    /// ([`kernels::activation::elu_f32`](crate::kernels::activation::elu_f32), with its bound);
+    /// the derivative uses std's `exp`.
     ///
     /// # Panics
     ///
@@ -369,12 +372,14 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[-0.63212055, 2.0]);
     /// ```
     pub fn elu(&mut self, x: Var, alpha: T) -> Var {
-        self.map(Op::Elu(x, alpha.to_f64()), x, |v| elu_value(v, alpha))
+        self.map_slice(Op::Elu(x, alpha.to_f64()), x, |v| T::elu_in_place(v, alpha))
     }
 
     /// Records SELU: `scale · elu(x, alpha)` with `scale = 1.0507009873554805` and
     /// `alpha = 1.6732632423543772`, the constants PyTorch uses. The derivative is `scale` for
     /// `x > 0` and `scale · alpha · eˣ` elsewhere, computed from the input.
+    /// In f32 the value runs the ELU's SIMD kernel of the current level
+    /// ([`kernels::activation::selu_f32`](crate::kernels::activation::selu_f32)).
     ///
     /// # Panics
     ///
@@ -391,13 +396,13 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0, 1.050701]);
     /// ```
     pub fn selu(&mut self, x: Var) -> Var {
-        self.map(Op::Selu(x), x, |v| {
-            T::from_f64(SELU_SCALE) * elu_value(v, T::from_f64(SELU_ALPHA))
-        })
+        self.map_slice(Op::Selu(x), x, T::selu_in_place)
     }
 
     /// Records CELU: `max(0, x) + min(0, alpha · (e^(x/alpha) - 1))`. PyTorch's default `alpha`
     /// is 1. The derivative is 1 for `x > 0` and `e^(x/alpha)` elsewhere.
+    /// In f32 the value runs the ELU's SIMD kernel of the current level for a positive
+    /// `alpha` ([`kernels::activation::celu_f32`](crate::kernels::activation::celu_f32)).
     ///
     /// # Panics
     ///
@@ -415,7 +420,9 @@ impl<T: Real> Tape<'_, T> {
     /// ```
     pub fn celu(&mut self, x: Var, alpha: T) -> Var {
         assert!(alpha != T::ZERO, "celu: alpha must not be 0");
-        self.map(Op::Celu(x, alpha.to_f64()), x, |v| celu_value(v, alpha))
+        self.map_slice(Op::Celu(x, alpha.to_f64()), x, |v| {
+            T::celu_in_place(v, alpha)
+        })
     }
 
     /// Records SiLU (Swish): `x · σ(x)`. The derivative is `σ(x) · (1 + x · (1 - σ(x)))`.
@@ -443,6 +450,9 @@ impl<T: Real> Tape<'_, T> {
 
     /// Records Mish: `x · tanh(softplus(x))`, with softplus at PyTorch's defaults (`beta` 1,
     /// threshold 20). The derivative is `tanh(sp) + x · σ(x) · (1 - tanh²(sp))`.
+    /// In f32 the value runs the softplus and tanh SIMD kernels of the current level
+    /// ([`kernels::activation::mish_f32`](crate::kernels::activation::mish_f32), with its
+    /// bound); the derivative uses the scalar forms.
     ///
     /// # Panics
     ///
@@ -459,12 +469,15 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[0.0, 100.0]);
     /// ```
     pub fn mish(&mut self, x: Var) -> Var {
-        self.map(Op::Mish(x), x, mish_value)
+        self.map_slice(Op::Mish(x), x, T::mish_in_place)
     }
 
     /// Records softplus: `ln(1 + e^(beta·x)) / beta` where `beta · x <= threshold`, and `x` itself
     /// above, which is exact and avoids overflow. PyTorch's defaults are `beta = 1` and
     /// `threshold = 20`. The derivative is `σ(beta · x)`, and 1 above the threshold.
+    /// In f32 the value runs the softplus SIMD kernel of the current level
+    /// ([`kernels::activation::softplus_beta_f32`](crate::kernels::activation::softplus_beta_f32));
+    /// the derivative uses the scalar sigmoid.
     ///
     /// # Panics
     ///
@@ -482,7 +495,7 @@ impl<T: Real> Tape<'_, T> {
     /// ```
     pub fn softplus(&mut self, x: Var, beta: T, threshold: T) -> Var {
         let op = Op::Softplus(x, beta.to_f64(), threshold.to_f64());
-        self.map(op, x, |v| softplus_value(v, beta, threshold))
+        self.map_slice(op, x, |v| T::softplus_in_place(v, beta, threshold))
     }
 
     /// Records softsign: `x / (1 + |x|)`. The derivative is `1 / (1 + |x|)²`.
@@ -596,6 +609,8 @@ impl<T: Real> Tape<'_, T> {
 
     /// Records log-sigmoid: `log σ(x)`, computed as `min(x, 0) - ln(1 + e^-|x|)` so it never
     /// overflows: `log_sigmoid(-1000)` is exactly -1000. The derivative is `σ(-x)`.
+    /// In f32 the value runs the softplus SIMD kernel of the current level
+    /// ([`kernels::activation::log_sigmoid_f32`](crate::kernels::activation::log_sigmoid_f32)).
     ///
     /// # Panics
     ///
@@ -612,7 +627,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(tape.value(y).data(), &[-1000.0, 0.0]);
     /// ```
     pub fn log_sigmoid(&mut self, x: Var) -> Var {
-        self.map(Op::LogSigmoid(x), x, log_sigmoid_value)
+        self.map_slice(Op::LogSigmoid(x), x, T::log_sigmoid_in_place)
     }
 
     /// Records PReLU: `x` where `x > 0`, `slope · x` elsewhere. `slope` has shape `[1]` (one
