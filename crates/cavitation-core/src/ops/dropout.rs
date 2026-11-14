@@ -18,8 +18,9 @@ fn check_p(p: f64) {
 
 impl<T: Real> Tape<'_, T> {
     /// Records inverted dropout of `x` with the mask `keep`: each value whose `keep` entry
-    /// is `true` is multiplied by `1 / (1 - p)`, each other value by 0, as PyTorch's dropout
-    /// does with the same mask. The gradient goes back through the same multipliers.
+    /// is `true` is multiplied by `1 / (1 - p)` (with `1 - p` rounded to the element type
+    /// first, as PyTorch divides), each other value by 0, as PyTorch's dropout does with the
+    /// same mask. The gradient goes back through the same multipliers.
     ///
     /// This is the form a test uses to reproduce a mask drawn elsewhere (PyTorch's, for
     /// example); a layer draws its mask with [`dropout`](Self::dropout).
@@ -96,7 +97,9 @@ impl<T: Real> Tape<'_, T> {
     /// backward pass sends the gradient through them to `x` alone.
     fn dropout_by(&mut self, x: Var, p: f64, mut kept: impl FnMut(usize) -> bool) -> Var {
         let shape = self.shape(x);
-        let scale = T::from_f64(1.0 / (1.0 - p));
+        // PyTorch divides in the element type: `bernoulli_(1 - p).div_(1 - p)`, so the scale
+        // is 1 over `1 - p` rounded to `T`, not `1 / (1 - p)` rounded once.
+        let scale = T::ONE / T::from_f64(1.0 - p);
         let mut buf = self.take_buffer(shape.len());
         for (i, m) in buf.iter_mut().enumerate() {
             *m = if kept(i) { scale } else { T::ZERO };
@@ -217,6 +220,44 @@ mod tests {
         assert_ne!(base, mask(1, 1, 1));
         assert_ne!(base, mask(1, 2, 0));
         assert_ne!(base, mask(2, 1, 0));
+    }
+
+    /// The f32 scale is `1 / f32(1 - p)`, PyTorch's, not `f32(1 / (1 - p))`: at p = 0.025
+    /// the two differ by one ulp.
+    #[test]
+    fn dropout_scale_divides_in_the_element_type() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let v = tape.input(Tensor::full(&[1], 1.0f32).view());
+        let y = tape.dropout_with_mask(v, &[true], 0.025);
+        let torch = 1.0f32 / (1.0 - 0.025f64) as f32;
+        assert_ne!(
+            torch,
+            (1.0 / (1.0 - 0.025f64)) as f32,
+            "p = 0.025 tells them apart"
+        );
+        assert_eq!(tape.value(y).data(), &[torch]);
+    }
+
+    /// A mask gives the same values on a training tape as on an evaluation tape: only
+    /// `dropout`, not `dropout_with_mask`, depends on the mode.
+    #[test]
+    fn dropout_with_mask_ignores_the_mode() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let x = Tensor::from_vec(vec![1.0f32, -2.0, 3.0], &[3]).unwrap();
+        let mut run = |training: bool| {
+            let mut tape = if training {
+                graph.training_tape(&store.values, 1, 1)
+            } else {
+                graph.tape(&store.values)
+            };
+            let v = tape.input(x.view());
+            let y = tape.dropout_with_mask(v, &[true, false, true], 0.5);
+            tape.value(y).data().to_vec()
+        };
+        assert_eq!(run(true), run(false));
     }
 
     /// The gradient check passes through a fixed mask in f64.

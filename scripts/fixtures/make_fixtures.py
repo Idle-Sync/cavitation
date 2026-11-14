@@ -577,12 +577,13 @@ def make_select():
 def make_dropout():
     """dropout_with_mask: inverted dropout with the mask PyTorch's own dropout draws.
 
-    The mask comes from `F.dropout` of ones under a fixed seed (its non-zero positions), and
-    the case computes `x * (keep / (1 - p))`, the product PyTorch's dropout kernel forms
-    (Bernoulli draws divided by `1 - p`, times the input), so the gradient runs through the
-    same multipliers. Built after every other case, so its draws shift none of their inputs.
+    The mask comes from `F.dropout` of ones under a fixed seed (its non-zero positions). The
+    f32 case is `F.dropout` itself under the same seed, so it is PyTorch's own result, scale
+    rounding included; the float64 reference is `x * (keep / (1 - p))` in float64. p = 0.025
+    is a probability where dividing in f32 and in f64 give scales one ulp apart. Built after
+    every other case, so its draws shift none of their inputs.
     """
-    for p, shape in [(0.3, (16, 33)), (0.5, (4, 7)), (0.9, (3, 5))]:
+    for p, shape in [(0.3, (16, 33)), (0.5, (4, 7)), (0.9, (3, 5)), (0.025, (2, 40))]:
         generator_state = torch.get_rng_state()
         torch.manual_seed(1234)
         keep = F.dropout(torch.ones(shape), p, training=True) != 0
@@ -590,9 +591,16 @@ def make_dropout():
         keep_list = [bool(k) for k in keep.reshape(-1).tolist()]
 
         def dropped(x, keep=keep, p=p):
+            if x.dtype == torch.float32:
+                state = torch.get_rng_state()
+                torch.manual_seed(1234)
+                out = F.dropout(x, p, training=True)
+                torch.set_rng_state(state)
+                check(bool((((out != 0) == keep) | (x == 0)).all()), "dropout mask replays")
+                return out
             return x * (keep.to(x.dtype) / (1 - p))
 
-        name = f"dropout-with-mask-p{int(p * 10)}-{shape_name(shape)}"
+        name = f"dropout-with-mask-p{round(p * 1000)}-{shape_name(shape)}"
         add_case(name, "dropout_with_mask", {"p": p, "keep": keep_list}, [rnd(*shape)], dropped)
 
 

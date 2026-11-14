@@ -1756,7 +1756,9 @@ pub struct FitConfig<'s> {
     pub shuffle_seed: Option<u64>,
     /// The seed of the random draws layers make while training, such as
     /// [`Dropout`](crate::Dropout)'s masks ([`Trainer::set_dropout_seed`]); independent of
-    /// `shuffle_seed`.
+    /// `shuffle_seed`. Each `fit` call numbers its steps from 1, so two calls with the same
+    /// seed draw the same masks step for step; give a later call another seed to continue
+    /// with fresh masks.
     pub dropout_seed: u64,
     /// How the learning rate changes from step to step or epoch to epoch, with the
     /// optimiser's rate as its peak.

@@ -365,7 +365,7 @@ pub(crate) fn train(
             let order = &batcher.order()[range.clone()];
             let view = batcher.gather(data, range.clone(), &mut batch);
             let (value, checked) = {
-                let mut tape = graph.tape(&params.values);
+                let mut tape = graph.training_tape(&params.values, 0, step);
                 let x = tape.input(view.x);
                 let out = model.forward_traced(&mut tape, x, &mut trace);
                 let mut loss = match (setup.loss, view.targets) {

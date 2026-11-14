@@ -995,7 +995,8 @@ impl Run<'_, '_, '_> {
             optimizer: r.optimizer,
             loss: r.loss,
             shuffle_seed: r.shuffle_seed,
-            dropout_seed: 0,
+            // A network with dropout draws its retraining masks from the shuffle seed.
+            dropout_seed: r.shuffle_seed.unwrap_or(0),
             schedule: LrSchedule::Constant,
             health: Health::quiet(),
             on_epoch: None,
