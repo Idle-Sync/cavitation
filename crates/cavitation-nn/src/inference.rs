@@ -22,7 +22,7 @@ use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::{self, Level, MatMut, MatRef};
 use cavitation_core::{
-    Error, Gate, GeluApprox, ParamStore, TensorView, log_softmax_row, softmax_row,
+    Error, Gate, GeluApprox, ParamStore, Real, TensorView, log_softmax_row, softmax_row,
 };
 
 use crate::{Activation, ActivationKind, NeuronMask, Sequential};
@@ -169,8 +169,8 @@ pub struct InferenceModel {
     bufs: [Vec<f32>; 2],
 }
 
-// Compiles only while `InferenceModel` is `Send` and `Sync`, so a change that loses either
-// (a field that is neither, say) fails the build, not a user's program.
+/// Compiles only while `InferenceModel` is `Send` and `Sync`, so a change that loses either
+/// (a field that is neither, say) fails the build, not a user's program.
 const _: () = {
     /// Requires `T: Send + Sync`.
     const fn send_and_sync<T: Send + Sync>() {}
@@ -1329,7 +1329,7 @@ impl Run {
             (Some(bias), true) => {
                 for row in dst.chunks_exact_mut(outputs) {
                     for (o, &b) in row.iter_mut().zip(bias) {
-                        *o = relu_value(*o + b);
+                        *o = Real::relu(*o + b);
                     }
                 }
             }
@@ -1342,7 +1342,7 @@ impl Run {
             }
             (None, true) => {
                 for o in dst.iter_mut() {
-                    *o = relu_value(*o);
+                    *o = Real::relu(*o);
                 }
             }
             (None, false) => {}
@@ -1375,11 +1375,6 @@ fn apply_mask(keep: &[f32], data: &mut [f32], width: usize) {
     }
 }
 
-/// ReLU as the ReLU layer computes it: 0 at or below 0, `v` above, NaN stays NaN.
-fn relu_value(v: f32) -> f32 {
-    if v <= 0.0 { 0.0 } else { v }
-}
-
 /// Replaces every value with a gated linear unit's gate at it, as the tape computes it:
 /// the sigmoid, SiLU and tanh-GELU gates on the SIMD kernels of `level`, the others one
 /// value at a time.
@@ -1402,7 +1397,7 @@ fn element_wise(level: Level, form: &InferenceLayer, data: &mut [f32], width: us
     match form {
         InferenceLayer::Activation(ActivationKind::Relu) => {
             for v in data.iter_mut() {
-                *v = relu_value(*v);
+                *v = Real::relu(*v);
             }
         }
         InferenceLayer::Activation(ActivationKind::Tanh) => tanh_f32_with(level, data),

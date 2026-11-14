@@ -3,8 +3,8 @@
 use crate::graph::{BackwardCtx, Var};
 use crate::ops::Op;
 use crate::ops::activation::{
-    GeluApprox, gelu_derivative, gelu_value, relu_derivative, relu_value, sigmoid_value,
-    silu_derivative, silu_value,
+    GeluApprox, gelu_derivative, gelu_value, relu_derivative, sigmoid_value, silu_derivative,
+    silu_value,
 };
 use crate::{Real, Tape};
 
@@ -50,7 +50,7 @@ impl Gate {
         match self {
             Gate::Sigmoid => sigmoid_value(x),
             Gate::Gelu(approx) => gelu_value(x, approx),
-            Gate::Relu => relu_value(x),
+            Gate::Relu => x.relu(),
             Gate::Silu => silu_value(x),
         }
     }
@@ -102,7 +102,7 @@ impl<T: Real> Tape<'_, T> {
         );
         let width = dims[dims.len() - 1];
         let half = width / 2;
-        let mut dims_out = [0usize; 6];
+        let mut dims_out = [0usize; crate::Shape::MAX_RANK];
         dims_out[..dims.len()].copy_from_slice(dims);
         dims_out[dims.len() - 1] = half;
         let out_shape = crate::Shape::new(&dims_out[..dims.len()]);

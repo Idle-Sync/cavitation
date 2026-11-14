@@ -28,6 +28,7 @@
 //! ```
 
 use super::{Level, MatRef, reference, supported};
+use crate::Real;
 
 /// One input times a weight matrix stored transposed, with the kernel for the current
 /// [`level`](super::level): `out[j] = bias[j] + Σᵢ x[i] · w_t[i][j]`, then
@@ -132,17 +133,11 @@ pub fn matvec_f32_with(
             reference::matvec(w_t, x, bias, out);
             if relu {
                 for v in out.iter_mut() {
-                    *v = relu_value(*v);
+                    *v = Real::relu(*v);
                 }
             }
         }
     }
-}
-
-/// ReLU as the ReLU layer computes it: 0 at or below 0 (so -0 becomes +0), `v` above 0, NaN
-/// stays NaN.
-pub(super) fn relu_value(v: f32) -> f32 {
-    if v <= 0.0 { 0.0 } else { v }
 }
 
 /// One matvec, checked, for a SIMD kernel.
@@ -191,7 +186,7 @@ impl Job<'_> {
                 Some(b) => b[j0 + q] + a,
                 None => a,
             };
-            *o = if self.relu { relu_value(v) } else { v };
+            *o = if self.relu { Real::relu(v) } else { v };
         }
     }
 }

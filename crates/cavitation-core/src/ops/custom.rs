@@ -20,6 +20,20 @@ pub(crate) const MAX_INPUTS: usize = 4;
 ///
 /// [`gradcheck`]: crate::gradcheck
 ///
+/// # What the tape relies on
+///
+/// - `forward` must be pure and cheap to repeat: it reads only its inputs and writes only
+///   its output, and gives the same output for the same inputs. [`gradcheck`] calls it twice
+///   for every input element it checks, and nothing tells it apart from the first call.
+/// - The backward pass calls `backward` only when at least one input takes a gradient (it
+///   depends on a parameter). When some inputs do and others do not, `backward` still gets
+///   a buffer for every input; what it writes into the buffers of inputs that take no
+///   gradient is discarded.
+/// - A panic in `forward` unwinds out of [`Tape::custom`], and one in `backward` out of
+///   [`Tape::backward`]. The graph stays usable (the next tape starts clean); after a panic
+///   in `backward`, the parameter gradients hold only part of the pass, so call
+///   [`ParamStore::zero_grad`](crate::ParamStore::zero_grad) before using them.
+///
 /// # Examples
 ///
 /// The square, `x²`, whose derivative is `2x`:
@@ -318,5 +332,104 @@ mod tests {
     fn debug_shows_the_name() {
         let op: Arc<dyn CustomOp<f32> + Send + Sync> = Arc::new(Fixed(Shape::new(&[1])));
         assert_eq!(format!("{op:?}"), "CustomOp(\"fixed\")");
+    }
+
+    /// The sum of two inputs whose `backward` panics when `panic_in_backward`, and writes 7
+    /// into both gradient buffers otherwise.
+    struct Sum2 {
+        /// Whether `backward` panics.
+        panic_in_backward: bool,
+    }
+
+    impl<T: Real> CustomOp<T> for Sum2 {
+        fn name(&self) -> &str {
+            "sum2"
+        }
+
+        fn output_shape(&self, inputs: &[Shape]) -> Shape {
+            inputs[0]
+        }
+
+        fn forward(&self, inputs: &[TensorView<T>], mut output: TensorViewMut<T>) {
+            let (a, b) = (inputs[0].data(), inputs[1].data());
+            for (i, y) in output.data_mut().iter_mut().enumerate() {
+                *y = a[i] + b[i];
+            }
+        }
+
+        fn backward(
+            &self,
+            _inputs: &[TensorView<T>],
+            _output: TensorView<T>,
+            _grad_output: TensorView<T>,
+            grad_inputs: &mut [TensorViewMut<T>],
+        ) {
+            assert!(!self.panic_in_backward, "sum2: backward panics");
+            for g in grad_inputs.iter_mut() {
+                g.data_mut().fill(T::from_f64(7.0));
+            }
+        }
+    }
+
+    /// `backward` is not called when no input takes a gradient (it would panic here), and
+    /// with one input that does, what it writes for the other input is discarded: only the
+    /// parameter's gradient is written.
+    #[test]
+    fn backward_runs_only_for_inputs_that_take_a_gradient() {
+        let panics: Arc<dyn CustomOp<f32> + Send + Sync> = Arc::new(Sum2 {
+            panic_in_backward: true,
+        });
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[2], 1.0f32));
+        let mut graph = Graph::new();
+        let x = Tensor::full(&[2], 2.0f32);
+        {
+            let mut tape = graph.tape(&store.values);
+            let a = tape.input(x.view());
+            let b = tape.input(x.view());
+            let y = tape.custom(&panics, &[a, b]);
+            let loss = tape.sum(y);
+            tape.backward(loss, &mut store.grads);
+        }
+        assert!(store.grads.is_stale(p));
+
+        let writes: Arc<dyn CustomOp<f32> + Send + Sync> = Arc::new(Sum2 {
+            panic_in_backward: false,
+        });
+        let mut tape = graph.tape(&store.values);
+        let a = tape.input(x.view());
+        let b = tape.param(p);
+        let y = tape.custom(&writes, &[a, b]);
+        let loss = tape.sum(y);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        assert_eq!(store.grad(p).data(), &[7.0, 7.0]);
+    }
+
+    /// A panic in `backward` unwinds out of `Tape::backward`, and the graph records and
+    /// differentiates a new tape normally afterwards.
+    #[test]
+    fn graph_is_usable_after_a_panic_in_backward() {
+        let panics: Arc<dyn CustomOp<f32> + Send + Sync> = Arc::new(Sum2 {
+            panic_in_backward: true,
+        });
+        let mut store = ParamStore::new();
+        let p = store.add(Tensor::full(&[2], 1.0f32));
+        let mut graph = Graph::new();
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut tape = graph.tape(&store.values);
+            let a = tape.param(p);
+            let y = tape.custom(&panics, &[a, a]);
+            let loss = tape.sum(y);
+            tape.backward(loss, &mut store.grads);
+        }));
+        assert!(caught.is_err());
+        store.zero_grad();
+        let mut tape = graph.tape(&store.values);
+        let a = tape.param(p);
+        let loss = tape.sum(a);
+        tape.backward(loss, &mut store.grads);
+        drop(tape);
+        assert_eq!(store.grad(p).data(), &[1.0, 1.0]);
     }
 }
