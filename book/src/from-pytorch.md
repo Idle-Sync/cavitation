@@ -93,7 +93,7 @@ The formulas match; the last bits of a value need not. In f32, `Tanh` and `Sigmo
 
 ## Saving and loading
 
-`save` writes every parameter as an `F32` `.safetensors` file, named by `Sequential::parameter_names`: `0.weight`, `0.bias`, `2.weight` and so on, where the number is the layer's index in the `Sequential`. A `Linear` stores its weight as `[outputs, inputs]`, the layout of PyTorch's `nn.Linear`, so the file is what `safetensors.torch.save_file(model.state_dict(), path)` writes for the same `nn.Sequential`, and loads there too. `load` reads `F32` files, and `F16`, `BF16` and `F64` ones too: half precision widens to `F32` exactly, and `F64` rounds to the nearest `F32`, as `.float()` does in PyTorch.
+`save` writes every parameter as an `F32` `.safetensors` file, named by `Sequential::parameter_names`: `0.weight`, `0.bias`, `2.weight` and so on, where the number is the layer's index in the `Sequential`. A `Linear` stores its weight as `[outputs, inputs]`, the layout of PyTorch's `nn.Linear`, so the file is what `safetensors.torch.save_file(model.state_dict(), path)` writes for the same `nn.Sequential`, and loads there too. `load` reads `F32` files, and `F16`, `BF16` and `F64` ones too: half precision widens to `F32` exactly, and `F64` rounds to the nearest `F32`, as `.float()` does in PyTorch. `save` also records the layer kinds (`linear,relu,linear`) in the file's metadata, which PyTorch ignores; `load` refuses a file saved from other kinds, so GELU weights do not load silently into a ReLU network.
 
 ```rust,ignore
 {{#include ../../crates/cavitation/examples/from_pytorch.rs:save}}
