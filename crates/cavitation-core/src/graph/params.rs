@@ -162,7 +162,10 @@ impl<T: Real> ParamValues<T> {
 /// Each gradient is either current or stale. [`ParamStore::zero_grad`] marks every gradient
 /// stale without writing to it; a stale gradient reads as zeros. The first contribution
 /// after that overwrites the buffer and later ones add to it, which saves a zeroing pass
-/// over every gradient each step.
+/// over every gradient each step. The gradients of the values inside a backward pass
+/// follow the same rule. Because the first contribution is written rather than added to
+/// zeros, a gradient can hold −0 where adding to zeros would give +0; the two compare
+/// equal, and the optimisers treat them alike.
 ///
 /// # Examples
 ///
