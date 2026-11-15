@@ -227,8 +227,9 @@ mod tests {
             // padding and dilation on both axes, so windows near a band's edge read rows
             // the next band reads too.
             (8, 2, (70, 90), (3, 3), (2, 2), (2, 1), (2, 1)),
-            // 36 · 330 column values per image: 5 whole images per chunk, so the 9 images
-            // of a `conv2d_matches_direct_loops` batch span two chunks, the second short.
+            // 36 · 330 column values per image: 5 whole images per chunk. In a batch of 96
+            // each of the 16 groups holds 6 images, so a group is a chunk of 5 and a chunk
+            // of 1.
             (4, 3, (20, 33), (3, 3), (2, 1), (1, 1), (1, 1)),
         ];
         cases
@@ -246,13 +247,15 @@ mod tests {
         (0..n).map(|_| rng.range(-1.0, 1.0)).collect()
     }
 
-    /// In f64 the tape's output and gradients match the direct loops within rounding, on
-    /// every geometry, with and without a bias.
+    /// In f64 the tape's output and gradients match the direct loops within rounding
+    /// (1e-12 of each value's size, plus 1e-12), on every geometry, with and without a bias.
     #[test]
     fn conv2d_matches_direct_loops() {
         for (k, g) in geometries().iter().enumerate() {
             for with_bias in [true, false] {
-                let batch = if images_per_chunk(g, 9) < 9 { 9 } else { 3 };
+                // 96 images (16 groups of 6) where a chunk can hold several whole images, so
+                // chunks of several images and short last chunks run; else 9.
+                let batch = if images_per_chunk(g, 96) > 1 { 96 } else { 9 };
                 let x = values(batch * g.in_width(), k as u64);
                 let wv = values(g.weight_len(), 10 + k as u64);
                 let bv = values(g.out_channels(), 20 + k as u64);
@@ -288,7 +291,9 @@ mod tests {
                 let close = |a: &[f64], b: &[f64], what: &str| {
                     for (i, (p, q)) in a.iter().zip(b).enumerate() {
                         assert!(
-                            (p - q).abs() < 1e-12,
+                            // Relative to the value: a weight gradient of the 96-image
+                            // batch sums tens of thousands of products.
+                            (p - q).abs() < 1e-12 * (1.0 + q.abs()),
                             "geometry {k} {what}[{i}]: {p} against {q}"
                         );
                     }

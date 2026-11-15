@@ -703,16 +703,18 @@ pub fn images_per_chunk(geom: &Conv2dGeom, batch: usize) -> usize {
     (COLUMN_BUDGET / per_image).clamp(1, largest)
 }
 
-/// The fewest windows a band of output rows holds when the image allows it, so that each
-/// band's GEMM stays wide enough for the packed kernels even when the budget alone would
-/// give it only a few rows.
+/// The fewest windows the widest band [`rows_per_chunk`] may choose holds, before the bands
+/// are evened out, so that each band's GEMM stays wide enough for the packed kernels even
+/// when the budget alone would give it only a few rows.
 const MIN_BAND_WINDOWS: usize = 128;
 
 /// The number of output rows each chunk of an image takes for `geom`: all of them when one
-/// image's columns fit in [`COLUMN_BUDGET`], else the image is cut into as few bands as
-/// keep each band within the budget, as even as they go, each band at least 128 windows
-/// (or one row, if a row is wider). Bands of `rows` rows from row 0, the last one shorter
-/// when they do not divide the image.
+/// image's columns fit in [`COLUMN_BUDGET`]. Else the widest band allowed is as many rows
+/// as fit in the budget, raised to at least 128 windows (and one row), and the image is cut
+/// into as few bands of at most that many rows as it takes, as even as they go; so a band
+/// may exceed the budget for a very wide kernel, or hold fewer than 128 windows after the
+/// evening out. Bands of `rows` rows from row 0, the last one shorter when they do not
+/// divide the image.
 ///
 /// ```
 /// use cavitation_core::kernels::conv::{Conv2dGeom, rows_per_chunk};
