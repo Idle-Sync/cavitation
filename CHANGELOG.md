@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Tensors and autograd (`cavitation-core`)
 
 - `max_pool2d` and its backward pass run blocks of planes in parallel, and the forward pass reads only each window's taps inside the image, with a dedicated loop for 2 × 2 windows with stride 2. On an Intel Celeron N5105 at 4 threads, the forward passes of the `cifar-cnn` network's two poolings take 7 ms per training step instead of 70. The results are unchanged, bit for bit; the old loops are kept as `kernels::pooling::max_pool2d_reference`, and `kernels::pooling::planes_per_task` gives the block size (#201).
+- `batch_norm2d` and its backward pass run one task per channel on the thread pool. Each channel's sums keep their order, so the results are unchanged, bit for bit. On an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's four batch norms take 46 ms per training step instead of 74 (#201).
 
 ### Data, examples, guide and benchmark
 
