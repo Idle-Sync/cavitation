@@ -11,13 +11,15 @@ mod common;
 use cavitation_core::{Graph, ParamStore, Tensor};
 use cavitation_gpu::kernels::{BiasAdd, ChannelDims, ChannelSums};
 use common::{
-    Kit, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values, sum_bound,
+    FLOOR, Kit, TENSOR, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values,
+    sum_bound,
 };
 
 /// The shapes both kernels run: a single value, a small matrix, an NCHW batch of odd sizes,
 /// one channel of exactly one chunk (4,096 values) and of one value more, a batch whose
-/// channels span several chunks, and the CIFAR network's first convolution output at batch
-/// 128 (131,072 values per channel).
+/// channels span several chunks, a 1000-row matrix of 10 channels, a matrix of 300 channels
+/// (two workgroups of the sums' second pass), and the CIFAR network's first convolution
+/// output at batch 128 (131,072 values per channel).
 fn shapes() -> Vec<ChannelDims> {
     vec![
         ChannelDims::new(1, 1, 1),
@@ -27,6 +29,7 @@ fn shapes() -> Vec<ChannelDims> {
         ChannelDims::new(1, 1, 4097),
         ChannelDims::new(3, 4, 5000),
         ChannelDims::rows(1000, 10),
+        ChannelDims::rows(3, 300),
         ChannelDims::new(128, 32, 1024),
     ]
 }
@@ -100,8 +103,8 @@ fn bias_add_twin() {
     });
 }
 
-/// The CPU arithmetic bias add is checked against is the CPU tape's own: a `[N]` bias added
-/// to an `[M, N]` input by `Tape::add` gives the same bits.
+/// The CPU twin's `v + bias[c]` is `Tape::add`'s broadcast, bit for bit: a `[N]` bias added
+/// to an `[M, N]` input.
 #[test]
 fn bias_add_is_the_tapes_broadcast_add() {
     for_each_gpu(|gpu| {
@@ -172,8 +175,8 @@ fn channel_sums_exact_twin() {
 }
 
 /// Channel sums on seeded values, against the exact (`f64`) sums of the same `f32` values:
-/// each within `2(L + 2) · u · Σ|x|` for `L = outer · inner` values, the bound of a sum in any
-/// order; and the same bits on a second run, the tree being fixed.
+/// each within `2(L + 2) · u · Σ|x| + (2L − 1) · 2⁻¹²⁶` for `L = outer · inner` values; and the
+/// same bits on a second run, the tree being fixed.
 #[test]
 fn channel_sums_rounding_twin() {
     for_each_gpu(|gpu| {
@@ -191,10 +194,11 @@ fn channel_sums_rounding_twin() {
             }
             let got = gpu_sums(&mut kit, &kernel, dims, &x);
             let l = dims.summed() as usize;
+            let flushes = (2 * l - 2) as f64 * FLOOR;
             let worst = assert_within(
                 &got,
                 &exact,
-                |c| sum_bound(l, abs[c]),
+                |c| sum_bound(l, abs[c]) + flushes,
                 &format!("channel sums {dims:?}"),
             );
             println!(
@@ -228,7 +232,7 @@ fn refusals() {
         let mut kit = kit(gpu, ChannelDims::new(1, 1, 64));
         let bias_add = BiasAdd::new(gpu, &mut kit.cache).unwrap();
         let sums = ChannelSums::new(gpu, &mut kit.cache).unwrap();
-        let (a, b) = (kit.zeros(64), kit.zeros(64));
+        let (a, b, one) = (kit.zeros(64), kit.zeros(64), kit.zeros(1));
         let mut bias = |dims: ChannelDims,
                         x: &cavitation_gpu::PooledBuffer,
                         y: &cavitation_gpu::PooledBuffer| {
@@ -241,9 +245,12 @@ fn refusals() {
             bias(ChannelDims::new(1 << 16, 1 << 16, 1), &a, &b)
                 .contains("more than the 2147483648")
         );
-        assert!(bias(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor needs 65 f32s"));
-        assert!(bias(ChannelDims::new(1, 65, 1), &a, &b).contains("the bias needs 65 f32s"));
+        assert!(bias(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor: needs 65 f32s"));
+        assert!(bias(ChannelDims::new(1, 65, 1), &a, &b).contains("the bias: needs 65 f32s"));
         assert!(bias(ChannelDims::new(1, 1, 64), &a, &a).contains("different buffers"));
+        let wrapping = ChannelDims::new(65_536, 65_537, 4_294_901_761);
+        assert_eq!(wrapping.len(), u64::MAX);
+        assert!(bias(wrapping, &a, &b).contains("more than the 2147483648"));
         let mut sum = |dims: ChannelDims,
                        x: &cavitation_gpu::PooledBuffer,
                        y: &cavitation_gpu::PooledBuffer| {
@@ -258,8 +265,56 @@ fn refusals() {
         assert!(
             sum(ChannelDims::new(1, 1, 1 << 29), &a, &b).contains("more than 65535 in a dimension")
         );
-        assert!(sum(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor needs 65 f32s"));
-        assert!(sum(ChannelDims::new(1, 65, 1), &a, &b).contains("the tensor needs 65 f32s"));
+        assert!(
+            sum(ChannelDims::new(1 << 16, 1 << 16, 1), &a, &b).contains("more than the 2147483648")
+        );
+        assert!(sum(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor: needs 65 f32s"));
+        assert!(sum(ChannelDims::new(1, 2, 32), &a, &one).contains("the output: needs 2 f32s"));
         assert!(sum(ChannelDims::new(1, 1, 64), &a, &a).contains("different buffers"));
+    });
+}
+
+/// Both kernels go by the shape, not by their buffers' lengths: with buffers longer than the
+/// tensor, the bias add leaves the values past it unchanged and the sums leave them out.
+#[test]
+fn buffers_longer_than_the_tensor() {
+    for_each_gpu(|gpu| {
+        let dims = ChannelDims::new(3, 4, 50);
+        let n = dims.len() as usize;
+        let mut kit = kit(gpu, dims);
+        let mut x = exact_values(70, n);
+        x.extend([7.0f32; 300]);
+        let bias = [1.0f32, 2.0, -1.0, -2.0, 99.0, 99.0];
+        let bias_add = BiasAdd::new(gpu, &mut kit.cache).unwrap();
+        let got = gpu_bias_add(&mut kit, &bias_add, dims, &bias, &x);
+        assert!(
+            got[n..].iter().all(|&v| v == 7.0),
+            "the tail past the tensor changed"
+        );
+        let want: Vec<f32> = x[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + bias[channel(dims, i)])
+            .collect();
+        assert_exact(&got[..n], &want, "bias add with a long buffer");
+        let sums = ChannelSums::new(gpu, &mut kit.cache).unwrap();
+        let (xb, out) = (kit.upload(&x), kit.pool.take(4 * 10, TENSOR));
+        let call = sums.call(&mut kit.steps, &mut kit.pool, dims, &xb, &out);
+        let mut step = kit.steps.begin();
+        step.upload(out.buffer(), 0, &[0x40; 40]);
+        sums.record(&mut step, &call);
+        let _ = step.finish();
+        let got = kit.read(&out);
+        let mut want = vec![0.0f32; 4];
+        for (i, v) in x[..n].iter().enumerate() {
+            want[channel(dims, i)] += v;
+        }
+        assert_exact(&got[..4], &want, "channel sums with a long input");
+        let sentinel = f32::from_le_bytes([0x40; 4]);
+        assert!(
+            got[4..].iter().all(|&v| v == sentinel),
+            "the sums wrote past the channels"
+        );
+        call.release(&mut kit.pool);
     });
 }

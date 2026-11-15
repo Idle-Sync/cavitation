@@ -1,11 +1,15 @@
 //! Per-channel kernels on the GPU over tensors laid out `[outer][channels][inner]`: a Linear
 //! layer's `M × N` output is `outer = M`, `inner = 1`, a convolution's NCHW output is
-//! `outer = batch`, `inner = h · w`. [`BiasAdd`] adds a bias per channel, exactly;
+//! `outer = batch`, `inner = h · w`. [`BiasAdd`] adds a bias per channel, with the CPU's bits
+//! on normal values;
 //! [`ChannelSums`] sums each channel over the other two axes in a fixed tree, for a bias's
 //! gradient and batch norm's statistics, within the bound of a sum in any order. Both only
 //! add, so neither assumes anything about fused multiply-adds.
 
-use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder};
+use crate::{
+    BufferPool, Gpu, GpuError, MAX_WORKGROUPS_PER_DIMENSION, PipelineCache, PooledBuffer, Shader,
+    Step, StepEncoder,
+};
 
 /// Threads per workgroup in every kernel here, passed to them as the `WORKGROUP` override.
 /// The sums' workgroup tree halves it, so it must be a power of two.
@@ -22,13 +26,10 @@ const CHUNK: u64 = (WORKGROUP * PER_LANE) as u64;
 /// workgroup's lanes past the end.
 const MAX_VALUES: u64 = 1 << 31;
 
-/// The most workgroups a grid dimension takes.
-const MAX_GRID: u64 = 65_535;
-
 /// Bytes of the `Dims` uniform: `outer`, `channels`, `inner` and the chunks per channel.
 const DIMS_BYTES: u64 = 16;
 
-/// The parts every kernel here shares: the `Dims` uniform's layout.
+/// The parts every kernel here shares: the `WORKGROUP` override and the `Dims` uniform.
 macro_rules! dims {
     () => {
         "
@@ -40,14 +41,14 @@ macro_rules! dims {
 }
 
 /// Bias add, one thread per value of `out`, numbered over `dispatch_split`'s grid:
-/// `out[(b·C + c)·P + p] += bias[c]`.
+/// `y[(b·C + c)·P + p] += bias[c]`.
 const BIAS_ADD: Shader = Shader {
     name: "bias add",
     source: concat!(
         dims!(),
         "
         @group(0) @binding(0) var<storage, read> bias: array<f32>;
-        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> y: array<f32>;
         @group(0) @binding(2) var<uniform> dims: Dims;
 
         @compute @workgroup_size(WORKGROUP)
@@ -58,7 +59,7 @@ const BIAS_ADD: Shader = Shader {
         ) {
             let i = (group.x + group.y * groups.x) * WORKGROUP + lane;
             if (i >= dims.outer * dims.channels * dims.inner) { return; }
-            out[i] = out[i] + bias[(i / dims.inner) % dims.channels];
+            y[i] = y[i] + bias[(i / dims.inner) % dims.channels];
         }
         "
     ),
@@ -99,8 +100,8 @@ const CHANNEL_PARTIALS: Shader = Shader {
             }
             lanes[lane] = acc;
             workgroupBarrier();
-            for (var half = WORKGROUP / 2u; half > 0u; half = half / 2u) {
-                if (lane < half) { lanes[lane] = lanes[lane] + lanes[lane + half]; }
+            for (var width = WORKGROUP / 2u; width > 0u; width = width / 2u) {
+                if (lane < width) { lanes[lane] = lanes[lane] + lanes[lane + width]; }
                 workgroupBarrier();
             }
             if (lane == 0u) { partials[c * dims.chunks + chunk] = lanes[0]; }
@@ -109,31 +110,30 @@ const CHANNEL_PARTIALS: Shader = Shader {
     ),
 };
 
-/// Channel sums, second pass: one thread per channel, numbered over `dispatch_split`'s grid,
-/// adds its chunks' partial sums in chunk order.
+/// Channel sums, second pass: one thread per channel (at most 65,535, so one grid row) adds
+/// its chunks' partial sums in chunk order.
 const CHANNEL_MERGE: Shader = Shader {
     name: "channel sums merge",
     source: concat!(
         dims!(),
         "
         @group(0) @binding(0) var<storage, read> partials: array<f32>;
-        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> sums: array<f32>;
         @group(0) @binding(2) var<uniform> dims: Dims;
 
         @compute @workgroup_size(WORKGROUP)
         fn main(
             @builtin(workgroup_id) group: vec3<u32>,
-            @builtin(num_workgroups) groups: vec3<u32>,
             @builtin(local_invocation_index) lane: u32,
         ) {
-            let c = (group.x + group.y * groups.x) * WORKGROUP + lane;
+            let c = group.x * WORKGROUP + lane;
             if (c >= dims.channels) { return; }
             let base = c * dims.chunks;
             var acc = partials[base];
             for (var k = 1u; k < dims.chunks; k = k + 1u) {
                 acc = acc + partials[base + k];
             }
-            out[c] = acc;
+            sums[c] = acc;
         }
         "
     ),
@@ -165,9 +165,11 @@ pub struct ChannelDims {
 impl ChannelDims {
     /// `outer` blocks of `channels` channels of `inner` values.
     ///
+    /// # Examples
+    ///
     /// ```
     /// use cavitation_gpu::kernels::ChannelDims;
-    /// assert_eq!(ChannelDims::new(2, 3, 4).len(), 24);
+    /// assert_eq!(ChannelDims::new(2, 3, 4).inner, 4);
     /// ```
     pub fn new(outer: u32, channels: u32, inner: u32) -> ChannelDims {
         ChannelDims {
@@ -179,6 +181,8 @@ impl ChannelDims {
 
     /// A row-major `m × n` matrix, each column a channel: `new(m, n, 1)`.
     ///
+    /// # Examples
+    ///
     /// ```
     /// use cavitation_gpu::kernels::ChannelDims;
     /// assert_eq!(ChannelDims::rows(5, 7).summed(), 5);
@@ -187,17 +191,27 @@ impl ChannelDims {
         ChannelDims::new(m, n, 1)
     }
 
-    /// The values of the whole tensor: `outer · channels · inner`.
+    /// The values of the whole tensor: `outer · channels · inner`, or `u64::MAX` for a shape
+    /// too large to count in a `u64`.
+    ///
+    /// # Examples
     ///
     /// ```
     /// use cavitation_gpu::kernels::ChannelDims;
     /// assert_eq!(ChannelDims::new(2, 3, 4).len(), 24);
     /// ```
     pub fn len(&self) -> u64 {
-        u64::from(self.outer) * u64::from(self.channels) * u64::from(self.inner)
+        u64::try_from(self.len_wide()).unwrap_or(u64::MAX)
+    }
+
+    /// The values of the whole tensor, without overflow.
+    fn len_wide(&self) -> u128 {
+        u128::from(self.outer) * u128::from(self.channels) * u128::from(self.inner)
     }
 
     /// Whether the tensor holds no values.
+    ///
+    /// # Examples
     ///
     /// ```
     /// use cavitation_gpu::kernels::ChannelDims;
@@ -209,6 +223,8 @@ impl ChannelDims {
 
     /// The values summed into each channel's sum: `outer · inner`, the length `L` the
     /// sums' bound counts.
+    ///
+    /// # Examples
     ///
     /// ```
     /// use cavitation_gpu::kernels::ChannelDims;
@@ -226,9 +242,9 @@ impl ChannelDims {
             "{what}: every dimension must be above 0, got {self:?}"
         );
         assert!(
-            self.len() <= MAX_VALUES,
+            self.len_wide() <= u128::from(MAX_VALUES),
             "{what}: {self:?} holds {} values, more than the {MAX_VALUES} the kernels take",
-            self.len()
+            self.len_wide()
         );
     }
 
@@ -339,7 +355,7 @@ fn bind(
 fn check_len(what: &str, buffer: &PooledBuffer, values: u64) {
     assert!(
         buffer.len() >= 4 * values,
-        "{what} needs {values} f32s ({} bytes), but its buffer has {} bytes",
+        "{what}: needs {values} f32s ({} bytes), but its buffer has {} bytes",
         4 * values,
         buffer.len()
     );
@@ -347,8 +363,8 @@ fn check_len(what: &str, buffer: &PooledBuffer, values: u64) {
 
 /// Adds a bias per channel to a tensor in place, on the GPU: `out[b][c][p] += bias[c]` for
 /// a tensor laid out `[outer][channels][inner]` ([`ChannelDims`]). Each value takes one
-/// correctly rounded addition, as the CPU's broadcast `add` does, so on normal values the
-/// result is the CPU's, bit for bit.
+/// correctly rounded addition, as the CPU's broadcast `add` does, so on normal values and
+/// sums the result is the CPU's, bit for bit; a subnormal is flushed.
 ///
 /// [`call`](BiasAdd::call) prepares one bias add on given buffers, made once when a model is
 /// compiled, and [`record`](BiasAdd::record) adds it to a step.
@@ -394,6 +410,8 @@ impl BiasAdd {
     ///
     /// [`GpuError::Shader`] if the kernel does not build on this GPU.
     ///
+    /// # Examples
+    ///
     /// ```
     /// use cavitation_gpu::kernels::BiasAdd;
     /// use cavitation_gpu::{Gpu, PipelineCache};
@@ -420,6 +438,8 @@ impl BiasAdd {
     /// If a dimension is 0, the tensor holds more than 2³¹ values, a buffer is shorter than
     /// its values, or `bias` and `out` are the same buffer.
     ///
+    /// # Examples
+    ///
     /// ```
     /// use cavitation_gpu::kernels::{BiasAdd, ChannelDims};
     /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
@@ -443,8 +463,8 @@ impl BiasAdd {
         out: &PooledBuffer,
     ) -> BiasAddCall {
         dims.check("bias add");
-        check_len("the bias", bias, u64::from(dims.channels));
-        check_len("the tensor", out, dims.len());
+        check_len("bias add: the bias", bias, u64::from(dims.channels));
+        check_len("bias add: the tensor", out, dims.len());
         assert!(
             bias.buffer() != out.buffer(),
             "bias add: the bias and the tensor it is added to must be different buffers"
@@ -514,9 +534,14 @@ impl BiasAddCall {
 /// channel's values (in the order `b·inner + p`) in one workgroup, each lane in order and
 /// then the lanes in a halving tree, and a second pass adds a channel's chunks in order. The
 /// tree depends on the shape alone. It is not the CPU's order, so against the exact sum of
-/// the same `f32` values each channel's sum of `L = outer · inner` values is within
-/// `2(L + 2) · 2⁻²⁴ · Σ|x| + 2⁻¹²⁶`, as any order of the additions is; on small integers,
-/// whose sums are exact in any order, it is the CPU's sum bit for bit.
+/// the same `f32` values each channel's sum of its `L = outer · inner` values is within
+/// `2(L + 2) · 2⁻²⁴ · Σ|x| + (2L − 1) · 2⁻¹²⁶`. The tree passes each value through at most
+/// 15 + 8 + (chunks − 1) additions, fewer than `L`, so the relative term holds as for any
+/// order; the absolute term allows every input and every addition to be flushed. On integers
+/// whose partial sums stay below 2²⁴ it is the CPU's sum bit for bit.
+///
+/// With `inner = 1` (a matrix's columns), neighbouring lanes read values `channels` apart,
+/// which costs memory bandwidth on wide matrices.
 ///
 /// # Examples
 ///
@@ -560,6 +585,8 @@ impl ChannelSums {
     ///
     /// [`GpuError::Shader`] if a pass does not build on this GPU.
     ///
+    /// # Examples
+    ///
     /// ```
     /// use cavitation_gpu::kernels::ChannelSums;
     /// use cavitation_gpu::{Gpu, PipelineCache};
@@ -597,7 +624,10 @@ impl ChannelSums {
     ///
     /// If a dimension is 0, the tensor holds more than 2³¹ values, there are more than
     /// 65,535 channels or more than 65,535 chunks of a channel, a buffer is shorter than its
-    /// values, or `x` and `out` are the same buffer.
+    /// values, or `x` and `out` are the same buffer: wgpu would allow it (the passes are
+    /// separate dispatches), but a tensor summed into itself is refused as a mistake.
+    ///
+    /// # Examples
     ///
     /// ```
     /// use cavitation_gpu::kernels::{ChannelDims, ChannelSums};
@@ -626,13 +656,14 @@ impl ChannelSums {
         dims.check("channel sums");
         let chunks = dims.summed().div_ceil(CHUNK);
         assert!(
-            u64::from(dims.channels) <= MAX_GRID && chunks <= MAX_GRID,
+            u64::from(dims.channels) <= u64::from(MAX_WORKGROUPS_PER_DIMENSION)
+                && chunks <= u64::from(MAX_WORKGROUPS_PER_DIMENSION),
             "channel sums: {dims:?} needs a grid of {chunks} chunks by {} channels, more than \
-             {MAX_GRID} in a dimension",
+             {MAX_WORKGROUPS_PER_DIMENSION} in a dimension",
             dims.channels
         );
-        check_len("the tensor", x, dims.len());
-        check_len("the sums", out, u64::from(dims.channels));
+        check_len("channel sums: the tensor", x, dims.len());
+        check_len("channel sums: the output", out, u64::from(dims.channels));
         assert!(
             x.buffer() != out.buffer(),
             "channel sums: the tensor and its sums must be different buffers"
@@ -667,7 +698,7 @@ impl ChannelSums {
             &call.partials_group,
             [call.chunks, call.dims.channels, 1],
         );
-        step.dispatch_split(
+        step.dispatch(
             &self.merge,
             &call.merge_group,
             call.dims.channels.div_ceil(WORKGROUP),
