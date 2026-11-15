@@ -14,6 +14,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `BufferPool` hands out GPU buffers by size class and usage and reuses those handed back. Up to 4 MiB a class is the request rounded up to a power of two (at least 256 bytes); above, to a quarter step between powers of two, so a large buffer is at most a quarter larger than asked for. Lengths are whole 4-byte words, within the device's binding limits. The pool counts the buffers and bytes it creates (`created`, `created_bytes`) and the buffers still out (`outstanding`), so a loop that takes and gives back the same sizes can show it creates buffers in its first pass only. `PooledBuffer::binding` binds only the bytes asked for, so a shader's `arrayLength` sees the request, not the class.
 - `PipelineCache` builds each compute pipeline once per `Shader`, entry point, set of `override` values (in any order) and layout, and counts what it builds. `get` uses the layout wgpu derives from the shader; `get_with_layout` takes an explicit one, so one bind group serves every pipeline built with it. A shader that does not compile (in naga or in the backend's compiler), a missing entry point, or an unknown or NaN `override` is `GpuError::Shader` with wgpu's message, and nothing is cached for it. A workgroup array sized by an `override` constant works on Vulkan and on DX12 with DXC and with FXC.
 
+### Layers, training and inference (`cavitation-nn`)
+
+- The dead-ReLU report counts by channel through a pooling layer too: in `Conv2d → MaxPool2d → ReLU` (or an average pooling there), a channel is reported dead only when every pooled position of it is, as it already was with batch norm or other element-wise layers in between. Before, such a ReLU fell back to counting each position, so the flat positions of a live channel came back as dead (#222).
+
 ## v0.3.2 (2026-11-15)
 
 ### Layers, training and inference (`cavitation-nn`)
