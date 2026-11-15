@@ -799,7 +799,8 @@ impl Evaluator {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidData`] if `data` has class targets or an output is not finite, and as
+    /// [`Error::InvalidData`] if `data` has class targets or an output or a target is not
+    /// finite, and as
     /// [`evaluate`](Self::evaluate) does for the data checks that do not involve the loss.
     ///
     /// # Panics
