@@ -1,6 +1,6 @@
 //! Benchmark runner for the cavitation neural network library.
 //!
-//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info>`:
+//! `cavitation-bench <all|mnist|cifar|digits|latency|gemm|gemm-gpu|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info>`:
 //!
 //! - `info` prints the CPU, the kernel levels, the thread count and the compiler.
 //! - `mnist [--batch 32|128] [--adam]` times epochs of the 1M network on MNIST;
@@ -20,6 +20,10 @@
 //!   training step of the named network at the current kernel level and thread count
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
 //!   GFLOPS (`2·m·n·k` / time) and threads used, then the rate over all eight.
+//! - `gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096] [--warm-up SECONDS]`,
+//!   with the `gpu` feature, times the tiled GPU GEMM on square products, plain and with
+//!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
+//!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
 //!   [--ours-only] [--profile N]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
@@ -96,6 +100,8 @@
 //! comparison quotes the fastest setting, with the default one beside it.
 
 mod cnn;
+#[cfg(feature = "gpu")]
+mod gemm_gpu;
 mod machine;
 mod numpy;
 mod runs;
@@ -109,13 +115,14 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|gemm-gpu|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
     \x20 digits  [--python PATH] [--numpy-best]\n\
     \x20 latency [--python PATH] [--numpy-best]\n\
     \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
+    \x20 gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096] [--warm-up SECONDS] (with the gpu feature)\n\
     \x20 conv    [--batch N]\n\
     \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
     \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
@@ -161,6 +168,10 @@ fn main() -> ExitCode {
             .then(info)
             .ok_or_else(|| "info takes no arguments".to_string()),
         "gemm" => gemm(rest),
+        #[cfg(feature = "gpu")]
+        "gemm-gpu" => gemm_gpu::run(rest),
+        #[cfg(not(feature = "gpu"))]
+        "gemm-gpu" => Err("gemm-gpu needs the gpu feature: build with --features gpu".to_string()),
         "conv" => conv(rest),
         "mnist-cnn" | "cifar-cnn" => {
             let net = if command == "mnist-cnn" {

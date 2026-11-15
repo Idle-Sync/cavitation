@@ -25,6 +25,9 @@
 //! - [`kernels::OptimizerKernel`] and [`kernels::OptimizerRule`]: SGD (with momentum and
 //!   weight decay), Adam and AdamW over a model's parameters in one dispatch, with
 //!   per-parameter update counts, skipped when the step's finite flag is set.
+//! - [`kernels::Gemm`]: the tiled matrix product `C = A·B + β·C` with either operand
+//!   transposed, within `2(k + 3) · u · Σ|terms|` of the exact product and exact on small
+//!   integers.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
