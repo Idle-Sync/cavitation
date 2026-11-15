@@ -9,8 +9,9 @@
 //! sides start from the same weights and see the same batches; only the dropout masks
 //! differ. The results go to `result.json` in the same folder.
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use cavitation_core::kernels::{level, threads};
@@ -262,7 +263,7 @@ fn train_torch(
     rows: usize,
 ) -> Result<(Vec<Epoch>, Vec<String>), String> {
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/bench/torch_cnn.py");
-    let out = Command::new(&o.python)
+    let mut child = Command::new(&o.python)
         .arg("-I")
         .arg(&script)
         .args(["--mode", "train", "--net", net.data])
@@ -277,7 +278,9 @@ fn train_torch(
         .args(["--rows", &rows.to_string()])
         .args(["--threads", &threads().to_string()])
         .args(["--seed", &o.seed.to_string()])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| {
             format!(
                 "could not run `{}`: {e}; pass the interpreter that has PyTorch with --python \
@@ -285,29 +288,42 @@ fn train_torch(
                 o.python
             )
         })?;
-    if !out.status.success() {
-        return Err(format!(
-            "torch_cnn.py failed ({}):\n{}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (mut epochs, mut about) = (Vec::new(), Vec::new());
-    for line in text.lines() {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        match words.as_slice() {
-            ["epoch", _, loss, acc, secs] => {
-                let num = |w: &str| w.parse::<f64>().map_err(|_| format!("bad line `{line}`"));
-                epochs.push(Epoch {
-                    loss: num(loss)?,
-                    accuracy: num(acc)?,
-                    seconds: num(secs)?,
-                });
+    // Read stderr on its own thread so a chatty child cannot block on a full pipe while
+    // stdout is read here.
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let (mut epochs, mut about, mut text) = (Vec::new(), Vec::new(), String::new());
+    let mut bad = None;
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|e| format!("could not read torch_cnn.py's output: {e}"))?;
+        text.push_str(&line);
+        text.push('\n');
+        match torch_line(&line) {
+            Ok(Some(TorchLine::Epoch(epoch))) => {
+                print_torch_epoch(epochs.len() + 1, &epoch);
+                epochs.push(epoch);
             }
-            ["torch", ..] => about.push(line.to_string()),
-            _ => {}
+            Ok(Some(TorchLine::About)) => about.push(line),
+            Ok(None) => {}
+            Err(e) => {
+                bad.get_or_insert(e);
+            }
         }
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("could not wait for torch_cnn.py: {e}"))?;
+    let errors = errors.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("torch_cnn.py failed ({status}):\n{errors}"));
+    }
+    if let Some(e) = bad {
+        return Err(e);
     }
     if epochs.len() != o.epochs {
         return Err(format!(
@@ -316,16 +332,45 @@ fn train_torch(
             o.epochs
         ));
     }
-    for (e, epoch) in epochs.iter().enumerate() {
-        println!(
-            "  torch epoch {:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s",
-            e + 1,
-            epoch.loss,
-            epoch.accuracy * 100.0,
-            epoch.seconds
-        );
-    }
     Ok((epochs, about))
+}
+
+/// One line of `torch_cnn.py`'s output that the benchmark reads.
+#[derive(Debug, PartialEq)]
+enum TorchLine {
+    /// `epoch <n> <loss> <accuracy> <seconds>`.
+    Epoch(Epoch),
+    /// A line about PyTorch itself, starting `torch`.
+    About,
+}
+
+/// Reads one line of `torch_cnn.py`'s output: an epoch, a line about PyTorch, or `None` for
+/// anything else. An `epoch` line whose numbers do not parse is an error.
+fn torch_line(line: &str) -> Result<Option<TorchLine>, String> {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    match words.as_slice() {
+        ["epoch", _, loss, acc, secs] => {
+            let num = |w: &str| w.parse::<f64>().map_err(|_| format!("bad line `{line}`"));
+            Ok(Some(TorchLine::Epoch(Epoch {
+                loss: num(loss)?,
+                accuracy: num(acc)?,
+                seconds: num(secs)?,
+            })))
+        }
+        ["torch", ..] => Ok(Some(TorchLine::About)),
+        _ => Ok(None),
+    }
+}
+
+/// Prints one PyTorch epoch in the same form as ours, as soon as it arrives.
+fn print_torch_epoch(n: usize, epoch: &Epoch) {
+    println!(
+        "  torch epoch {:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s",
+        n,
+        epoch.loss,
+        epoch.accuracy * 100.0,
+        epoch.seconds
+    );
 }
 
 /// The median of the epoch times after the first, whose time includes the warm-up (the
@@ -465,6 +510,26 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `torch_line` reads epoch lines and lines about PyTorch, skips others, and rejects an
+    /// epoch line whose numbers do not parse.
+    #[test]
+    fn torch_lines_are_read_one_at_a_time() {
+        assert_eq!(
+            torch_line("epoch 3 0.250000 0.981000 6.500000"),
+            Ok(Some(TorchLine::Epoch(Epoch {
+                loss: 0.25,
+                accuracy: 0.981,
+                seconds: 6.5
+            })))
+        );
+        assert_eq!(
+            torch_line("torch 2.15.0+cpu, 4 threads"),
+            Ok(Some(TorchLine::About))
+        );
+        assert_eq!(torch_line("loading data"), Ok(None));
+        assert!(torch_line("epoch 1 nan? 0.5 1.0").is_err());
+    }
 
     /// The parameter count of `net`.
     fn count(net: &Sequential, params: &ParamStore) -> usize {

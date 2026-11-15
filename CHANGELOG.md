@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Data, examples, guide and benchmark
+
+- `cavitation-bench mnist-cnn` and `cifar-cnn` print each PyTorch epoch as it finishes, rather than all of them once PyTorch exits (#228).
+
 ## v0.3.0 (2026-11-15)
 
 ### Breaking changes
