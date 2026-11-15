@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Tensors and autograd (`cavitation-core`)
 
 - A GEMM called from inside a thread-pool task, such as a convolution group's, is planned for the one thread it runs on, rather than split for the thread count asked for into tasks that then run one after another. The results are unchanged, bit for bit. On an Intel Celeron N5105 at 4 threads, the weight gradient of the `cifar-cnn` network's first convolution takes 15 ms instead of 26 (#201).
+- `max_pool2d` and its backward pass run blocks of planes in parallel, and the forward pass reads only each window's taps inside the image, with a dedicated loop for 2 × 2 windows with stride 2. On an Intel Celeron N5105 at 4 threads, the forward passes of the `cifar-cnn` network's two poolings take 7 ms per training step instead of 70. The results are unchanged, bit for bit; the old loops are kept as `kernels::pooling::max_pool2d_reference`, and `kernels::pooling::planes_per_task` gives the block size (#201).
 
 ### Data, examples, guide and benchmark
 

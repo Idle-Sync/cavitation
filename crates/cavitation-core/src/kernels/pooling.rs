@@ -2,8 +2,10 @@
 //! rows, as PyTorch's `nn.MaxPool2d`, `nn.AvgPool2d` and `nn.AdaptiveAvgPool2d` compute
 //! them.
 //!
-//! Pooling is cheap next to the convolutions around it, so these plain loops are both the
-//! implementation and the reference; every window is read in row-major order.
+//! Every window is read in row-major order. Max pooling runs blocks of planes in parallel and
+//! reads only each window's in-image taps; [`max_pool2d_reference`] is its plain-loop twin.
+//! Average and adaptive pooling are cheap next to the convolutions around them, so their
+//! plain loops are both the implementation and the reference.
 //!
 //! # Examples
 //!
@@ -18,6 +20,7 @@
 //! assert_eq!(out, [5.0, 7.0, 13.0, 15.0]);
 //! ```
 
+use super::conv::Parts;
 use crate::{Error, Real};
 
 /// The shape of a 2-D pooling: channels and image size, window, stride, zero padding and
@@ -371,6 +374,11 @@ fn check_len(what: &str, len: usize, expected: usize) {
 /// for each output the position of its winner within its input plane (`row · width +
 /// column`), which the backward pass sends the gradient to.
 ///
+/// The planes (one channel of one image) are cut into blocks of [`planes_per_task`] run as
+/// tasks on the thread pool, and each window reads only the taps inside the image, found
+/// once per window from the geometry. Every output depends on its own window alone, so the
+/// result is the same for any thread count, and the same bits as [`max_pool2d_reference`].
+///
 /// # Panics
 ///
 /// Panics if a slice has the wrong length, naming it.
@@ -385,6 +393,208 @@ fn check_len(what: &str, len: usize, expected: usize) {
 /// assert_eq!(winners, [0, 2]); // a tie goes to the first; NaN wins
 /// ```
 pub fn max_pool2d<T: Real>(
+    geom: &Pool2dGeom,
+    batch: usize,
+    x: &[T],
+    out: &mut [T],
+    winners: Option<&mut [usize]>,
+) {
+    let (oh, ow) = geom.out_size();
+    let (h, w) = geom.input;
+    check_len("the input", x.len(), batch * geom.in_width());
+    check_len("the output", out.len(), batch * geom.out_width());
+    if let Some(winners) = winners.as_deref() {
+        check_len("the winners", winners.len(), batch * geom.out_width());
+    }
+    let planes = batch * geom.channels;
+    let per = planes_per_task(geom);
+    let has_winners = winners.is_some();
+    let outs = Parts(out.as_mut_ptr());
+    let wins = Parts(winners.map_or(std::ptr::null_mut(), <[usize]>::as_mut_ptr));
+    super::pool::run(super::threads(), planes.div_ceil(per), &|t| {
+        let first = t.index * per;
+        let n = per.min(planes - first);
+        // SAFETY: task `t.index` alone covers planes `first..first + n`, inside the batch, so
+        // its parts of `out` and of `winners` (when given) are its own.
+        let (o, wn) = unsafe {
+            (
+                outs.slice(first * oh * ow, n * oh * ow),
+                if has_winners {
+                    wins.slice(first * oh * ow, n * oh * ow)
+                } else {
+                    &mut []
+                },
+            )
+        };
+        max_pool_planes(geom, &x[first * h * w..][..n * h * w], o, wn);
+    });
+}
+
+/// The number of planes one task of [`max_pool2d`] takes: about 2¹⁶ input values' worth, at
+/// least one plane. It depends on the geometry alone, never on the thread count.
+///
+/// ```
+/// use cavitation_core::kernels::pooling::{Pool2dGeom, planes_per_task};
+/// assert_eq!(planes_per_task(&Pool2dGeom::new(32, (32, 32), (2, 2)).unwrap()), 64);
+/// assert_eq!(planes_per_task(&Pool2dGeom::new(1, (512, 512), (2, 2)).unwrap()), 1);
+/// ```
+pub fn planes_per_task(geom: &Pool2dGeom) -> usize {
+    let (h, w) = geom.input;
+    ((1 << 16) / (h * w)).max(1)
+}
+
+/// The taps `t` of `0..kernel` along one axis whose pixel `o · stride + t · dilation −
+/// padding` lies inside `0..size`, for output position `o`: a range, since the pixel grows
+/// with `t`. Empty only for a window that misses the image, which the geometry refuses.
+fn taps(
+    o: usize,
+    (kernel, stride, padding, dilation): (usize, usize, usize, usize),
+    size: usize,
+) -> std::ops::Range<usize> {
+    let base = o * stride;
+    // Without dilation (the usual case) the bounds need no division.
+    let (start, end) = if dilation == 1 {
+        (
+            padding.saturating_sub(base),
+            (size + padding).saturating_sub(base),
+        )
+    } else {
+        (
+            padding.saturating_sub(base).div_ceil(dilation),
+            (size + padding).saturating_sub(base).div_ceil(dilation),
+        )
+    };
+    let end = end.min(kernel);
+    start..end.max(start)
+}
+
+/// [`max_pool2d`] on whole planes: `x` holds the planes' pixels, `out` and `winners` their
+/// outputs (`winners` is empty when not wanted). Each window's first in-image tap starts it,
+/// and a later tap wins when `value > best` or `value` is NaN, as in
+/// [`max_pool2d_reference`].
+fn max_pool_planes<T: Real>(geom: &Pool2dGeom, x: &[T], out: &mut [T], winners: &mut [usize]) {
+    let (oh, ow) = geom.out_size();
+    let (h, w) = geom.input;
+    let (kh, kw) = geom.kernel;
+    let ((sh, sw), (ph, pw), (dh, dw)) = (geom.stride, geom.padding, geom.dilation);
+    let keep = !winners.is_empty();
+    if geom.kernel == (2, 2)
+        && geom.stride == (2, 2)
+        && geom.padding == (0, 0)
+        && geom.dilation == (1, 1)
+        && 2 * oh <= h
+        && 2 * ow <= w
+    {
+        return max_pool_2x2(geom, x, out, winners);
+    }
+    for (p, (plane, o_plane)) in x
+        .chunks_exact(h * w)
+        .zip(out.chunks_exact_mut(oh * ow))
+        .enumerate()
+    {
+        for (oy, o_row) in o_plane.chunks_exact_mut(ow).enumerate() {
+            let ti = taps(oy, (kh, sh, ph, dh), h);
+            for (ox, o) in o_row.iter_mut().enumerate() {
+                let tj = taps(ox, (kw, sw, pw, dw), w);
+                let x0 = ox * sw + tj.start * dw - pw;
+                let mut at = (oy * sh + ti.start * dh - ph) * w + x0;
+                let mut best = plane[at];
+                for i in ti.clone() {
+                    let start = (oy * sh + i * dh - ph) * w + x0;
+                    if dw == 1 {
+                        for (j, &v) in plane[start..start + tj.len()].iter().enumerate() {
+                            #[allow(clippy::eq_op)] // `v != v` is the NaN test `Real` offers
+                            let nan = v != v;
+                            if v > best || nan {
+                                best = v;
+                                at = start + j;
+                            }
+                        }
+                    } else {
+                        for (j, &v) in plane[start..].iter().step_by(dw).take(tj.len()).enumerate()
+                        {
+                            #[allow(clippy::eq_op)] // `v != v` is the NaN test `Real` offers
+                            let nan = v != v;
+                            if v > best || nan {
+                                best = v;
+                                at = start + j * dw;
+                            }
+                        }
+                    }
+                }
+                *o = best;
+                if keep {
+                    winners[(p * oh + oy) * ow + ox] = at;
+                }
+            }
+        }
+    }
+}
+
+/// [`max_pool_planes`] for 2 × 2 windows with stride 2 and every window inside the image
+/// (no padding or dilation), the usual pooling: the same four taps in the same order and the
+/// same rule, with the window's position known without any bounds arithmetic.
+fn max_pool_2x2<T: Real>(geom: &Pool2dGeom, x: &[T], out: &mut [T], winners: &mut [usize]) {
+    let (oh, ow) = geom.out_size();
+    let (h, w) = geom.input;
+    let keep = !winners.is_empty();
+    for (p, (plane, o_plane)) in x
+        .chunks_exact(h * w)
+        .zip(out.chunks_exact_mut(oh * ow))
+        .enumerate()
+    {
+        for (oy, o_row) in o_plane.chunks_exact_mut(ow).enumerate() {
+            let top = 2 * oy * w;
+            let (r0, r1) = (&plane[top..][..2 * ow], &plane[top + w..][..2 * ow]);
+            for (ox, ((o, a), b)) in o_row
+                .iter_mut()
+                .zip(r0.as_chunks::<2>().0)
+                .zip(r1.as_chunks::<2>().0)
+                .enumerate()
+            {
+                let mut best = a[0];
+                let mut at = 0;
+                for (k, v) in [a[1], b[0], b[1]].into_iter().enumerate() {
+                    #[allow(clippy::eq_op)] // `v != v` is the NaN test `Real` offers
+                    let nan = v != v;
+                    if v > best || nan {
+                        best = v;
+                        at = k + 1;
+                    }
+                }
+                *o = best;
+                if keep {
+                    // Taps 0 and 1 are on the top row, 2 and 3 on the next.
+                    winners[(p * oh + oy) * ow + ox] = top + (at >> 1) * w + 2 * ox + (at & 1);
+                }
+            }
+        }
+    }
+}
+
+/// The plain loops of [`max_pool2d`], its reference twin: the same results, every tap checked
+/// against the image as it is read. Max pooling of `batch` images `x` into `out`, as
+/// PyTorch's CPU kernel computes it: each output is the largest value of its window, the
+/// taps read in row-major order with a later one winning when `value > best` or `value` is
+/// NaN (so a NaN wins, and the last NaN of a window wins over an earlier one), padding never
+/// winning. `winners`, if given, receives
+/// for each output the position of its winner within its input plane (`row · width +
+/// column`), which the backward pass sends the gradient to.
+///
+/// # Panics
+///
+/// Panics if a slice has the wrong length, naming it.
+///
+/// ```
+/// use cavitation_core::kernels::pooling::{Pool2dGeom, max_pool2d_reference};
+/// let geom = Pool2dGeom::new(1, (1, 4), (1, 2)).unwrap();
+/// let (mut out, mut winners) = (vec![0.0f32; 2], vec![0; 2]);
+/// max_pool2d_reference(&geom, 1, &[3.0, 3.0, f32::NAN, 1.0], &mut out, Some(&mut winners));
+/// assert_eq!(out[0], 3.0);
+/// assert!(out[1].is_nan());
+/// assert_eq!(winners, [0, 2]); // a tie goes to the first; NaN wins
+/// ```
+pub fn max_pool2d_reference<T: Real>(
     geom: &Pool2dGeom,
     batch: usize,
     x: &[T],
@@ -434,7 +644,9 @@ pub fn max_pool2d<T: Real>(
 }
 
 /// Adds each output gradient of [`max_pool2d`] to its winner's position in `dx`, output by
-/// output in order. `dx` is added to, not overwritten.
+/// output in order within each plane. `dx` is added to, not overwritten. The planes run in
+/// blocks of [`planes_per_task`] on the thread pool; each plane's sums depend on it alone,
+/// so the result is the same for any thread count.
 ///
 /// # Panics
 ///
@@ -459,13 +671,26 @@ pub fn max_pool2d_backward<T: Real>(
     check_len("the output gradient", dy.len(), batch * geom.out_width());
     check_len("the winners", winners.len(), batch * geom.out_width());
     check_len("the input gradient", dx.len(), batch * geom.in_width());
-    for (p, plane) in dx.chunks_exact_mut(h * w).enumerate() {
-        let g = &dy[p * oh * ow..][..oh * ow];
-        let at = &winners[p * oh * ow..][..oh * ow];
-        for (&gv, &a) in g.iter().zip(at) {
-            plane[a] += gv;
-        }
-    }
+    let per = planes_per_task(geom);
+    let dxs = Parts(dx.as_mut_ptr());
+    super::pool::run(
+        super::threads(),
+        (batch * geom.channels).div_ceil(per),
+        &|t| {
+            let first = t.index * per;
+            let n = per.min(batch * geom.channels - first);
+            // SAFETY: task `t.index` alone covers planes `first..first + n`, inside the batch, so
+            // its part of `dx` is its own.
+            let dx = unsafe { dxs.slice(first * h * w, n * h * w) };
+            for (p, plane) in dx.chunks_exact_mut(h * w).enumerate() {
+                let g = &dy[(first + p) * oh * ow..][..oh * ow];
+                let at = &winners[(first + p) * oh * ow..][..oh * ow];
+                for (&gv, &a) in g.iter().zip(at) {
+                    plane[a] += gv;
+                }
+            }
+        },
+    );
 }
 
 /// The in-image part of average-pooling window `o` along one axis, and the length PyTorch
@@ -956,5 +1181,69 @@ mod tests {
         let lhs: f64 = y.iter().zip(&u).map(|(a, b)| a * b).sum();
         let rhs: f64 = x.iter().zip(&back).map(|(a, b)| a * b).sum();
         assert!((lhs - rhs).abs() < 1e-12);
+    }
+
+    /// The fast max pooling gives the reference twin's bits and winners, for f32 and f64,
+    /// with and without winners, and the backward pass gives a plain loop's sums, on 2 × 2
+    /// windows (odd sizes included) and on geometries with stride, padding, dilation and
+    /// `ceil_mode`, over batches of more planes than one task takes. The values are drawn
+    /// from a few levels, so windows hold ties, and some are NaN or infinite.
+    #[test]
+    fn max_pool2d_matches_reference() {
+        fn check<T: Real>(g: &Pool2dGeom, batch: usize, x: &[T]) {
+            let n = batch * g.out_width();
+            let (mut a, mut b) = (vec![T::ZERO; n], vec![T::ZERO; n]);
+            let (mut wa, mut wb) = (vec![0; n], vec![usize::MAX; n]);
+            max_pool2d(g, batch, x, &mut a, Some(&mut wa));
+            max_pool2d_reference(g, batch, x, &mut b, Some(&mut wb));
+            let bits = |v: &[T]| v.iter().map(|x| x.to_f64().to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&a), bits(&b), "{g:?}");
+            assert_eq!(wa, wb, "{g:?}");
+            let mut c = vec![T::ZERO; n];
+            max_pool2d(g, batch, x, &mut c, None);
+            assert_eq!(bits(&c), bits(&b), "{g:?} without winners");
+            // The backward pass, over blocks of planes, against one plain loop over them all.
+            let (oh, ow) = g.out_size();
+            let plane = g.input().0 * g.input().1;
+            let dy: Vec<T> = (0..n).map(|i| T::from_f64((i % 7) as f64 - 3.0)).collect();
+            let mut fast = vec![T::ONE; x.len()];
+            max_pool2d_backward(g, batch, &dy, &wb, &mut fast);
+            let mut plain = vec![T::ONE; x.len()];
+            for (i, (&d, &at)) in dy.iter().zip(&wb).enumerate() {
+                plain[i / (oh * ow) * plane + at] += d;
+            }
+            assert_eq!(bits(&fast), bits(&plain), "{g:?} backward");
+        }
+        let mut rng = crate::Rng::seed(9);
+        let geoms = [
+            Pool2dGeom::new(3, (64, 64), (2, 2)).unwrap(),
+            // 2 x 2 windows on odd sizes: rounded down, every window inside (the 2 x 2
+            // path), and with `ceil_mode`, a last window half outside (the general loop).
+            Pool2dGeom::new(2, (65, 63), (2, 2)).unwrap(),
+            Pool2dGeom::with_options(2, (65, 63), (2, 2), (2, 2), (0, 0), (1, 1), true).unwrap(),
+            Pool2dGeom::with_options(2, (65, 63), (3, 3), (2, 2), (1, 1), (1, 1), true).unwrap(),
+            Pool2dGeom::with_options(2, (70, 66), (3, 2), (2, 1), (1, 1), (2, 2), false).unwrap(),
+            Pool2dGeom::with_options(1, (9, 9), (3, 3), (1, 1), (1, 1), (2, 2), false).unwrap(),
+            Pool2dGeom::with_options(1, (1, 5), (1, 2), (1, 2), (0, 1), (1, 1), true).unwrap(),
+            Pool2dGeom::new(1, (2, 3), (2, 3)).unwrap(),
+        ];
+        for g in geoms {
+            let batch = if planes_per_task(&g) < 2 * g.channels() {
+                3
+            } else {
+                1 + planes_per_task(&g)
+            };
+            let x: Vec<f64> = (0..batch * g.in_width())
+                .map(|_| match rng.below(40) {
+                    0 => f64::NAN,
+                    1 => f64::INFINITY,
+                    2 => f64::NEG_INFINITY,
+                    k => (k % 5) as f64 - 2.0,
+                })
+                .collect();
+            check(&g, batch, &x);
+            let x32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+            check(&g, batch, &x32);
+        }
     }
 }
