@@ -37,7 +37,7 @@ It trains with `fit`, Adam at 1e-3 and batches of 64, and prints the test accura
 {{#include ../../crates/cavitation/examples/mnist_cnn.rs:fit}}
 ```
 
-The run turns off the health checks' dead-ReLU report. The report counts each position of a convolution's output as a neuron. The blank border of a digit leaves many positions at 0 for a whole epoch, but the channel there is not dead.
+The health checks stay at their defaults. After a convolution, the dead-ReLU report counts a channel as dead only when every position in it stayed at 0 for the whole epoch. So the blank border of a digit, which leaves some positions at 0, does not set it off.
 
 Run it with `scripts/data/get-mnist.sh` once, then `cargo run --release --example mnist_cnn -p cavitation`. On an Intel Celeron N5105 (4 cores, kernel level `sse4.2`, 4 threads, with other work running on the machine) it printed:
 
