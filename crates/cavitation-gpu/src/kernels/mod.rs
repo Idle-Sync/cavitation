@@ -1,6 +1,7 @@
 //! The GPU kernels, one module per family, each with the CPU twin its tests check against.
 
 mod batch_norm;
+mod bindings;
 mod gemm;
 mod reduce;
 

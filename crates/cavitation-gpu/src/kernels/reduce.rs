@@ -26,8 +26,9 @@ const CHUNK: u64 = (WORKGROUP * PER_LANE) as u64;
 /// workgroup's lanes past the end.
 const MAX_VALUES: u64 = 1 << 31;
 
-/// Bytes of the `Dims` uniform: `outer`, `channels`, `inner`, the chunks per channel and
-/// whether the sums add to the output, padded to 16-byte rows.
+/// Bytes of the `Dims` uniform: `outer`, `channels`, `inner`, the chunks per channel, whether
+/// the sums add to the output, where they go in it, what they are divided by, and where the
+/// summed values start in the input.
 const DIMS_BYTES: u64 = 32;
 
 /// The parts every kernel here shares: the `WORKGROUP` override and the `Dims` uniform.
@@ -42,9 +43,9 @@ macro_rules! dims {
             inner: u32,
             chunks: u32,
             accumulate: u32,
-            pad0: u32,
-            pad1: u32,
-            pad2: u32,
+            offset: u32,
+            divisor: f32,
+            start: u32,
         }
         "
     };
@@ -79,9 +80,10 @@ const BIAS_ADD: Shader = Shader {
 /// The first pass of a per-channel sum, around a kernel's own bindings and its
 /// `fn term(i: u32, c: u32) -> f32`, the value summed for value `i` of channel `c`:
 /// workgroup `(chunk, c)` sums the terms of values `chunk · CHUNK` onwards of channel `c`,
-/// taken in the order `j = b·P + p`. Each lane adds every `WORKGROUP`-th term of the chunk in
-/// order, then the lanes' sums meet in a fixed halving tree. The partial sums are binding 1
-/// and the `Dims` uniform binding 2; the term's inputs take binding 0 and from 3 on.
+/// taken in the order `j = b·P + p`, the tensor starting `dims.start` values into its inputs.
+/// Each lane adds every `WORKGROUP`-th term of the chunk in order, then the lanes' sums meet
+/// in a fixed halving tree. The partial sums are binding 1 and the `Dims` uniform binding 2;
+/// the term's inputs take binding 0 and from 3 on.
 macro_rules! partials_pass {
     ($bindings:literal, $term:literal) => {
         concat!(
@@ -111,7 +113,8 @@ macro_rules! partials_pass {
                     let j = first + k * WORKGROUP;
                     if (j < len) {
                         let b = j / dims.inner;
-                        acc = acc + term((b * dims.channels + c) * dims.inner + j % dims.inner, c);
+                        let i = (b * dims.channels + c) * dims.inner + j % dims.inner;
+                        acc = acc + term(dims.start + i, c);
                     }
                 }
                 lanes[lane] = acc;
@@ -129,7 +132,7 @@ macro_rules! partials_pass {
 pub(crate) use partials_pass;
 
 /// Channel sums, first pass: the terms are the values themselves.
-const CHANNEL_PARTIALS: Shader = Shader {
+pub(crate) const CHANNEL_PARTIALS: Shader = Shader {
     name: "channel sums partials",
     source: partials_pass!(
         "@group(0) @binding(0) var<storage, read> x: array<f32>;",
@@ -138,7 +141,9 @@ const CHANNEL_PARTIALS: Shader = Shader {
 };
 
 /// Channel sums, second pass: one thread per channel (at most 65,535, so one grid row) adds
-/// its chunks' partial sums in chunk order, then, when accumulating, the output's old value.
+/// its chunks' partial sums in chunk order, divides by the divisor when there is one (not
+/// 0), then, when accumulating, adds the output's old value; channel `c` goes to
+/// `sums[offset + c]`.
 const CHANNEL_MERGE: Shader = Shader {
     name: "channel sums merge",
     source: concat!(
@@ -160,8 +165,10 @@ const CHANNEL_MERGE: Shader = Shader {
             for (var k = 1u; k < dims.chunks; k = k + 1u) {
                 acc = acc + partials[base + k];
             }
-            if (dims.accumulate != 0u) { acc = acc + sums[c]; }
-            sums[c] = acc;
+            if (dims.divisor != 0.0) { acc = acc / dims.divisor; }
+            let at = dims.offset + c;
+            if (dims.accumulate != 0u) { acc = acc + sums[at]; }
+            sums[at] = acc;
         }
         "
     ),
@@ -276,16 +283,19 @@ impl ChannelDims {
         );
     }
 
-    /// The `Dims` uniform's bytes, with `chunks` chunks per channel and the `accumulate`
-    /// flag.
-    fn uniform(&self, chunks: u32, accumulate: bool) -> [u8; DIMS_BYTES as usize] {
+    /// The `Dims` uniform's bytes, with `chunks` chunks per channel, the input's `start` and
+    /// where the sums go, `to`.
+    fn uniform(&self, chunks: u32, start: u32, to: &SumsTo<'_>) -> [u8; DIMS_BYTES as usize] {
         let mut bytes = [0u8; DIMS_BYTES as usize];
         for (slot, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip([
             self.outer,
             self.channels,
             self.inner,
             chunks,
-            u32::from(accumulate),
+            u32::from(to.accumulate),
+            to.offset,
+            to.divisor.unwrap_or(0.0).to_bits(),
+            start,
         ]) {
             slot.copy_from_slice(&word.to_le_bytes());
         }
@@ -527,7 +537,7 @@ impl BiasAdd {
             bias.buffer() != out.buffer(),
             "bias add: the bias and the tensor it is added to must be different buffers"
         );
-        let params = upload_dims(steps, pool, &dims.uniform(0, false));
+        let params = upload_dims(steps, pool, &dims.uniform(0, 0, &SumsTo::new(out)));
         let group = bind(steps, &self.group, bias, out, &params);
         BiasAddCall {
             dims,
@@ -700,15 +710,12 @@ impl ChannelSums {
         out: &PooledBuffer,
         accumulate: bool,
     ) -> ChannelSumsCall {
-        self.sums.call(
-            steps,
-            pool,
-            "channel sums",
-            dims,
-            (x, dims.len()),
-            &[],
-            (out, accumulate),
-        )
+        let to = SumsTo {
+            accumulate,
+            ..SumsTo::new(out)
+        };
+        self.sums
+            .call(steps, pool, "channel sums", dims, (x, 0), &[], to)
     }
 
     /// Adds the sums `call` to `step`: the first pass's grid of chunks by channels, then the
@@ -719,6 +726,32 @@ impl ChannelSums {
     /// See [`ChannelSums`].
     pub fn record(&self, step: &mut Step<'_>, call: &ChannelSumsCall) {
         self.sums.record(step, call);
+    }
+}
+
+/// Where a per-channel sum goes: channel `c` to `out[offset + c]`, divided by `divisor` if
+/// given, then overwriting the old value or (`accumulate`) added to it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SumsTo<'a> {
+    /// The output buffer.
+    pub(crate) out: &'a PooledBuffer,
+    /// Where channel 0 goes, in values.
+    pub(crate) offset: u32,
+    /// Whether the sums add to the old values.
+    pub(crate) accumulate: bool,
+    /// What each sum is divided by, as an `f32` the host rounded, for a mean.
+    pub(crate) divisor: Option<f32>,
+}
+
+impl<'a> SumsTo<'a> {
+    /// The plain case: sums overwriting `out` from its start.
+    pub(crate) fn new(out: &'a PooledBuffer) -> SumsTo<'a> {
+        SumsTo {
+            out,
+            offset: 0,
+            accumulate: false,
+            divisor: None,
+        }
     }
 }
 
@@ -770,14 +803,15 @@ impl TermSums {
     }
 
     /// Prepares one sum, named `what` in panics, of each channel's terms of a tensor shaped
-    /// `dims` into `out`, overwritten or (with its flag set) added to: `first` (with the
-    /// `f32`s it must hold) at binding 0 and `extra` inputs (each with its length) from
-    /// binding 3, as [`ChannelSums::call`] does.
+    /// `dims` into `to`: `first` at binding 0, the tensor starting `start` values into it,
+    /// and `extra` inputs (each with the values it must hold) from binding 3, as
+    /// [`ChannelSums::call`] does.
     ///
     /// # Panics
     ///
-    /// As [`ChannelSums::call`], for every input, and if `extra` does not hold the inputs
-    /// the term reads.
+    /// As [`ChannelSums::call`], for every input (the first holding `start` values more),
+    /// and if `extra` does not hold the inputs the term reads or the output is too short
+    /// for its offset.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn call(
         &self,
@@ -785,10 +819,11 @@ impl TermSums {
         pool: &mut BufferPool,
         what: &str,
         dims: ChannelDims,
-        first: (&PooledBuffer, u64),
+        (first, start): (&PooledBuffer, u32),
         extra: &[(&PooledBuffer, u64)],
-        (out, accumulate): (&PooledBuffer, bool),
+        to: SumsTo<'_>,
     ) -> ChannelSumsCall {
+        let out = to.out;
         dims.check(what);
         let chunks = dims.summed().div_ceil(CHUNK);
         assert!(
@@ -804,17 +839,21 @@ impl TermSums {
             self.extra,
             extra.len()
         );
-        check_len(&format!("{what}: the tensor"), first.0, first.1);
+        check_len(
+            &format!("{what}: the tensor"),
+            first,
+            u64::from(start) + dims.len(),
+        );
         for (k, (buffer, len)) in extra.iter().enumerate() {
             check_len(&format!("{what}: input {}", k + 1), buffer, *len);
         }
         check_len(
             &format!("{what}: the output"),
             out,
-            u64::from(dims.channels),
+            u64::from(to.offset) + u64::from(dims.channels),
         );
         assert!(
-            first.0.buffer() != out.buffer(),
+            first.buffer() != out.buffer(),
             "{what}: the tensor and its sums must be different buffers"
         );
         for (k, (buffer, _)) in extra.iter().enumerate() {
@@ -825,13 +864,13 @@ impl TermSums {
             );
         }
         let chunks = chunks as u32;
-        let params = upload_dims(steps, pool, &dims.uniform(chunks, accumulate));
+        let params = upload_dims(steps, pool, &dims.uniform(chunks, start, &to));
         let partials = pool.take(
             4 * u64::from(chunks) * u64::from(dims.channels),
             wgpu::BufferUsages::STORAGE,
         );
         let extras: Vec<&PooledBuffer> = extra.iter().map(|e| e.0).collect();
-        let partials_group = bind_with(steps, &self.group, first.0, &partials, &params, &extras);
+        let partials_group = bind_with(steps, &self.group, first, &partials, &params, &extras);
         let merge_group = bind(steps, &self.merge_group, &partials, out, &params);
         ChannelSumsCall {
             dims,

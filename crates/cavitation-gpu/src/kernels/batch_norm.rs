@@ -9,9 +9,13 @@
 //! CPU's stats node holds them: the mean, `1 / √(var + eps)` and the unbiased variance (0 for
 //! running statistics). The bounds assume every multiply-add may round twice.
 
-use super::reduce::{ChannelSumsCall, TermSums, partials_pass};
+use super::bindings::{Kind, bind, check_distinct, check_len, layout, upload_uniform, word_bytes};
+use super::reduce::{ChannelSumsCall, SumsTo, TermSums, partials_pass};
 use super::{ChannelDims, ChannelSums};
 use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder};
+
+/// The kernel's name in panic messages.
+const NAME: &str = "batch norm";
 
 /// Threads per workgroup in every kernel here, passed as the `WORKGROUP` override.
 const WORKGROUP: u32 = 256;
@@ -227,121 +231,6 @@ const RUNNING: Shader = Shader {
         }
     ",
 };
-
-/// A bind group layout entry for a compute buffer at `binding`, used as `kind` says.
-fn entry(binding: u32, kind: Kind) -> wgpu::BindGroupLayoutEntry {
-    let ty = match kind {
-        Kind::Read => wgpu::BufferBindingType::Storage { read_only: true },
-        Kind::Write => wgpu::BufferBindingType::Storage { read_only: false },
-        Kind::Uniform(_) => wgpu::BufferBindingType::Uniform,
-    };
-    let min_binding_size = match kind {
-        Kind::Uniform(size) => std::num::NonZeroU64::new(size),
-        _ => None,
-    };
-    wgpu::BindGroupLayoutEntry {
-        binding,
-        visibility: wgpu::ShaderStages::COMPUTE,
-        ty: wgpu::BindingType::Buffer {
-            ty,
-            has_dynamic_offset: false,
-            min_binding_size,
-        },
-        count: None,
-    }
-}
-
-/// How a binding is used.
-#[derive(Clone, Copy)]
-enum Kind {
-    /// A read-only storage buffer.
-    Read,
-    /// A read-write storage buffer.
-    Write,
-    /// A uniform of this many bytes.
-    Uniform(u64),
-}
-
-/// A bind group layout and its pipeline layout, with the bindings `kinds` at 0, 1, ….
-fn layout(gpu: &Gpu, label: &str, kinds: &[Kind]) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
-    let device = gpu.device();
-    let entries: Vec<_> = kinds
-        .iter()
-        .enumerate()
-        .map(|(k, &kind)| entry(k as u32, kind))
-        .collect();
-    let group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some(label),
-        entries: &entries,
-    });
-    let pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some(label),
-        bind_group_layouts: &[Some(&group)],
-        immediate_size: 0,
-    });
-    (group, pipeline)
-}
-
-/// A counted bind group on `layout` with `buffers` at bindings 0, 1, ….
-fn bind(
-    steps: &mut StepEncoder,
-    layout: &wgpu::BindGroupLayout,
-    buffers: &[&PooledBuffer],
-) -> wgpu::BindGroup {
-    let entries: Vec<_> = buffers
-        .iter()
-        .enumerate()
-        .map(|(k, b)| wgpu::BindGroupEntry {
-            binding: k as u32,
-            resource: b.binding(),
-        })
-        .collect();
-    steps.bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout,
-        entries: &entries,
-    })
-}
-
-/// Panics, naming `what`, unless `buffer` holds at least `values` 4-byte values.
-fn check_len(what: &str, buffer: &PooledBuffer, values: u64) {
-    assert!(
-        buffer.len() >= 4 * values,
-        "batch norm: the {what} needs {values} values ({} bytes), but its buffer has {} bytes",
-        4 * values,
-        buffer.len()
-    );
-}
-
-/// Panics unless the buffer a kernel writes, `written` (named), is none of the buffers
-/// `read` (named) that it is used with: wgpu refuses a dispatch that writes a buffer it also
-/// reads, and an alias between them is a mistake in the caller either way.
-fn check_distinct(written: (&str, &PooledBuffer), read: &[(&str, &PooledBuffer)]) {
-    for (name, buffer) in read {
-        assert!(
-            written.1.buffer() != buffer.buffer(),
-            "batch norm: the {} and the {name} must be different buffers",
-            written.0
-        );
-    }
-}
-
-/// A uniform buffer from `pool` holding `bytes`, uploaded in a step of its own.
-fn upload_uniform(steps: &mut StepEncoder, pool: &mut BufferPool, bytes: &[u8]) -> PooledBuffer {
-    let buffer = pool.take(
-        bytes.len() as u64,
-        wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    );
-    let mut step = steps.begin();
-    step.upload(buffer.buffer(), 0, bytes);
-    let _ = step.finish();
-    buffer
-}
-
-/// Little-endian bytes of `words`.
-fn word_bytes<const N: usize>(words: [u32; N]) -> Vec<u8> {
-    words.iter().flat_map(|w| w.to_le_bytes()).collect()
-}
 
 /// The `Params` uniform's bytes for `dims`, `flags` and `eps`, with `m = outer · inner` and
 /// `m − 1` and eps rounded to `f32` as the CPU rounds them.
@@ -568,19 +457,19 @@ impl BatchNorm2d {
             "batch norm: eps must be 0 or at least 2⁻¹²⁶ in f32, which flushes smaller ones; \
              got {eps}"
         );
-        check_len("input", x, dims.len());
-        check_len("output", y, dims.len());
-        check_len("statistics", stats, 3 * c);
+        check_len(NAME, "input", x, dims.len());
+        check_len(NAME, "output", y, dims.len());
+        check_len(NAME, "statistics", stats, 3 * c);
         let mut read = vec![("input", x)];
         if let Some((w, b)) = affine {
-            check_len("weight", w, c);
-            check_len("bias", b, c);
+            check_len(NAME, "weight", w, c);
+            check_len(NAME, "bias", b, c);
             read.extend([("weight", w), ("bias", b)]);
         }
         match from {
             BatchStats::Running { mean, var } => {
-                check_len("running mean", mean, c);
-                check_len("running variance", var, c);
+                check_len(NAME, "running mean", mean, c);
+                check_len(NAME, "running variance", var, c);
                 read.extend([("running mean", mean), ("running variance", var)]);
             }
             BatchStats::Batch => assert!(
@@ -589,9 +478,9 @@ impl BatchNorm2d {
                  {dims:?}"
             ),
         }
-        check_distinct(("statistics", stats), &read);
+        check_distinct(NAME, ("statistics", stats), &read);
         read.push(("statistics", stats));
-        check_distinct(("output", y), &read);
+        check_distinct(NAME, ("output", y), &read);
         let flags = if affine.is_some() { AFFINE } else { 0 };
         let uniform = upload_uniform(steps, pool, &params(dims, flags, eps));
         let (batch, running_group) = match from {
@@ -604,9 +493,9 @@ impl BatchNorm2d {
                     pool,
                     "batch norm centred squares",
                     dims,
-                    (x, dims.len()),
+                    (x, 0),
                     &[(stats, 3 * c)],
-                    (&squares, false),
+                    SumsTo::new(&squares),
                 );
                 let batch = BatchPass {
                     mean_group: bind(steps, &self.stats_group, &[stats, &uniform, &sums, &sums]),
@@ -742,22 +631,24 @@ impl BatchNorm2d {
             *x.buffer() == forward.input && *stats.buffer() == forward.stats,
             "batch norm: the backward pass must read the forward pass's input and statistics"
         );
-        check_len("output gradient", grad_out, len);
-        check_len("input gradient", grad_in, len);
+        check_len(NAME, "output gradient", grad_out, len);
+        check_len(NAME, "input gradient", grad_in, len);
         let mut read = vec![
             ("output gradient", grad_out),
             ("input", x),
             ("statistics", stats),
         ];
         if let Some((w, dw, db)) = affine {
-            check_len("weight", w, c);
-            check_len("weight gradient", dw, c);
-            check_len("bias gradient", db, c);
+            check_len(NAME, "weight", w, c);
+            check_len(NAME, "weight gradient", dw, c);
+            check_len(NAME, "bias gradient", db, c);
             check_distinct(
+                NAME,
                 ("weight gradient", dw),
                 &[("bias gradient", db), ("weight", w)],
             );
             check_distinct(
+                NAME,
                 ("bias gradient", db),
                 &[("weight", w), ("input", x), ("statistics", stats)],
             );
@@ -767,7 +658,7 @@ impl BatchNorm2d {
                 ("bias gradient", db),
             ]);
         }
-        check_distinct(("input gradient", grad_in), &read);
+        check_distinct(NAME, ("input gradient", grad_in), &read);
         let batch = forward.batch.is_some();
         let flags = (if forward.affine { AFFINE } else { 0 }) | (if batch { BATCH } else { 0 });
         let uniform = upload_uniform(steps, pool, &params(dims, flags, 0.0));
@@ -785,9 +676,9 @@ impl BatchNorm2d {
                 pool,
                 "batch norm dy x̂",
                 dims,
-                (grad_out, len),
+                (grad_out, 0),
                 &[(x, len), (stats, 3 * c)],
-                (sdx, false),
+                SumsTo::new(sdx),
             ),
         });
         let (sdy, sdx) = targets.unwrap_or((grad_out, grad_out));
@@ -894,10 +785,11 @@ impl BatchNorm2d {
             "batch norm: the running update must read the forward pass's statistics"
         );
         let c = u64::from(forward.dims.channels);
-        check_len("running mean", mean, c);
-        check_len("running variance", var, c);
-        check_len("finite flag", finite, 1);
+        check_len(NAME, "running mean", mean, c);
+        check_len(NAME, "running variance", var, c);
+        check_len(NAME, "finite flag", finite, 1);
         check_distinct(
+            NAME,
             ("running mean", mean),
             &[
                 ("statistics", stats),
@@ -906,6 +798,7 @@ impl BatchNorm2d {
             ],
         );
         check_distinct(
+            NAME,
             ("running variance", var),
             &[("statistics", stats), ("finite flag", finite)],
         );
