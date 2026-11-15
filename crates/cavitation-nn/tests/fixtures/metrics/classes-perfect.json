@@ -1,0 +1,76 @@
+{
+ "sklearn_version": "1.9.1",
+ "kind": "classes",
+ "classes": 2,
+ "targets": [
+  0,
+  1,
+  1,
+  0,
+  1
+ ],
+ "predicted": [
+  0,
+  1,
+  1,
+  0,
+  1
+ ],
+ "confusion": [
+  [
+   2,
+   0
+  ],
+  [
+   0,
+   3
+  ]
+ ],
+ "accuracy": 1.0,
+ "labels": [
+  0,
+  1
+ ],
+ "per_class": {
+  "precision": [
+   1.0,
+   1.0
+  ],
+  "recall": [
+   1.0,
+   1.0
+  ],
+  "f1": [
+   1.0,
+   1.0
+  ],
+  "f2": [
+   1.0,
+   1.0
+  ],
+  "support": [
+   2,
+   3
+  ]
+ },
+ "averages": {
+  "macro": {
+   "precision": 1.0,
+   "recall": 1.0,
+   "f1": 1.0,
+   "f2": 1.0
+  },
+  "weighted": {
+   "precision": 1.0,
+   "recall": 1.0,
+   "f1": 1.0,
+   "f2": 1.0
+  },
+  "micro": {
+   "precision": 1.0,
+   "recall": 1.0,
+   "f1": 1.0,
+   "f2": 1.0
+  }
+ }
+}
