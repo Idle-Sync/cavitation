@@ -21,3 +21,10 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "parki
 # Blocks on wgpu's futures (adapter and device requests), which finish without an executor
 # on native backends.
 pollster = "1.0.1"
+
+# Counts host allocations in warm steps; it installs its own global allocator, so it runs
+# alone, without the test harness.
+[[test]]
+name = "step_alloc"
+harness = false
+
