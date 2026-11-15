@@ -67,6 +67,7 @@ scripts/data/get-cifar10.sh                       # CIFAR-10 into data/cifar10/
 cargo run --release -p cavitation-bench -- mnist-cnn --seed 0 --python <python with torch>
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --python <python with torch>
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --ours-only   # Cavitation's half only
+cargo run --release -p cavitation-bench -- cifar-cnn --profile 15            # time per layer, no training run
 ```
 
 The PyTorch side is `scripts/bench/torch_cnn.py`; `scripts/fixtures/requirements.txt` lists what its Python needs. Each run writes `result.json` under `target/bench/cnn/<benchmark>-seed<N>/`.

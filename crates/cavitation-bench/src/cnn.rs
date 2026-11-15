@@ -12,14 +12,15 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use crate::runs::median;
 use cavitation_core::kernels::{level, threads};
 use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng};
 use cavitation_datasets::{cifar10, mnist};
 use cavitation_nn::{
     Adam, Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Dropout, Flatten, Health, Init, Linear,
-    Loss, MaxPool2d, Relu, Sequential, Trainer, accuracy, save,
+    Loss, MaxPool2d, Relu, Sequential, StepProfile, Trainer, accuracy, save,
 };
 
 /// One of the two benchmark networks with its pinned schedule.
@@ -125,6 +126,9 @@ pub struct Options {
     pub python: String,
     /// `--ours-only`: skip the PyTorch side.
     pub ours_only: bool,
+    /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
+    /// steps) and print each layer's median forward and backward time.
+    pub profile: Option<usize>,
 }
 
 impl Options {
@@ -141,6 +145,7 @@ impl Options {
             rows: None,
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
             ours_only: false,
+            profile: None,
         };
         let mut rest = args.iter();
         let number = |flag: &str, v: Option<&String>, zero_ok: bool| -> Result<usize, String> {
@@ -157,6 +162,7 @@ impl Options {
                 "--rows" => o.rows = Some(number("--rows", rest.next(), false)?),
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
                 "--ours-only" => o.ours_only = true,
+                "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
@@ -251,6 +257,94 @@ fn train_ours(
         epochs.push(epoch);
     }
     Ok(epochs)
+}
+
+/// The `--profile` run: trains `steps` + 3 batches of `train` in the seeded batch order, the
+/// last `steps` with [`Trainer::profile_next_step`], and prints each layer's median forward
+/// and backward time, then the loss's, the optimiser's and the whole step's. Nothing is
+/// written.
+///
+/// # Errors
+///
+/// Returns a message if a training step fails.
+fn profile(
+    model: &Sequential,
+    params: &mut ParamStore,
+    train: &Dataset,
+    net: Net,
+    seed: u64,
+    steps: usize,
+) -> Result<(), String> {
+    let mut trainer = Trainer::new(model, Adam::new(1e-3), Loss::CrossEntropy, net.batch);
+    trainer.set_health(Health::quiet());
+    let mut batcher = Batcher::new(train.len(), net.batch, Some(seed));
+    let mut batch = Batch::new(train, net.batch);
+    let mut profiles = Vec::with_capacity(steps);
+    let mut step = 0;
+    while step < steps + 3 {
+        batcher.epoch();
+        for range in batcher.batches() {
+            if step == steps + 3 {
+                break;
+            }
+            let view = batcher.gather(train, range, &mut batch);
+            if step >= 3 {
+                trainer.profile_next_step();
+            }
+            trainer
+                .step(model, params, view)
+                .map_err(|e| e.to_string())?;
+            if step >= 3 {
+                profiles.push(
+                    trainer
+                        .last_profile()
+                        .expect("this step was profiled")
+                        .clone(),
+                );
+            }
+            step += 1;
+        }
+    }
+    println!(
+        "{} profile: batch {}, kernel {}, {} threads, medians of {steps} steps after 3 warm-up steps",
+        net.name,
+        net.batch,
+        level(),
+        threads()
+    );
+    let ms = |pick: &dyn Fn(&StepProfile) -> Duration| {
+        median(
+            &profiles
+                .iter()
+                .map(|p| pick(p).as_secs_f64() * 1e3)
+                .collect::<Vec<_>>(),
+        )
+    };
+    println!(
+        "{:>3}  {:<22} {:>12} {:>12}",
+        "", "layer", "forward ms", "backward ms"
+    );
+    for i in 0..model.len() {
+        println!(
+            "{i:>3}  {:<22} {:>12.2} {:>12.2}",
+            model.layer(i).name(),
+            ms(&|p| p.forward[i]),
+            ms(&|p| p.backward[i])
+        );
+    }
+    println!(
+        "{:>3}  {:<22} {:>12.2} {:>12.2}",
+        "",
+        "loss",
+        ms(&|p| p.loss),
+        ms(&|p| p.backward_loss)
+    );
+    println!(
+        "optimizer {:.2} ms, whole step {:.2} ms",
+        ms(&|p| p.optimizer),
+        ms(&|p| p.total)
+    );
+    Ok(())
 }
 
 /// Runs `torch_cnn.py --mode train` on the run's files and reads its epoch lines, each
@@ -426,6 +520,14 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
         }
         train = train.subset(0..rows);
     }
+    if let Some(steps) = o.profile {
+        let mut params = ParamStore::new();
+        let model = match net.data {
+            "cifar" => cifar_network(&mut params, o.seed),
+            _ => mnist_network(&mut params, o.seed),
+        };
+        return profile(&model, &mut params, &train, net, o.seed, steps);
+    }
     let dir = dir_root
         .join("cnn")
         .join(format!("{}-seed{}", net.name, o.seed));
@@ -579,6 +681,10 @@ mod tests {
         assert_eq!(Options::parse(MNIST, &[]).unwrap().epochs, 5);
         assert!(Options::parse(MNIST, &args(&["--epochs", "0"])).is_err());
         assert!(Options::parse(MNIST, &args(&["--what"])).is_err());
+        assert_eq!(Options::parse(MNIST, &[]).unwrap().profile, None);
+        let p = Options::parse(CIFAR, &args(&["--profile", "7"])).unwrap();
+        assert_eq!(p.profile, Some(7));
+        assert!(Options::parse(CIFAR, &args(&["--profile", "0"])).is_err());
     }
 
     /// The steady time is the median after the first epoch.
