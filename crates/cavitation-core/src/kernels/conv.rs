@@ -1210,18 +1210,19 @@ pub fn direct_input_grad_runs(level: Level, geom: &Conv2dGeom) -> bool {
 }
 
 /// The scratch [`conv3x3_direct`] and [`conv3x3_direct_input_grad`] need for `geom` on
-/// `threads` threads: the weights in blocks of four channels, and one zero-padded image per
-/// worker.
+/// `threads` threads at any level: the weights in blocks of four channels (each stored four
+/// times over at SSE4.2), and one zero-padded image per worker.
 ///
 /// ```
 /// use cavitation_core::kernels::conv::{Conv2dGeom, direct_scratch};
 /// let g = Conv2dGeom::with_options(4, 8, (4, 4), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
-/// assert_eq!(direct_scratch(&g, 2), 4 * 8 * 9 + 2 * 8 * 6 * 6);
+/// assert_eq!(direct_scratch(&g, 2), 4 * 8 * 9 * 4 + 2 * 8 * 6 * 6);
 /// ```
 pub fn direct_scratch(geom: &Conv2dGeom, threads: usize) -> usize {
     let (h, w) = geom.input;
     let channels = geom.in_channels.max(geom.out_channels);
-    geom.weight_len() + threads.clamp(1, super::pool::MAX_THREADS) * channels * (h + 2) * (w + 2)
+    4 * geom.weight_len()
+        + threads.clamp(1, super::pool::MAX_THREADS) * channels * (h + 2) * (w + 2)
 }
 
 /// The direct 3 × 3 convolution of `batch` images `x` by `weight` (`[out, in, 3, 3]`), plus
@@ -1366,18 +1367,24 @@ fn direct_run(
     let (wp, plane) = (w + 2, (h + 2) * (w + 2));
     let workers = threads.min(batch).clamp(1, super::pool::MAX_THREADS);
     let pad_len = cin * plane;
-    let need = cin * cout * 9 + workers * pad_len;
+    // SSE4.2 reads each weight already broadcast to four lanes: a broadcast from memory
+    // costs it a shuffle, which on cores with one four-wide multiply per cycle costs as much
+    // as a multiply. AVX2 and NEON broadcast in the load itself.
+    let rep = if level == Level::Sse42 { 4 } else { 1 };
+    let weights_len = cin * cout * 9 * rep;
+    let need = weights_len + workers * pad_len;
     assert!(
         scratch.len() >= need,
         "conv3x3_direct: the scratch holds {} values, expected at least {need}",
         scratch.len()
     );
-    let (packed, pads) = scratch.split_at_mut(cin * cout * 9);
+    let (packed, pads) = scratch.split_at_mut(weights_len);
     for ob in 0..cout / 4 {
         for c in 0..cin {
             for k in 0..9 {
                 for o in 0..4 {
-                    packed[((ob * cin + c) * 9 + k) * 4 + o] = weight(ob * 4 + o, c, k);
+                    let at = (((ob * cin + c) * 9 + k) * 4 + o) * rep;
+                    packed[at..at + rep].fill(weight(ob * 4 + o, c, k));
                 }
             }
         }

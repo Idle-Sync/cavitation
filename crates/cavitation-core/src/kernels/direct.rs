@@ -12,7 +12,9 @@
 pub(super) struct Job {
     /// The image, `cin` planes of `(h + 2) × (w + 2)` with a border of zeros.
     pub(super) pad: *const f32,
-    /// The weights in blocks of four output channels: `[cout / 4][cin][9][4]`.
+    /// The weights in blocks of four output channels, each weight stored `rep` times (4 at
+    /// SSE4.2, so a vector load gives it broadcast; 1 elsewhere):
+    /// `[cout / 4][cin][9][4][rep]`.
     pub(super) weights: *const f32,
     /// The bias, `cout` values, added after each sum; none for the input gradient.
     pub(super) bias: Option<*const f32>,
@@ -32,10 +34,11 @@ pub(super) struct Job {
 
 /// Writes the four-output-channel blocks of `job` with a kernel `$name` (and its row helper
 /// `$rows`) of `$lanes` lanes under target feature `$feat`, with `$zero`, `$load`, `$store`,
-/// `$splat`, `$add` and `$madd(acc, x, w)`, which returns `acc + x · w`.
+/// `$splat`, `$add`, `$madd(acc, x, w)`, which returns `acc + x · w`, and `$weight(p)`,
+/// which reads the weight at `p` (stored `$rep` times) as a broadcast vector.
 macro_rules! direct_kernel {
-    ($name:ident, $rows:ident, $feat:literal, $lanes:literal, $zero:expr, $load:path,
-     $store:path, $splat:path, $add:path, $madd:path) => {
+    ($name:ident, $rows:ident, $feat:literal, $lanes:literal, $rep:literal, $zero:expr,
+     $load:path, $store:path, $splat:path, $add:path, $madd:path, $weight:path) => {
         /// Writes every output of `job`, `UR` vectors of a row at a time while they fit and
         /// then one.
         ///
@@ -81,10 +84,10 @@ macro_rules! direct_kernel {
             // write is an output of rows `y` of channels `4·ob..4·ob + 4`, columns
             // `x0..x0 + UR · lanes`, all inside `out` by the contract.
             unsafe {
-                let wb = job.weights.add(ob * job.cin * 36);
+                let wb = job.weights.add(ob * job.cin * 36 * $rep);
                 for c in 0..job.cin {
                     let base = job.pad.add(c * plane + y * wp + x0);
-                    let wc = wb.add(c * 36);
+                    let wc = wb.add(c * 36 * $rep);
                     for ky in 0..3 {
                         let row = base.add(ky * wp);
                         for kx in 0..3 {
@@ -92,9 +95,9 @@ macro_rules! direct_kernel {
                             for (u, v) in v.iter_mut().enumerate() {
                                 *v = $load(row.add(kx + $lanes * u));
                             }
-                            let wk = wc.add((ky * 3 + kx) * 4);
+                            let wk = wc.add((ky * 3 + kx) * 4 * $rep);
                             for (o, acc) in acc.iter_mut().enumerate() {
-                                let wv = $splat(*wk.add(o));
+                                let wv = $weight(wk.add(o * $rep));
                                 for (a, &x) in acc.iter_mut().zip(&v) {
                                     *a = $madd(*a, x, wv);
                                 }
@@ -149,17 +152,31 @@ mod x86 {
         _mm256_fmadd_ps(x, w, acc)
     }
 
+    /// The weight at `p` in all eight lanes, one broadcast load.
+    ///
+    /// # Safety
+    ///
+    /// `p` must point to a readable f32, and the CPU must support AVX2.
+    #[inline]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn weight_avx2(p: *const f32) -> __m256 {
+        // SAFETY: the caller's contract.
+        _mm256_set1_ps(unsafe { *p })
+    }
+
     direct_kernel!(
         direct_sse,
         rows_sse,
         "sse4.2",
+        4,
         4,
         _mm_setzero_ps(),
         _mm_loadu_ps,
         _mm_storeu_ps,
         _mm_set1_ps,
         _mm_add_ps,
-        madd_sse
+        madd_sse,
+        _mm_loadu_ps
     );
 
     direct_kernel!(
@@ -167,12 +184,14 @@ mod x86 {
         rows_avx2,
         "avx2,fma",
         8,
+        1,
         _mm256_setzero_ps(),
         _mm256_loadu_ps,
         _mm256_storeu_ps,
         _mm256_set1_ps,
         _mm256_add_ps,
-        madd_avx2
+        madd_avx2,
+        weight_avx2
     );
 }
 
@@ -184,7 +203,7 @@ pub(super) use arm::direct_neon;
 mod arm {
     use super::Job;
     use std::arch::aarch64::{
-        float32x4_t, vaddq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32,
+        float32x4_t, vaddq_f32, vdupq_n_f32, vfmaq_f32, vld1q_dup_f32, vld1q_f32, vst1q_f32,
     };
 
     /// `acc + x · w`, rounded once.
@@ -199,11 +218,13 @@ mod arm {
         rows_neon,
         "neon",
         4,
+        1,
         vdupq_n_f32(0.0),
         vld1q_f32,
         vst1q_f32,
         vdupq_n_f32,
         vaddq_f32,
-        madd_neon
+        madd_neon,
+        vld1q_dup_f32
     );
 }
