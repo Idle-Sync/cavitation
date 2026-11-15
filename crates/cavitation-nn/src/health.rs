@@ -790,6 +790,9 @@ pub struct HealthMonitor<'s> {
     alive: Vec<bool>,
     /// Whether `alive` holds at least one step of this epoch.
     tracked: bool,
+    /// The dead-neuron list lent to each `Warning::DeadNeurons` and taken back after it
+    /// is sent, so an epoch whose report is no longer than one before allocates nothing.
+    dead: Vec<usize>,
     /// For each layer whose dead-neuron report was printed to standard error (with no
     /// sink), how many of [`DEAD_THRESHOLDS`] the printed share had reached.
     dead_printed: Vec<(usize, usize)>,
@@ -833,6 +836,7 @@ impl<'s> HealthMonitor<'s> {
             relu_layers: Vec::new(),
             alive: Vec::new(),
             tracked: false,
+            dead: Vec::new(),
             dead_printed: Vec::new(),
             printed: Vec::new(),
             repeats: Vec::new(),
@@ -880,10 +884,10 @@ impl<'s> HealthMonitor<'s> {
     /// on [`Health`]: a dead-neuron report when its share passes a threshold not passed
     /// before; the first norm or non-finite warning of each parameter, with later ones kept
     /// for the summary of `end_epoch`; anything else always.
-    fn emit(&mut self, warning: Warning) {
+    fn emit(&mut self, warning: Warning) -> Warning {
         if let Some(sink) = self.health.sink.as_mut() {
             sink(&warning);
-            return;
+            return warning;
         }
         match warning {
             Warning::DeadNeurons {
@@ -927,6 +931,7 @@ impl<'s> HealthMonitor<'s> {
                 eprintln!("cavitation: warning: {warning}")
             }
         }
+        warning
     }
 
     /// Prints one line per kind for the parameters whose norm or non-finite warning repeated
@@ -1439,21 +1444,26 @@ impl<'s> HealthMonitor<'s> {
                 }
                 // After an image layer a position of a live channel that saw only flat
                 // input is not dead: only the positions of channels dead everywhere count.
-                let mut neurons = Vec::new();
+                let mut neurons = std::mem::take(&mut self.dead);
+                neurons.clear();
                 for start in (0..width).step_by(spatial) {
                     if alive[start..start + spatial].iter().all(|&a| !a) {
                         neurons.extend(start..start + spatial);
                     }
                 }
                 if neurons.is_empty() {
+                    self.dead = neurons;
                     continue;
                 }
-                self.emit(Warning::DeadNeurons {
+                let sent = self.emit(Warning::DeadNeurons {
                     epoch,
                     layer,
                     width,
                     neurons,
                 });
+                if let Warning::DeadNeurons { neurons, .. } = sent {
+                    self.dead = neurons;
+                }
             }
         }
         self.print_repeats(epoch);
