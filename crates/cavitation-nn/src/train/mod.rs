@@ -15,7 +15,7 @@ mod step_log;
 mod stopping;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
-pub use evaluate::{Evaluation, Evaluator, evaluate};
+pub use evaluate::{Evaluation, Evaluator, confusion_matrix, evaluate};
 pub use fit::{
     EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig, StepControl,
     StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled, fit_with_hooks,

@@ -13,10 +13,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-cavitation-core = { path = "../cavitation-core", version = "0.3.1" }
+cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
 safetensors = "0.8.0"
 # Training and inference on the GPU, behind the `gpu` feature (off by default).
-cavitation-gpu = { path = "../cavitation-gpu", version = "0.3.1", optional = true }
+cavitation-gpu = { path = "../cavitation-gpu", version = "0.3.2", optional = true }
 
 [features]
 # GPU mode through wgpu; it adds wgpu and its dependencies to the build.

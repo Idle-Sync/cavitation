@@ -10,9 +10,23 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `BufferPool` hands out GPU buffers by size class and usage and reuses those handed back. Up to 4 MiB a class is the request rounded up to a power of two (at least 256 bytes); above, to a quarter step between powers of two, so a large buffer is at most a quarter larger than asked for. Lengths are whole 4-byte words, within the device's binding limits. The pool counts the buffers and bytes it creates (`created`, `created_bytes`) and the buffers still out (`outstanding`), so a loop that takes and gives back the same sizes can show it creates buffers in its first pass only. `PooledBuffer::binding` binds only the bytes asked for, so a shader's `arrayLength` sees the request, not the class.
 - `PipelineCache` builds each compute pipeline once per `Shader`, entry point, set of `override` values (in any order) and layout, and counts what it builds. `get` uses the layout wgpu derives from the shader; `get_with_layout` takes an explicit one, so one bind group serves every pipeline built with it. A shader that does not compile (in naga or in the backend's compiler), a missing entry point, or an unknown or NaN `override` is `GpuError::Shader` with wgpu's message, and nothing is cached for it. A workgroup array sized by an `override` constant works on Vulkan and on DX12 with DXC and with FXC.
 
+## v0.3.2 (2026-11-15)
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
+- `Evaluator::confusion` and the free `confusion_matrix` give a model's `ConfusionMatrix` on class targets, its accuracy equal to `evaluate`'s, with all-NaN rows counted as unpredicted. `Evaluator::class_scores` gives each row's softmax probability of a class (or the output itself for a one-output model) for `roc_auc` and `average_precision`. `confusion_matrix` is in the prelude (#237).
+- `metrics::RegressionMetrics`: mean absolute error, mean squared error, RMSE and R² per output of `[rows, outputs]` values and averaged over the outputs, as scikit-learn's `raw_values` and `uniform_average` (R² of a constant target column, or of one row, 1 or 0, as `force_finite`; scikit-learn gives NaN for one row). `metrics::log_loss` (probabilities clipped at `f32::EPSILON`; rows that are not probabilities are refused) and `metrics::top_k_accuracy` (ties ranked by the higher class index, as scikit-learn). Checked against scikit-learn 1.9.1 fixtures (#237).
+- `Evaluator::regression`: a model's `RegressionMetrics` on value targets, its mean R² equal to `evaluate`'s (#237).
+
+### Classic machine learning (`cavitation-ml`)
+
+- `LogisticModel::confusion`: the model's `ConfusionMatrix` on class targets, its accuracy equal to `score`'s (#237).
+
+### Data, examples, guide and benchmark
+
+- Guide chapter "Measuring a classifier" and the `classification_metrics` example: the confusion matrix and classification report of a digits network, ROC AUC and average precision for "is it a 9?", and the always-"no" baseline whose accuracy is 87.5% and recall 0 (#237).
+- The regression chapter of the guide points to `RegressionMetrics` for errors in the targets' units (MAE, RMSE) beside R² (#237).
 
 ## v0.3.1 (2026-11-15)
 
