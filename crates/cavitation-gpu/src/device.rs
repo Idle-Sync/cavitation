@@ -184,6 +184,13 @@ pub enum GpuError {
         /// For each adapter tried, in order: its name and backend, and wgpu's message.
         failures: Vec<String>,
     },
+    /// A shader did not compile, or its pipeline could not be built.
+    Shader {
+        /// The shader's name and entry point.
+        shader: String,
+        /// wgpu's message.
+        message: String,
+    },
 }
 
 impl fmt::Display for GpuError {
@@ -217,6 +224,9 @@ impl fmt::Display for GpuError {
             }
             GpuError::Device { failures } => {
                 write!(f, "could not open a GPU device: {}", failures.join("; "))
+            }
+            GpuError::Shader { shader, message } => {
+                write!(f, "shader {shader} could not be built: {message}")
             }
         }
     }

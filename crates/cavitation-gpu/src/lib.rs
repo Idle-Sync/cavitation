@@ -12,6 +12,10 @@
 //!   backend (Metal on macOS, Vulkan elsewhere, then DX12 on Windows), and
 //!   [`Gpu::with_backend`] asks for one.
 //! - [`GpuInfo`]: what was chosen, for printing.
+//! - [`BufferPool`] and [`PooledBuffer`]: GPU buffers by size class, reused once handed
+//!   back, with a count of the buffers created.
+//! - [`PipelineCache`] and [`Shader`]: compute pipelines built once per shader, entry point
+//!   and `override` values, with a count of the pipelines built.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
@@ -41,9 +45,13 @@
 //! }
 //! ```
 
+mod buffer;
 mod device;
+mod pipeline;
 
+pub use buffer::{BufferPool, PooledBuffer};
 pub use device::{Backend, Gpu, GpuError, GpuInfo};
+pub use pipeline::{PipelineCache, Shader};
 /// The wgpu crate this one is built on, for the types [`Gpu::device`] and [`Gpu::queue`]
 /// work with.
 ///
