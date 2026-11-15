@@ -4,6 +4,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.3.0 (2026-11-15)
+
 ### Breaking changes
 
 - `save` and `load` now cover `Sequential::state_names` (parameters, then each layer's buffers) rather than `parameter_names`; for a model without buffers the two are the same.

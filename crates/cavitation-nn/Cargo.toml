@@ -13,7 +13,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-cavitation-core = { path = "../cavitation-core", version = "0.2.0" }
+cavitation-core = { path = "../cavitation-core", version = "0.3.0" }
 safetensors = "0.8.0"
 
 [dev-dependencies]
