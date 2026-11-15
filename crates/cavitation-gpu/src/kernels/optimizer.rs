@@ -7,8 +7,10 @@
 //! same rule. The host keeps each parameter's update count and commits it only once a
 //! step's readback shows the update ran.
 
-use crate::{BufferPool, kernels::bind_buffers};
-use crate::{GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder, wgpu};
+use super::bind_buffers;
+use crate::{
+    BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder, wgpu,
+};
 
 /// Threads per workgroup, and parameter elements per workgroup: every optimiser kernel's
 /// `@workgroup_size`, passed to it as the `WORKGROUP` override.
@@ -21,7 +23,8 @@ const MAX_ELEMENTS: usize = 1 << 31;
 /// Bytes of the shared constants' uniform buffer: [`SHARED_WORDS`] `f32`s.
 const SHARED_BYTES: u64 = 4 * SHARED_WORDS as u64;
 
-/// `f32`s in the shared constants, padded to a multiple of four for the uniform layout.
+/// `f32`s in the shared constants: nine, padded to whole 16-byte rows, the unit HLSL lays a
+/// constant buffer out in.
 const SHARED_WORDS: usize = 12;
 
 /// Bytes of one parameter's constants in the per-parameter buffer.
@@ -281,15 +284,15 @@ impl OptimizerRule {
         }
     }
 
-    /// Panics, naming the setting, unless every setting is finite and the betas are in
-    /// `[0, 1)`, as the CPU's Adam requires.
-    fn check(&self) {
-        let (lr, rest) = match *self {
+    /// The settings as `[lr, momentum, weight decay, β₁, β₂, eps]`, 0 for those the rule
+    /// does not have.
+    fn settings(&self) -> [f64; 6] {
+        match *self {
             OptimizerRule::Sgd {
                 lr,
                 momentum,
                 weight_decay,
-            } => (lr, [momentum, weight_decay, 0.0, 0.0]),
+            } => [lr, momentum, weight_decay, 0.0, 0.0, 0.0],
             OptimizerRule::Adam {
                 lr,
                 beta1,
@@ -303,17 +306,21 @@ impl OptimizerRule {
                 beta2,
                 eps,
                 weight_decay,
-            } => {
-                assert!(
-                    (0.0..1.0).contains(&beta1) && (0.0..1.0).contains(&beta2),
-                    "optimizer: Adam betas must be in [0, 1), got ({beta1}, {beta2})"
-                );
-                (lr, [beta1, beta2, eps, weight_decay])
-            }
-        };
+            } => [lr, 0.0, weight_decay, beta1, beta2, eps],
+        }
+    }
+
+    /// Panics, naming the rule, unless every setting is finite once rounded to the `f32` the
+    /// kernel receives, and the betas are in `[0, 1)`, as the CPU's Adam requires.
+    fn check(&self) {
+        let [.., beta1, beta2, _] = self.settings();
         assert!(
-            lr.is_finite() && rest.iter().all(|v| v.is_finite()),
-            "optimizer: every setting must be finite, got {self:?}"
+            (0.0..1.0).contains(&beta1) && (0.0..1.0).contains(&beta2),
+            "optimizer: Adam betas must be in [0, 1), got ({beta1}, {beta2})"
+        );
+        assert!(
+            self.settings().iter().all(|&v| (v as f32).is_finite()),
+            "optimizer: every setting must be finite as an f32, got {self:?}"
         );
     }
 }
@@ -327,17 +334,24 @@ impl OptimizerRule {
 /// parameters together, in the order of `lens`.
 ///
 /// The arithmetic is the CPU optimisers' in `f32`, each step from the `f32`-rounded
-/// settings and per-step constants (computed on the host in `f64`). Against the exact
-/// result of those constants and the step's starting state, an SGD value without weight
-/// decay or momentum is one fused multiply-add, within `2⁻²⁴·|p'|` (one rounding) where the
-/// backend fuses it (WGSL allows `fma` two roundings; Metal fuses, as do Vulkan and DX12 on
-/// the cards measured); with weight decay or momentum, within `2⁻²⁴·(|p'| + lr·(|b| + |s|))` for the step `s = g + wd·p` and buffer
-/// `b`; an Adam or AdamW value within
-/// `2⁻²⁴·(|p'| + |p_s| + step_size·(19·|m/d| + (|m| + 2(1 − β₁)|g|) / d))`, where `p_s` is
-/// AdamW's shrunk value (0 for Adam) and `d` the denominator, the moments within
-/// `2⁻²⁴·(|m| + 2(1 − β₁)|g|)` and `6·2⁻²⁴·v`, each plus `2⁻¹²⁶` for a flushed state. The
-/// Adam bound allows for WGSL's square root (from `inverseSqrt`, 2 ulp, and a division) and
-/// division (2.5 ulp).
+/// settings and per-step constants (computed on the host in `f64`). Against the exact result
+/// of those constants and the step's starting state, with `u = 2⁻²⁴`, and assuming each
+/// `fma` rounds once (WGSL allows it two roundings; it is fused on Metal on the Apple M4, and
+/// on Vulkan and DX12 on the NVIDIA GTX 1660 Super, as measured):
+///
+/// - **SGD without weight decay or momentum:** the value `p' = p − lr·g` is one `fma`,
+///   within `u·|p'|`, one rounding.
+/// - **SGD with either:** for the step `s = g + wd·p` and `b = μ·b_old + s` (`b = s` on a
+///   parameter's first update or without momentum), the value within
+///   `u·(|p'| + lr·(|b| + |s|))` and the momentum buffer within `u·(|b| + |s|)`.
+/// - **Adam and AdamW:** for the new moments `m` and `v`, the denominator
+///   `d = √v · c₂ + eps` and AdamW's shrunk value `p_s = p·(1 − lr·wd)` (0 for Adam), the
+///   value within `u·(|p'| + |p_s| + step_size·(19·|m/d| + (|m| + 2(1 − β₁)|g|) / d))`, the
+///   first moment within `u·(|m| + 2(1 − β₁)|g|)` and the second within `6u·v`. These allow
+///   for WGSL's square root (from `inverseSqrt`, 2 ulp, then a division) and its division
+///   (2.5 ulp).
+///
+/// Every bound also carries `2⁻¹²⁶`, for a value or state the GPU flushes to zero.
 ///
 /// A step runs in three parts: [`record`](Self::record) uploads the step's constants and
 /// dispatches, the caller finishes the step and reads its finite flag back, and
@@ -355,7 +369,7 @@ impl OptimizerRule {
 /// if let Some(gpu) = Gpu::new() {
 ///     let mut pool = BufferPool::new(&gpu);
 ///     let rule = OptimizerRule::Sgd { lr: 0.5, momentum: 0.0, weight_decay: 0.0 };
-///     let mut sgd = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut pool, rule, &[2]).unwrap();
+///     let mut sgd = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut pool, rule, &[2]).unwrap();
 ///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
 ///         | wgpu::BufferUsages::COPY_SRC;
 ///     let (values, grads, flag) = (pool.take(8, usage), pool.take(8, usage), pool.take(4, usage));
@@ -385,12 +399,8 @@ pub struct OptimizerKernel {
     elements: usize,
     /// The rule's kernel.
     pipeline: wgpu::ComputePipeline,
-    /// For each workgroup, its parameter and the first element it updates.
+    /// For each workgroup, its parameter and the first element it updates, written once.
     table: PooledBuffer,
-    /// The table's bytes, uploaded with the first step.
-    table_bytes: Vec<u8>,
-    /// Whether a step has uploaded the table.
-    table_uploaded: bool,
     /// Each parameter's constants for the step being recorded.
     infos: PooledBuffer,
     /// The per-parameter constants' bytes, rebuilt in place every step.
@@ -408,9 +418,11 @@ pub struct OptimizerKernel {
 }
 
 impl OptimizerKernel {
-    /// The kernel for `rule` over parameters of `lens` elements each, built (or found) in
-    /// `cache`, with its own small buffers (the workgroup table and the constants) from
-    /// `pool`. Every parameter starts with no updates.
+    /// The kernel for `rule` over parameters of `lens` elements each on `gpu`, built (or
+    /// found) in `cache`, with its own small buffers (the workgroup table and the constants)
+    /// from `pool`, which [`release`](Self::release) hands back. The workgroup table is
+    /// written here, through `gpu`'s queue, so it is in place for the first step. Every
+    /// parameter starts with no updates.
     ///
     /// # Errors
     ///
@@ -419,7 +431,7 @@ impl OptimizerKernel {
     /// # Panics
     ///
     /// If `lens` is empty or holds a 0, the parameters hold more than 2³¹ elements together,
-    /// a setting is not finite, or Adam's betas are outside `[0, 1)`.
+    /// a setting is not finite as an `f32`, or Adam's betas are outside `[0, 1)`.
     ///
     /// ```
     /// use cavitation_gpu::kernels::{OptimizerKernel, OptimizerRule};
@@ -428,11 +440,12 @@ impl OptimizerKernel {
     /// if let Some(gpu) = Gpu::new() {
     ///     let mut pool = BufferPool::new(&gpu);
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let adam = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut pool, rule, &[784 * 128, 128]).unwrap();
+    ///     let adam = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut pool, rule, &[784 * 128, 128]).unwrap();
     ///     assert_eq!(adam.steps(), &[0, 0]);
     /// }
     /// ```
     pub fn new(
+        gpu: &Gpu,
         cache: &mut PipelineCache,
         pool: &mut BufferPool,
         rule: OptimizerRule,
@@ -469,14 +482,14 @@ impl OptimizerKernel {
             }
         };
         let read = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let table = pool.take(table_bytes.len() as u64, read);
+        gpu.queue().write_buffer(table.buffer(), 0, &table_bytes);
         Ok(OptimizerKernel {
             rule,
             lens: lens.to_vec(),
             elements,
             pipeline,
-            table: pool.take(table_bytes.len() as u64, read),
-            table_bytes,
-            table_uploaded: false,
+            table,
             infos: pool.take((INFO_BYTES * lens.len()) as u64, read),
             info_bytes: vec![0; INFO_BYTES * lens.len()],
             shared: pool.take(
@@ -498,7 +511,7 @@ impl OptimizerKernel {
     ///
     /// if let Some(gpu) = Gpu::new() {
     ///     let rule = OptimizerRule::adam_w(1e-3, 1e-2);
-    ///     let kernel = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[4]).unwrap();
+    ///     let kernel = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[4]).unwrap();
     ///     assert_eq!(kernel.rule(), rule);
     /// }
     /// ```
@@ -518,7 +531,7 @@ impl OptimizerKernel {
     ///
     /// if let Some(gpu) = Gpu::new() {
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let mut kernel = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[4]).unwrap();
+    ///     let mut kernel = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[4]).unwrap();
     ///     kernel.set_learning_rate(5e-4);
     ///     assert_eq!(kernel.rule().learning_rate(), 5e-4);
     /// }
@@ -544,7 +557,7 @@ impl OptimizerKernel {
     ///
     /// if let Some(gpu) = Gpu::new() {
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let kernel = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[4, 2]).unwrap();
+    ///     let kernel = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[4, 2]).unwrap();
     ///     assert_eq!(kernel.steps(), &[0, 0]);
     /// }
     /// ```
@@ -552,9 +565,9 @@ impl OptimizerKernel {
         &self.steps
     }
 
-    /// The bytes a step that records this kernel uploads, at most: the per-parameter and
-    /// shared constants, and on the first step the workgroup table. A step encoder's
-    /// [`upload_bytes`](crate::StepSizes::upload_bytes) must leave room for them.
+    /// The bytes a step that records this kernel uploads: the per-parameter and shared
+    /// constants. A step encoder's [`upload_bytes`](crate::StepSizes::upload_bytes) must
+    /// leave room for them.
     ///
     /// ```
     /// use cavitation_gpu::kernels::{OptimizerKernel, OptimizerRule};
@@ -562,12 +575,12 @@ impl OptimizerKernel {
     ///
     /// if let Some(gpu) = Gpu::new() {
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let kernel = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[256]).unwrap();
-    ///     assert_eq!(kernel.upload_bytes(), 8 + 16 + 48);
+    ///     let kernel = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut BufferPool::new(&gpu), rule, &[256]).unwrap();
+    ///     assert_eq!(kernel.upload_bytes(), 16 + 48);
     /// }
     /// ```
     pub fn upload_bytes(&self) -> u64 {
-        (self.table_bytes.len() + self.info_bytes.len()) as u64 + SHARED_BYTES
+        self.info_bytes.len() as u64 + SHARED_BYTES
     }
 
     /// The bind group, made once: the parameters' `values` and `grads`, the rule's `state`
@@ -578,8 +591,8 @@ impl OptimizerKernel {
     ///
     /// # Panics
     ///
-    /// If a buffer does not hold exactly the parameters' elements, `state` holds the wrong
-    /// number of buffers, or `finite` holds no `u32`, naming the buffer.
+    /// If a buffer does not hold exactly the parameters' elements, or `state` holds the
+    /// wrong number of buffers, naming the buffer.
     ///
     /// ```
     /// use cavitation_gpu::kernels::{OptimizerKernel, OptimizerRule};
@@ -588,7 +601,7 @@ impl OptimizerKernel {
     /// if let Some(gpu) = Gpu::new() {
     ///     let mut pool = BufferPool::new(&gpu);
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let adam = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut pool, rule, &[3, 5]).unwrap();
+    ///     let adam = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut pool, rule, &[3, 5]).unwrap();
     ///     let usage = wgpu::BufferUsages::STORAGE;
     ///     let [values, grads, m, v] = [0; 4].map(|_| pool.take(32, usage));
     ///     let flag = pool.take(4, usage);
@@ -625,11 +638,6 @@ impl OptimizerKernel {
         for s in state {
             check("a state buffer", s);
         }
-        assert!(
-            finite.len() >= 4,
-            "optimizer: the finite flag holds {} bytes, expected at least 4",
-            finite.len()
-        );
         let mut buffers = vec![
             values,
             grads,
@@ -644,8 +652,7 @@ impl OptimizerKernel {
 
     /// Records one update of the parameters marked in `active` (those with a gradient this
     /// step; the others keep their values, state and update counts) in `step`, with a group
-    /// from [`bind_group`](Self::bind_group): uploads the step's constants, the workgroup
-    /// table on the first step, and dispatches. The update is skipped on the GPU when the
+    /// from [`bind_group`](Self::bind_group): uploads the step's constants and dispatches. The update is skipped on the GPU when the
     /// step's finite flag is set; once the step is finished and its flag read back,
     /// [`commit`](Self::commit) says whether it ran.
     ///
@@ -661,7 +668,7 @@ impl OptimizerKernel {
     /// if let Some(gpu) = Gpu::new() {
     ///     let mut pool = BufferPool::new(&gpu);
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let mut adam = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut pool, rule, &[3, 5]).unwrap();
+    ///     let mut adam = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut pool, rule, &[3, 5]).unwrap();
     ///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     ///     let [values, grads, m, v] = [0; 4].map(|_| pool.take(32, usage));
     ///     let flag = pool.take(4, usage);
@@ -687,16 +694,7 @@ impl OptimizerKernel {
             !self.recorded,
             "optimizer: the last recorded step was not committed"
         );
-        if !self.table_uploaded {
-            step.upload(self.table.buffer(), 0, &self.table_bytes);
-            self.table_uploaded = true;
-        }
-        let (beta1, beta2) = match self.rule {
-            OptimizerRule::Sgd { .. } => (0.0, 0.0),
-            OptimizerRule::Adam { beta1, beta2, .. }
-            | OptimizerRule::AdamW { beta1, beta2, .. } => (beta1, beta2),
-        };
-        let lr = self.rule.learning_rate();
+        let [lr, _, _, beta1, beta2, _] = self.rule.settings();
         let mut end = 0;
         for (k, info) in self
             .info_bytes
@@ -751,7 +749,7 @@ impl OptimizerKernel {
     /// if let Some(gpu) = Gpu::new() {
     ///     let mut pool = BufferPool::new(&gpu);
     ///     let rule = OptimizerRule::adam(1e-3, 0.0);
-    ///     let mut adam = OptimizerKernel::new(&mut PipelineCache::new(&gpu), &mut pool, rule, &[4]).unwrap();
+    ///     let mut adam = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut pool, rule, &[4]).unwrap();
     ///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
     ///     let [values, grads, m, v] = [0; 4].map(|_| pool.take(16, usage));
     ///     let flag = pool.take(4, usage);
@@ -775,33 +773,34 @@ impl OptimizerKernel {
         }
         self.recorded = false;
     }
+
+    /// Hands the kernel's own buffers (the workgroup table and the constants) back to
+    /// `pool`, the pool it was made with, for reuse.
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::{OptimizerKernel, OptimizerRule};
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut pool = BufferPool::new(&gpu);
+    ///     let rule = OptimizerRule::adam(1e-3, 0.0);
+    ///     let kernel = OptimizerKernel::new(&gpu, &mut PipelineCache::new(&gpu), &mut pool, rule, &[4]).unwrap();
+    ///     kernel.release(&mut pool);
+    ///     assert_eq!(pool.outstanding(), 0);
+    /// }
+    /// ```
+    pub fn release(self, pool: &mut BufferPool) {
+        pool.give(self.table);
+        pool.give(self.infos);
+        pool.give(self.shared);
+    }
 }
 
 /// The shared constants of `rule` as the kernels' `Shared` uniform lays them out, each
 /// rounded to `f32` from its `f64`: the learning rate, momentum, weight decay, betas, one
 /// minus each beta, eps, AdamW's shrink factor `1 − lr·wd`, and padding.
 fn shared_constants(rule: &OptimizerRule) -> [f32; SHARED_WORDS] {
-    let (lr, momentum, wd, beta1, beta2, eps) = match *rule {
-        OptimizerRule::Sgd {
-            lr,
-            momentum,
-            weight_decay,
-        } => (lr, momentum, weight_decay, 0.0, 0.0, 0.0),
-        OptimizerRule::Adam {
-            lr,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-        }
-        | OptimizerRule::AdamW {
-            lr,
-            beta1,
-            beta2,
-            eps,
-            weight_decay,
-        } => (lr, 0.0, weight_decay, beta1, beta2, eps),
-    };
+    let [lr, momentum, wd, beta1, beta2, eps] = rule.settings();
     let values = [
         lr,
         momentum,

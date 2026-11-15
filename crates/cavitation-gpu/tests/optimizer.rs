@@ -1,7 +1,8 @@
 //! The GPU optimiser kernel against the CPU optimisers of `cavitation_nn`, on every backend
 //! this machine has: SGD (plain, with weight decay, with momentum, with both), Adam (with and
-//! without weight decay) and AdamW, 50 updates of six parameters that straddle workgroups,
-//! some parameters skipping some steps. Each step is checked from the GPU's own starting
+//! without weight decay) and AdamW, 50 updates of seven parameters whose lengths end
+//! anywhere in a workgroup, some parameters skipping some steps, and a model of 65,536
+//! one-element parameters, whose workgroups take two grid rows. Each step is checked from the GPU's own starting
 //! state against the exact result of the CPU's arithmetic with the GPU's `f32` constants,
 //! within the bounds `OptimizerKernel` states; that arithmetic is pinned to the real CPU
 //! optimisers bit for bit. Skipped steps, update counts and buffer checks are tested too.
@@ -15,10 +16,10 @@ use cavitation_gpu::{Gpu, PooledBuffer};
 use cavitation_nn::{Adam, AdamW, Optimizer, Sgd};
 use common::{Kit, Seeded, U, assert_within, for_each_gpu, seeded_values};
 
-/// The parameters' lengths: whole workgroups, parts of one, a single element, and lengths
-/// one either side of a workgroup, so every way a parameter can meet a workgroup's edge is
-/// covered.
-const LENS: [usize; 6] = [1000, 37, 1, 300, 256, 257];
+/// The parameters' lengths. Each workgroup updates one parameter's run of 256 elements, and
+/// these end it at every kind of place: a 232-element tail (1000), 37, a single element, a
+/// 44-element tail (300), exactly one workgroup (256), one past (257) and one short (255).
+const LENS: [usize; 7] = [1000, 37, 1, 300, 256, 257, 255];
 
 /// Updates per twin.
 const STEPS: usize = 50;
@@ -174,7 +175,8 @@ struct Exact {
 /// The CPU optimisers' arithmetic for one element (`sgd_reference` and `adam_reference` in
 /// `cavitation_nn::optim`): the value `p`, its state `m` and `v`, its gradient `g`, and
 /// whether this is its first update, with constants `c`. The bounds are those
-/// `OptimizerKernel`'s docs state, with 5% to spare for second-order terms.
+/// `OptimizerKernel`'s docs state, with 5% to spare for second-order terms, except plain
+/// SGD's one rounding, which has none.
 fn exact(
     rule: &OptimizerRule,
     c: &Constants,
@@ -206,7 +208,11 @@ fn exact(
                 value,
                 m: step,
                 v: 0.0,
-                value_bound: 1.05 * value_bound,
+                value_bound: if plain {
+                    value_bound
+                } else {
+                    1.05 * value_bound
+                },
                 m_bound: 1.05 * U * (step.abs() + s.abs()),
                 v_bound: 0.0,
             }
@@ -391,26 +397,30 @@ fn the_exact_arithmetic_is_the_cpu_optimisers() {
                 offset += n;
             }
             opt.step(&mut store);
-        }
-        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
-        let mut offset = 0;
-        for (k, &id) in ids.iter().enumerate() {
-            let range = offset..offset + LENS[k];
-            offset += LENS[k];
-            assert_eq!(
-                bits(store.value(id).data()),
-                bits(&state[0][range.clone()]),
-                "{rule:?} parameter {k}'s values"
-            );
-            for (s, cpu) in opt.state(id).into_iter().enumerate() {
-                if let Some(cpu) = cpu {
-                    assert_eq!(
-                        bits(cpu),
-                        bits(&state[s + 1][range.clone()]),
-                        "{rule:?} parameter {k}'s state {s}"
-                    );
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let mut offset = 0;
+            for (k, &id) in ids.iter().enumerate() {
+                let range = offset..offset + LENS[k];
+                offset += LENS[k];
+                assert_eq!(
+                    bits(store.value(id).data()),
+                    bits(&state[0][range.clone()]),
+                    "{rule:?} step {t} parameter {k}'s values"
+                );
+                for (s, cpu) in opt.state(id).into_iter().enumerate() {
+                    if let Some(cpu) = cpu {
+                        assert_eq!(
+                            bits(cpu),
+                            bits(&state[s + 1][range.clone()]),
+                            "{rule:?} step {t} parameter {k}'s state {s}"
+                        );
+                    }
                 }
             }
+        }
+        let n = STEPS as u32;
+        assert_eq!(counts, [n, n, 37, n, 47, n, n]);
+        for (k, &id) in ids.iter().enumerate() {
             let kept = opt.state(id).iter().filter(|s| s.is_some()).count();
             assert_eq!(
                 kept,
@@ -418,17 +428,6 @@ fn the_exact_arithmetic_is_the_cpu_optimisers() {
                 "{rule:?} parameter {k} keeps its state"
             );
         }
-        assert_eq!(
-            counts,
-            [
-                STEPS as u32,
-                STEPS as u32,
-                37,
-                STEPS as u32,
-                47,
-                STEPS as u32
-            ]
-        );
     }
 }
 
@@ -458,7 +457,9 @@ struct Twin {
 impl Twin {
     /// The twin of `rule`, its values starting at `start`.
     fn new(kit: &mut Kit, rule: OptimizerRule, start: &[f32]) -> Twin {
-        let kernel = OptimizerKernel::new(&mut kit.cache, &mut kit.pool, rule, &LENS).unwrap();
+        let kernel =
+            OptimizerKernel::new(&kit.gpu.clone(), &mut kit.cache, &mut kit.pool, rule, &LENS)
+                .unwrap();
         let values = kit.upload(start);
         let grads = kit.zeros(start.len());
         let state: Vec<PooledBuffer> = (0..rule.state_buffers())
@@ -632,9 +633,10 @@ fn one_pipeline_per_rule() {
         let mut kit = kit(gpu);
         let before = kit.cache.pipelines_built();
         let rule = OptimizerRule::adam(1e-3, 0.0);
-        OptimizerKernel::new(&mut kit.cache, &mut kit.pool, rule, &[10]).unwrap();
-        OptimizerKernel::new(&mut kit.cache, &mut kit.pool, rule, &LENS).unwrap();
+        OptimizerKernel::new(&kit.gpu.clone(), &mut kit.cache, &mut kit.pool, rule, &[10]).unwrap();
+        OptimizerKernel::new(&kit.gpu.clone(), &mut kit.cache, &mut kit.pool, rule, &LENS).unwrap();
         OptimizerKernel::new(
+            &kit.gpu.clone(),
             &mut kit.cache,
             &mut kit.pool,
             OptimizerRule::adam(5e-4, 1e-2),
@@ -652,7 +654,14 @@ fn misuse_is_refused() {
     for_each_gpu(|gpu| {
         let mut kit = kit(gpu);
         let rule = OptimizerRule::adam(1e-3, 0.0);
-        let kernel = OptimizerKernel::new(&mut kit.cache, &mut kit.pool, rule, &[4, 4]).unwrap();
+        let kernel = OptimizerKernel::new(
+            &kit.gpu.clone(),
+            &mut kit.cache,
+            &mut kit.pool,
+            rule,
+            &[4, 4],
+        )
+        .unwrap();
         let (good, short, flag) = (kit.zeros(8), kit.zeros(7), kit.zeros(1));
         let message = |f: &mut dyn FnMut()| {
             let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("refused");
@@ -681,5 +690,128 @@ fn misuse_is_refused() {
                 .record(&mut step, &twin.group, &[true; LENS.len()])
         });
         assert!(m.contains("was not committed"), "{m}");
+    });
+}
+
+/// A step skipped before any parameter's first update leaves the first update as it was:
+/// SGD's buffer still starts as the step itself and Adam's bias corrections still start at
+/// `t = 1`, so a skip and then a step give the bits of that step alone.
+#[test]
+fn a_skip_before_the_first_update_changes_nothing() {
+    for_each_gpu(|gpu| {
+        let momentum = OptimizerRule::Sgd {
+            lr: 0.1,
+            momentum: 0.9,
+            weight_decay: 1e-2,
+        };
+        for rule in [momentum, OptimizerRule::adam(1e-2, 1e-2)] {
+            let mut kit = kit(gpu);
+            let total = LENS.iter().sum::<usize>();
+            let start = seeded_values(8, total, -1.0, 1.0);
+            let mut skipped = Twin::new(&mut kit, rule, &start);
+            skipped.step(&mut kit, &gradients(8, 0), 1, 3);
+            assert!(skipped.kernel.steps().iter().all(|&c| c == 0));
+            skipped.step(&mut kit, &gradients(8, 1), 0, 3);
+            let mut direct = Twin::new(&mut kit, rule, &start);
+            direct.step(&mut kit, &gradients(8, 1), 0, 3);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let (a, b) = (skipped.read(&mut kit), direct.read(&mut kit));
+            for s in 0..3 {
+                assert_eq!(bits(&a[s]), bits(&b[s]), "{rule:?}: buffer {s}");
+            }
+            assert_eq!(skipped.kernel.steps(), direct.kernel.steps());
+        }
+    });
+}
+
+/// 65,536 one-element parameters: 65,536 workgroups, so the grid takes two rows and all but
+/// one workgroup of the second row lie past the table. Every parameter moves by one plain
+/// SGD step, within one rounding, and counts one update.
+#[test]
+fn many_parameters_cover_a_split_grid() {
+    for_each_gpu(|gpu| {
+        let n = 1 << 16;
+        let lens = vec![1; n];
+        let mut kit = Kit::new(gpu, 1 << 21);
+        let rule = OptimizerRule::Sgd {
+            lr: 0.5,
+            momentum: 0.0,
+            weight_decay: 0.0,
+        };
+        let mut kernel =
+            OptimizerKernel::new(&kit.gpu.clone(), &mut kit.cache, &mut kit.pool, rule, &lens)
+                .unwrap();
+        let start = seeded_values(9, n, -1.0, 1.0);
+        let g = seeded_values(10, n, -1.0, 1.0);
+        let (values, grads, flag) = (kit.upload(&start), kit.upload(&g), kit.zeros(1));
+        let group = kernel.bind_group(&mut kit.steps, &values, &grads, &[], &flag);
+        let mut step = kit.steps.begin();
+        kernel.record(&mut step, &group, &vec![true; n]);
+        let _ = step.finish();
+        kernel.commit(true);
+        let lr = f64::from(0.5f32);
+        let reference: Vec<f64> = start
+            .iter()
+            .zip(&g)
+            .map(|(&p, &g)| f64::from(p) - lr * f64::from(g))
+            .collect();
+        assert_within(
+            &kit.read(&values),
+            &reference,
+            |i| U * reference[i].abs(),
+            "sgd over 65,536 parameters",
+        );
+        assert!(kernel.steps().iter().all(|&c| c == 1));
+    });
+}
+
+/// The documented refusals of `new`, `record` and `commit`: no parameters, an empty one,
+/// a setting that is not finite as an `f32`, betas outside `[0, 1)`, a commit with nothing
+/// recorded, and active flags of the wrong length.
+#[test]
+fn refusals() {
+    for_each_gpu(|gpu| {
+        let message = |f: &mut dyn FnMut()| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("refused");
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|m| m.to_string()))
+                .unwrap_or_default()
+        };
+        let mut kit = kit(gpu);
+        let gpu = kit.gpu.clone();
+        let adam = OptimizerRule::adam(1e-3, 0.0);
+        let mut new = |rule: OptimizerRule, lens: &[usize]| {
+            message(&mut || {
+                let _ = OptimizerKernel::new(&gpu, &mut kit.cache, &mut kit.pool, rule, lens);
+            })
+        };
+        assert!(new(adam, &[]).contains("at least one element"));
+        assert!(new(adam, &[3, 0]).contains("at least one element"));
+        let huge = OptimizerRule::Sgd {
+            lr: 1e39,
+            momentum: 0.0,
+            weight_decay: 0.0,
+        };
+        assert!(new(huge, &[3]).contains("finite as an f32"));
+        let nan = OptimizerRule::adam(f64::NAN, 0.0);
+        assert!(new(nan, &[3]).contains("finite as an f32"));
+        let betas = OptimizerRule::Adam {
+            lr: 1e-3,
+            beta1: 1.0,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        };
+        assert!(new(betas, &[3]).contains("betas must be in [0, 1)"));
+        let mut kernel =
+            OptimizerKernel::new(&gpu, &mut kit.cache, &mut kit.pool, adam, &[3]).unwrap();
+        assert!(message(&mut || kernel.commit(true)).contains("no step was recorded"));
+        let [values, grads, m, v] = [0; 4].map(|_| kit.zeros(3));
+        let flag = kit.zeros(1);
+        let group = kernel.bind_group(&mut kit.steps, &values, &grads, &[&m, &v], &flag);
+        let mut step = kit.steps.begin();
+        let m = message(&mut || kernel.record(&mut step, &group, &[true, true]));
+        assert!(m.contains("2 active flags for 1 parameters"), "{m}");
     });
 }
