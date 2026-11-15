@@ -16,6 +16,9 @@
 //!   back, with a count of the buffers created.
 //! - [`PipelineCache`] and [`Shader`]: compute pipelines built once per shader, entry point
 //!   and `override` values, with a count of the pipelines built.
+//! - [`StepEncoder`], [`Step`] and [`StepOutput`]: one step's uploads, dispatches and
+//!   readbacks recorded in one command encoder and submitted once, through staging and
+//!   readback buffers made once, with GPU timestamps per span when profiling.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
@@ -48,10 +51,12 @@
 mod buffer;
 mod device;
 mod pipeline;
+mod step;
 
 pub use buffer::{BufferPool, PooledBuffer};
 pub use device::{Backend, Gpu, GpuError, GpuInfo};
 pub use pipeline::{PipelineCache, Shader};
+pub use step::{MAX_WORKGROUPS_PER_DIMENSION, Step, StepEncoder, StepOutput, StepSizes};
 /// The wgpu crate this one is built on, for the types [`Gpu::device`] and [`Gpu::queue`]
 /// work with.
 ///
