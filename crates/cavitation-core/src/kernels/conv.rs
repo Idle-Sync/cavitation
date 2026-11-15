@@ -707,12 +707,14 @@ fn workers(batch: usize, threads: usize) -> usize {
 }
 
 /// A pointer that tasks on several threads may hold at once, each using its own part. The
-/// convolutions here and max pooling (`super::pooling`) use it.
-pub(super) struct Parts<T>(pub(super) *mut T);
+/// convolutions here, max pooling (`super::pooling`) and batch normalisation
+/// (`ops::batch_norm`) use it.
+pub(crate) struct Parts<T>(pub(crate) *mut T);
 
-// SAFETY: `Parts` is only used by the functions below and by `pooling::max_pool2d`, each
-// task of which touches a disjoint part (its group's images, its worker's scratch, its
-// block of planes) of a buffer borrowed mutably for the whole call.
+// SAFETY: `Parts` is only used by the functions below, by `pooling::max_pool2d` and its
+// backward pass and by `ops::batch_norm`, each task of which touches a disjoint part (its
+// group's images, its worker's scratch, its block of planes, its channel) of a buffer
+// borrowed mutably for the whole call.
 unsafe impl<T: Send> Sync for Parts<T> {}
 
 impl<T> Parts<T> {
@@ -722,7 +724,7 @@ impl<T> Parts<T> {
     ///
     /// `start + len` is inside the buffer, and no other live slice overlaps this one.
     #[allow(clippy::mut_from_ref)]
-    pub(super) unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
+    pub(crate) unsafe fn slice(&self, start: usize, len: usize) -> &mut [T] {
         // SAFETY: as the caller promises.
         unsafe { std::slice::from_raw_parts_mut(self.0.add(start), len) }
     }

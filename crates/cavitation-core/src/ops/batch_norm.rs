@@ -1,7 +1,13 @@
 //! Batch normalisation on the tape: `batch_norm2d`, with its backward pass, on images stored
 //! as flat NCHW rows.
+//!
+//! Both passes run one task per channel on the thread pool. Each channel's sums run in a
+//! fixed order on the thread that takes it, so every result is the same for any thread
+//! count.
 
 use crate::graph::{BackwardCtx, BufferUpdate, ParamId, Var};
+use crate::kernels::conv::Parts;
+use crate::kernels::{self, pool};
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
 
@@ -136,7 +142,11 @@ impl<T: Real> Tape<'_, T> {
                     "{NAME}: batch statistics need more than one value per channel, got \
                      {batch} images of {spatial} values"
                 );
-                for c in 0..channels {
+                // One task per channel: each channel's sums run in the same order on one
+                // thread, so the statistics are the same for any thread count.
+                let parts = [means, inv, unbiased].map(|p| Parts(p.as_mut_ptr()));
+                pool::run(kernels::threads(), channels, &|t| {
+                    let c = t.index;
                     let mut sum = T::ZERO;
                     for n in 0..batch {
                         for &v in &xv[n * width + c * spatial..][..spatial] {
@@ -151,10 +161,13 @@ impl<T: Real> Tape<'_, T> {
                             sq += d * d;
                         }
                     }
-                    means[c] = mean;
-                    inv[c] = T::ONE / (sq / T::from_f64(m as f64) + eps_t).sqrt();
-                    unbiased[c] = sq / T::from_f64((m - 1) as f64);
-                }
+                    // SAFETY: task `c` alone writes element `c` of each of the three
+                    // statistics, each `channels` long.
+                    let [mp, ip, up] = parts.each_ref().map(|p| unsafe { &mut p.slice(c, 1)[0] });
+                    *mp = mean;
+                    *ip = T::ONE / (sq / T::from_f64(m as f64) + eps_t).sqrt();
+                    *up = sq / T::from_f64((m - 1) as f64);
+                });
             }
         }
         let mut out = self.take_buffer(batch * width);
@@ -162,17 +175,22 @@ impl<T: Real> Tape<'_, T> {
             let xv = self.data(x);
             let w = weight.map(|v| self.data(v));
             let b = bias.map(|v| self.data(v));
-            for n in 0..batch {
-                for c in 0..channels {
-                    let (mean, inv) = (stats[c], stats[channels + c]);
-                    let g = w.map_or(T::ONE, |w| w[c]);
-                    let s = b.map_or(T::ZERO, |b| b[c]);
+            let outs = Parts(out.as_mut_ptr());
+            let stats = &stats;
+            pool::run(kernels::threads(), channels, &|t| {
+                let c = t.index;
+                let (mean, inv) = (stats[c], stats[channels + c]);
+                let g = w.map_or(T::ONE, |w| w[c]);
+                let s = b.map_or(T::ZERO, |b| b[c]);
+                for n in 0..batch {
                     let at = n * width + c * spatial;
-                    for (o, &v) in out[at..][..spatial].iter_mut().zip(&xv[at..][..spatial]) {
+                    // SAFETY: task `c` alone writes channel `c`'s values of each image.
+                    let o = unsafe { outs.slice(at, spatial) };
+                    for (o, &v) in o.iter_mut().zip(&xv[at..][..spatial]) {
                         *o = (v - mean) * inv * g + s;
                     }
                 }
-            }
+            });
         }
         if let Some(r) = running
             && self.is_training()
@@ -218,7 +236,10 @@ pub(super) fn backward<T: Real>(
     let w = weight.map(|v| ctx.value(v));
     // Per channel: Σ dy and Σ dy · x̂.
     let mut sums = ctx.scratch(2 * channels);
-    for c in 0..channels {
+    let threads = kernels::threads();
+    let sp = Parts(sums.as_mut_ptr());
+    pool::run(threads, channels, &|t| {
+        let c = t.index;
         let (mean, inv) = (sv[c], sv[channels + c]);
         let (mut s, mut sx) = (T::ZERO, T::ZERO);
         for n in 0..batch {
@@ -228,9 +249,12 @@ pub(super) fn backward<T: Real>(
                 sx += g * ((v - mean) * inv);
             }
         }
-        sums[c] = s;
-        sums[channels + c] = sx;
-    }
+        // SAFETY: task `c` alone writes elements `c` and `channels + c` of `sums`.
+        unsafe {
+            sp.slice(c, 1)[0] = s;
+            sp.slice(channels + c, 1)[0] = sx;
+        }
+    });
     for (v, offset) in [(bias, 0), (weight, channels)] {
         if let Some(v) = v
             && let Some(slot) = ctx.slot(v)
@@ -241,14 +265,18 @@ pub(super) fn backward<T: Real>(
     if let Some(slot) = ctx.slot(x) {
         slot.update_with(|buf, beta| {
             let mf = T::from_f64(m as f64);
-            for c in 0..channels {
+            let bufs = Parts(buf.as_mut_ptr());
+            let sums = &sums;
+            pool::run(threads, channels, &|t| {
+                let c = t.index;
                 let (mean, inv) = (sv[c], sv[channels + c]);
                 let g = w.map_or(T::ONE, |w| w[c]);
                 // Σ (dy · γ) and Σ (dy · γ) · x̂ over the channel.
                 let (sg, sgx) = (sums[c] * g, sums[channels + c] * g);
                 for n in 0..batch {
                     let at = n * width + c * spatial;
-                    let dst = &mut buf[at..][..spatial];
+                    // SAFETY: task `c` alone writes channel `c`'s values of each image.
+                    let dst = unsafe { bufs.slice(at, spatial) };
                     for ((d, &dy), &v) in dst
                         .iter_mut()
                         .zip(&out_grad[at..][..spatial])
@@ -264,7 +292,7 @@ pub(super) fn backward<T: Real>(
                         *d = if beta == T::ZERO { dx } else { *d + dx };
                     }
                 }
-            }
+            });
         });
     }
     ctx.release(sums);
