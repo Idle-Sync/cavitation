@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### GPU
+
+- `cavitation_core::dropout_mask(seed, step, stream, p, len, write)` draws the dropout mask a training tape draws, without a tape, so a device that applies dropout itself drops the same values. `Tape::dropout` draws through the same code, and its masks are v0.3's, bit for bit (checked against a v0.3 fixture).
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
