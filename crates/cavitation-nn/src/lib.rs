@@ -62,6 +62,11 @@
 //! assert!((answer - 0.25).abs() < 0.1, "{answer}");
 //! ```
 
+// The `gpu` feature's dependency, which no item in this crate uses yet; this keeps it from
+// being reported as unused.
+#[cfg(feature = "gpu")]
+use cavitation_gpu as _;
+
 mod activation;
 mod batch_norm;
 mod conv;

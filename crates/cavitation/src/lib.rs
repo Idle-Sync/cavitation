@@ -10,7 +10,8 @@
 //! too, as `cavitation::cavitation_ml`: least squares and regression in `f64`. With the
 //! `inspect` feature, off by default, the inspector crate is re-exported as
 //! `cavitation::cavitation_inspect`: a server on this machine that shows a run in the
-//! browser.
+//! browser. With the `gpu` feature, off by default, the GPU crate is re-exported as
+//! `cavitation::cavitation_gpu`: the GPU device through wgpu.
 //!
 //! # Three levels of use
 //!
@@ -124,6 +125,18 @@
 //! [`Layer`]: cavitation_nn::Layer
 
 pub use cavitation_core;
+/// GPU access through wgpu (Vulkan, Metal, DX12): choosing a GPU and opening its device.
+/// Present with the `gpu` feature, which is off by default.
+///
+/// ```
+/// use cavitation::cavitation_gpu::Gpu;
+/// // `None` without a GPU.
+/// if let Some(gpu) = Gpu::new() {
+///     println!("{}", gpu.info());
+/// }
+/// ```
+#[cfg(feature = "gpu")]
+pub use cavitation_gpu;
 /// A live view of a training run in the browser: an HTTP and Server-Sent Events server on
 /// this machine, built on `std::net` alone. Present with the `inspect` feature, which is off
 /// by default.
