@@ -29,6 +29,7 @@ mod aarch64;
 mod accelerate;
 pub mod activation;
 pub mod conv;
+mod direct;
 pub mod gemm;
 pub mod matvec;
 pub mod pool;

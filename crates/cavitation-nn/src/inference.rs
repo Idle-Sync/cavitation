@@ -18,7 +18,9 @@ use cavitation_core::kernels::activation::{
     celu_f32_with, elu_f32_with, gelu_tanh_f32_with, log_sigmoid_f32_with, mish_f32_with,
     selu_f32_with, sigmoid_f32_with, silu_f32_with, softplus_beta_f32_with, tanh_f32_with,
 };
-use cavitation_core::kernels::conv::{conv2d_forward, conv2d_scratch};
+use cavitation_core::kernels::conv::{
+    conv2d_forward, conv2d_scratch, conv3x3_direct, direct_runs, direct_scratch,
+};
 use cavitation_core::kernels::gemm::gemm_f32_with;
 use cavitation_core::kernels::matvec::matvec_f32_with;
 use cavitation_core::kernels::pooling::{Pool2dGeom, adaptive_avg_pool2d, avg_pool2d, max_pool2d};
@@ -1326,7 +1328,7 @@ fn conv_scratch_len(steps: &[Step], rows: usize, threads: usize) -> usize {
         .iter()
         .filter_map(|s| match &s.op {
             Op::Layer(InferenceLayer::Conv2d { geom, .. }) => {
-                Some(conv2d_scratch(geom, rows, threads))
+                Some(conv2d_scratch(geom, rows, threads).max(direct_scratch(geom, threads)))
             }
             _ => None,
         })
@@ -1540,10 +1542,11 @@ impl Run {
     }
 
     /// One `Conv2d` step from `src` (`rows` input images) into `dst` (`rows` output images),
-    /// by [`conv2d_forward`] with the GEMM of this call's level and threads, as the tape
-    /// computes it: with the tape's bits, for one input as for a batch, except at the
-    /// Accelerate level, where a product of another shape can differ within the GEMM bound
-    /// (see [`conv2d_forward`]); `scratch` holds [`conv2d_scratch`] values.
+    /// as the tape computes it at this call's level and threads: by [`conv3x3_direct`] where
+    /// [`direct_runs`] accepts the geometry, else by [`conv2d_forward`] with the GEMM. It
+    /// gives the tape's bits, for one input as for a batch, except at the Accelerate level,
+    /// where a product of another shape can differ within the GEMM bound (see
+    /// [`conv2d_forward`]); `scratch` holds [`conv2d_scratch`] and [`direct_scratch`] values.
     fn conv2d(
         &self,
         geom: &Conv2dGeom,
@@ -1554,6 +1557,12 @@ impl Run {
         scratch: &mut [f32],
     ) {
         let (level, threads) = (self.level, self.threads);
+        if direct_runs(level, geom) {
+            conv3x3_direct(
+                level, geom, self.rows, src, weight, bias, dst, scratch, threads,
+            );
+            return;
+        }
         let gemm = |a: MatRef<'_, f32>, b: MatRef<'_, f32>, beta: f32, c: MatMut<'_, f32>| {
             gemm_f32_with(level, threads, 1.0, a, b, beta, c);
         };

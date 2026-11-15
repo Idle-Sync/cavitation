@@ -1,17 +1,24 @@
 //! 2-D convolution on the tape: `conv2d`, with its backward pass.
 //!
-//! The batch is cut into groups of images ([`groups`]) run in parallel; each group copies
-//! its images' windows into column matrices and multiplies them by the weight with the GEMM
-//! of the current kernel level (`Real::gemm`), by [`conv2d_forward`] and
+//! In f32, a 3 × 3 convolution with stride 1 and padding 1 runs its forward pass and its
+//! input gradient as a direct convolution ([`conv3x3_direct`], [`conv3x3_direct_input_grad`])
+//! where [`direct_runs`] accepts it at the current kernel level. Everything else, and every
+//! weight gradient, cuts the batch into groups of images ([`groups`]) run in parallel; each
+//! group copies its images' windows into column matrices and multiplies them by the weight
+//! with the GEMM of the current kernel level (`Real::gemm`), by [`conv2d_forward`] and
 //! [`conv2d_backward`]. Nothing is kept between the forward and the backward pass, which
 //! builds the columns again. A 1 × 1 kernel with stride 1 and no padding multiplies each
 //! image itself.
 
 use crate::graph::{BackwardCtx, Var};
-use crate::kernels::conv::{Conv2dGeom, conv2d_backward, conv2d_forward, conv2d_scratch, groups};
+use crate::kernels::conv::{
+    Conv2dGeom, conv2d_backward, conv2d_forward, conv2d_scratch, conv3x3_direct,
+    conv3x3_direct_input_grad, direct_input_grad_runs, direct_runs, direct_scratch, groups,
+};
 use crate::kernels::{self, MatMut, MatRef};
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
+use std::any::TypeId;
 
 /// The operation's name, used in panic messages.
 const NAME: &str = "conv2d";
@@ -84,24 +91,60 @@ impl<T: Real> Tape<'_, T> {
         let batch = check_shapes(&geom, &self.shape(x), &self.shape(weight), sb.as_ref());
         let threads = kernels::threads();
         let mut out = self.take_buffer(batch * geom.out_width());
-        let mut scratch = self.take_buffer(conv2d_scratch(&geom, batch, threads));
+        let mut scratch = self.take_buffer(scratch_len(&geom, batch, threads));
         let bv = bias.map(|b| self.data(b));
-        conv2d_forward(
-            &geom,
-            batch,
-            self.data(x),
-            self.data(weight),
-            bv,
-            &mut out,
-            &mut scratch,
-            threads,
-            &gemm::<T>,
-        );
+        let level = kernels::level();
+        let mut direct = false;
+        if direct_runs(level, &geom)
+            && let (Some(xs), Some(ws), Some(o), Some(sc)) = (
+                as_f32(self.data(x)),
+                as_f32(self.data(weight)),
+                as_f32_mut(&mut out),
+                as_f32_mut(&mut scratch),
+            )
+        {
+            let bs = bv.map(|b| as_f32(b).expect("the bias has the input's type"));
+            conv3x3_direct(level, &geom, batch, xs, ws, bs, o, sc, threads);
+            direct = true;
+        }
+        if !direct {
+            conv2d_forward(
+                &geom,
+                batch,
+                self.data(x),
+                self.data(weight),
+                bv,
+                &mut out,
+                &mut scratch,
+                threads,
+                &gemm::<T>,
+            );
+        }
         self.give_buffer(scratch);
         let start = self.push_labels(&geom.to_words());
         let so = Shape::new(&[batch, geom.out_width()]);
         self.push(Op::Conv2d(x, weight, bias, start), so, out)
     }
+}
+
+/// The scratch a convolution of `batch` images of `geom` takes on `threads` threads, by
+/// whichever path runs it.
+fn scratch_len(geom: &Conv2dGeom, batch: usize, threads: usize) -> usize {
+    conv2d_scratch(geom, batch, threads).max(direct_scratch(geom, threads))
+}
+
+/// `v` as f32 values, when `T` is f32.
+fn as_f32<T: Real>(v: &[T]) -> Option<&[f32]> {
+    (TypeId::of::<T>() == TypeId::of::<f32>())
+        // SAFETY: `T` is `f32`, so the slice is reinterpreted as itself.
+        .then(|| unsafe { std::slice::from_raw_parts(v.as_ptr().cast::<f32>(), v.len()) })
+}
+
+/// `v` as mutable f32 values, when `T` is f32.
+fn as_f32_mut<T: Real>(v: &mut [T]) -> Option<&mut [f32]> {
+    (TypeId::of::<T>() == TypeId::of::<f32>())
+        // SAFETY: `T` is `f32`, so the slice is reinterpreted as itself, borrowed as `v` is.
+        .then(|| unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr().cast::<f32>(), v.len()) })
 }
 
 /// `c = a · b + beta · c` with the current level's GEMM.
@@ -142,7 +185,7 @@ pub(super) fn backward<T: Real>(
         });
     }
     let threads = kernels::threads();
-    let mut scratch = ctx.scratch(conv2d_scratch(&geom, batch, threads));
+    let mut scratch = ctx.scratch(scratch_len(&geom, batch, threads));
     if ctx.takes_grad(weight) {
         let count = groups(batch);
         let mut parts = ctx.scratch(count * cout * kl);
@@ -176,6 +219,18 @@ pub(super) fn backward<T: Real>(
     {
         slot.update_with(|buf, beta| {
             let add = beta != T::ZERO;
+            let level = kernels::level();
+            if direct_input_grad_runs(level, &geom)
+                && let (Some(dy), Some(ws), Some(dx), Some(sc)) = (
+                    as_f32(out_grad),
+                    as_f32(wv),
+                    as_f32_mut(&mut *buf),
+                    as_f32_mut(&mut scratch),
+                )
+            {
+                conv3x3_direct_input_grad(level, &geom, batch, dy, ws, dx, add, sc, threads);
+                return;
+            }
             conv2d_backward(
                 &geom,
                 batch,

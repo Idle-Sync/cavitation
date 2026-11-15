@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- A 3 × 3 convolution with stride 1, padding 1 and dilation 1 runs its forward pass and its input gradient as a direct convolution in f32 at the SSE4.2, AVX2 and NEON levels, where the output channels (for the input gradient, the input channels) are a multiple of 4 and the width a multiple of the vector width (`kernels::conv::conv3x3_direct`, `conv3x3_direct_input_grad`, `direct_runs`, `direct_input_grad_runs`, `direct_scratch`). Each image is copied once into a zero-padded buffer and every output is summed over the input channels and taps in a fixed order, with no column matrix; the weight gradient, f64, the Accelerate level and every other geometry keep im2col and the GEMM. On an Intel Celeron N5105 at 4 threads (batch 128, interleaved medians, machine under load), the `cifar-cnn` network's convolutions take 6.6, 70.1, 34.1 and 82.6 ms forward instead of 12.7, 89.3, 37.1 and 88.1, and the input gradients of the last three 70.9, 33.2 and 83.4 ms instead of 78.8, 33.4 and 90.3. The results stay the same for any thread count, and `InferenceModel` runs the same kernel, so it still agrees with the tape bit for bit; they differ from v0.3's in the last bits, within the bound of the sum. Each kernel matches its scalar twin, `conv3x3_direct_twin`, bit for bit (#246).
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
