@@ -91,6 +91,37 @@ The formulas match; the last bits of a value need not. In f32, `Tanh` and `Sigmo
 
 **Shape errors panic.** Building a network and stepping it by hand is code you write next to the model, so a wrong shape inside it is a programming error: `Trainer::step` and the `Sequential` mask calls panic with a message naming the shapes. The calls that a program drives from data or from a user's input, such as `InferenceModel::set_mask` and `Evaluator::set_neuron_mask`, return a `Result`.
 
+## Early stopping and plateaus
+
+PyTorch has `ReduceLROnPlateau` and leaves early stopping to your own loop. In Cavitation both are settings of `fit`, and both read each whole epoch's report.
+
+- **`LrSchedule::ReduceOnPlateau`** is `ReduceLROnPlateau` stepped once per epoch, with the same `factor`, `patience`, `threshold` (`Threshold::Relative` is `threshold_mode='rel'`, `Threshold::Absolute` is `'abs'`), `cooldown` and `min_lr`. For the same sequence of measures it gives PyTorch's rates, bit for bit. `LrSchedule::reduce_on_plateau(monitor)` takes PyTorch's defaults. The measure is a `Monitor`: the training loss, the validation loss, or the validation score (accuracy, or R² for value targets). PyTorch's `mode` follows from it: `'min'` for a loss, `'max'` for the score.
+- **`FitConfig::early_stopping`** stops after `patience` epochs in a row without an improvement of more than `min_delta`, as Keras's `EarlyStopping` counts them. With `restore_best` (the default) the run ends with the best epoch's parameters and batch-norm buffers, also when it runs to its last epoch; Keras puts them back only when it stops early. `History::best_epoch` names that epoch and `History::stopped_early` says whether the rule ended the run.
+
+```rust
+use cavitation::prelude::*;
+
+// Watch the validation accuracy: halve the rate after 2 flat epochs, stop after 5.
+let mut stop = EarlyStopping::new(Monitor::ValidationScore, 5);
+stop.min_delta = 1e-3;
+let config = FitConfig {
+    epochs: 100,
+    schedule: LrSchedule::ReduceOnPlateau {
+        monitor: Monitor::ValidationScore,
+        factor: 0.5,
+        patience: 2,
+        threshold: Threshold::default(),
+        cooldown: 0,
+        min_lr: 1e-5,
+    },
+    early_stopping: Some(stop),
+    ..FitConfig::default()
+};
+assert_eq!(config.epochs, 100);
+```
+
+A validation measure needs `FitConfig::validation`; without it `fit` returns `Error::InvalidData` before the first step.
+
 ## Saving and loading
 
 `save` writes every parameter as an `F32` `.safetensors` file, named by `Sequential::parameter_names`: `0.weight`, `0.bias`, `2.weight` and so on, where the number is the layer's index in the `Sequential`. A `Linear` stores its weight as `[outputs, inputs]`, the layout of PyTorch's `nn.Linear`, so the file is what `safetensors.torch.save_file(model.state_dict(), path)` writes for the same `nn.Sequential`, and loads there too. `load` reads `F32` files, and `F16`, `BF16` and `F64` ones too: half precision widens to `F32` exactly, and `F64` rounds to the nearest `F32`, as `.float()` does in PyTorch. `save` also records the layer kinds (`linear,relu,linear`) in the file's metadata, which PyTorch ignores; `load` refuses a file saved from other kinds, so GELU weights do not load silently into a ReLU network.

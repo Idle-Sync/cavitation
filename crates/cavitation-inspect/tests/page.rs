@@ -119,6 +119,7 @@ fn fit_config() -> FitConfig<'static> {
         health: Health::quiet(),
         on_epoch: None,
         validation: None,
+        early_stopping: None,
     }
 }
 

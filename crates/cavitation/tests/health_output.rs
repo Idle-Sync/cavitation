@@ -68,6 +68,7 @@ fn train_digits(optimizer: OptimizerConfig, epochs: usize) {
         health: Health::default(),
         on_epoch: None,
         validation: None,
+        early_stopping: None,
     };
     fit(&net, &mut params, &train, config).unwrap();
 }

@@ -3,14 +3,16 @@
 //! `fit`), held-out measurement
 //! ([`Evaluator`] and [`evaluate`], in `evaluate`), [`Standardizer`], which standardises
 //! inputs or targets and folds that into a network (in `standardize`), [`StepLog`], a
-//! [`StepControl`] that records every step (in `step_log`), and [`Flow`], which a progress
-//! callback returns to go on or stop.
+//! [`StepControl`] that records every step (in `step_log`), [`EarlyStopping`] and the
+//! [`Monitor`] and [`Threshold`] it and the plateau schedule watch with (in `stopping`), and
+//! [`Flow`], which a progress callback returns to go on or stop.
 
 mod data;
 mod evaluate;
 mod fit;
 mod standardize;
 mod step_log;
+mod stopping;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
 pub use evaluate::{Evaluation, Evaluator, evaluate};
@@ -21,6 +23,7 @@ pub use fit::{
 pub(crate) use fit::{check_dataset, check_widths};
 pub use standardize::Standardizer;
 pub use step_log::{StepLog, StepRecord};
+pub use stopping::{EarlyStopping, Monitor, Threshold};
 
 /// What a progress callback returns: go on with the run, or stop it there. The
 /// [`shrink`](crate::shrink::shrink()) tool's `on_step` callback returns one after each step.

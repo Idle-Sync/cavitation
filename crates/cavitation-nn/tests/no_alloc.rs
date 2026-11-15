@@ -1366,6 +1366,50 @@ fn fit_validation_steady_state() -> usize {
     FIT_AFTER_EPOCH_2.load(Ordering::Relaxed) + control.after
 }
 
+/// `fit` with a validation set, early stopping (restoring the best parameters) and the
+/// plateau schedule, both on the validation loss, on the 50k network for 6 epochs: from the
+/// end of epoch 2 to the end of the run, the best-parameter copies, the plateau steps and
+/// the final restore allocate nothing. The first copy is made at epoch 1. A large relative
+/// threshold and patience 0 make the schedule lower the rate after most epochs. The best
+/// epoch is from 2 to 5 (it is 2), so a copy is refreshed and the run ends by copying it
+/// back, both counted.
+fn fit_watching_steady_state() -> usize {
+    let (train, validation) = synthetic_centred_1437().split_at(1000);
+    let mut params = ParamStore::new();
+    let net = network_50k(&mut params);
+    let stop = cavitation_nn::EarlyStopping::new(cavitation_nn::Monitor::ValidationLoss, 100);
+    let config = cavitation_nn::FitConfig {
+        epochs: 6,
+        batch: 128,
+        health: Health::quiet(),
+        validation: Some(validation),
+        early_stopping: Some(stop),
+        schedule: cavitation_nn::LrSchedule::ReduceOnPlateau {
+            monitor: cavitation_nn::Monitor::ValidationLoss,
+            factor: 0.5,
+            patience: 0,
+            threshold: cavitation_nn::Threshold::Relative(0.5),
+            cooldown: 0,
+            min_lr: 0.0,
+        },
+        on_epoch: Some(Box::new(|report, _, _| {
+            if report.epoch == 2 {
+                FIT_EPOCH_2.store(allocations(), Ordering::Relaxed);
+            }
+        })),
+        ..cavitation_nn::FitConfig::default()
+    };
+    let history = cavitation_nn::fit(&net, &mut params, &train, config).unwrap();
+    let made = allocations() - FIT_EPOCH_2.load(Ordering::Relaxed);
+    assert_eq!(history.epochs.len(), 6);
+    // A best epoch before the last, so the run ends with a restore.
+    assert!(
+        history.best_epoch.is_some_and(|e| (2..6).contains(&e)),
+        "{history:?}"
+    );
+    made
+}
+
 /// `fit` with a validation set on a small CNN (two convolutions, the first without a bias
 /// and followed by batch normalisation) for 6 epochs on 1,000 rows, the other 437
 /// validating: from the third epoch on, nothing is allocated, the compiled model's
@@ -1507,7 +1551,7 @@ fn fit_validation_tape_steady_state() -> usize {
 
 /// Runs every scenario and fails if any allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 30] = [
+    let scenarios: [Scenario; 31] = [
         ("optimizers_steady_state", optimizers_steady_state),
         ("optimizers_step_steady_state", optimizers_step_steady_state),
         ("gather_steady_state", gather_steady_state),
@@ -1547,6 +1591,7 @@ fn main() -> ExitCode {
         ),
         ("profiled_step_reuses_buffers", profiled_step_reuses_buffers),
         ("fit_validation_steady_state", fit_validation_steady_state),
+        ("fit_watching_steady_state", fit_watching_steady_state),
         ("dead_report_steady_state", dead_report_steady_state),
         (
             "fit_validation_cnn_steady_state",

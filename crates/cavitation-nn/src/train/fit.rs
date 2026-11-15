@@ -5,10 +5,14 @@
 use std::fmt;
 use std::time::{Duration, Instant};
 
-use cavitation_core::{Error, Graph, ParamId, ParamStore, Reduction, Tape, TensorView, Var};
+use cavitation_core::{
+    Error, Graph, ParamId, ParamStore, ParamValues, Reduction, Tape, TensorView, Var,
+};
 
+use super::stopping::{Plateau, PlateauRule, Verdict, Watch};
 use super::{
-    Batch, BatchView, Batcher, Dataset, Evaluation, Evaluator, Flow, Targets, TargetsView,
+    Batch, BatchView, Batcher, Dataset, EarlyStopping, Evaluation, Evaluator, Flow, Monitor,
+    Targets, TargetsView, Threshold,
 };
 use crate::{
     Adagrad, Adam, AdamW, Health, HealthMonitor, Hooks, InferenceModel, NeuronMask, Optimizer,
@@ -1526,7 +1530,9 @@ impl OptimizerConfig {
 /// set it before every step. `fit` takes the rate from
 /// [`learning_rate`](Self::learning_rate), counting every step position of the run (a step
 /// left out under [`OnNonFinite::Skip`](crate::OnNonFinite::Skip) still counts), until a
-/// [`StepControl`] overrides the rate.
+/// [`StepControl`] overrides the rate. [`ReduceOnPlateau`](Self::ReduceOnPlateau) instead
+/// watches a measure after each whole epoch and lowers the rate for the next epoch when the
+/// measure stalls.
 ///
 /// # Examples
 ///
@@ -1573,13 +1579,70 @@ pub enum LrSchedule {
         /// The rate the schedule approaches; the last step trains a little above it.
         min_lr: f64,
     },
+    /// PyTorch's `ReduceLROnPlateau`, stepped after every whole epoch on `monitor`: an
+    /// epoch whose value is not better than the best so far by `threshold` is a bad epoch;
+    /// once more than `patience` bad epochs have come in a row, the next epoch trains at the
+    /// rate times `factor`, but not below `min_lr`, and the `cooldown` epochs after that
+    /// count no bad epochs. A reduction of less than 1e-8 (PyTorch's `eps`) is not made. For
+    /// the same sequence of values it gives PyTorch's rates, bit for bit. A loss is watched
+    /// in PyTorch's `mode='min'`, [`Monitor::ValidationScore`] in `mode='max'`.
+    ///
+    /// The rate stays constant within an epoch. A partial epoch (a [`StepControl`] stopped
+    /// the run) is not counted. [`reduce_on_plateau`](Self::reduce_on_plateau) gives
+    /// PyTorch's defaults.
+    ReduceOnPlateau {
+        /// The measure watched.
+        monitor: Monitor,
+        /// What each reduction multiplies the rate by; above 0 and below 1.
+        factor: f64,
+        /// Bad epochs in a row allowed before a reduction.
+        patience: usize,
+        /// How much better counts as better.
+        threshold: Threshold,
+        /// Epochs after a reduction in which bad epochs are not counted.
+        cooldown: usize,
+        /// The lowest rate; not negative.
+        min_lr: f64,
+    },
 }
 
 impl LrSchedule {
+    /// [`ReduceOnPlateau`](Self::ReduceOnPlateau) on `monitor` with PyTorch's defaults:
+    /// factor 0.1, patience 10, a relative threshold of 1e-4, no cooldown and no minimum
+    /// rate.
+    ///
+    /// ```
+    /// use cavitation_nn::{LrSchedule, Monitor, Threshold};
+    /// let schedule = LrSchedule::reduce_on_plateau(Monitor::ValidationLoss);
+    /// assert_eq!(
+    ///     schedule,
+    ///     LrSchedule::ReduceOnPlateau {
+    ///         monitor: Monitor::ValidationLoss,
+    ///         factor: 0.1,
+    ///         patience: 10,
+    ///         threshold: Threshold::Relative(1e-4),
+    ///         cooldown: 0,
+    ///         min_lr: 0.0,
+    ///     }
+    /// );
+    /// ```
+    pub fn reduce_on_plateau(monitor: Monitor) -> LrSchedule {
+        LrSchedule::ReduceOnPlateau {
+            monitor,
+            factor: 0.1,
+            patience: 10,
+            threshold: Threshold::default(),
+            cooldown: 0,
+            min_lr: 0.0,
+        }
+    }
+
     /// The learning rate of step `step` (counting from 0, the number of step positions
     /// already run) of a run of `epochs` epochs of `steps_per_epoch` steps each, whose peak
     /// rate is `initial`. For the per-epoch schedules the step's epoch is
-    /// `step / steps_per_epoch`.
+    /// `step / steps_per_epoch`. [`ReduceOnPlateau`](Self::ReduceOnPlateau) depends on the
+    /// measures it watches, not on the step, so here it gives `initial`; [`fit`] passes the
+    /// rate the rule has reached as `initial`.
     ///
     /// # Panics
     ///
@@ -1617,7 +1680,7 @@ impl LrSchedule {
         };
         let warmup = |steps: usize| initial * (step + 1) as f64 / steps as f64;
         match *self {
-            LrSchedule::Constant => initial,
+            LrSchedule::Constant | LrSchedule::ReduceOnPlateau { .. } => initial,
             LrSchedule::Cosine { min_lr } => cosine(min_lr, step / steps_per_epoch, epochs),
             LrSchedule::Warmup { steps } if step < steps => warmup(steps),
             LrSchedule::Warmup { .. } => initial,
@@ -1716,7 +1779,7 @@ impl EpochReport {
     }
 }
 
-/// Every epoch's report from one [`fit`].
+/// Every epoch's report from one [`fit`], and what [`FitConfig::early_stopping`] did.
 ///
 /// # Examples
 ///
@@ -1724,13 +1787,20 @@ impl EpochReport {
 /// use cavitation_nn::{EpochReport, History};
 /// let report =
 ///     EpochReport::new(1, 0.5, 100, 0.01);
-/// let history = History { epochs: vec![report] };
-/// assert_eq!(history.epochs.len(), 1);
+/// let history = History { epochs: vec![report], ..History::default() };
+/// assert_eq!((history.epochs.len(), history.best_epoch), (1, None));
 /// ```
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct History {
     /// The reports, in epoch order.
     pub epochs: Vec<EpochReport>,
+    /// With [`FitConfig::early_stopping`], the epoch whose measure was the best, counting
+    /// from 1; with [`EarlyStopping::restore_best`] the run ended with its parameter
+    /// values. `None` without early stopping, or when no epoch had a value that counted
+    /// (each was NaN).
+    pub best_epoch: Option<usize>,
+    /// Whether [`FitConfig::early_stopping`] ended the run before its last epoch.
+    pub stopped_early: bool,
 }
 
 /// How [`fit`] trains. Taken by value, because it holds the `on_epoch` callback.
@@ -1784,11 +1854,18 @@ pub struct FitConfig<'s> {
     /// model with a layer that has no inference form is measured on the tape and copies its
     /// parameter values each epoch.
     pub validation: Option<Dataset>,
+    /// When to end the run before `epochs` because a measure stopped improving, and
+    /// whether to end it with the best epoch's parameters; `None` runs every epoch. The
+    /// rule runs after `on_epoch` and before a [`StepControl`]'s `after_epoch`, which still
+    /// sees the epoch the rule stops on. Copying the best parameters allocates once, at
+    /// the first best epoch; later copies reuse that memory.
+    pub early_stopping: Option<EarlyStopping>,
 }
 
 impl Default for FitConfig<'_> {
     /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, dropout
-    /// seed 0, the default health checks, no callback, no validation set.
+    /// seed 0, the default health checks, no callback, no validation set, no early
+    /// stopping.
     fn default() -> Self {
         FitConfig {
             epochs: 10,
@@ -1804,6 +1881,7 @@ impl Default for FitConfig<'_> {
             health: Health::default(),
             on_epoch: None,
             validation: None,
+            early_stopping: None,
         }
     }
 }
@@ -1826,6 +1904,7 @@ impl fmt::Debug for FitConfig<'_> {
                 "validation",
                 &self.validation.as_ref().map(|v| (v.len(), v.features())),
             )
+            .field("early_stopping", &self.early_stopping)
             .finish()
     }
 }
@@ -2199,6 +2278,7 @@ fn run_fit(
         check_model_and_loss(run.model(), config.loss, held_out).map_err(named)?;
         check_finite(held_out).map_err(named)?;
     }
+    let watched = check_watching(&config, validation_set.is_some())?;
     let mut trainer = Trainer::with_boxed(
         run.model(),
         config.optimizer.build(),
@@ -2215,7 +2295,16 @@ fn run_fit(
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut history = History {
         epochs: Vec::with_capacity(config.epochs.min(1024)),
+        ..History::default()
     };
+    let mut plateau = watched
+        .plateau
+        .map(|(monitor, rule)| (monitor, Plateau::new(rule.higher_is_better), rule));
+    let mut watch = config.early_stopping.map(|rule| (Watch::new(&rule), rule));
+    // The best epoch's parameter values, made at the first best epoch and refreshed in
+    // place; and whether training has changed the parameters since that copy.
+    let mut best: Option<ParamValues> = None;
+    let mut trained_since_best = false;
     params.zero_grad();
     trainer.rates = Some(StepRates {
         schedule: config.schedule,
@@ -2226,6 +2315,7 @@ fn run_fit(
     for epoch in 1..=config.epochs {
         let start = Instant::now();
         let end = trainer.run_epoch(&mut run, params, train, &mut batcher, hooks, epoch)?;
+        trained_since_best = true;
         let whole = end.whole;
         if whole {
             trainer.end_epoch(epoch)?;
@@ -2252,6 +2342,29 @@ fn run_fit(
         if end.stopped {
             break;
         }
+        if let Some((monitor, state, rule)) = &mut plateau
+            && !trainer.schedule_stopped
+            && let Some(rates) = trainer.rates.as_mut()
+        {
+            let value = monitor.value(&report).expect("checked before the run");
+            rates.initial = state.step(rule, value, rates.initial);
+        }
+        let mut stop_early = false;
+        if let Some((state, rule)) = &mut watch {
+            let value = rule.monitor.value(&report).expect("checked before the run");
+            match state.step(rule, epoch, value) {
+                Verdict::Improved if rule.restore_best => {
+                    match &mut best {
+                        Some(copy) => copy.clone_from(&params.values),
+                        None => best = Some(params.values.clone()),
+                    }
+                    trained_since_best = false;
+                }
+                Verdict::Improved | Verdict::Waiting => {}
+                Verdict::Stop => stop_early = epoch < config.epochs,
+            }
+            history.best_epoch = state.best_epoch;
+        }
         if let Run::Controlled(model, control) = &mut run {
             let mut handle = ModelHandle::new(model);
             let mut trainer = TrainerHandle::new(&mut trainer);
@@ -2259,8 +2372,93 @@ fn run_fit(
                 break;
             }
         }
+        if stop_early {
+            history.stopped_early = true;
+            break;
+        }
+    }
+    if let Some(copy) = &best
+        && trained_since_best
+    {
+        params.values.clone_from(copy);
     }
     Ok(history)
+}
+
+/// The rules of a run that watch a measure, once [`check_watching`] has checked them.
+struct Watched {
+    /// The plateau schedule's measure and rule, if the schedule is
+    /// [`LrSchedule::ReduceOnPlateau`].
+    plateau: Option<(Monitor, PlateauRule)>,
+}
+
+/// Checks `config`'s plateau schedule and early-stopping rule: a validation measure needs
+/// a validation set (`has_validation`), and each setting must be in its range. Returns
+/// the plateau rule ready to step.
+fn check_watching(config: &FitConfig, has_validation: bool) -> Result<Watched, Error> {
+    let bad = |msg: String| Err(Error::InvalidData(msg));
+    let needs_set = |what: &str, monitor: Monitor| {
+        if monitor.needs_validation() && !has_validation {
+            Err(Error::InvalidData(format!(
+                "{what} watches {monitor:?}, but FitConfig::validation is None"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let mut plateau = None;
+    if let LrSchedule::ReduceOnPlateau {
+        monitor,
+        factor,
+        patience,
+        threshold,
+        cooldown,
+        min_lr,
+    } = config.schedule
+    {
+        needs_set("LrSchedule::ReduceOnPlateau", monitor)?;
+        if !(factor > 0.0 && factor < 1.0) {
+            return bad(format!(
+                "LrSchedule::ReduceOnPlateau: factor {factor} must be above 0 and below 1"
+            ));
+        }
+        if !(min_lr >= 0.0 && min_lr.is_finite()) {
+            return bad(format!(
+                "LrSchedule::ReduceOnPlateau: min_lr {min_lr} must be finite and not negative"
+            ));
+        }
+        let amount = threshold.amount();
+        if !(amount >= 0.0 && amount.is_finite()) {
+            return bad(format!(
+                "LrSchedule::ReduceOnPlateau: threshold {amount} must be finite and not \
+                 negative"
+            ));
+        }
+        plateau = Some((
+            monitor,
+            PlateauRule {
+                higher_is_better: monitor.higher_is_better(),
+                factor,
+                patience,
+                threshold,
+                cooldown,
+                min_lr,
+            },
+        ));
+    }
+    if let Some(rule) = &config.early_stopping {
+        needs_set("FitConfig::early_stopping", rule.monitor)?;
+        if rule.patience == 0 {
+            return bad("FitConfig::early_stopping: patience must be at least 1".to_string());
+        }
+        if !(rule.min_delta >= 0.0 && rule.min_delta.is_finite()) {
+            return bad(format!(
+                "FitConfig::early_stopping: min_delta {} must be finite and not negative",
+                rule.min_delta
+            ));
+        }
+    }
+    Ok(Watched { plateau })
 }
 
 /// The share of rows of `data` whose largest output of `model` is at the row's class
@@ -2464,6 +2662,7 @@ mod tests {
             health: Health::default(),
             on_epoch: None,
             validation: None,
+            early_stopping: None,
         };
         let history = fit(&net, &mut params, &data, config).unwrap();
         assert_eq!(history.epochs.len(), 2000);
@@ -4737,5 +4936,212 @@ mod tests {
         crate::evaluate(&net, &params, &data, Loss::CrossEntropy, 4).unwrap();
         assert_eq!(training.load(Ordering::Relaxed), 4);
         assert!(evaluation.load(Ordering::Relaxed) > after_fit);
+    }
+
+    /// A one-weight run for the watching rules: one `Linear` from a zero input, so its
+    /// output is its bias, trained by SGD towards 1 on one row per epoch. `validation`, if
+    /// given, is a row whose target is that value.
+    fn bias_run(
+        validation: Option<f32>,
+    ) -> (Sequential, ParamStore, Dataset, Option<Dataset>, ParamId) {
+        let row = |target: f32| Dataset {
+            x: Tensor::zeros(&[1, 1]),
+            targets: Targets::Values(Tensor::full(&[1, 1], target)),
+        };
+        let mut params = ParamStore::new();
+        let layer = Linear::new(&mut params, 1, 1, &mut Rng::seed(0));
+        let bias = layer.bias().unwrap();
+        (
+            Sequential::new().push(layer),
+            params,
+            row(1.0),
+            validation.map(row),
+            bias,
+        )
+    }
+
+    /// Records the learning rate of each epoch's first step.
+    struct RateLog(Vec<f64>);
+
+    impl StepControl for RateLog {
+        fn after_step(
+            &mut self,
+            info: &StepInfo,
+            _model: &mut ModelHandle<'_>,
+            _params: &ParamStore,
+            trainer: &mut TrainerHandle<'_>,
+        ) -> Flow {
+            if info.step as usize == info.epoch {
+                self.0.push(trainer.learning_rate());
+            }
+            Flow::Continue
+        }
+    }
+
+    /// `fit` steps `ReduceOnPlateau` after each epoch on the training loss and trains the
+    /// next epoch at the rate it gives. The loss starts at 1 and stays above 0.1 for six
+    /// epochs, so under a relative threshold of 0.9 every epoch after the first is bad, and
+    /// with patience 1 every second bad epoch halves the rate.
+    #[test]
+    fn fit_reduces_the_rate_on_a_plateau() {
+        let (mut net, mut params, data, _, _) = bias_run(None);
+        let config = FitConfig {
+            epochs: 6,
+            batch: 1,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 0.1,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            schedule: LrSchedule::ReduceOnPlateau {
+                monitor: Monitor::TrainingLoss,
+                factor: 0.5,
+                patience: 1,
+                threshold: Threshold::Relative(0.9),
+                cooldown: 0,
+                min_lr: 0.0,
+            },
+            health: Health::quiet(),
+            ..FitConfig::default()
+        };
+        let mut log = RateLog(Vec::new());
+        let history = fit_controlled(
+            &mut net,
+            &mut params,
+            &data,
+            config,
+            &mut Hooks::new(),
+            &mut log,
+        )
+        .unwrap();
+        assert_eq!(history.epochs.len(), 6);
+        assert_eq!(log.0, [0.1, 0.1, 0.1, 0.05, 0.05, 0.025]);
+        assert_eq!((history.best_epoch, history.stopped_early), (None, false));
+    }
+
+    /// Early stopping on a validation row whose target (−1) the training (towards 1) moves
+    /// away from: epoch 1 is the best, epochs 2 and 3 are worse, so patience 2 ends the run
+    /// after epoch 3 with epoch 1's bias put back, or epoch 3's without `restore_best`. A
+    /// control's `after_epoch` still sees epoch 3.
+    #[test]
+    fn fit_stops_early_and_restores_the_best() {
+        use std::sync::Mutex;
+        for restore_best in [true, false] {
+            let (mut net, mut params, data, validation, bias) = bias_run(Some(-1.0));
+            let biases = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&biases);
+            let mut rule = EarlyStopping::new(Monitor::ValidationLoss, 2);
+            rule.restore_best = restore_best;
+            let config = FitConfig {
+                epochs: 10,
+                batch: 1,
+                optimizer: OptimizerConfig::Sgd {
+                    lr: 0.1,
+                    momentum: 0.0,
+                    weight_decay: 0.0,
+                },
+                loss: Loss::Mse,
+                health: Health::quiet(),
+                validation,
+                early_stopping: Some(rule),
+                on_epoch: Some(Box::new(move |_, _, params: &ParamStore| {
+                    sink.lock().unwrap().push(params.value(bias).data()[0]);
+                })),
+                ..FitConfig::default()
+            };
+            let mut log = RateLog(Vec::new());
+            let history = fit_controlled(
+                &mut net,
+                &mut params,
+                &data,
+                config,
+                &mut Hooks::new(),
+                &mut log,
+            )
+            .unwrap();
+            assert_eq!(history.epochs.len(), 3);
+            assert_eq!((history.best_epoch, history.stopped_early), (Some(1), true));
+            let biases = biases.lock().unwrap();
+            let want = if restore_best { biases[0] } else { biases[2] };
+            assert_eq!(
+                params.value(bias).data()[0],
+                want,
+                "restore_best {restore_best}"
+            );
+            assert_eq!(log.0.len(), 3);
+        }
+    }
+
+    /// A run whose last epoch is its best ends with its own parameters and does not count
+    /// as stopped early; the patience never ran out.
+    #[test]
+    fn early_stopping_without_a_stop_keeps_the_last_epoch() {
+        let (net, mut params, data, validation, _) = bias_run(Some(1.0));
+        let config = FitConfig {
+            epochs: 4,
+            batch: 1,
+            loss: Loss::Mse,
+            health: Health::quiet(),
+            validation,
+            early_stopping: Some(EarlyStopping::new(Monitor::ValidationLoss, 1)),
+            ..FitConfig::default()
+        };
+        let history = fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(history.epochs.len(), 4);
+        assert_eq!(
+            (history.best_epoch, history.stopped_early),
+            (Some(4), false)
+        );
+    }
+
+    /// A validation measure without a validation set, a patience of 0, a negative
+    /// `min_delta`, and a plateau factor of 1, a negative `min_lr` or a NaN threshold are
+    /// `InvalidData`, before any step.
+    #[test]
+    fn bad_watching_settings_are_errors() {
+        let run = |early: Option<EarlyStopping>, schedule: LrSchedule, validation: bool| {
+            let (net, mut params, data, held_out, bias) = bias_run(validation.then_some(1.0));
+            let before = params.value(bias).data()[0];
+            let config = FitConfig {
+                epochs: 2,
+                batch: 1,
+                loss: Loss::Mse,
+                health: Health::quiet(),
+                validation: held_out,
+                early_stopping: early,
+                schedule,
+                ..FitConfig::default()
+            };
+            let err = fit(&net, &mut params, &data, config).unwrap_err();
+            assert_eq!(params.value(bias).data()[0], before);
+            let Error::InvalidData(message) = err else {
+                panic!("not InvalidData: {err}")
+            };
+            message
+        };
+        let plain = LrSchedule::Constant;
+        let early = |patience, min_delta| {
+            let mut rule = EarlyStopping::new(Monitor::ValidationScore, patience);
+            rule.min_delta = min_delta;
+            Some(rule)
+        };
+        assert!(run(early(2, 0.0), plain, false).contains("FitConfig::validation is None"));
+        assert!(run(early(0, 0.0), plain, true).contains("patience"));
+        assert!(run(early(2, -1.0), plain, true).contains("min_delta"));
+        let plateau = |factor, threshold, min_lr| LrSchedule::ReduceOnPlateau {
+            monitor: Monitor::ValidationLoss,
+            factor,
+            patience: 1,
+            threshold,
+            cooldown: 0,
+            min_lr,
+        };
+        let rel = Threshold::default();
+        assert!(run(None, plateau(0.1, rel, 0.0), false).contains("ReduceOnPlateau watches"));
+        assert!(run(None, plateau(1.0, rel, 0.0), true).contains("factor"));
+        assert!(run(None, plateau(0.1, rel, -1.0), true).contains("min_lr"));
+        let nan = Threshold::Absolute(f64::NAN);
+        assert!(run(None, plateau(0.1, nan, 0.0), true).contains("threshold"));
     }
 }
