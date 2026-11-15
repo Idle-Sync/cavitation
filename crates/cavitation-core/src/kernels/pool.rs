@@ -202,6 +202,14 @@ pub fn run(threads: usize, tasks: usize, job: &(dyn Fn(Task) + Sync)) {
     run_on_pool(wanted, tasks, job);
 }
 
+/// Whether a [`run`] called now from this thread would run all its tasks on this thread:
+/// on one of the pool's workers (a nested call), or while another call holds the pool. The
+/// answer can change as soon as it is read (another call may end), so it is a hint for
+/// planning work, never something a result may depend on.
+pub(crate) fn runs_inline() -> bool {
+    IS_WORKER.get() || POOL.busy.load(Ordering::Relaxed)
+}
+
 /// Splits `M` mutable slices and one shared slice, all of the same length, into chunks of
 /// `chunk` elements (the last one shorter when the length is not a multiple) and runs `job`
 /// once per chunk through [`run`] on at most `threads` threads. Chunk `i` covers elements

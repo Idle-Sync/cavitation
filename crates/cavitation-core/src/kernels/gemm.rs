@@ -179,7 +179,8 @@ pub fn gemm_f32(alpha: f32, a: MatRef<f32>, b: MatRef<f32>, beta: f32, c: MatMut
 /// rows (or columns) that do not overlap, padded or not, and fits in `i32` indices; any other
 /// layout, or `alpha = 0`, runs the NEON kernel instead. [`Level::Reference`] runs
 /// [`reference::gemm`] on one thread. Products too small to be worth splitting run on one thread;
-/// [`threads_used`] tells how many a call uses. Each level rounds differently (fused multiply-add
+/// [`threads_used`] tells how many a call uses, and a call made inside a thread-pool task runs
+/// on that task's thread alone. Each level rounds differently (fused multiply-add
 /// rounds once per step, and each kernel blocks the sum differently), so results are bit-identical
 /// across thread counts within one level, not across levels.
 ///
@@ -303,7 +304,8 @@ unsafe fn dispatch<K: Kernel>(
 /// (a layout it cannot express runs on `threads_used(Level::Neon, ..)` threads instead), for
 /// empty products and for products too small to be worth splitting, else the most threads
 /// any step of the product runs on (never more than its number of tasks, nor more than the
-/// pool's maximum of 256).
+/// pool's maximum of 256). A call made inside a thread-pool task runs on one thread whatever
+/// this says.
 ///
 /// # Examples
 ///
@@ -369,7 +371,8 @@ fn launch(threads: usize, tasks: usize) -> usize {
 
 /// How the packed driver splits an `m` by `n` by `k` product (after any swap), from the
 /// shape and the thread count alone. The driver and [`threads_used`] both read it, so the
-/// reported thread count is the one the driver uses.
+/// reported thread count is the one the driver uses, except that the driver plans a call for
+/// one thread when the pool would run it inline (`pool::runs_inline`).
 #[derive(Clone, Copy)]
 struct Plan {
     /// The thread count passed to the pool: 1 below [`SINGLE_THREAD_FLOPS`].
@@ -664,6 +667,11 @@ unsafe fn packed<K: Kernel>(
     // The thread count asked for, before the plan lowers it for a small product: the
     // packing buffers are reserved for it.
     let asked = threads.min(super::pool::MAX_THREADS);
+    // A call made from inside a pool task (a convolution group's GEMM) or while another call
+    // holds the pool runs every task on this thread: plan it for one, rather than splitting
+    // it into tasks that would only run one after another. The plan's blocks of the sum do
+    // not depend on the thread count, so neither does the result.
+    let threads = if pool::runs_inline() { 1 } else { threads };
     let plan = Plan::new::<K>(m, n, k, threads);
     let Plan {
         threads,

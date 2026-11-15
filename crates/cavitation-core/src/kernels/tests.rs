@@ -594,7 +594,8 @@ fn product_bits(
 /// 1, 2, 3, 4 and 7 threads give bit-identical results on 300 x 700 x 500, on the training
 /// shapes 128 x 1024 x 784 (B transposed, as in a forward pass) and 32 x 256 x 1024, and on
 /// 1024 x 128 x 256, which the driver computes with A and B swapped, at every fast level and
-/// Accelerate. The test binary re-runs itself as a child that runs only
+/// Accelerate; and a call asking for 4 threads from inside a pool task, which the driver
+/// plans for one, gives the same bits too. The test binary re-runs itself as a child that runs only
 /// `threads_bit_identical_child`, so nothing else holds the thread pool and the multi-threaded
 /// products really use its workers.
 #[test]
@@ -632,6 +633,19 @@ fn threads_bit_identical_child() {
                         "{level}, {m}x{n}x{k}, beta {beta}: {threads} threads differ from 1"
                     );
                 }
+                // Asked for 4 threads from inside a pool task, where the driver plans for
+                // one because the pool would run every task inline.
+                let nested = std::sync::Mutex::new(None);
+                super::pool::run(2, 2, &|t| {
+                    if t.index == 0 {
+                        let bits = product_bits(level, 4, rm(&a, m, k), b.view(), beta, &c0);
+                        *nested.lock().unwrap() = Some(bits);
+                    }
+                });
+                assert!(
+                    nested.into_inner().unwrap() == Some(one),
+                    "{level}, {m}x{n}x{k}, beta {beta}: a call inside a pool task differs"
+                );
             }
         }
     }
