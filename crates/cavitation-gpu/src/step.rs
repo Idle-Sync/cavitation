@@ -78,7 +78,7 @@ struct Timestamps {
 ///
 /// With [`set_profiling`](StepEncoder::set_profiling) on and timestamps available, each
 /// [`Step::span`] runs in compute passes of its own with timestamps at their beginnings and
-/// ends, and [`StepOutput::spans`] gives each span's GPU time, added up over its passes. A
+/// ends, and [`StepOutput::spans`] gives each span's GPU time, from the beginning of its first pass to the end of its last. A
 /// profiled step has a pass boundary per span, so its timings describe a step structured
 /// for profiling. Without profiling, dispatches share passes and spans only label them.
 ///
@@ -893,8 +893,11 @@ impl<'a> Step<'a> {
     }
 }
 
-/// Sets each span's GPU time to the sum of its passes' times, from the resolved timestamp
-/// `ticks` (two per pass, in pass order) and the nanoseconds per tick. A span with no timed
+/// Sets each span's GPU time from the resolved timestamp `ticks` (two per pass, in pass
+/// order) and the nanoseconds per tick: from the beginning of its first timed pass to the
+/// end of its last, so the commands between its passes (an upload inside the span) count
+/// too, and the result does not depend on how a backend times work between passes. A span's
+/// passes are consecutive, since spans are recorded one after another. A span with no timed
 /// pass, or with a pass whose end tick is before its beginning, keeps `None`.
 fn add_span_times(
     spans: &mut [(&'static str, Option<f64>)],
@@ -902,22 +905,19 @@ fn add_span_times(
     ticks: &[[u8; 8]],
     period: f64,
 ) {
-    let mut broken = vec![false; spans.len()];
-    for (pass, &span) in passes.iter().enumerate() {
-        let begin = u64::from_le_bytes(ticks[2 * pass]);
-        let end = u64::from_le_bytes(ticks[2 * pass + 1]);
-        if end < begin {
-            broken[span] = true;
-            continue;
+    let tick = |i: usize| u64::from_le_bytes(ticks[i]);
+    let mut first = 0;
+    while first < passes.len() {
+        let span = passes[first];
+        let mut last = first;
+        let mut ordered = tick(2 * first + 1) >= tick(2 * first);
+        while last + 1 < passes.len() && passes[last + 1] == span {
+            last += 1;
+            ordered &= tick(2 * last + 1) >= tick(2 * last);
         }
-        let time = (end - begin) as f64 * period;
-        let total = spans[span].1.get_or_insert(0.0);
-        *total += time;
-    }
-    for (span, is_broken) in spans.iter_mut().zip(broken) {
-        if is_broken {
-            span.1 = None;
-        }
+        let (begin, end) = (tick(2 * first), tick(2 * last + 1));
+        spans[span].1 = (ordered && end >= begin).then(|| (end - begin) as f64 * period);
+        first = last + 1;
     }
 }
 
@@ -966,8 +966,8 @@ impl<'a> StepOutput<'a> {
         self.bytes
     }
 
-    /// The step's spans in order, each with its GPU time in nanoseconds (added up over its
-    /// passes) when the step was profiled and the device has timestamps, `None`
+    /// The step's spans in order, each with its GPU time in nanoseconds (from its first pass's
+    /// beginning to its last pass's end) when the step was profiled and the device has timestamps, `None`
     /// otherwise.
     ///
     /// # Examples
@@ -1059,10 +1059,11 @@ mod tests {
         assert_eq!(round_up(12, 8), 16);
     }
 
-    /// A span's time is the sum of its passes; a span without a pass, or with a pass whose
-    /// ticks run backwards, has none.
+    /// A span's time runs from its first pass's beginning to its last pass's end, the gap
+    /// between its passes included; a span without a pass, or with a pass whose ticks run
+    /// backwards, has none.
     #[test]
-    fn span_times_add_up_over_passes() {
+    fn span_times_cover_all_their_passes() {
         let mut spans = vec![("a", None), ("b", None), ("c", None), ("d", None)];
         // Passes: a, a, b, d; d's ticks run backwards.
         let passes = [0, 0, 1, 3];
@@ -1072,7 +1073,7 @@ mod tests {
         assert_eq!(
             spans,
             [
-                ("a", Some(80.0)),
+                ("a", Some(260.0)),
                 ("b", Some(2.0)),
                 ("c", None),
                 ("d", None)
