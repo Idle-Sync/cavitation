@@ -7,7 +7,7 @@
 use std::time::Instant;
 
 use cavitation_gpu::{
-    BufferPool, Gpu, MAX_WORKGROUPS_PER_DIMENSION, PipelineCache, PooledBuffer, Shader,
+    Backend, BufferPool, Gpu, MAX_WORKGROUPS_PER_DIMENSION, PipelineCache, PooledBuffer, Shader,
     StepEncoder, StepSizes, wgpu,
 };
 
@@ -248,7 +248,7 @@ fn warm_steps_create_nothing() {
 
 /// A profiled step times each span on the GPU: every span that dispatches gets a positive
 /// time, a span with sixteen large dispatches takes longer than one with a small one, a
-/// span whose dispatches straddle an upload keeps the time of both halves, and the spans
+/// span whose dispatches straddle an upload keeps the time of both halves (off Metal), and the spans
 /// together take no longer than the whole step did on the clock.
 #[test]
 fn profiled_spans_have_gpu_times() {
@@ -301,8 +301,12 @@ fn profiled_spans_have_gpu_times() {
     assert!(times[3] >= 0.0, "{times:?}");
     assert!(times[1] > times[0], "{times:?}");
     // Two large dispatches against sixteen: the straddling span's time covers both halves,
-    // so it is well above one sixteenth of the large span's.
-    assert!(times[2] > times[1] / 16.0, "{times:?}");
+    // so it is well above one sixteenth of the large span's. On Metal the passes on either
+    // side of a copy are not timed on one timeline and one half can read as about 0, so
+    // there the span need only have a time.
+    if gpu.info().backend != Backend::Metal {
+        assert!(times[2] > times[1] / 16.0, "{times:?}");
+    }
     assert!(
         times.iter().sum::<f64>() <= wall,
         "{times:?} against {wall}"
