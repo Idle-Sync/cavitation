@@ -13,6 +13,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 - `LogisticModel::confusion`: the model's `ConfusionMatrix` on class targets, its accuracy equal to `score`'s (#237).
 
+### Data, examples, guide and benchmark
+
+- Guide chapter "Measuring a classifier" and the `classification_metrics` example: the confusion matrix and classification report of a digits network, ROC AUC and average precision for "is it a 9?", and the always-"no" baseline whose accuracy is 87.5% and recall 0 (#237).
+
 ## v0.3.1 (2026-11-15)
 
 ### Tensors and autograd (`cavitation-core`)
@@ -24,7 +28,6 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
-- Guide chapter "Measuring a classifier" and the `classification_metrics` example: the confusion matrix and classification report of a digits network, ROC AUC and average precision for "is it a 9?", and the always-"no" baseline whose accuracy is 87.5% and recall 0 (#237).
 - `BENCHMARKS.md`: `mnist-cnn` and `cifar-cnn` results against PyTorch on an Intel Celeron N5105, an AMD Ryzen 7 2700X and an Apple M4, with accuracy and epoch time per seed.
 - `cavitation-bench mnist-cnn` and `cifar-cnn` take `--profile N`: N training steps on the real data, printing each layer's median forward and backward time, the loss's, the optimiser's and the whole step's.
 - `cavitation-bench mnist-cnn` and `cifar-cnn` print each PyTorch epoch as it finishes, rather than all of them once PyTorch exits (#228).
