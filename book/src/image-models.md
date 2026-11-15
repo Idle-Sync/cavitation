@@ -8,7 +8,7 @@ Convolution, pooling, batch normalisation and dropout run on the same tape, in t
 - loading a CNN trained in PyTorch;
 - a small steering model trained on synthetic road images.
 
-The programs are three examples in `crates/cavitation/examples/`: `mnist_cnn.rs`, `load_torch_cnn.rs` and `steering_cnn.rs`.
+The programs are three examples: `crates/cavitation/examples/mnist_cnn.rs`, `crates/cavitation/examples/load_torch_cnn.rs` and `crates/cavitation/examples/steering_cnn.rs`.
 
 ## Images as rows
 
