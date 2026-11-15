@@ -166,8 +166,9 @@ pub fn compact<T: Real>(
     Ok((out, store))
 }
 
-/// Whether `model` has an image layer: a `Conv2d`, a `BatchNorm2d` or a pooling.
-fn has_image_layers<T: Real>(model: &Sequential<T>) -> bool {
+/// Whether `model` has an image layer: a `Conv2d`, a `BatchNorm2d` or a pooling. Such a
+/// model is compacted by `compact_image`.
+pub(super) fn has_image_layers<T: Real>(model: &Sequential<T>) -> bool {
     (0..model.len()).any(|i| {
         let layer = model.layer(i);
         layer.as_conv2d().is_some()

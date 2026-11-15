@@ -112,10 +112,6 @@ pub fn ablate(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unsupported`], naming the layer, if the model has an image layer
-/// (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or `AdaptiveAvgPool2d`): the shrink
-/// tools work on the neurons of dense networks.
-///
 /// Returns [`Error::InvalidData`] if an entry of `linears` is not the index of a hidden
 /// `Linear` layer: a layer that is not a `Linear`, or the last `Linear`, whose neurons are
 /// the model's outputs (the message names the layer); if `batch` is 0; and as
@@ -197,7 +193,6 @@ pub fn ablate_controlled(
     batch: usize,
     on_neuron: &mut dyn FnMut(&Ablation) -> Flow,
 ) -> Result<Vec<Ablation>, Error> {
-    super::refuse_image_layers(model, "ablate")?;
     let mut chosen: Vec<usize> = Vec::with_capacity(linears.len());
     for &linear in linears {
         check_hidden(model, linear, "ablate")?;
