@@ -84,7 +84,7 @@ Both group tied scores, as scikit-learn does.
 
 ## The baseline that accuracy flatters
 
-12.5% of the test digits are 9s. A detector that always answers "no" needs no model at all:
+12.5% of the test digits are nines. A detector that always answers "no" needs no model at all:
 
 ```rust,ignore
 {{#include ../../crates/cavitation/examples/classification_metrics.rs:baseline}}
