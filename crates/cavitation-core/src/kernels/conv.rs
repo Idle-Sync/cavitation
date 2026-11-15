@@ -480,12 +480,29 @@ fn check_len(what: &str, len: usize, expected: usize) {
 /// assert_eq!(cols, [1.0, 3.0, 2.0, 4.0]);
 /// ```
 pub fn im2col<T: Real>(geom: &Conv2dGeom, batch: usize, x: &[T], cols: &mut [T]) {
+    check_len("the input", x.len(), batch * geom.in_width());
+    check_len(
+        "the column matrix",
+        cols.len(),
+        geom.kernel_len() * batch * geom.out_size().0 * geom.out_size().1,
+    );
+    unroll(geom, batch, x, (0, geom.out_size().0), cols);
+}
+
+/// [`im2col`] for output rows `r0..r0 + nr` of each of the `batch` images `x` only: `cols`
+/// is `[kernel_len, batch · nr · out_w]`, each image's `nr` rows of windows in row-major
+/// order. Lengths are the caller's to check.
+fn unroll<T: Real>(
+    geom: &Conv2dGeom,
+    batch: usize,
+    x: &[T],
+    (r0, nr): (usize, usize),
+    cols: &mut [T],
+) {
     let (oh, ow) = geom.out_size();
     let (h, w) = geom.input;
-    let windows = oh * ow;
+    let windows = nr * ow;
     let n_cols = batch * windows;
-    check_len("the input", x.len(), batch * geom.in_width());
-    check_len("the column matrix", cols.len(), geom.kernel_len() * n_cols);
     let (kh, kw) = geom.kernel;
     let ((sh, sw), (ph, pw), (dh, dw)) = (geom.stride, geom.padding, geom.dilation);
     for c in 0..geom.in_channels {
@@ -497,8 +514,8 @@ pub fn im2col<T: Real>(geom: &Conv2dGeom, batch: usize, x: &[T], cols: &mut [T])
                 for n in 0..batch {
                     let plane = &x[(n * geom.in_channels + c) * h * w..][..h * w];
                     let dst = &mut row[n * windows..][..windows];
-                    for oy in 0..oh {
-                        let line = &mut dst[oy * ow..][..ow];
+                    for oy in r0..r0 + nr {
+                        let line = &mut dst[(oy - r0) * ow..][..ow];
                         if !rows.contains(&oy) {
                             line.fill(T::ZERO);
                             continue;
@@ -571,19 +588,38 @@ fn span(
 /// assert_eq!(dx, [1.0, 2.0, 1.0]);
 /// ```
 pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]) {
+    check_len("the input gradient", dx.len(), batch * geom.in_width());
+    check_len(
+        "the column matrix",
+        cols.len(),
+        geom.kernel_len() * batch * geom.out_size().0 * geom.out_size().1,
+    );
+    roll_back(geom, batch, cols, (0, geom.out_size().0), dx);
+}
+
+/// [`col2im`] for a column matrix of output rows `r0..r0 + nr` of each image only, laid out
+/// as [`unroll`] writes it: adds each tap's value to the input position it was read from,
+/// by channel, then kernel row, then kernel column, then output position. Lengths are the
+/// caller's to check.
+fn roll_back<T: Real>(
+    geom: &Conv2dGeom,
+    batch: usize,
+    cols: &[T],
+    (r0, nr): (usize, usize),
+    dx: &mut [T],
+) {
     let (oh, ow) = geom.out_size();
     let (h, w) = geom.input;
-    let windows = oh * ow;
+    let windows = nr * ow;
     let n_cols = batch * windows;
-    check_len("the input gradient", dx.len(), batch * geom.in_width());
-    check_len("the column matrix", cols.len(), geom.kernel_len() * n_cols);
     let (kh, kw) = geom.kernel;
     let ((sh, sw), (ph, pw), (dh, dw)) = (geom.stride, geom.padding, geom.dilation);
     for n in 0..batch {
         for c in 0..geom.in_channels {
             let plane = &mut dx[(n * geom.in_channels + c) * h * w..][..h * w];
             for i in 0..kh {
-                let rows = span(oh, i, sh, ph, dh, h);
+                let all = span(oh, i, sh, ph, dh, h);
+                let rows = all.start.max(r0)..all.end.min(r0 + nr);
                 for j in 0..kw {
                     let across = span(ow, j, sw, pw, dw, w);
                     if across.is_empty() {
@@ -593,7 +629,7 @@ pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]
                     let first = across.start * sw + j * dw - pw;
                     for oy in rows.clone() {
                         let y = oy * sh + i * dh - ph;
-                        let line = &src[oy * ow + across.start..][..across.len()];
+                        let line = &src[(oy - r0) * ow + across.start..][..across.len()];
                         let dst = &mut plane[y * w..][..w];
                         for (k, &v) in line.iter().enumerate() {
                             dst[first + k * sw] += v;
@@ -616,11 +652,12 @@ pub fn col2im<T: Real>(geom: &Conv2dGeom, batch: usize, cols: &[T], dx: &mut [T]
 /// ```
 pub const CONV_GROUPS: usize = 16;
 
-/// How many column-matrix values one group aims to hold at once (2 MB in f32): a group
+/// How many column-matrix values one group aims to hold at once (256 KB in f32): a group
 /// takes its images in chunks of `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so each
-/// GEMM is wide enough for the packed kernels while each thread's columns stay near its
-/// cache. An image whose own columns are more than this is taken alone. The chunk size
-/// depends on the geometry and the batch alone, never on the thread count.
+/// GEMM is wide enough for the packed kernels while every thread's columns fit in the
+/// caches the threads share. An image whose own columns are more than this is taken in
+/// bands of output rows ([`rows_per_chunk`]) instead. The chunks depend on the geometry and
+/// the batch alone, never on the thread count.
 ///
 /// ```
 /// use cavitation_core::kernels::conv::{COLUMN_BUDGET, Conv2dGeom, images_per_chunk};
@@ -630,7 +667,7 @@ pub const CONV_GROUPS: usize = 16;
 /// assert!(9 * 36 * 8 <= COLUMN_BUDGET);
 /// assert_eq!(images_per_chunk(&geom, 128), 8);
 /// ```
-pub const COLUMN_BUDGET: usize = 1 << 19;
+pub const COLUMN_BUDGET: usize = 1 << 16;
 
 /// The number of groups a batch of `batch` images is cut into: `min(batch, CONV_GROUPS)`,
 /// at least 1.
@@ -666,14 +703,110 @@ pub fn images_per_chunk(geom: &Conv2dGeom, batch: usize) -> usize {
     (COLUMN_BUDGET / per_image).clamp(1, largest)
 }
 
+/// The fewest windows the widest band [`rows_per_chunk`] may choose holds, before the bands
+/// are evened out, so that each band's GEMM stays wide enough for the packed kernels even
+/// when the budget alone would give it only a few rows.
+const MIN_BAND_WINDOWS: usize = 128;
+
+/// The number of output rows each chunk of an image takes for `geom`: all of them when one
+/// image's columns fit in [`COLUMN_BUDGET`]. Else the widest band allowed is as many rows
+/// as fit in the budget, raised to at least 128 windows (and one row), and the image is cut
+/// into as few bands of at most that many rows as it takes, as even as they go; so a band
+/// may exceed the budget for a very wide kernel, or hold fewer than 128 windows after the
+/// evening out. Bands of `rows` rows from row 0, the last one shorter when they do not
+/// divide the image.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{Conv2dGeom, rows_per_chunk};
+/// // 32 channels of 32 x 32 with a 3 x 3 kernel: 288 · 32 column values per output row, so
+/// // at most 7 rows fit in the budget, and 32 rows go in 5 bands of 7 (the last of 4).
+/// let geom = Conv2dGeom::with_options(32, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// assert_eq!(rows_per_chunk(&geom), 7);
+/// // A small image is taken whole.
+/// assert_eq!(rows_per_chunk(&Conv2dGeom::new(1, 4, (8, 8), (3, 3)).unwrap()), 6);
+/// ```
+pub fn rows_per_chunk(geom: &Conv2dGeom) -> usize {
+    let (oh, ow) = geom.out_size();
+    let most = (COLUMN_BUDGET / (geom.kernel_len() * ow))
+        .max(MIN_BAND_WINDOWS.div_ceil(ow))
+        .clamp(1, oh);
+    oh.div_ceil(oh.div_ceil(most))
+}
+
+/// The windows of one chunk for `batch` images of `geom`: several whole images, or one
+/// band of one image's output rows.
+fn chunk_windows(geom: &Conv2dGeom, batch: usize) -> usize {
+    let (oh, ow) = geom.out_size();
+    let rows = rows_per_chunk(geom);
+    if rows < oh {
+        rows * ow
+    } else {
+        images_per_chunk(geom, batch) * oh * ow
+    }
+}
+
+/// The chunks of a group of `len` images, in order, each `(first image, images, first
+/// row, rows)` within the group: whole images [`images_per_chunk`] at a time when an
+/// image's columns fit in [`COLUMN_BUDGET`], else each image in bands of
+/// [`rows_per_chunk`] output rows. They depend on the geometry and the batch alone.
+struct Chunks {
+    /// The images in the group.
+    len: usize,
+    /// Images per chunk when whole images are taken.
+    per: usize,
+    /// Output rows per band, or the whole height when whole images are taken.
+    rows: usize,
+    /// The output height.
+    oh: usize,
+    /// The next chunk's first image.
+    n: usize,
+    /// The next chunk's first row.
+    r: usize,
+}
+
+impl Chunks {
+    /// The chunks of a group of `len` images of a batch of `batch` images of `geom`.
+    fn new(geom: &Conv2dGeom, batch: usize, len: usize) -> Chunks {
+        Chunks {
+            len,
+            per: images_per_chunk(geom, batch),
+            rows: rows_per_chunk(geom),
+            oh: geom.out_size().0,
+            n: 0,
+            r: 0,
+        }
+    }
+}
+
+impl Iterator for Chunks {
+    type Item = (usize, usize, usize, usize);
+
+    /// The next chunk: `(first image, images, first row, rows)`.
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.n >= self.len {
+            return None;
+        }
+        if self.rows >= self.oh {
+            let (n0, nb) = (self.n, self.per.min(self.len - self.n));
+            self.n += nb;
+            return Some((n0, nb, 0, self.oh));
+        }
+        let (n0, r0, nr) = (self.n, self.r, self.rows.min(self.oh - self.r));
+        self.r += nr;
+        if self.r == self.oh {
+            (self.n, self.r) = (self.n + 1, 0);
+        }
+        Some((n0, 1, r0, nr))
+    }
+}
+
 /// One worker's scratch for `batch` images of `geom`: a column matrix and a product of one
-/// chunk ([`images_per_chunk`]), none for a 1 × 1 kernel with stride 1 and no padding.
+/// chunk ([`chunk_windows`]), none for a 1 × 1 kernel with stride 1 and no padding.
 fn worker_scratch(geom: &Conv2dGeom, batch: usize) -> (usize, usize) {
     if geom.is_pointwise() {
         return (0, 0);
     }
-    let (oh, ow) = geom.out_size();
-    let windows = images_per_chunk(geom, batch) * oh * ow;
+    let windows = chunk_windows(geom, batch);
     (geom.kernel_len() * windows, geom.out_channels() * windows)
 }
 
@@ -748,10 +881,11 @@ impl<T, F: Fn(MatRef<'_, T>, MatRef<'_, T>, T, MatMut<'_, T>) + Sync> ConvGemm<T
 /// The convolution of `batch` images `x` by `weight` (`[out, kernel_len]` row-major, the
 /// `[out, in, kh, kw]` weight's own layout), plus `bias`, into `out`, with `gemm` computing
 /// the products. The batch is cut into [`groups`] of consecutive images, run as tasks on up
-/// to `threads` threads; each group takes its images [`images_per_chunk`] at a time, copies
-/// their windows into its thread's column matrix, multiplies it by the weight into its
-/// product (`[out, images · windows]`) and moves each value to its output image, adding
-/// the bias. A 1 × 1 kernel with stride 1 and no padding multiplies each image itself. Each
+/// to `threads` threads; each group takes its images [`images_per_chunk`] at a time (or, for
+/// an image too large for [`COLUMN_BUDGET`], in bands of [`rows_per_chunk`] output rows),
+/// copies their windows into its thread's column matrix, multiplies it by the weight into
+/// its product (`[out, windows]`) and moves each value to its output image, adding the
+/// bias. A 1 × 1 kernel with stride 1 and no padding multiplies each image itself. Each
 /// output depends on its own image alone, so the result is the same for any thread count.
 /// The tape and `InferenceModel` both run this, so they agree bit for bit at every kernel
 /// level whose GEMM gives each value the same bits whatever the product's shape (the
@@ -806,7 +940,6 @@ pub fn conv2d_forward<T: Real>(
         (cols_len + prod_len) * workers
     );
     let count = groups(batch);
-    let per = images_per_chunk(geom, batch);
     let wm = MatRef::new(weight, cout, kl, kl, 1).expect("checked length");
     let (outs, scratches) = (Parts(out.as_mut_ptr()), Parts(scratch.as_mut_ptr()));
     super::pool::run(workers, count, &|t| {
@@ -828,12 +961,11 @@ pub fn conv2d_forward<T: Real>(
                 gemm(wm, rhs, T::ZERO, y);
             }
         } else {
-            let mut n0 = 0;
-            while n0 < len {
-                let nb = per.min(len - n0);
-                let cols_n = nb * windows;
+            for (n0, nb, r0, nr) in Chunks::new(geom, batch, len) {
+                let cw = nr * ow;
+                let cols_n = nb * cw;
                 let cm = &mut cols[..kl * cols_n];
-                im2col(geom, nb, &x[n0 * in_w..][..nb * in_w], cm);
+                unroll(geom, nb, &x[n0 * in_w..][..nb * in_w], (r0, nr), cm);
                 let pm = &mut prod[..cout * cols_n];
                 gemm(
                     wm,
@@ -846,10 +978,9 @@ pub fn conv2d_forward<T: Real>(
                     .enumerate()
                 {
                     for (o, plane) in y.chunks_exact_mut(windows).enumerate() {
-                        plane.copy_from_slice(&pm[o * cols_n + k * windows..][..windows]);
+                        plane[r0 * ow..][..cw].copy_from_slice(&pm[o * cols_n + k * cw..][..cw]);
                     }
                 }
-                n0 += nb;
             }
         }
         if let Some(b) = bias {
@@ -931,7 +1062,6 @@ pub fn conv2d_backward<T: Real>(
         check_len("the weight gradient's parts", d.len(), count * cout * kl);
         Parts(d.as_mut_ptr())
     });
-    let per = images_per_chunk(geom, batch);
     let wm = MatRef::new(weight, cout, kl, kl, 1).expect("checked length");
     let scratches = Parts(scratch.as_mut_ptr());
     super::pool::run(workers, count, &|t| {
@@ -962,19 +1092,18 @@ pub fn conv2d_backward<T: Real>(
                     );
                 }
             } else {
-                let mut n0 = 0;
-                while n0 < len {
-                    let nb = per.min(len - n0);
-                    let cols_n = nb * windows;
-                    im2col(
+                for (i, (n0, nb, r0, nr)) in Chunks::new(geom, batch, len).enumerate() {
+                    let cols_n = nb * nr * ow;
+                    unroll(
                         geom,
                         nb,
                         &x[n0 * in_w..][..nb * in_w],
+                        (r0, nr),
                         &mut cols[..kl * cols_n],
                     );
                     gather(
                         &dy[n0 * out_w..][..nb * out_w],
-                        windows,
+                        (windows, ow, r0, nr),
                         cout,
                         &mut dyp[..cout * cols_n],
                     );
@@ -982,14 +1111,13 @@ pub fn conv2d_backward<T: Real>(
                         .expect("checked length");
                     let cm = MatRef::new(&cols[..kl * cols_n], kl, cols_n, cols_n, 1)
                         .expect("checked length");
-                    let beta = if n0 == 0 { T::ZERO } else { T::ONE };
+                    let beta = if i == 0 { T::ZERO } else { T::ONE };
                     gemm(
                         gm,
                         cm.transpose(),
                         beta,
                         MatMut::new(&mut *dw, cout, kl, kl, 1).expect("checked length"),
                     );
-                    n0 += nb;
                 }
             }
         }
@@ -1012,13 +1140,11 @@ pub fn conv2d_backward<T: Real>(
                 if !add {
                     dx.fill(T::ZERO);
                 }
-                let mut n0 = 0;
-                while n0 < len {
-                    let nb = per.min(len - n0);
-                    let cols_n = nb * windows;
+                for (n0, nb, r0, nr) in Chunks::new(geom, batch, len) {
+                    let cols_n = nb * nr * ow;
                     gather(
                         &dy[n0 * out_w..][..nb * out_w],
-                        windows,
+                        (windows, ow, r0, nr),
                         cout,
                         &mut dyp[..cout * cols_n],
                     );
@@ -1031,23 +1157,28 @@ pub fn conv2d_backward<T: Real>(
                         T::ZERO,
                         MatMut::new(&mut *dcols, kl, cols_n, cols_n, 1).expect("checked length"),
                     );
-                    col2im(geom, nb, dcols, &mut dx[n0 * in_w..][..nb * in_w]);
-                    n0 += nb;
+                    roll_back(geom, nb, dcols, (r0, nr), &mut dx[n0 * in_w..][..nb * in_w]);
                 }
             }
         }
     });
 }
 
-/// Gathers the output gradient of `dy.len() / (out · windows)` consecutive images, each
-/// `[out, windows]`, into `dst` as `[out, images · windows]`: channel `o` of every image
-/// side by side, image after image.
-fn gather<T: Real>(dy: &[T], windows: usize, cout: usize, dst: &mut [T]) {
+/// Gathers output rows `r0..r0 + nr` of the output gradient of `dy.len() / (out ·
+/// windows)` consecutive images, each `[out, windows]` with rows of `ow` windows, into `dst`
+/// as `[out, images · nr · ow]`: channel `o` of every image side by side, image after image.
+fn gather<T: Real>(
+    dy: &[T],
+    (windows, ow, r0, nr): (usize, usize, usize, usize),
+    cout: usize,
+    dst: &mut [T],
+) {
     let images = dy.len() / (cout * windows);
-    let cols_n = images * windows;
+    let cw = nr * ow;
+    let cols_n = images * cw;
     for (k, image) in dy.chunks_exact(cout * windows).enumerate() {
         for (o, plane) in image.chunks_exact(windows).enumerate() {
-            dst[o * cols_n + k * windows..][..windows].copy_from_slice(plane);
+            dst[o * cols_n + k * cw..][..cw].copy_from_slice(&plane[r0 * ow..][..cw]);
         }
     }
 }
