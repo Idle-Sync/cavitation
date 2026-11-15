@@ -142,11 +142,12 @@ fn reciprocal(n: u64) -> f32 {
 ///
 /// - **`S`:** within `ΔS = Σ (6 + 5|x_j|)·u·e^(x_j) + 2(K + 2)·u·S` for `K` classes.
 /// - **`ln S`:** within `Δ = ΔS/S + (2⁻²¹ if S ≤ 2, else 6u·ln S)`.
-/// - **A row's loss:** within `u·|x_label| + Δ + u·ℓ`.
+/// - **A row's loss:** within `2u·(|z_label| + |max| + ln S) + Δ`: its two subtractions in
+///   either order, as a compiler may reassociate them.
 /// - **The loss:** the row losses' bounds summed and divided by the batch, plus
 ///   `2(B + 2)·u·Σℓ / B` and `5u` of itself for the division.
 /// - **A gradient:** with `t_j = x_j − ln S` and `p_j = e^(t_j)`, within
-///   `w·p_j·(u|x_j| + u|t_j| + Δ + (6 + 4|t_j|)·u) + 2u·|p_j − onehot|/B` of
+///   `w·p_j·(2u·(|z_j| + |max| + ln S) + Δ + (6 + 4|t_j|)·u) + 2u·|p_j − onehot|/B` of
 ///   `(p_j − onehot)/B`.
 ///
 /// Each bound adds 2⁻¹²⁶ for every value that may be flushed.
