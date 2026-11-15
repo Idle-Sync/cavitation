@@ -652,7 +652,7 @@ fn roll_back<T: Real>(
 /// ```
 pub const CONV_GROUPS: usize = 16;
 
-/// How many column-matrix values one group aims to hold at once (256 KB in f32): a group
+/// How many column-matrix values one group aims to hold at once (512 KB in f32): a group
 /// takes its images in chunks of `max(1, COLUMN_BUDGET / (kernel_len · windows))`, so each
 /// GEMM is wide enough for the packed kernels while every thread's columns fit in the
 /// caches the threads share. An image whose own columns are more than this is taken in
@@ -667,7 +667,7 @@ pub const CONV_GROUPS: usize = 16;
 /// assert!(9 * 36 * 8 <= COLUMN_BUDGET);
 /// assert_eq!(images_per_chunk(&geom, 128), 8);
 /// ```
-pub const COLUMN_BUDGET: usize = 1 << 16;
+pub const COLUMN_BUDGET: usize = 1 << 17;
 
 /// The number of groups a batch of `batch` images is cut into: `min(batch, CONV_GROUPS)`,
 /// at least 1.
@@ -719,9 +719,9 @@ const MIN_BAND_WINDOWS: usize = 128;
 /// ```
 /// use cavitation_core::kernels::conv::{Conv2dGeom, rows_per_chunk};
 /// // 32 channels of 32 x 32 with a 3 x 3 kernel: 288 · 32 column values per output row, so
-/// // at most 7 rows fit in the budget, and 32 rows go in 5 bands of 7 (the last of 4).
+/// // at most 14 rows fit in the budget, and 32 rows go in 3 bands of 11 (the last of 10).
 /// let geom = Conv2dGeom::with_options(32, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
-/// assert_eq!(rows_per_chunk(&geom), 7);
+/// assert_eq!(rows_per_chunk(&geom), 11);
 /// // A small image is taken whole.
 /// assert_eq!(rows_per_chunk(&Conv2dGeom::new(1, 4, (8, 8), (3, 3)).unwrap()), 6);
 /// ```
