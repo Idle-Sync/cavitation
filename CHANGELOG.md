@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- `sum` and `mean` over a whole tensor, and `sum_axis` and `mean_axis` over the last axis, run one plain running sum per output, and their backward passes divide each output gradient once and write it with `fill`. The results are unchanged, bit for bit. On an Intel Celeron N5105, `sum` over a `[128, 32768]` f32 input takes 4.7–4.9 ms forward instead of 15.7 and 2.1–2.6 ms backward instead of 10.7 (three interleaved runs, medians of 21) (#234).
+
 ## v0.3.2 (2026-11-15)
 
 ### Layers, training and inference (`cavitation-nn`)
