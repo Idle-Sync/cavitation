@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- A GEMM called from inside a thread-pool task, such as a convolution group's, is planned for the one thread it runs on, rather than split for the thread count asked for into tasks that then run one after another. The results are unchanged, bit for bit. On an Intel Celeron N5105 at 4 threads, the weight gradient of the `cifar-cnn` network's first convolution takes 15 ms instead of 26 (#201).
+
 ### Data, examples, guide and benchmark
 
 - `BENCHMARKS.md`: `mnist-cnn` and `cifar-cnn` results against PyTorch on an Intel Celeron N5105, an AMD Ryzen 7 2700X and an Apple M4, with accuracy and epoch time per seed.

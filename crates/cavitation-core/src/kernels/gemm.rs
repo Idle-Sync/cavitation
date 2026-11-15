@@ -664,6 +664,11 @@ unsafe fn packed<K: Kernel>(
     // The thread count asked for, before the plan lowers it for a small product: the
     // packing buffers are reserved for it.
     let asked = threads.min(super::pool::MAX_THREADS);
+    // A call made from inside a pool task (a convolution group's GEMM) or while another call
+    // holds the pool runs every task on this thread: plan it for one, rather than splitting
+    // it into tasks that would only run one after another. The plan's blocks of the sum do
+    // not depend on the thread count, so neither does the result.
+    let threads = if pool::runs_inline() { 1 } else { threads };
     let plan = Plan::new::<K>(m, n, k, threads);
     let Plan {
         threads,
