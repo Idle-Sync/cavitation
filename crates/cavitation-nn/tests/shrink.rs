@@ -3185,7 +3185,7 @@ fn custom_ranking_sees_channels() {
     assert_eq!(off_in(&report.steps[0], 4), [0, 2]);
 }
 
-/// The conv refusals, each before anything changes: `fold_means` with a conv to shrink;
+/// The conv refusals, each before anything changes: `fold_means` into a conv with padding;
 /// a listed layer that is neither a `Linear` nor a `Conv2d`; a mask set with `set_mask`
 /// inside a conv's run; a mask at the run's end that switches off part of a channel; a
 /// listed conv whose channels reach the model's output; and a model with nothing to
@@ -3211,9 +3211,10 @@ fn conv_refusals() {
         }
         err
     };
+    // The second conv has padding 1, so the first conv's channels cannot fold into it.
     let err = attempt(&base, config(Vec::new(), true));
     assert!(
-        matches!(&err, Error::InvalidData(m) if m.contains("fold_means")),
+        matches!(&err, Error::InvalidData(m) if m.contains("padding (1, 1)")),
         "{err}"
     );
     let err = attempt(&base, config(vec![2], false));
@@ -3307,4 +3308,116 @@ fn train_found_size_on_a_cnn() {
     assert_eq!(bn.channels(), 2);
     assert_eq!(values.value(bn.weight().unwrap()).data(), &[1.0; 2]);
     assert_eq!(values.value(bn.bias().unwrap()).data(), &[0.0; 2]);
+}
+
+/// conv(1 → 3, 3 × 3, no padding) on 5 × 5 images → ReLU, then `next`, with channel 1 of
+/// the conv made constant: weights 0 and bias 0.7, so 0.7 at every position of every row.
+fn constant_channel_cnn(params: &mut ParamStore, next: &str) -> Sequential {
+    use cavitation_core::Conv2dGeom;
+    use cavitation_nn::{Conv2d, Flatten};
+    let mut rng = Rng::seed(21);
+    let conv = Conv2d::new(
+        params,
+        Conv2dGeom::new(1, 3, (5, 5), (3, 3)).unwrap(),
+        &mut rng,
+    );
+    let w = params.value_mut(conv.weight()).data_mut();
+    w[9..18].fill(0.0);
+    params.value_mut(conv.bias().unwrap()).data_mut()[1] = 0.7;
+    let net = Sequential::new().push(conv).push(Relu);
+    match next {
+        "linear" => net.push(Flatten).push(Linear::new(params, 27, 3, &mut rng)),
+        _ => net
+            .push(Conv2d::new(
+                params,
+                Conv2dGeom::new(3, 2, (3, 3), (2, 2)).unwrap(),
+                &mut rng,
+            ))
+            .push(Flatten)
+            .push(Linear::new(params, 8, 3, &mut rng)),
+    }
+}
+
+/// With `fold_means`, removing a channel that is the same at every position of every row
+/// leaves the network's outputs as they were, within rounding, when the channel reaches a
+/// conv without padding (its mean times the sum of its taps goes into the conv's bias) and
+/// when it reaches the `Linear` after a `Flatten` (each position's mean times its column
+/// goes into the bias). Without the fold the outputs change.
+#[test]
+fn fold_means_for_channels() {
+    for next in ["linear", "conv"] {
+        for fold_means in [true, false] {
+            let mut params = ParamStore::new();
+            let mut net = constant_channel_cnn(&mut params, next);
+            let x = clusters(40, 25, 42).x;
+            let mut before = InferenceModel::compile(&net, &params).unwrap();
+            let want = before.infer_batch(x.view()).data().to_vec();
+            let config = ShrinkConfig {
+                layers: vec![0],
+                fold_means,
+                step_bp: 4000,
+                max_removed_bp: 4000,
+                dead_first: false,
+                criterion: Some(ALWAYS),
+                ranking: Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
+                    ctx.on
+                        .iter()
+                        .map(|&c| if c == 1 { 0.0 } else { 1.0 })
+                        .collect()
+                })),
+                retrain: RetrainConfig {
+                    epochs: 0,
+                    ..RetrainConfig::default()
+                },
+                ..quick(clusters(20, 25, 43))
+            };
+            let report = shrink(&mut net, &mut params, &clusters(40, 25, 44), config).unwrap();
+            assert_eq!(off_in(&report.steps[0], 0), [1], "{next}");
+            let mut after = InferenceModel::compile(&net, &params).unwrap();
+            let got = after.infer_batch(x.view()).data().to_vec();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            if fold_means {
+                assert!(worst <= 1e-5, "{next}: off by {worst}");
+            } else {
+                assert!(worst > 1e-3, "{next}: the channel mattered by only {worst}");
+            }
+        }
+    }
+}
+
+/// `fold_means` refuses a conv whose channels reach a layer with no bias.
+#[test]
+fn fold_means_needs_a_bias_after_a_conv() {
+    use cavitation_core::Conv2dGeom;
+    use cavitation_nn::{Conv2d, Flatten};
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(22);
+    let mut net = Sequential::new()
+        .push(Conv2d::new(
+            &mut params,
+            Conv2dGeom::new(1, 3, (5, 5), (3, 3)).unwrap(),
+            &mut rng,
+        ))
+        .push(Relu)
+        .push(Flatten)
+        .push(Linear::without_bias(
+            &mut params,
+            27,
+            3,
+            Init::XavierUniform,
+            &mut rng,
+        ));
+    let config = ShrinkConfig {
+        fold_means: true,
+        ..quick(clusters(20, 25, 45))
+    };
+    let err = shrink(&mut net, &mut params, &clusters(20, 25, 46), config).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidData(m) if m.contains("which has no bias")),
+        "{err}"
+    );
 }

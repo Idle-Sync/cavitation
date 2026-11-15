@@ -285,6 +285,28 @@ impl Sums {
     }
 }
 
+/// The mean of each value at [`Sequential::channel_layer`] of the `Conv2d` at layer
+/// `conv` over the rows of `data`, run in batches of `batch` rows: one mean per channel and
+/// position, channel by channel (`channels × plane` values). What `shrink`'s `fold_means`
+/// folds into a `Linear` after a `Flatten`.
+pub(super) fn position_means(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    conv: usize,
+    batch: usize,
+) -> Result<Vec<f64>, Error> {
+    let layer = model.channel_layer(conv);
+    let (sums, rows) = per_value(model, params, data, &[layer], batch, "shrink")?;
+    let (channels, plane) = model.channel_shape(conv);
+    let sums = sums
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_else(|| Sums::new(channels * plane));
+    Ok(sums.sum.iter().map(|s| s / rows as f64).collect())
+}
+
 /// Runs `data` through `model` in batches of `batch` rows and keeps [`Sums`] of the output
 /// of each of `layers` (in order; `None` for a layer whose output was never seen), with the
 /// row count. Uses the compiled model, or the tape for a model with a layer that has no
