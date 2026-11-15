@@ -26,8 +26,9 @@ const CHUNK: u64 = (WORKGROUP * PER_LANE) as u64;
 /// workgroup's lanes past the end.
 const MAX_VALUES: u64 = 1 << 31;
 
-/// Bytes of the `Dims` uniform: `outer`, `channels`, `inner` and the chunks per channel.
-const DIMS_BYTES: u64 = 16;
+/// Bytes of the `Dims` uniform: `outer`, `channels`, `inner`, the chunks per channel and
+/// whether the sums add to the output, padded to 16-byte rows.
+const DIMS_BYTES: u64 = 32;
 
 /// The parts every kernel here shares: the `WORKGROUP` override and the `Dims` uniform.
 macro_rules! dims {
@@ -35,10 +36,20 @@ macro_rules! dims {
         "
         override WORKGROUP: u32;
 
-        struct Dims { outer: u32, channels: u32, inner: u32, chunks: u32 }
+        struct Dims {
+            outer: u32,
+            channels: u32,
+            inner: u32,
+            chunks: u32,
+            accumulate: u32,
+            pad0: u32,
+            pad1: u32,
+            pad2: u32,
+        }
         "
     };
 }
+pub(crate) use dims;
 
 /// Bias add, one thread per value of `out`, numbered over `dispatch_split`'s grid:
 /// `y[(b·C + c)·P + p] += bias[c]`.
@@ -65,53 +76,69 @@ const BIAS_ADD: Shader = Shader {
     ),
 };
 
-/// Channel sums, first pass: workgroup `(chunk, c)` sums values `chunk · CHUNK` onwards of
-/// channel `c`, taken in the order `j = b·P + p`. Each lane adds every `WORKGROUP`-th value
-/// of the chunk in order, then the lanes' sums meet in a fixed halving tree.
+/// The first pass of a per-channel sum, around a kernel's own bindings and its
+/// `fn term(i: u32, c: u32) -> f32`, the value summed for value `i` of channel `c`:
+/// workgroup `(chunk, c)` sums the terms of values `chunk · CHUNK` onwards of channel `c`,
+/// taken in the order `j = b·P + p`. Each lane adds every `WORKGROUP`-th term of the chunk in
+/// order, then the lanes' sums meet in a fixed halving tree. The partial sums are binding 1
+/// and the `Dims` uniform binding 2; the term's inputs take binding 0 and from 3 on.
+macro_rules! partials_pass {
+    ($bindings:literal, $term:literal) => {
+        concat!(
+            $crate::kernels::reduce::dims!(),
+            "
+            override PER_LANE: u32;
+
+            @group(0) @binding(1) var<storage, read_write> partials: array<f32>;
+            @group(0) @binding(2) var<uniform> dims: Dims;
+            ",
+            $bindings,
+            $term,
+            "
+            var<workgroup> lanes: array<f32, WORKGROUP>;
+
+            @compute @workgroup_size(WORKGROUP)
+            fn main(
+                @builtin(workgroup_id) group: vec3<u32>,
+                @builtin(local_invocation_index) lane: u32,
+            ) {
+                let chunk = group.x;
+                let c = group.y;
+                let len = dims.outer * dims.inner;
+                let first = chunk * WORKGROUP * PER_LANE + lane;
+                var acc = 0.0;
+                for (var k = 0u; k < PER_LANE; k = k + 1u) {
+                    let j = first + k * WORKGROUP;
+                    if (j < len) {
+                        let b = j / dims.inner;
+                        acc = acc + term((b * dims.channels + c) * dims.inner + j % dims.inner, c);
+                    }
+                }
+                lanes[lane] = acc;
+                workgroupBarrier();
+                for (var width = WORKGROUP / 2u; width > 0u; width = width / 2u) {
+                    if (lane < width) { lanes[lane] = lanes[lane] + lanes[lane + width]; }
+                    workgroupBarrier();
+                }
+                if (lane == 0u) { partials[c * dims.chunks + chunk] = lanes[0]; }
+            }
+            "
+        )
+    };
+}
+pub(crate) use partials_pass;
+
+/// Channel sums, first pass: the terms are the values themselves.
 const CHANNEL_PARTIALS: Shader = Shader {
     name: "channel sums partials",
-    source: concat!(
-        dims!(),
-        "
-        override PER_LANE: u32;
-
-        @group(0) @binding(0) var<storage, read> x: array<f32>;
-        @group(0) @binding(1) var<storage, read_write> partials: array<f32>;
-        @group(0) @binding(2) var<uniform> dims: Dims;
-
-        var<workgroup> lanes: array<f32, WORKGROUP>;
-
-        @compute @workgroup_size(WORKGROUP)
-        fn main(
-            @builtin(workgroup_id) group: vec3<u32>,
-            @builtin(local_invocation_index) lane: u32,
-        ) {
-            let chunk = group.x;
-            let c = group.y;
-            let len = dims.outer * dims.inner;
-            let first = chunk * WORKGROUP * PER_LANE + lane;
-            var acc = 0.0;
-            for (var k = 0u; k < PER_LANE; k = k + 1u) {
-                let j = first + k * WORKGROUP;
-                if (j < len) {
-                    let b = j / dims.inner;
-                    acc = acc + x[(b * dims.channels + c) * dims.inner + j % dims.inner];
-                }
-            }
-            lanes[lane] = acc;
-            workgroupBarrier();
-            for (var width = WORKGROUP / 2u; width > 0u; width = width / 2u) {
-                if (lane < width) { lanes[lane] = lanes[lane] + lanes[lane + width]; }
-                workgroupBarrier();
-            }
-            if (lane == 0u) { partials[c * dims.chunks + chunk] = lanes[0]; }
-        }
-        "
+    source: partials_pass!(
+        "@group(0) @binding(0) var<storage, read> x: array<f32>;",
+        "fn term(i: u32, c: u32) -> f32 { return x[i]; }"
     ),
 };
 
 /// Channel sums, second pass: one thread per channel (at most 65,535, so one grid row) adds
-/// its chunks' partial sums in chunk order.
+/// its chunks' partial sums in chunk order, then, when accumulating, the output's old value.
 const CHANNEL_MERGE: Shader = Shader {
     name: "channel sums merge",
     source: concat!(
@@ -133,6 +160,7 @@ const CHANNEL_MERGE: Shader = Shader {
             for (var k = 1u; k < dims.chunks; k = k + 1u) {
                 acc = acc + partials[base + k];
             }
+            if (dims.accumulate != 0u) { acc = acc + sums[c]; }
             sums[c] = acc;
         }
         "
@@ -236,7 +264,7 @@ impl ChannelDims {
 
     /// Panics, naming `what` and the dims, unless every dimension is above 0 and the tensor
     /// fits the kernels' `u32` indices.
-    fn check(&self, what: &str) {
+    pub(crate) fn check(&self, what: &str) {
         assert!(
             !self.is_empty(),
             "{what}: every dimension must be above 0, got {self:?}"
@@ -248,14 +276,16 @@ impl ChannelDims {
         );
     }
 
-    /// The `Dims` uniform's bytes, with `chunks` chunks per channel.
-    fn uniform(&self, chunks: u32) -> [u8; DIMS_BYTES as usize] {
+    /// The `Dims` uniform's bytes, with `chunks` chunks per channel and the `accumulate`
+    /// flag.
+    fn uniform(&self, chunks: u32, accumulate: bool) -> [u8; DIMS_BYTES as usize] {
         let mut bytes = [0u8; DIMS_BYTES as usize];
         for (slot, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip([
             self.outer,
             self.channels,
             self.inner,
             chunks,
+            u32::from(accumulate),
         ]) {
             slot.copy_from_slice(&word.to_le_bytes());
         }
@@ -280,23 +310,34 @@ fn storage(binding: u32, read_only: bool) -> wgpu::BindGroupLayoutEntry {
 /// The layout every kernel here takes: a read-only storage buffer, a read-write one, and the
 /// `Dims` uniform, at bindings 0, 1 and 2.
 fn layout(gpu: &Gpu, label: &str) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+    layout_with(gpu, label, 0)
+}
+
+/// [`layout`] with `extra` more read-only storage buffers, at bindings 3 onwards.
+fn layout_with(
+    gpu: &Gpu,
+    label: &str,
+    extra: u32,
+) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
     let device = gpu.device();
+    let mut entries = vec![
+        storage(0, true),
+        storage(1, false),
+        wgpu::BindGroupLayoutEntry {
+            binding: 2,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: std::num::NonZeroU64::new(DIMS_BYTES),
+            },
+            count: None,
+        },
+    ];
+    entries.extend((0..extra).map(|k| storage(3 + k, true)));
     let group = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some(label),
-        entries: &[
-            storage(0, true),
-            storage(1, false),
-            wgpu::BindGroupLayoutEntry {
-                binding: 2,
-                visibility: wgpu::ShaderStages::COMPUTE,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: std::num::NonZeroU64::new(DIMS_BYTES),
-                },
-                count: None,
-            },
-        ],
+        entries: &entries,
     });
     let pipeline = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some(label),
@@ -331,23 +372,40 @@ fn bind(
     output: &PooledBuffer,
     params: &PooledBuffer,
 ) -> wgpu::BindGroup {
+    bind_with(steps, layout, input, output, params, &[])
+}
+
+/// [`bind`] with `extra` read-only buffers at bindings 3 onwards.
+fn bind_with(
+    steps: &mut StepEncoder,
+    layout: &wgpu::BindGroupLayout,
+    input: &PooledBuffer,
+    output: &PooledBuffer,
+    params: &PooledBuffer,
+    extra: &[&PooledBuffer],
+) -> wgpu::BindGroup {
+    let mut entries = vec![
+        wgpu::BindGroupEntry {
+            binding: 0,
+            resource: input.binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 1,
+            resource: output.binding(),
+        },
+        wgpu::BindGroupEntry {
+            binding: 2,
+            resource: params.binding(),
+        },
+    ];
+    entries.extend(extra.iter().enumerate().map(|(k, b)| wgpu::BindGroupEntry {
+        binding: 3 + k as u32,
+        resource: b.binding(),
+    }));
     steps.bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: input.binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: output.binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: params.binding(),
-            },
-        ],
+        entries: &entries,
     })
 }
 
@@ -469,7 +527,7 @@ impl BiasAdd {
             bias.buffer() != out.buffer(),
             "bias add: the bias and the tensor it is added to must be different buffers"
         );
-        let params = upload_dims(steps, pool, &dims.uniform(0));
+        let params = upload_dims(steps, pool, &dims.uniform(0, false));
         let group = bind(steps, &self.group, bias, out, &params);
         BiasAddCall {
             dims,
@@ -528,7 +586,7 @@ impl BiasAddCall {
 
 /// Sums each channel of a tensor laid out `[outer][channels][inner]` ([`ChannelDims`]) over
 /// its `outer · inner` values, on the GPU: a bias's gradient, or the sums batch norm's
-/// statistics start from.
+/// statistics start from. Each call either overwrites its output or adds the sums to it.
 ///
 /// The sum is a fixed tree, the same on every run: a first pass sums each chunk of a
 /// channel's values (in the order `b·inner + p`) in one workgroup, each lane in order and
@@ -538,7 +596,9 @@ impl BiasAddCall {
 /// `2(L + 2) · 2⁻²⁴ · Σ|x| + (2L − 1) · 2⁻¹²⁶`. The tree passes each value through at most
 /// 15 + 8 + (chunks − 1) additions, fewer than `L`, so the relative term holds as for any
 /// order; the absolute term allows every input and every addition to be flushed. On integers
-/// whose partial sums stay below 2²⁴ it is the CPU's sum bit for bit.
+/// whose partial sums stay below 2²⁴ it is the CPU's sum bit for bit. Accumulating adds the
+/// output's old value `o` once more, after the tree: count it as one more value, `L + 1`
+/// terms with `|o|` in the sum of magnitudes.
 ///
 /// With `inner = 1` (a matrix's columns), neighbouring lanes read values `channels` apart,
 /// which costs memory bandwidth on wide matrices.
@@ -558,7 +618,7 @@ impl BiasAddCall {
 ///         | wgpu::BufferUsages::COPY_SRC;
 ///     let (x, out) = (pool.take(24, usage), pool.take(8, usage));
 ///     let mut steps = StepEncoder::new(&gpu, StepSizes { upload_bytes: 64, readback_bytes: 8, ..StepSizes::default() });
-///     let call = sums.call(&mut steps, &mut pool, ChannelDims::rows(3, 2), &x, &out);
+///     let call = sums.call(&mut steps, &mut pool, ChannelDims::rows(3, 2), &x, &out, false);
 ///     let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
 ///     let mut step = steps.begin();
 ///     step.upload(x.buffer(), 0, &bytes(&[1.0, 10.0, 2.0, 20.0, 3.0, 30.0]));
@@ -570,12 +630,8 @@ impl BiasAddCall {
 /// ```
 #[derive(Debug)]
 pub struct ChannelSums {
-    /// The layout of group 0 of both passes: the input, the output and the `Dims` uniform.
-    group: wgpu::BindGroupLayout,
-    /// The first pass: one partial sum per chunk of each channel.
-    partials: wgpu::ComputePipeline,
-    /// The second pass: each channel's partial sums in order.
-    merge: wgpu::ComputePipeline,
+    /// The two passes, summing the values themselves.
+    sums: TermSums,
 }
 
 impl ChannelSums {
@@ -598,24 +654,14 @@ impl ChannelSums {
     /// }
     /// ```
     pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<ChannelSums, GpuError> {
-        let (group, layout) = layout(gpu, "channel sums");
-        let workgroup = ("WORKGROUP", f64::from(WORKGROUP));
-        let partials = cache.get_with_layout(
-            CHANNEL_PARTIALS,
-            "main",
-            &[workgroup, ("PER_LANE", f64::from(PER_LANE))],
-            &layout,
-        )?;
-        let merge = cache.get_with_layout(CHANNEL_MERGE, "main", &[workgroup], &layout)?;
         Ok(ChannelSums {
-            group,
-            partials,
-            merge,
+            sums: TermSums::new(gpu, cache, CHANNEL_PARTIALS, 0)?,
         })
     }
 
     /// Prepares one sum of each channel of `x` (shaped `dims`) into `out` (one value per
-    /// channel, overwritten): its `Dims` uniform and its buffer of partial sums (one per
+    /// channel), overwriting it, or adding the sums to it when `accumulate` is set (for a
+    /// gradient with several sources): its `Dims` uniform and its buffer of partial sums (one per
     /// chunk of 4,096 values of each channel), taken from `pool`, the uniform uploaded in a
     /// step of its own, and the two passes' bind groups, made through `steps` so they are
     /// counted. Made once, when a model is compiled.
@@ -640,7 +686,7 @@ impl ChannelSums {
     ///     let x = pool.take(4 * dims.len(), wgpu::BufferUsages::STORAGE);
     ///     let out = pool.take(4 * 32, wgpu::BufferUsages::STORAGE);
     ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
-    ///     let call = sums.call(&mut steps, &mut pool, dims, &x, &out);
+    ///     let call = sums.call(&mut steps, &mut pool, dims, &x, &out, false);
     ///     assert_eq!(call.chunks(), 32); // 131,072 values per channel
     ///     call.release(&mut pool);
     /// }
@@ -652,30 +698,141 @@ impl ChannelSums {
         dims: ChannelDims,
         x: &PooledBuffer,
         out: &PooledBuffer,
+        accumulate: bool,
     ) -> ChannelSumsCall {
-        dims.check("channel sums");
+        self.sums.call(
+            steps,
+            pool,
+            "channel sums",
+            dims,
+            (x, dims.len()),
+            &[],
+            (out, accumulate),
+        )
+    }
+
+    /// Adds the sums `call` to `step`: the first pass's grid of chunks by channels, then the
+    /// second pass's one thread per channel.
+    ///
+    /// # Examples
+    ///
+    /// See [`ChannelSums`].
+    pub fn record(&self, step: &mut Step<'_>, call: &ChannelSumsCall) {
+        self.sums.record(step, call);
+    }
+}
+
+/// The two passes of a per-channel sum of a kernel's own term (built with
+/// `partials_pass!`), with `extra` read-only inputs besides the one at binding 0: the
+/// machinery behind [`ChannelSums`], and the sums of other kernels' terms, such as batch
+/// norm's centred squares.
+#[derive(Debug)]
+pub(crate) struct TermSums {
+    /// The first pass's layout: the first input, the partial sums, the `Dims` uniform and the
+    /// extra inputs.
+    group: wgpu::BindGroupLayout,
+    /// The second pass's layout: the partial sums, the output and the `Dims` uniform.
+    merge_group: wgpu::BindGroupLayout,
+    /// The extra inputs the term reads.
+    extra: u32,
+    /// The first pass: one partial sum per chunk of each channel.
+    partials: wgpu::ComputePipeline,
+    /// The second pass: each channel's partial sums in order.
+    merge: wgpu::ComputePipeline,
+}
+
+impl TermSums {
+    /// Builds the passes of `shader`, a first pass from `partials_pass!` reading `extra`
+    /// inputs past binding 0, and the shared second pass, on `gpu` through `cache`.
+    pub(crate) fn new(
+        gpu: &Gpu,
+        cache: &mut PipelineCache,
+        shader: Shader,
+        extra: u32,
+    ) -> Result<TermSums, GpuError> {
+        let (merge_group, merge_layout) = layout(gpu, "channel sums merge");
+        let (group, layout) = layout_with(gpu, shader.name, extra);
+        let workgroup = ("WORKGROUP", f64::from(WORKGROUP));
+        let partials = cache.get_with_layout(
+            shader,
+            "main",
+            &[workgroup, ("PER_LANE", f64::from(PER_LANE))],
+            &layout,
+        )?;
+        let merge = cache.get_with_layout(CHANNEL_MERGE, "main", &[workgroup], &merge_layout)?;
+        Ok(TermSums {
+            group,
+            merge_group,
+            extra,
+            partials,
+            merge,
+        })
+    }
+
+    /// Prepares one sum, named `what` in panics, of each channel's terms of a tensor shaped
+    /// `dims` into `out`, overwritten or (with its flag set) added to: `first` (with the
+    /// `f32`s it must hold) at binding 0 and `extra` inputs (each with its length) from
+    /// binding 3, as [`ChannelSums::call`] does.
+    ///
+    /// # Panics
+    ///
+    /// As [`ChannelSums::call`], for every input, and if `extra` does not hold the inputs
+    /// the term reads.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn call(
+        &self,
+        steps: &mut StepEncoder,
+        pool: &mut BufferPool,
+        what: &str,
+        dims: ChannelDims,
+        first: (&PooledBuffer, u64),
+        extra: &[(&PooledBuffer, u64)],
+        (out, accumulate): (&PooledBuffer, bool),
+    ) -> ChannelSumsCall {
+        dims.check(what);
         let chunks = dims.summed().div_ceil(CHUNK);
         assert!(
             u64::from(dims.channels) <= u64::from(MAX_WORKGROUPS_PER_DIMENSION)
                 && chunks <= u64::from(MAX_WORKGROUPS_PER_DIMENSION),
-            "channel sums: {dims:?} needs a grid of {chunks} chunks by {} channels, more than \
+            "{what}: {dims:?} needs a grid of {chunks} chunks by {} channels, more than \
              {MAX_WORKGROUPS_PER_DIMENSION} in a dimension",
             dims.channels
         );
-        check_len("channel sums: the tensor", x, dims.len());
-        check_len("channel sums: the output", out, u64::from(dims.channels));
         assert!(
-            x.buffer() != out.buffer(),
-            "channel sums: the tensor and its sums must be different buffers"
+            extra.len() == self.extra as usize,
+            "{what}: the term reads {} more inputs, got {}",
+            self.extra,
+            extra.len()
         );
+        check_len(&format!("{what}: the tensor"), first.0, first.1);
+        for (k, (buffer, len)) in extra.iter().enumerate() {
+            check_len(&format!("{what}: input {}", k + 1), buffer, *len);
+        }
+        check_len(
+            &format!("{what}: the output"),
+            out,
+            u64::from(dims.channels),
+        );
+        assert!(
+            first.0.buffer() != out.buffer(),
+            "{what}: the tensor and its sums must be different buffers"
+        );
+        for (k, (buffer, _)) in extra.iter().enumerate() {
+            assert!(
+                buffer.buffer() != out.buffer(),
+                "{what}: input {} and the sums must be different buffers",
+                k + 1
+            );
+        }
         let chunks = chunks as u32;
-        let params = upload_dims(steps, pool, &dims.uniform(chunks));
+        let params = upload_dims(steps, pool, &dims.uniform(chunks, accumulate));
         let partials = pool.take(
             4 * u64::from(chunks) * u64::from(dims.channels),
             wgpu::BufferUsages::STORAGE,
         );
-        let partials_group = bind(steps, &self.group, x, &partials, &params);
-        let merge_group = bind(steps, &self.group, &partials, out, &params);
+        let extras: Vec<&PooledBuffer> = extra.iter().map(|e| e.0).collect();
+        let partials_group = bind_with(steps, &self.group, first.0, &partials, &params, &extras);
+        let merge_group = bind(steps, &self.merge_group, &partials, out, &params);
         ChannelSumsCall {
             dims,
             chunks,
@@ -688,11 +845,7 @@ impl ChannelSums {
 
     /// Adds the sums `call` to `step`: the first pass's grid of chunks by channels, then the
     /// second pass's one thread per channel.
-    ///
-    /// # Examples
-    ///
-    /// See [`ChannelSums`].
-    pub fn record(&self, step: &mut Step<'_>, call: &ChannelSumsCall) {
+    pub(crate) fn record(&self, step: &mut Step<'_>, call: &ChannelSumsCall) {
         step.dispatch_grid(
             &self.partials,
             &call.partials_group,
@@ -707,7 +860,8 @@ impl ChannelSums {
 }
 
 /// One prepared sum: its shape, its chunks per channel, its `Dims` uniform, its partial sums
-/// and the two passes' bind groups, from [`ChannelSums::call`].
+/// and the two passes' bind groups, from [`ChannelSums::call`] (or another kernel's sum of
+/// its own terms).
 ///
 /// # Examples
 ///
