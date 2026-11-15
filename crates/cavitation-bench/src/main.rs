@@ -21,14 +21,18 @@
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
 //!   GFLOPS (`2·m·n·k` / time) and threads used, then the rate over all eight.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--ours-only]` train the v0.3 benchmark CNNs (LeNet-5's layout on MNIST, Adam lr 1e-3,
-//!   batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10 epochs) here and then
+//!   [--ours-only] [--profile N]` train the v0.3 benchmark CNNs (LeNet-5's layout on
+//!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
+//!   epochs) here and then
 //!   with `scripts/bench/torch_cnn.py` at the same thread count, from the same initial
 //!   weights and batch order, which the run writes to `bench/cnn/<name>-seed<seed>/` under
 //!   the target folder (see the `cnn` module). Each epoch's mean loss, test accuracy and
 //!   training time are printed for both, then the final accuracies and the median epoch
 //!   time after the first, with ours over PyTorch's; `result.json` in the same folder keeps
 //!   them. `--rows` trains on the first N training images only, for a quick run.
+//!   `--profile N` runs only N training steps, after 3 warm-up steps, with
+//!   `Trainer::profile_next_step`, and prints each layer's median forward and backward time,
+//!   then the loss's, the optimiser's and the whole step's, and writes no files.
 //! - `subnormal [--steps N]` (default 2,000) times the optimiser update of one parameter of
 //!   1,068,810 elements whose gradient is 1e-3 on the first step and 0 after, for SGD,
 //!   SGD with momentum 0.9 and Adam (lr 1e-3), so their state decays through the subnormal
@@ -113,8 +117,8 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 conv    [--batch N]\n\
-    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only]\n\
-    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only]\n\
+    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
+    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
