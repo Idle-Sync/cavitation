@@ -787,16 +787,17 @@ impl Evaluator {
             }
             Ok(())
         })?;
-        Ok(m.unwrap_or_else(|| ConfusionMatrix::new(0)))
+        Ok(m.expect("check_dataset refuses data with no rows, so run visits a batch"))
     }
 
     /// Fills `out` (cleared first) with each row's score for class `class`, for
     /// [`roc_auc`](crate::metrics::roc_auc) and
     /// [`average_precision`](crate::metrics::average_precision): the softmax probability of
-    /// `class` over the row's outputs, computed in f64 with the largest output taken out, or,
-    /// for a model with one output, that output itself (a logit, which ranks the rows as its
-    /// sigmoid does). A row whose outputs hold a NaN scores NaN. Allocates nothing once `out`
-    /// has room for every row.
+    /// `class` over the row's outputs, computed in f64 with the largest output taken out. For
+    /// a model with one output, `class` must be 0 and the score is that output itself: the
+    /// logit of the positive class, which ranks the rows as its sigmoid does. A row whose
+    /// outputs hold a NaN or an infinity scores NaN. Allocates nothing once `out` has room
+    /// for every row.
     ///
     /// # Errors
     ///
@@ -967,9 +968,9 @@ pub fn evaluate(
 }
 
 /// The softmax probability of entry `class` of `row`, in f64 with the largest entry taken
-/// out, rounded to f32; NaN if the row holds a NaN.
+/// out, rounded to f32; NaN if the row holds a NaN or an infinity.
 fn softmax_of(row: &[f32], class: usize) -> f32 {
-    if row.iter().any(|v| v.is_nan()) {
+    if row.iter().any(|v| !v.is_finite()) {
         return f32::NAN;
     }
     let top = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
@@ -1771,6 +1772,7 @@ mod tests {
         ));
         assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
     }
+
     /// On each engine, the confusion matrix's accuracy is `evaluate`'s and its off-diagonal
     /// counts are `misclassified`'s rows; the class scores are probabilities that sum to 1
     /// over the classes, and the free `confusion_matrix` gives the same matrix.

@@ -54,7 +54,7 @@ The accuracy is 97.5%, and the report shows where the other 2.5% went. Each row 
 - **F1** is their harmonic mean, `2·P·R / (P + R)`, which is low when either one is. `f_beta(class, beta)` weights recall `beta` times as much as precision. F2 (`beta = 2`) suits a task where missing a case costs more than a false alarm, such as screening.
 - **Support** is the number of rows of the class.
 
-The last two lines average over the classes. The **macro** average treats every class alike, so a rare class that does badly pulls it down as much as a common one. The **weighted** average weights each class by its support, so it stays close to accuracy. A third, **micro**, pools the counts of every class into one rate (`Average::Micro`). For single-label classes, micro precision and micro recall both equal accuracy.
+The last two lines average over the classes. The **macro** average treats every class alike, so a rare class that does badly pulls it down as much as a common one. The **weighted** average weights each class by its support, so it stays close to accuracy. A third, **micro**, pools the counts of every class into one rate (`Average::Micro`). When every row has a prediction, micro precision and micro recall both equal accuracy.
 
 Two conventions match scikit-learn's defaults:
 
