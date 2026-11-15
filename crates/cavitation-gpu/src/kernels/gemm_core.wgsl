@@ -1,33 +1,10 @@
-// The tiled GEMM's product, after gemm_head.wgsl and a pair of loaders (gemm_load.wgsl or a
-// kernel's own). A workgroup of 16 × 16 threads computes a 64 × 64 tile of product z = the
-// workgroup's z, each thread a 4 × 4 block strided by 16 in both directions (rows ty + 16i,
+// The tiled GEMM's product, after gemm_head.wgsl, a pair of loaders (gemm_load.wgsl or a
+// kernel's own) and a store (gemm_store.wgsl or a kernel's own). A workgroup of 16 × 16
+// threads computes a 64 × 64 tile of product z = the workgroup's z, each thread a 4 × 4 block strided by 16 in both directions (rows ty + 16i,
 // columns tx + 16j), so its shared-memory reads are conflict-free and its stores coalesce.
 // k is walked in steps of 16 through the two padded shared tiles; the accumulators are four
 // named vec4s, never an indexed private array. Each output's products are added in
 // increasing k with fma; loads past an edge read 0, so any m, n and k work.
-
-// Writes one output of product z's C, if it is inside C, adding beta times the old value
-// unless beta is 0 (tested by its bits, so either zero overwrites C without reading it).
-fn store_one(z: u32, row: u32, column: u32, value: f32) {
-    if (row >= dims.m || column >= dims.n) {
-        return;
-    }
-    let at = dims.c_offset + z * dims.c_batch + row * dims.ldc + column;
-    var out = value;
-    if ((bitcast<u32>(dims.beta) & 0x7fffffffu) != 0u) {
-        out = out + dims.beta * c[at];
-    }
-    c[at] = out;
-}
-
-// Writes the four outputs of one of a thread's rows: columns col, col + 16, col + 32 and
-// col + 48.
-fn store_row(z: u32, row: u32, col: u32, v: vec4<f32>) {
-    store_one(z, row, col, v.x);
-    store_one(z, row, col + 16u, v.y);
-    store_one(z, row, col + 32u, v.z);
-    store_one(z, row, col + 48u, v.w);
-}
 
 @compute @workgroup_size(16, 16)
 fn main(
