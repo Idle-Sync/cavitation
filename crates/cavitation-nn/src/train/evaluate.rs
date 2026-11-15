@@ -7,7 +7,7 @@ use cavitation_core::{Error, Graph, ParamStore, ParamValues, TensorView};
 
 use super::fit::{argmax, check_dataset, check_model_and_loss, check_widths};
 use super::{Dataset, Loss, Targets, TargetsView};
-use crate::metrics::ConfusionMatrix;
+use crate::metrics::{ConfusionMatrix, RegressionMetrics};
 use crate::{InferenceModel, NeuronMask, Sequential};
 
 /// What [`Evaluator::evaluate`] measures on a data set.
@@ -788,6 +788,56 @@ impl Evaluator {
             Ok(())
         })?;
         Ok(m.expect("check_dataset refuses data with no rows, so run visits a batch"))
+    }
+
+    /// The regression errors of the model's outputs on `data`, which must have value
+    /// targets: [`RegressionMetrics`] per output (mean absolute and squared error, RMSE,
+    /// R²) and averaged. Its [`r2_mean`](RegressionMetrics::r2_mean) equals
+    /// [`evaluate`](Self::evaluate)'s R² to rounding: both give a constant target column
+    /// (or a single row) 1 or 0. Copies the outputs of every row, so it allocates once per
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidData`] if `data` has class targets or an output or a target is not
+    /// finite, and as
+    /// [`evaluate`](Self::evaluate) does for the data checks that do not involve the loss.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`evaluate`](Self::evaluate) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+    /// let x = Tensor::from_vec(vec![0.0f32, 1.0, 2.0], &[3, 1]).unwrap();
+    /// let y = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], &[3, 1]).unwrap();
+    /// let data = Dataset { x, targets: Targets::Values(y) };
+    /// let mut evaluator = Evaluator::new(&net, &params, Loss::Mse, 2).unwrap();
+    /// let m = evaluator.regression(&data).unwrap();
+    /// let e = evaluator.evaluate(&data).unwrap();
+    /// assert!((m.r2_mean() - e.r2.unwrap()).abs() < 1e-12);
+    /// assert!(m.mae(0) >= 0.0);
+    /// ```
+    pub fn regression(&mut self, data: &Dataset) -> Result<RegressionMetrics, Error> {
+        check_dataset(data)?;
+        let Targets::Values(targets) = &data.targets else {
+            return Err(Error::InvalidData(
+                "regression needs value targets, but the data has class targets".to_string(),
+            ));
+        };
+        check_widths(&self.model, data)?;
+        let mut predicted = Vec::with_capacity(targets.data().len());
+        self.run(data, false, None, |_, outputs, targets| {
+            if let TargetsView::Values(values) = targets {
+                check_value_width(values, outputs.shape().dims()[1])?;
+            }
+            predicted.extend_from_slice(outputs.data());
+            Ok(())
+        })?;
+        RegressionMetrics::new(targets.data(), &predicted, targets.shape().dims()[1])
     }
 
     /// Fills `out` (cleared first) with each row's score for class `class`, for
@@ -1805,5 +1855,40 @@ mod tests {
             assert!(sums.iter().all(|s| (s - 1.0).abs() < 1e-5), "{sums:?}");
             assert!(evaluator.class_scores(&data, classes, &mut scores).is_err());
         }
+    }
+
+    /// `regression` gives `evaluate`'s R² as its mean, its own MAE checks out by hand
+    /// against the outputs, and class targets are refused.
+    #[test]
+    fn regression_agrees_with_evaluate() {
+        let (net, params, data) = case(Loss::Mse, 120, 3);
+        let mut evaluator = Evaluator::new(&net, &params, Loss::Mse, 32).unwrap();
+        let m = evaluator.regression(&data).unwrap();
+        let e = evaluator.evaluate(&data).unwrap();
+        assert!((m.r2_mean() - e.r2.unwrap()).abs() < 1e-12);
+        let out = crate::InferenceModel::compile(&net, &params)
+            .unwrap()
+            .infer_batch(data.x.view())
+            .data()
+            .to_vec();
+        let Targets::Values(t) = &data.targets else {
+            unreachable!()
+        };
+        let width = t.shape().dims()[1];
+        let mae0: f64 = t
+            .data()
+            .chunks_exact(width)
+            .zip(out.chunks_exact(width))
+            .map(|(a, b)| (f64::from(a[0]) - f64::from(b[0])).abs())
+            .sum::<f64>()
+            / data.len() as f64;
+        assert!(
+            (m.mae(0) - mae0).abs() < 1e-9,
+            "{} against {mae0}",
+            m.mae(0)
+        );
+        let (cnet, cparams, cdata) = case(Loss::CrossEntropy, 30, 4);
+        let mut c = Evaluator::new(&cnet, &cparams, Loss::CrossEntropy, 8).unwrap();
+        assert!(c.regression(&cdata).is_err());
     }
 }
