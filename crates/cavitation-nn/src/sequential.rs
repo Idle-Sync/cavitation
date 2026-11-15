@@ -814,7 +814,7 @@ impl<T: Real> Sequential<T> {
 
     /// The output channels of the `Conv2d` at layer `conv` and the values per channel at
     /// [`channel_layer`](Self::channel_layer)'s output.
-    fn channel_shape(&self, conv: usize) -> (usize, usize) {
+    pub(crate) fn channel_shape(&self, conv: usize) -> (usize, usize) {
         let end = self.channel_layer(conv);
         let geom = self.layers[conv]
             .as_conv2d()
@@ -857,17 +857,14 @@ impl<T: Real> Sequential<T> {
     /// assert_eq!(net.channel_mask(0).unwrap().off().collect::<Vec<_>>(), [1]);
     /// ```
     pub fn set_channel_mask(&mut self, conv: usize, mask: NeuronMask) {
-        let (channels, plane) = self.channel_shape(conv);
+        let channels = self.channel_shape(conv).0;
         assert!(
             mask.width() == channels,
             "sequential: the channel mask on conv layer {conv} has width {}, but the layer \
              has {channels} output channels",
             mask.width()
         );
-        let off: Vec<usize> = mask
-            .off()
-            .flat_map(|c| c * plane..(c + 1) * plane)
-            .collect();
+        let values = self.channel_values(conv, &mask);
         let layer = self.channel_layer(conv);
         if let Some(other) = (conv..layer).find(|&l| self.masks[l].is_some()) {
             panic!(
@@ -876,7 +873,24 @@ impl<T: Real> Sequential<T> {
                  clear_mask({other}) first, so that one channel set carries one mask"
             );
         }
-        self.masks[layer] = Some(LayerMask::new(NeuronMask::from_off(channels * plane, &off)));
+        self.masks[layer] = Some(LayerMask::new(values));
+    }
+
+    /// The mask on the values at [`channel_layer`](Self::channel_layer) that `mask` (one
+    /// bit per output channel of the `Conv2d` at layer `conv`) stands for: each channel's
+    /// bit repeated over its positions there.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `conv` is not a `Conv2d`, or `mask`'s width is not its channels.
+    pub(crate) fn channel_values(&self, conv: usize, mask: &NeuronMask) -> NeuronMask {
+        let (channels, plane) = self.channel_shape(conv);
+        assert_eq!(mask.width(), channels, "a channel mask of the conv's width");
+        let off: Vec<usize> = mask
+            .off()
+            .flat_map(|c| c * plane..(c + 1) * plane)
+            .collect();
+        NeuronMask::from_off(channels * plane, &off)
     }
 
     /// The channel view of the mask on [`channel_layer`](Self::channel_layer) of the

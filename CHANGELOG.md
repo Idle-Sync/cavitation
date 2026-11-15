@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Layers, training and inference (`cavitation-nn`)
 
 - Channel masks for convolutions: `Sequential::channel_layer` names the layer that holds a `Conv2d`'s channels as the next layer receives them (the end of the run of `BatchNorm2d`, poolings and element-wise layers after it), `Sequential::set_channel_mask` switches whole output channels off there, as a mask that repeats each channel's bit over its positions, and `Sequential::channel_mask` reads it back per channel. An off channel sends 0 at every position, after batch norm (whose output at 0 is β) and the activations. The first step of shrinking CNNs by channel (#209).
+- `shrink::channel_activity` measures each output channel of chosen `Conv2d` layers over a data set (mean, mean absolute value, firing share and maximum over its positions and the rows, read at `channel_layer`), and `shrink::ablate_channels` switches each channel off in turn and ranks them by what each one's absence costs, as `activity` and `ablate` do for neurons. `Evaluator::set_mask` changes the mask on any layer's output between evaluations, the route for channel masks (#209).
 
 ## v0.3.2 (2026-11-15)
 

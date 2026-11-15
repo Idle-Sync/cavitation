@@ -27,8 +27,10 @@ mod compact;
 mod prune;
 mod scratch;
 
-pub use ablate::{Ablation, ablate, ablate_controlled, ablate_with};
-pub use activity::{LayerActivity, activity};
+pub use ablate::{
+    Ablation, ChannelAblation, ablate, ablate_channels, ablate_controlled, ablate_with,
+};
+pub use activity::{ChannelActivity, LayerActivity, activity, channel_activity};
 pub use compact::compact;
 pub use prune::{
     Criterion, RankContext, Ranking, RetrainConfig, ShrinkConfig, ShrinkReport, ShrinkStep,
