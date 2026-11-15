@@ -215,8 +215,9 @@ fn sweep(seed: u64) -> Vec<f32> {
     v.extend(seeded_values(seed, 50_000, -8.0, 8.0));
     // The tails and the exponential's clamp: where tanh and GELU saturate, and where the
     // sigmoid's e^-|x| reaches the subnormal range and the clamp at -104. The tails stop at
-    // ±1e12, where x³ still fits in f32: beyond, GELU's f32 formulas overflow to NaN on the CPU
-    // and the GPU alike, where the f64 reference stays finite.
+    // ±1e12: GELU's forward pass is finite everywhere, but its f32 backward formulas give NaN
+    // for |x| ≥ 1.8e19 (x² overflows) on the CPU and the GPU alike, while the f64 reference
+    // stays finite. Issue #268 gives the backward passes their limits there.
     v.extend([
         -1e12, -50.0, -20.0, 20.0, 50.0, 1e12, -87.0, -90.0, -104.0, -110.0, 87.0, 104.0,
     ]);
