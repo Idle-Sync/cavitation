@@ -1518,6 +1518,260 @@ pub fn conv3x3_direct_twin(
     }
 }
 
+/// The output channels one task of [`conv3x3_direct_weight_grad`] takes: it pads each input
+/// plane once for all of them.
+const WEIGHT_GRAD_BLOCK: usize = 8;
+
+/// Whether the weight gradient of `geom` runs through [`conv3x3_direct_weight_grad`] at
+/// `level`: a 3 × 3 kernel with stride 1, padding 1 and dilation 1, a width that is a
+/// multiple of the level's vector width (4 at SSE4.2 and NEON, 8 at AVX2), at a level with
+/// one of those kernels on this CPU. Any channel counts.
+///
+/// ```
+/// use cavitation_core::kernels::Level;
+/// use cavitation_core::kernels::conv::{Conv2dGeom, direct_weight_grad_runs};
+/// let g = Conv2dGeom::with_options(3, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// assert!(!direct_weight_grad_runs(Level::Reference, &g));
+/// ```
+pub fn direct_weight_grad_runs(level: Level, geom: &Conv2dGeom) -> bool {
+    let lanes = match level {
+        Level::Sse42 | Level::Neon => 4,
+        Level::Avx2Fma => 8,
+        _ => return false,
+    };
+    super::supported(level)
+        && geom.kernel == (3, 3)
+        && geom.stride == (1, 1)
+        && geom.padding == (1, 1)
+        && geom.dilation == (1, 1)
+        && geom.input.1.is_multiple_of(lanes)
+}
+
+/// The scratch [`conv3x3_direct_weight_grad`] needs for `geom` on `threads` threads: for
+/// each worker, one zero-padded input plane and the running totals of a block of up to
+/// eight output channels.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{Conv2dGeom, direct_weight_grad_scratch};
+/// let g = Conv2dGeom::with_options(4, 16, (4, 4), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// assert_eq!(direct_weight_grad_scratch(&g, 2), 2 * (6 * 6 + 8 * 4 * 9));
+/// ```
+pub fn direct_weight_grad_scratch(geom: &Conv2dGeom, threads: usize) -> usize {
+    let (h, w) = geom.input;
+    let block = WEIGHT_GRAD_BLOCK.min(geom.out_channels);
+    threads.clamp(1, super::pool::MAX_THREADS) * ((h + 2) * (w + 2) + block * geom.in_channels * 9)
+}
+
+/// The weight gradient of a convolution [`direct_weight_grad_runs`] accepts: for each
+/// output channel `o`, input channel `c` and tap `(ky, kx)`,
+/// `dw[o][c][ky][kx] = Σₙ Σ_{y, x} dy[n][o][y][x] · x[n][c][y + ky − 1][x + kx − 1]` (0 outside
+/// the image), written into `dw` (`[out, in, 3, 3]`), or added to it with `add`, at kernel
+/// level `level`.
+///
+/// Each block of up to eight output channels is a task on up to `threads` threads, which
+/// owns that block's rows of `dw`. For each image in order and each input channel, it
+/// copies the plane into a zero-padded buffer and adds the image's sum for each output
+/// channel and tap to a running total that starts at zero; each image's sum runs one
+/// accumulator per vector lane and adds the lanes as a tree (see the kernels' module). At
+/// SSE4.2 each step is a multiply and then an add; at AVX2 and NEON it is one fused
+/// multiply-add. [`conv3x3_direct_weight_grad_twin`] sums in the same order and gives the
+/// same bits, and the result does not depend on `threads`. With `add`, the total is then
+/// added to what `dw` holds. `scratch` holds at least [`direct_weight_grad_scratch`] values.
+///
+/// # Panics
+///
+/// Panics if [`direct_weight_grad_runs`] refuses `geom` at `level`, or if a slice has the
+/// wrong length, naming it.
+///
+/// ```
+/// use cavitation_core::kernels::conv::{
+///     Conv2dGeom, conv3x3_direct_weight_grad, conv3x3_direct_weight_grad_twin,
+///     direct_weight_grad_runs, direct_weight_grad_scratch,
+/// };
+/// use cavitation_core::kernels::level;
+/// let g = Conv2dGeom::with_options(2, 3, (4, 8), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// if direct_weight_grad_runs(level(), &g) {
+///     let x: Vec<f32> = (0..2 * g.in_width()).map(|i| i as f32 / 9.0 - 3.0).collect();
+///     let dy: Vec<f32> = (0..2 * g.out_width()).map(|i| 1.0 - i as f32 / 40.0).collect();
+///     let (mut fast, mut twin) = (vec![0.0; g.weight_len()], vec![0.0; g.weight_len()]);
+///     let mut scratch = vec![0.0; direct_weight_grad_scratch(&g, 2)];
+///     conv3x3_direct_weight_grad(level(), &g, 2, &x, &dy, &mut fast, false, &mut scratch, 2);
+///     conv3x3_direct_weight_grad_twin(level(), &g, 2, &x, &dy, &mut twin, false);
+///     assert_eq!(fast, twin);
+/// }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub fn conv3x3_direct_weight_grad(
+    level: Level,
+    geom: &Conv2dGeom,
+    batch: usize,
+    x: &[f32],
+    dy: &[f32],
+    dw: &mut [f32],
+    add: bool,
+    scratch: &mut [f32],
+    threads: usize,
+) {
+    assert!(
+        direct_weight_grad_runs(level, geom),
+        "conv3x3_direct_weight_grad: {geom:?} does not run directly at {level:?}"
+    );
+    check_len("the input", x.len(), batch * geom.in_width());
+    check_len("the output gradient", dy.len(), batch * geom.out_width());
+    check_len("the weight gradient", dw.len(), geom.weight_len());
+    let (cin, cout, (h, w)) = (geom.in_channels, geom.out_channels, geom.input);
+    let (wp, plane) = (w + 2, (h + 2) * (w + 2));
+    let block = WEIGHT_GRAD_BLOCK.min(cout);
+    let tasks = cout.div_ceil(block);
+    let workers = threads.min(tasks).clamp(1, super::pool::MAX_THREADS);
+    let per_worker = plane + block * cin * 9;
+    let need = workers * per_worker;
+    assert!(
+        scratch.len() >= need,
+        "conv3x3_direct_weight_grad: the scratch holds {} values, expected at least {need}",
+        scratch.len()
+    );
+    let (in_w, out_w) = (cin * h * w, cout * h * w);
+    let (rows, parts) = (Parts(dw.as_mut_ptr()), Parts(scratch.as_mut_ptr()));
+    super::pool::run(workers, tasks, &|t| {
+        let (o0, o1) = (t.index * block, ((t.index + 1) * block).min(cout));
+        let len = (o1 - o0) * cin * 9;
+        // SAFETY: each worker runs one task at a time, so its scratch is its own; the
+        // block's rows of `dw` belong to this task alone.
+        let (mine, dst) = unsafe {
+            (
+                parts.slice(t.worker * per_worker, per_worker),
+                rows.slice(o0 * cin * 9, len),
+            )
+        };
+        let (pad, totals) = mine.split_at_mut(plane);
+        let totals = &mut totals[..len];
+        pad.fill(0.0);
+        totals.fill(0.0);
+        for n in 0..batch {
+            let image = &x[n * in_w..][..in_w];
+            for c in 0..cin {
+                for y in 0..h {
+                    pad[(y + 1) * wp + 1..][..w].copy_from_slice(&image[(c * h + y) * w..][..w]);
+                }
+                let job = direct::WeightJob {
+                    pad: pad.as_ptr(),
+                    dy: dy[n * out_w..].as_ptr(),
+                    out: totals.as_mut_ptr(),
+                    c,
+                    cin,
+                    o0,
+                    o1,
+                    h,
+                    w,
+                };
+                // SAFETY: `pad` holds one padded plane, `dy` the image's `cout` output
+                // planes and `totals` the block's `[o1 - o0][cin][9]` totals;
+                // `direct_weight_grad_runs` (checked above) makes `w` a multiple of the
+                // level's lanes and says this CPU supports `level`.
+                unsafe {
+                    match level {
+                        #[cfg(target_arch = "x86_64")]
+                        Level::Sse42 => direct::weight_grad_sse(&job),
+                        #[cfg(target_arch = "x86_64")]
+                        Level::Avx2Fma => direct::weight_grad_avx2(&job),
+                        #[cfg(target_arch = "aarch64")]
+                        Level::Neon => direct::weight_grad_neon(&job),
+                        _ => unreachable!(
+                            "direct_weight_grad_runs accepts only SSE4.2, AVX2 and NEON"
+                        ),
+                    }
+                }
+            }
+        }
+        for (d, &s) in dst.iter_mut().zip(totals.iter()) {
+            *d = if add { *d + s } else { s };
+        }
+    });
+}
+
+/// The scalar twin of [`conv3x3_direct_weight_grad`]: the same sums in the same order (one
+/// accumulator per lane of `level`'s vector width, each step `acc + dy · x` rounded twice
+/// at SSE4.2 and once (`mul_add`) at AVX2 and NEON, the lanes added as a tree, image after
+/// image into a total from zero), then written into `dw` or with `add` added to it. Runs
+/// any 3 × 3, stride-1, padding-1, dilation-1 geometry whose width is a multiple of the
+/// lane count.
+///
+/// # Panics
+///
+/// Panics if `geom` is not such a geometry, if `level` is not SSE4.2, AVX2 or NEON, or if
+/// a slice has the wrong length, naming it.
+///
+/// ```
+/// use cavitation_core::kernels::Level;
+/// use cavitation_core::kernels::conv::{Conv2dGeom, conv3x3_direct_weight_grad_twin};
+/// // One 1 x 4 image of ones and a gradient of ones: the centre tap sees all four values,
+/// // the side taps three, the rows above and below none.
+/// let g = Conv2dGeom::with_options(1, 1, (1, 4), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// let mut dw = [0.0f32; 9];
+/// conv3x3_direct_weight_grad_twin(Level::Sse42, &g, 1, &[1.0; 4], &[1.0; 4], &mut dw, false);
+/// assert_eq!(dw, [0.0, 0.0, 0.0, 3.0, 4.0, 3.0, 0.0, 0.0, 0.0]);
+/// ```
+pub fn conv3x3_direct_weight_grad_twin(
+    level: Level,
+    geom: &Conv2dGeom,
+    batch: usize,
+    x: &[f32],
+    dy: &[f32],
+    dw: &mut [f32],
+    add: bool,
+) {
+    let lanes = match level {
+        Level::Sse42 | Level::Neon => 4,
+        Level::Avx2Fma => 8,
+        other => panic!("conv3x3_direct_weight_grad_twin: no direct kernel at {other:?}"),
+    };
+    assert!(
+        geom.kernel == (3, 3)
+            && geom.stride == (1, 1)
+            && geom.padding == (1, 1)
+            && geom.dilation == (1, 1)
+            && geom.input.1.is_multiple_of(lanes),
+        "conv3x3_direct_weight_grad_twin: {geom:?} is not a 3 x 3, stride-1, padding-1 \
+         convolution {lanes} lanes wide"
+    );
+    check_len("the input", x.len(), batch * geom.in_width());
+    check_len("the output gradient", dy.len(), batch * geom.out_width());
+    check_len("the weight gradient", dw.len(), geom.weight_len());
+    let fused = lanes == 8 || level == Level::Neon;
+    let (cin, cout, (h, w)) = (geom.in_channels, geom.out_channels, geom.input);
+    let input = |n: usize, c: usize, iy: usize, ix: usize| {
+        if iy < 1 || iy > h || ix < 1 || ix > w {
+            0.0
+        } else {
+            x[((n * cin + c) * h + iy - 1) * w + ix - 1]
+        }
+    };
+    for o in 0..cout {
+        for c in 0..cin {
+            for t in 0..9 {
+                let (ky, kx) = (t / 3, t % 3);
+                let mut total = 0.0f32;
+                for n in 0..batch {
+                    let d = &dy[(n * cout + o) * h * w..][..h * w];
+                    let mut acc = vec![0.0f32; lanes];
+                    for y in 0..h {
+                        for x0 in (0..w).step_by(lanes) {
+                            for (i, a) in acc.iter_mut().enumerate() {
+                                let (g, v) = (d[y * w + x0 + i], input(n, c, y + ky, x0 + i + kx));
+                                *a = if fused { g.mul_add(v, *a) } else { *a + g * v };
+                            }
+                        }
+                    }
+                    total += direct::tree_sum(&acc);
+                }
+                let at = &mut dw[(o * cin + c) * 9 + t];
+                *at = if add { *at + total } else { total };
+            }
+        }
+    }
+}
+
 /// Gathers output rows `r0..r0 + nr` of the output gradient of `dy.len() / (out ·
 /// windows)` consecutive images, each `[out, windows]` with rows of `ow` windows, into `dst`
 /// as `[out, images · nr · ow]`: channel `o` of every image side by side, image after image.
@@ -1958,6 +2212,113 @@ mod tests {
                             "{level:?} geometry {k} input gradient, add {add}, {threads} threads"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// Every weight-gradient kernel this CPU runs gives its twin's bits, written and added,
+    /// at 1, 2 and 3 threads, on the direct geometries and on ones with output channels that
+    /// are not a multiple of 4 or of the eight-channel block.
+    #[test]
+    fn direct_weight_grad_matches_its_twin() {
+        let levels: Vec<Level> = Level::ALL
+            .iter()
+            .copied()
+            .filter(|&l| crate::kernels::supported(l))
+            .collect();
+        let mut geometries = direct_geometries();
+        for (cin, cout, input) in [(1, 1, (2, 8)), (3, 9, (4, 8)), (2, 19, (3, 16))] {
+            geometries.push(
+                Conv2dGeom::with_options(cin, cout, input, (3, 3), (1, 1), (1, 1), (1, 1)).unwrap(),
+            );
+        }
+        for level in levels {
+            for (k, g) in geometries.iter().enumerate() {
+                if !direct_weight_grad_runs(level, g) {
+                    continue;
+                }
+                let batch = 3;
+                let x = values32(batch * g.in_width(), 2000 + k as u64);
+                let dy = values32(batch * g.out_width(), 2100 + k as u64);
+                let start = values32(g.weight_len(), 2200 + k as u64);
+                let mut scratch = vec![f32::NAN; direct_weight_grad_scratch(g, 3)];
+                for add in [false, true] {
+                    let mut twin = start.clone();
+                    conv3x3_direct_weight_grad_twin(level, g, batch, &x, &dy, &mut twin, add);
+                    for threads in [1, 2, 3] {
+                        let mut fast = start.clone();
+                        conv3x3_direct_weight_grad(
+                            level,
+                            g,
+                            batch,
+                            &x,
+                            &dy,
+                            &mut fast,
+                            add,
+                            &mut scratch,
+                            threads,
+                        );
+                        assert_eq!(
+                            bits32(&fast),
+                            bits32(&twin),
+                            "{level:?} geometry {k} weight gradient, add {add}, {threads} threads"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The weight-gradient twin agrees with the f64 direct loops within the bound of its
+    /// longest chain of rounded steps: at most `2·h·w` within an image (a multiply and an
+    /// add per position, at SSE4.2), 3 for the lanes' tree and one per image, so
+    /// `|error| <= (2·h·w + batch + 4) · 2⁻²⁴ · Σ|dy·x|`, plus `2⁻¹²⁶` for subnormal
+    /// flushing, at both rounding forms and both lane counts.
+    #[test]
+    fn direct_weight_grad_twin_within_the_sum_bound() {
+        for level in [Level::Sse42, Level::Avx2Fma] {
+            for (k, g) in direct_geometries().iter().enumerate() {
+                if !g
+                    .input()
+                    .1
+                    .is_multiple_of(if level == Level::Sse42 { 4 } else { 8 })
+                {
+                    continue;
+                }
+                let batch = 2;
+                let x = values32(batch * g.in_width(), 2300 + k as u64);
+                let w = values32(g.weight_len(), 2400 + k as u64);
+                let dy = values32(batch * g.out_width(), 2500 + k as u64);
+                let wide = |v: &[f32]| v.iter().map(|&a| f64::from(a)).collect::<Vec<f64>>();
+                let abs = |v: &[f64]| v.iter().map(|a| a.abs()).collect::<Vec<f64>>();
+                let (x64, w64, dy64) = (wide(&x), wide(&w), wide(&dy));
+                let mut dx = vec![0.0; batch * g.in_width()];
+                let mut want = vec![0.0; g.weight_len()];
+                let mut db = vec![0.0; g.out_channels()];
+                conv2d_backward_reference(g, batch, &x64, &w64, &dy64, &mut dx, &mut want, &mut db);
+                let mut mass = vec![0.0; g.weight_len()];
+                conv2d_backward_reference(
+                    g,
+                    batch,
+                    &abs(&x64),
+                    &w64,
+                    &abs(&dy64),
+                    &mut dx,
+                    &mut mass,
+                    &mut db,
+                );
+                let mut got = vec![0.0; g.weight_len()];
+                conv3x3_direct_weight_grad_twin(level, g, batch, &x, &dy, &mut got, false);
+                let (h, wd) = g.input();
+                let gamma = (2 * h * wd + batch + 4) as f64 * 2f64.powi(-24);
+                for i in 0..got.len() {
+                    let err = (f64::from(got[i]) - want[i]).abs();
+                    assert!(
+                        err <= gamma * mass[i] + 2f64.powi(-126),
+                        "{level:?} geometry {k} weight gradient {i}: {err} > {}",
+                        gamma * mass[i]
+                    );
                 }
             }
         }

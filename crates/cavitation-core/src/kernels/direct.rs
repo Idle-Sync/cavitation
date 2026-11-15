@@ -1,12 +1,23 @@
-//! The SIMD kernels of the direct 3 × 3 convolution ([`conv3x3_direct`](super::conv::conv3x3_direct)):
-//! SSE4.2 (four lanes, multiply then add), AVX2 (eight lanes, fused multiply-add) and NEON
-//! (four lanes, fused multiply-add), each over one zero-padded image.
+//! The SIMD kernels of the direct 3 × 3 convolution ([`conv3x3_direct`](super::conv::conv3x3_direct))
+//! and of its weight gradient
+//! ([`conv3x3_direct_weight_grad`](super::conv::conv3x3_direct_weight_grad)): SSE4.2 (four
+//! lanes, multiply then add), AVX2 (eight lanes, fused multiply-add) and NEON (four lanes,
+//! fused multiply-add), each over one zero-padded image.
 //!
 //! Every output is a sum that starts at zero and adds `x · w` over the input channels in
 //! order, and within each channel over the kernel's rows and then its columns; at SSE4.2
 //! each step is a multiply and then an add, at AVX2 and NEON one fused multiply-add. The
 //! scalar twin ([`conv3x3_direct_twin`](super::conv::conv3x3_direct_twin)) sums in the same
 //! order, so each kernel matches it bit for bit.
+//!
+//! Each weight-gradient sum, for one output channel, input channel, tap and image, runs one
+//! accumulator per lane: lane `i` starts at zero and adds `dy · x` over the rows in order
+//! and within each row over the columns `x0 + i` for `x0 = 0, lanes, 2·lanes, …`, each step
+//! as above. The lanes are then added as a tree, `(l0 + l1) + (l2 + l3)` (and for eight
+//! lanes that sum plus the same of `l4..l8`), and the image's sum is added to the running
+//! total, image after image.
+//! [`conv3x3_direct_weight_grad_twin`](super::conv::conv3x3_direct_weight_grad_twin) sums in
+//! the same order.
 
 /// One padded image and where its outputs go: what a kernel needs for one task.
 pub(super) struct Job {
@@ -125,13 +136,95 @@ macro_rules! direct_kernel {
     };
 }
 
+/// One padded input plane and the output gradient it meets: what a weight-gradient kernel
+/// needs for one input channel of one image and a block of output channels.
+pub(super) struct WeightJob {
+    /// Input channel `c` of the image, a plane of `(h + 2) × (w + 2)` with a border of zeros.
+    pub(super) pad: *const f32,
+    /// The image's output gradient, `cout` planes of `h × w`.
+    pub(super) dy: *const f32,
+    /// The block's running totals, `[o1 − o0][cin][9]`; each image's sums are added to them.
+    pub(super) out: *mut f32,
+    /// The input channel.
+    pub(super) c: usize,
+    /// Input channels.
+    pub(super) cin: usize,
+    /// The block's first output channel.
+    pub(super) o0: usize,
+    /// One past the block's last output channel.
+    pub(super) o1: usize,
+    /// Output (and unpadded input) height.
+    pub(super) h: usize,
+    /// Output (and unpadded input) width, a multiple of the kernel's lane count.
+    pub(super) w: usize,
+}
+
+/// The sum of `lanes` as a tree: each half summed the same way, then the two halves added.
+/// One value is itself.
+pub(super) fn tree_sum(lanes: &[f32]) -> f32 {
+    match lanes.len() {
+        0 => 0.0,
+        1 => lanes[0],
+        n => tree_sum(&lanes[..n / 2]) + tree_sum(&lanes[n / 2..]),
+    }
+}
+
+/// Adds one image's weight-gradient sums for `job` with a kernel `$name` of `$lanes` lanes
+/// under target feature `$feat`, with `$zero`, `$load`, `$store` and `$madd(acc, x, w)`,
+/// which returns `acc + x · w`.
+macro_rules! weight_grad_kernel {
+    ($name:ident, $feat:literal, $lanes:literal, $zero:expr, $load:path, $store:path,
+     $madd:path) => {
+        /// For each output channel of `job`'s block, adds `Σ dy · x` over the image for
+        /// each of the nine taps to the block's totals.
+        ///
+        /// # Safety
+        ///
+        /// `job`'s pointers must hold what [`WeightJob`] describes, `job.w` must be a
+        /// multiple of the lane count, and the CPU must support the target feature.
+        #[target_feature(enable = $feat)]
+        pub(in crate::kernels) unsafe fn $name(job: &WeightJob) {
+            let wp = job.w + 2;
+            for o in job.o0..job.o1 {
+                let mut acc = [$zero; 9];
+                // SAFETY: every read is inside the padded plane (rows y..y + 3, columns
+                // x0..x0 + lanes + 2) or plane `o` of `dy`; every write is one of the
+                // block's totals for output channel `o` and input channel `c`.
+                unsafe {
+                    let d = job.dy.add(o * job.h * job.w);
+                    for y in 0..job.h {
+                        let mut x0 = 0;
+                        while x0 + $lanes <= job.w {
+                            let dv = $load(d.add(y * job.w + x0));
+                            for ky in 0..3 {
+                                let row = job.pad.add((y + ky) * wp + x0);
+                                for kx in 0..3 {
+                                    let t = ky * 3 + kx;
+                                    acc[t] = $madd(acc[t], dv, $load(row.add(kx)));
+                                }
+                            }
+                            x0 += $lanes;
+                        }
+                    }
+                    let out = job.out.add(((o - job.o0) * job.cin + job.c) * 9);
+                    let mut lanes = [0.0f32; $lanes];
+                    for (t, &a) in acc.iter().enumerate() {
+                        $store(lanes.as_mut_ptr(), a);
+                        *out.add(t) += tree_sum(&lanes);
+                    }
+                }
+            }
+        }
+    };
+}
+
 #[cfg(target_arch = "x86_64")]
-pub(super) use x86::{direct_avx2, direct_sse};
+pub(super) use x86::{direct_avx2, direct_sse, weight_grad_avx2, weight_grad_sse};
 
 /// The x86_64 kernels.
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use super::Job;
+    use super::{Job, WeightJob, tree_sum};
     use std::arch::x86_64::{
         __m128, __m256, _mm_add_ps, _mm_loadu_ps, _mm_mul_ps, _mm_set1_ps, _mm_setzero_ps,
         _mm_storeu_ps, _mm256_add_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_set1_ps,
@@ -179,6 +272,26 @@ mod x86 {
         _mm_loadu_ps
     );
 
+    weight_grad_kernel!(
+        weight_grad_sse,
+        "sse4.2",
+        4,
+        _mm_setzero_ps(),
+        _mm_loadu_ps,
+        _mm_storeu_ps,
+        madd_sse
+    );
+
+    weight_grad_kernel!(
+        weight_grad_avx2,
+        "avx2,fma",
+        8,
+        _mm256_setzero_ps(),
+        _mm256_loadu_ps,
+        _mm256_storeu_ps,
+        madd_avx2
+    );
+
     direct_kernel!(
         direct_avx2,
         rows_avx2,
@@ -196,12 +309,12 @@ mod x86 {
 }
 
 #[cfg(target_arch = "aarch64")]
-pub(super) use arm::direct_neon;
+pub(super) use arm::{direct_neon, weight_grad_neon};
 
 /// The aarch64 kernel.
 #[cfg(target_arch = "aarch64")]
 mod arm {
-    use super::Job;
+    use super::{Job, WeightJob, tree_sum};
     use std::arch::aarch64::{
         float32x4_t, vaddq_f32, vdupq_n_f32, vfmaq_f32, vld1q_dup_f32, vld1q_f32, vst1q_f32,
     };
@@ -226,5 +339,15 @@ mod arm {
         vaddq_f32,
         madd_neon,
         vld1q_dup_f32
+    );
+
+    weight_grad_kernel!(
+        weight_grad_neon,
+        "neon",
+        4,
+        vdupq_n_f32(0.0),
+        vld1q_f32,
+        vst1q_f32,
+        madd_neon
     );
 }
