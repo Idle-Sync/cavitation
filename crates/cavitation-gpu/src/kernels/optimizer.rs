@@ -335,21 +335,24 @@ impl OptimizerRule {
 ///
 /// The arithmetic is the CPU optimisers' in `f32`, each step from the `f32`-rounded
 /// settings and per-step constants (computed on the host in `f64`). Against the exact result
-/// of those constants and the step's starting state, with `u = 2⁻²⁴`, and assuming each
-/// `fma` rounds once (WGSL allows it two roundings; it is fused on Metal on the Apple M4, and
-/// on Vulkan and DX12 on the NVIDIA GTX 1660 Super, as measured):
+/// of those constants and the step's starting state, with `u = 2⁻²⁴`, the bounds below hold
+/// whether each `fma` rounds once or twice (WGSL allows either; DX12's FXC splits Adam's,
+/// as measured on the NVIDIA GTX 1660 Super), except plain SGD's single rounding:
 ///
 /// - **SGD without weight decay or momentum:** the value `p' = p − lr·g` is one `fma`,
-///   within `u·|p'|`, one rounding.
-/// - **SGD with either:** for the step `s = g + wd·p` and `b = μ·b_old + s` (`b = s` on a
-///   parameter's first update or without momentum), the value within
-///   `u·(|p'| + lr·(|b| + |s|))` and the momentum buffer within `u·(|b| + |s|)`.
-/// - **Adam and AdamW:** for the new moments `m` and `v`, the denominator
-///   `d = √v · c₂ + eps` and AdamW's shrunk value `p_s = p·(1 − lr·wd)` (0 for Adam), the
-///   value within `u·(|p'| + |p_s| + step_size·(19·|m/d| + (|m| + 2(1 − β₁)|g|) / d))`, the
-///   first moment within `u·(|m| + 2(1 − β₁)|g|)` and the second within `6u·v`. These allow
-///   for WGSL's square root (from `inverseSqrt`, 2 ulp, then a division) and its division
-///   (2.5 ulp).
+///   within `u·|p'|`, one rounding, where the backend fuses it (measured on Metal, Vulkan
+///   and both DX12 compilers); within `u·(|p'| + lr·|g|)` where it does not.
+/// - **SGD with either:** for the step `s = g + wd·p`, the buffer `b = μ·b_old + s` (`b = s`
+///   on a parameter's first update or without momentum) and
+///   `e_b = u·(|b| + μ·|b_old| + |s| + |wd·p|)`, the momentum buffer within `e_b` and the
+///   value within `u·(|p'| + lr·|b|) + lr·e_b`.
+/// - **Adam and AdamW:** for the gradient `g` after Adam's decay, the new moments `m` and
+///   `v`, the denominator `d = √v · c₂ + eps`, AdamW's shrunk value `p_s = p·(1 − lr·wd)` (0
+///   for Adam) and Adam's decay term `w = |wd·p|` (0 for AdamW), the first moment within
+///   `e_m = u·(|m| + β₁·|m_old| + 2(1 − β₁)|g| + (1 − β₁)·w)`, the second within
+///   `e_v = u·(6v + 2(1 − β₂)|g|·w)`, and the value within
+///   `u·(|p'| + |p_s|) + step_size·(|m/d|·(17u + e_v/(2v)) + e_m/d)`. These allow for WGSL's
+///   square root (from `inverseSqrt`, 2 ulp, then a division) and its division (2.5 ulp).
 ///
 /// Every bound also carries `2⁻¹²⁶`, for a value or state the GPU flushes to zero.
 ///

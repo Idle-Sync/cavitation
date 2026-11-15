@@ -175,8 +175,9 @@ struct Exact {
 /// The CPU optimisers' arithmetic for one element (`sgd_reference` and `adam_reference` in
 /// `cavitation_nn::optim`): the value `p`, its state `m` and `v`, its gradient `g`, and
 /// whether this is its first update, with constants `c`. The bounds are those
-/// `OptimizerKernel`'s docs state, with 5% to spare for second-order terms, except plain
-/// SGD's one rounding, which has none.
+/// `OptimizerKernel`'s docs state, which hold whether each `fma` rounds once or twice, with
+/// 5% to spare for second-order terms; plain SGD's one rounding has no margin and needs a
+/// fused `fma`.
 fn exact(
     rule: &OptimizerRule,
     c: &Constants,
@@ -189,36 +190,41 @@ fn exact(
     let (p, g) = (f64::from(p), f64::from(g));
     match rule {
         OptimizerRule::Sgd { .. } => {
+            let decay = (c.wd * p).abs();
             let mut step = g;
             if c.wd != 0.0 {
                 step += c.wd * p;
             }
             let s = step;
+            let mut carried = 0.0;
             if c.momentum != 0.0 && !first {
+                carried = (c.momentum * f64::from(m)).abs();
                 step += c.momentum * f64::from(m);
             }
             let value = p - c.lr * step;
             let plain = c.wd == 0.0 && c.momentum == 0.0;
+            let buffer = U * (step.abs() + carried + s.abs() + decay);
             let value_bound = if plain {
                 U * value.abs()
             } else {
-                U * (value.abs() + c.lr * (step.abs() + s.abs()))
+                1.05 * (U * (value.abs() + c.lr * step.abs()) + c.lr * buffer)
             };
             Exact {
                 value,
                 m: step,
                 v: 0.0,
-                value_bound: if plain {
-                    value_bound
-                } else {
-                    1.05 * value_bound
-                },
-                m_bound: 1.05 * U * (step.abs() + s.abs()),
+                value_bound,
+                m_bound: 1.05 * buffer,
                 v_bound: 0.0,
             }
         }
         _ => {
             let decoupled = matches!(rule, OptimizerRule::AdamW { .. });
+            let decay = if decoupled {
+                0.0
+            } else {
+                (c.wd * f64::from(p as f32)).abs()
+            };
             let (mut p, mut g) = (p, g);
             if decoupled {
                 p *= c.shrink;
@@ -232,17 +238,19 @@ fn exact(
             let a = c.one_minus_beta1 * g.abs();
             let shrunk = if decoupled { p.abs() } else { 0.0 };
             let ratio = (mi / d).abs();
+            let m_error =
+                U * (mi.abs() + c.beta1 * f64::from(m).abs() + 2.0 * a + c.one_minus_beta1 * decay);
+            let v_error = U * (6.0 * vi + 2.0 * c.one_minus_beta2 * g.abs() * decay);
+            let v_relative = if vi > 0.0 { v_error / vi } else { 0.0 };
             Exact {
                 value,
                 m: mi,
                 v: vi,
                 value_bound: 1.05
-                    * U
-                    * (value.abs()
-                        + shrunk
-                        + c.step_size * (19.0 * ratio + (mi.abs() + 2.0 * a) / d)),
-                m_bound: 1.05 * U * (mi.abs() + 2.0 * a),
-                v_bound: 1.05 * 6.0 * U * vi,
+                    * (U * (value.abs() + shrunk)
+                        + c.step_size * (ratio * (17.0 * U + v_relative / 2.0) + m_error / d)),
+                m_bound: 1.05 * m_error,
+                v_bound: 1.05 * v_error,
             }
         }
     }
