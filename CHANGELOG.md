@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Training health (`cavitation-nn`)
+
+- The dead-ReLU report counts by channel through a pooling layer too: in `Conv2d → MaxPool2d → ReLU` (or an average pooling there), a channel is reported dead only when every pooled position of it is, as it already was with batch norm or other element-wise layers in between. Before, such a ReLU fell back to counting each position, so the flat positions of a live channel came back as dead (#222).
+
 ## v0.3.2 (2026-11-15)
 
 ### Layers, training and inference (`cavitation-nn`)
