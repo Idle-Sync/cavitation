@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### GPU
+
+- A new crate, `cavitation-gpu`, reached through the `gpu` feature of `cavitation` (re-exported as `cavitation::cavitation_gpu`) or of `cavitation-nn`, both off by default; a default build has no wgpu in it. `Gpu::new()` opens the best hardware GPU on Vulkan, Metal or DX12 through wgpu 30 (Metal on macOS; Vulkan, then DX12 on Windows; Vulkan elsewhere), preferring a discrete GPU and trying the next adapter if a device fails to open, and returns `None` when there is none; software renderers, CPU and virtual adapters, paravirtual devices and OpenGL are left out. `Gpu::with_backend` asks for one backend and `Gpu::open` says why none could be opened. The device has up to 32 KiB of workgroup memory (less if the adapter has less) and GPU timestamps when the adapter offers them; `Gpu::info()` describes the adapter, driver and limits, and prints them through `Display`. `CAVITATION_GPU_BACKEND` (`vulkan`, `dx12` or `metal`) restricts every `Gpu` to one backend, and `CAVITATION_GPU_REQUIRED=1` turns a missing GPU into a panic, for test runs that must use the GPU. On DX12, shaders compile with DXC when `dxcompiler.dll` loads and with FXC otherwise; `WGPU_DX12_COMPILER=dxc` requires DXC.
+
 ## v0.3.2 (2026-11-15)
 
 ### Layers, training and inference (`cavitation-nn`)

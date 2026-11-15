@@ -18,6 +18,7 @@ cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
 cavitation-nn = { path = "../cavitation-nn", version = "0.3.2" }
 cavitation-ml = { path = "../cavitation-ml", version = "0.3.2", optional = true }
 cavitation-inspect = { path = "../cavitation-inspect", version = "0.3.2", optional = true }
+cavitation-gpu = { path = "../cavitation-gpu", version = "0.3.2", optional = true }
 
 [features]
 default = ["ml"]
@@ -25,6 +26,8 @@ default = ["ml"]
 ml = ["dep:cavitation-ml"]
 # The live training view in the browser, re-exported as `cavitation::cavitation_inspect`; off by default.
 inspect = ["dep:cavitation-inspect"]
+# GPU mode through wgpu (Vulkan, Metal, DX12), re-exported as `cavitation::cavitation_gpu`; off by default.
+gpu = ["dep:cavitation-gpu", "cavitation-nn/gpu"]
 
 [dev-dependencies]
 # Real datasets for the examples and known-result tests.
