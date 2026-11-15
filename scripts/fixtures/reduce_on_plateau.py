@@ -1,7 +1,7 @@
 """PyTorch's ReduceLROnPlateau learning rates for fixed measure sequences.
 
 Prints, for each case, the rate after each `step(measure)`, as the reference for the
-`reduce_on_plateau_matches_pytorch` test in crates/cavitation-nn/src/train/fit.rs. Run with
+`reduce_on_plateau_matches_pytorch` test in crates/cavitation-nn/src/train/stopping.rs. Run with
 `scripts/fixtures/.venv/bin/python -I scripts/fixtures/reduce_on_plateau.py`.
 """
 
