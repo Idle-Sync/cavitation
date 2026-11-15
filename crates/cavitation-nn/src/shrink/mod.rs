@@ -24,11 +24,14 @@
 mod ablate;
 mod activity;
 mod compact;
+mod compact_image;
 mod prune;
 mod scratch;
 
-pub use ablate::{Ablation, ablate, ablate_controlled, ablate_with};
-pub use activity::{LayerActivity, activity};
+pub use ablate::{
+    Ablation, ChannelAblation, ablate, ablate_channels, ablate_controlled, ablate_with,
+};
+pub use activity::{ChannelActivity, LayerActivity, activity, channel_activity};
 pub use compact::compact;
 pub use prune::{
     Criterion, RankContext, Ranking, RetrainConfig, ShrinkConfig, ShrinkReport, ShrinkStep,
@@ -41,7 +44,7 @@ use cavitation_core::{Error, Real};
 use crate::Sequential;
 
 /// The names of the built-in image layers that have no downcast: the three poolings.
-const POOL_NAMES: [&str; 3] = ["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
+pub(crate) const POOL_NAMES: [&str; 3] = ["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
 
 /// [`Error::Unsupported`] from `tool` if `model` has an image layer (`Conv2d`,
 /// `BatchNorm2d`, or a pooling layer, found by its name), naming the first one: the tools
