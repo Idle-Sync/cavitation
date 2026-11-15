@@ -65,7 +65,9 @@ pub use error::{Error, KeyErrors};
 pub use graph::{Graph, ParamGrads, ParamId, ParamStore, ParamValues, Tape, Var};
 pub use kernels::conv::Conv2dGeom;
 pub use kernels::pooling::Pool2dGeom;
-pub use ops::{CustomOp, Gate, GeluApprox, Reduction, RunningStats, log_softmax_row, softmax_row};
+pub use ops::{
+    CustomOp, Gate, GeluApprox, Reduction, RunningStats, dropout_mask, log_softmax_row, softmax_row,
+};
 pub use real::Real;
 pub use rng::{Rng, SplitMix64};
 pub use shape::Shape;
