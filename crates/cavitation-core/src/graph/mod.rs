@@ -559,6 +559,13 @@ fn mix(seed: u64) -> u64 {
     SplitMix64::new(seed).next_u64()
 }
 
+/// The seed of random stream `stream` at step `step` of the run seeded `seed`: what
+/// [`Tape::stream_seed`] returns on a training tape, and what [`dropout_mask`](crate::dropout_mask)
+/// draws from without one.
+pub(crate) fn stream_seed(seed: u64, step: u64, stream: u64) -> u64 {
+    mix(mix(mix(seed) ^ step) ^ stream)
+}
+
 impl<T: Real> Tape<'_, T> {
     /// Records an input: copies `x` into a pooled buffer. Inputs take no gradient.
     ///
@@ -1037,8 +1044,7 @@ impl<T: Real> Tape<'_, T> {
     /// assert_eq!(graph.tape(&store.values).stream_seed(0), None);
     /// ```
     pub fn stream_seed(&self, stream: u64) -> Option<u64> {
-        self.training
-            .map(|t| mix(mix(mix(t.seed) ^ t.step) ^ stream))
+        self.training.map(|t| stream_seed(t.seed, t.step, stream))
     }
 
     /// A stream id no earlier call on this tape returned: 0, then 1, and so on, in the order
