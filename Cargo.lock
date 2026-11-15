@@ -137,6 +137,7 @@ name = "cavitation-gpu"
 version = "0.3.2"
 dependencies = [
  "cavitation-core",
+ "cavitation-nn",
  "pollster",
  "wgpu",
 ]

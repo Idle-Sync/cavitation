@@ -9,6 +9,7 @@
 
 use cavitation_core::Pool2dGeom;
 
+use super::bind_buffers;
 use crate::{GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder, wgpu};
 
 /// Threads per workgroup: every pooling kernel's `@workgroup_size`, passed to it as the
@@ -301,27 +302,6 @@ fn dispatch(
     step.dispatch_split(pipeline, group, threads.div_ceil(WORKGROUP));
 }
 
-/// A bind group for `pipeline`'s group 0 with `buffers` at bindings 0, 1, ….
-fn bind(
-    steps: &mut StepEncoder,
-    pipeline: &wgpu::ComputePipeline,
-    buffers: &[&PooledBuffer],
-) -> wgpu::BindGroup {
-    let entries: Vec<wgpu::BindGroupEntry<'_>> = buffers
-        .iter()
-        .enumerate()
-        .map(|(i, b)| wgpu::BindGroupEntry {
-            binding: i as u32,
-            resource: b.binding(),
-        })
-        .collect();
-    steps.bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &entries,
-    })
-}
-
 /// Panics unless every index the kernels form along each axis of `geom` fits in `limit`:
 /// the padded size plus a window and a stride, which bounds every padded position and
 /// every intermediate of the kernels' window arithmetic.
@@ -565,7 +545,7 @@ impl MaxPool2d {
         check_buffer("the input", x, self.inputs as usize);
         check_buffer("the output", out, self.outputs as usize);
         check_buffer("the winners", winners, self.outputs as usize);
-        bind(steps, &self.forward, &[x, out, winners])
+        bind_buffers(steps, &self.forward, &[x, out, winners])
     }
 
     /// Records the forward pass in `step`, with a group from
@@ -626,7 +606,7 @@ impl MaxPool2d {
         check_buffer("the output gradient", dy, self.outputs as usize);
         check_buffer("the winners", winners, self.outputs as usize);
         check_buffer("the input gradient", dx, self.inputs as usize);
-        bind(steps, &self.backward, &[dy, winners, dx])
+        bind_buffers(steps, &self.backward, &[dy, winners, dx])
     }
 
     /// Records the backward pass in `step`, with a group from
@@ -852,7 +832,7 @@ impl AvgPool2d {
     ) -> wgpu::BindGroup {
         check_buffer("the input", x, self.inputs as usize);
         check_buffer("the output", out, self.outputs as usize);
-        bind(steps, &self.forward, &[x, out])
+        bind_buffers(steps, &self.forward, &[x, out])
     }
 
     /// Records the forward pass in `step`, with a group from
@@ -908,7 +888,7 @@ impl AvgPool2d {
     ) -> wgpu::BindGroup {
         check_buffer("the output gradient", dy, self.outputs as usize);
         check_buffer("the input gradient", dx, self.inputs as usize);
-        bind(steps, &self.backward, &[dy, dx])
+        bind_buffers(steps, &self.backward, &[dy, dx])
     }
 
     /// Records the backward pass in `step`, with a group from
