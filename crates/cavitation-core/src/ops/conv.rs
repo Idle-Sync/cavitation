@@ -220,9 +220,16 @@ mod tests {
             (1, 2, (3, 3), (2, 2), (1, 1), (3, 2), (1, 1)),
             // Stride and dilation above 1 on the same axis.
             (2, 2, (9, 8), (3, 2), (2, 2), (1, 1), (2, 3)),
-            // 288 · 1,024 column values per image: 7 images per chunk, so the 9 images of a
-            // `conv2d_matches_direct_loops` batch span two chunks, the second short.
+            // 288 · 1,024 column values per image, more than `COLUMN_BUDGET`: each image in
+            // bands of 7 output rows, the last of 4.
             (32, 2, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)),
+            // 72 · 45 column values per output row: bands of 18 and 17 rows, with stride,
+            // padding and dilation on both axes, so windows near a band's edge read rows
+            // the next band reads too.
+            (8, 2, (70, 90), (3, 3), (2, 2), (2, 1), (2, 1)),
+            // 36 · 330 column values per image: 5 whole images per chunk, so the 9 images
+            // of a `conv2d_matches_direct_loops` batch span two chunks, the second short.
+            (4, 3, (20, 33), (3, 3), (2, 1), (1, 1), (1, 1)),
         ];
         cases
             .into_iter()
