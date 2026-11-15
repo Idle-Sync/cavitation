@@ -13,9 +13,15 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
+- `Evaluator::confusion` and the free `confusion_matrix` give a model's `ConfusionMatrix` on class targets, its accuracy equal to `evaluate`'s, with all-NaN rows counted as unpredicted. `Evaluator::class_scores` gives each row's softmax probability of a class (or the output itself for a one-output model) for `roc_auc` and `average_precision`. `confusion_matrix` is in the prelude (#237).
+
+### Classic machine learning (`cavitation-ml`)
+
+- `LogisticModel::confusion`: the model's `ConfusionMatrix` on class targets, its accuracy equal to `score`'s (#237).
 
 ### Data, examples, guide and benchmark
 
+- Guide chapter "Measuring a classifier" and the `classification_metrics` example: the confusion matrix and classification report of a digits network, ROC AUC and average precision for "is it a 9?", and the always-"no" baseline whose accuracy is 87.5% and recall 0 (#237).
 - `BENCHMARKS.md`: `mnist-cnn` and `cifar-cnn` results against PyTorch on an Intel Celeron N5105, an AMD Ryzen 7 2700X and an Apple M4, with accuracy and epoch time per seed.
 - `cavitation-bench mnist-cnn` and `cifar-cnn` take `--profile N`: N training steps on the real data, printing each layer's median forward and backward time, the loss's, the optimiser's and the whole step's.
 - `cavitation-bench mnist-cnn` and `cifar-cnn` print each PyTorch epoch as it finishes, rather than all of them once PyTorch exits (#228).
