@@ -37,13 +37,13 @@ Every run uses 4 threads (`CAVITATION_THREADS=4`, and `torch.set_num_threads(4)`
 | B | 0 | e232af8 | 75.34 | 74.11 | 113.16 | 86.84 | 1.30 |
 | B | 1 | v0.3.0 | running | | | | |
 | B | 2 | v0.3.0 | queued | | | | |
-| C | 0 | v0.3.0 | running | | | | |
+| C | 0 | v0.3.0 | 76.63 | 74.66 | 30.26 | 43.13 | 0.70 |
 
 ## Notes
 
 - On machine A, the mnist-cnn runs and cifar-cnn seed 1 ran while other work was using the machine, so their times are less reliable than the "quiet" row. That row is the median epoch-2 time of the two rounds that started on an idle machine, out of three (one round started at 42% busy; `cifar-cnn --epochs 2`).
 - Single seeds of cifar-cnn swing by about 2 points either way. The network has dropout, and its random masks differ between the two libraries. Over seeds 0 and 1 on machine A, the mean test accuracy is 72.64% for Cavitation and 72.63% for PyTorch.
-- On machine C, a background program used 30–45% of one core during the runs.
+- On machine C, a background program used 30–45% of one core during the runs. The PyTorch build there reports `mkldnn False`.
 
 ## Running them
 
