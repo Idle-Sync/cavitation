@@ -239,6 +239,8 @@ Speed, measured on an Intel Celeron N5105 (4 cores, SSE4.2, no AVX) with `cargo 
 
 Each training figure is the median of 3 timed epochs (MNIST) or 100 epochs (digits); the inference figure is the median of 10 rounds of 10,000 calls. Your numbers will differ on other machines.
 
+The CNN benchmarks against PyTorch, on an Intel Celeron N5105, an AMD Ryzen 7 2700X and an Apple M4, are in [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Running the benchmark
 
 ```sh
