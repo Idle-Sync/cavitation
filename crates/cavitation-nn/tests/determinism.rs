@@ -1,7 +1,10 @@
 //! Training gives bit-identical parameters on 1 and on 4 threads, dropout masks and
-//! convolutions included.
+//! convolutions included, and the v0.3 CIFAR network gives bit-identical parameters and
+//! batch-norm buffers at 1, 2, 3 and 4 threads and from run to run.
 //!
 //! This target holds a single test because it sets the process-wide thread count.
+
+mod common;
 
 use cavitation_core::kernels::gemm::threads_used;
 use cavitation_core::kernels::{Level, level, set_threads};
@@ -130,6 +133,41 @@ fn train_cnn() -> Vec<u32> {
         .collect()
 }
 
+/// The CIFAR network of `common` trained for 20 steps of 16 rows (one epoch of 320 seeded
+/// rows of 3 × 32 × 32 images in `[0, 1)` with classes 0 to 9) with Adam, shuffled and with
+/// dropout; returns the bits of every parameter and buffer.
+fn train_cifar() -> Vec<u32> {
+    let n = 320;
+    let mut rng = Rng::seed(8);
+    let x: Vec<f32> = (0..n * 3072).map(|_| rng.uniform_f32()).collect();
+    let data = Dataset {
+        x: Tensor::from_vec(x, &[n, 3072]).unwrap(),
+        targets: Targets::Classes((0..n).map(|_| rng.below(10) as usize).collect()),
+    };
+    let mut params = ParamStore::new();
+    let net = common::cifar_cnn(&mut params, &mut Rng::seed(9));
+    let config = FitConfig {
+        epochs: 1,
+        batch: 16,
+        shuffle_seed: Some(5),
+        dropout_seed: 3,
+        health: Health::quiet(),
+        ..FitConfig::default()
+    };
+    fit(&net, &mut params, &data, config).unwrap();
+    net.state_names()
+        .into_iter()
+        .flat_map(|(_, id)| {
+            params
+                .value(id)
+                .data()
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// The same run with `set_threads(1)` and with `set_threads(4)` gives bit-identical
 /// parameters. On a CPU with a packed GEMM kernel, every matrix product of a full batch
 /// (forward, input gradient and weight gradient of each layer) runs on 4 threads at 4; at
@@ -171,4 +209,20 @@ fn threads_1_and_4_identical() {
     set_threads(4);
     let four = train_cnn();
     assert!(one == four, "CNN parameters differ between 1 and 4 threads");
+    set_threads(1);
+    let one = train_cifar();
+    // 1,117,162 parameters and 388 buffer values (each batch norm's running mean and
+    // variance, one value per channel each, and its count).
+    assert_eq!(one.len(), 1_117_550);
+    for threads in 2..=4 {
+        set_threads(threads);
+        assert!(
+            train_cifar() == one,
+            "CIFAR parameters and buffers differ between 1 and {threads} threads"
+        );
+    }
+    assert!(
+        train_cifar() == one,
+        "CIFAR parameters and buffers differ from run to run"
+    );
 }

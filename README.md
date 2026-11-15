@@ -15,6 +15,7 @@ What it contains:
 
 - An f32 tensor and reverse-mode autograd over a recorded tape.
 - Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, 17 activations plus the learnable PReLU layer (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
+- Image layers on rows of channel-by-channel pixels: `Conv2d` (stride, padding, dilation), `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `BatchNorm2d` with its running statistics, `Dropout`, and `Flatten`, each following PyTorch's layer of the same name.
 - `Linear`, activation layers and `Sequential`; Xavier and He initialisation; SGD (with momentum and weight decay), Adam, AdamW, RMSprop and Adagrad; cosine learning-rate decay.
 - `fit`, a step-by-step `Trainer`, and the manual loop.
 - Hooks, neuron masks, and health checks that warn about NaN or infinity, exploding and vanishing gradients and dead ReLU neurons.
@@ -213,6 +214,9 @@ cargo run --release --example linear_regression -p cavitation    # Concrete: exa
 cargo run --release --example logistic_regression -p cavitation  # Breast Cancer: Newton and gradient paths
 scripts/data/get-mnist.sh                            # downloads MNIST into data/mnist/ (once)
 cargo run --release --example mnist -p cavitation    # fit on MNIST with Adam and cosine decay
+cargo run --release --example mnist_cnn -p cavitation      # a LeNet-5-style CNN on MNIST
+cargo run --release --example load_torch_cnn -p cavitation # load a PyTorch CNN with batch norm, compare outputs
+cargo run --release --example steering_cnn -p cavitation   # read a road edge's angle from synthetic images
 ```
 
 The digits, Concrete and Breast Cancer data ship in the repository. MNIST is downloaded by its script, and CIFAR-10 (binary version, 50,000 training and 10,000 test images of 32 by 32 pixels in three colours) by `scripts/data/get-cifar10.sh` into `data/cifar10/`; `cavitation_datasets::cifar10::load` reads it, for the benchmark below.
@@ -223,6 +227,7 @@ Known results, from tests with fixed seeds (`crates/cavitation/tests/known_resul
 
 - XOR: a 2 → 8 tanh → 1 sigmoid network ends within 0.1 of every target after 2,000 full-batch epochs of SGD.
 - scikit-learn 8×8 digits: the 64 → 256 → 128 → 10 network (50,826 parameters) reaches 97.50% (351 of 360) on the held-out digits after 20 epochs of Adam.
+- Steering: the 9,633-parameter CNN of `cavitation_datasets::steering` reads the road edge's angle on 500 held-out synthetic images within 0.80° on average after 8 epochs (the test requires below 1.5°).
 - MNIST: the 784 → 1024 → 256 → 10 network (1,068,810 parameters) reaches 98.63% on the 10,000 test images after 10 epochs of Adam with cosine decay. This test is ignored by default because it needs the data; run it with `cargo test --release -p cavitation -- --ignored mnist_known_result --nocapture`.
 
 Speed, measured on an Intel Celeron N5105 (4 cores, SSE4.2, no AVX) with `cargo run --release -p cavitation-bench -- all`: release build, kernel level `sse4.2`, 4 threads, plain SGD for training, with numpy 2.4.4 (Python 3.14) measured in the same run on the same network, batch, data and step count; built with rustc 1.99.1.
@@ -269,13 +274,14 @@ This runs the gradient checks, the PyTorch fixture comparisons on every kernel l
 
 ## Guide
 
-The guide is in `book/`, in five chapters:
+The guide is in `book/`, in six chapters:
 
 - "Backprop by hand" works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks.
 - "Shrinking a network" finds how many neurons the digits network can do without and removes them.
 - "Watching a network train" runs the inspector on the digits network, reads each panel of the page, and measures what watching costs.
 - "Regression, exactly and by gradient" fits linear and logistic regression both ways and shows why the two meet.
 - "Coming from PyTorch" lists what matches PyTorch, so a model moved between the two gives the same outputs, and where a PyTorch habit gives a different answer or none.
+- "Image models" covers the row layout of images, a CNN on MNIST, dropout and batch norm in training and evaluation, loading a CNN with batch norm from PyTorch, and a steering model trained on synthetic road images.
 
 Build it with [mdBook](https://rust-lang.github.io/mdBook/):
 

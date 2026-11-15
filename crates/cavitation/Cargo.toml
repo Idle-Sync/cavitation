@@ -29,6 +29,9 @@ inspect = ["dep:cavitation-inspect"]
 [dev-dependencies]
 # Real datasets for the examples and known-result tests.
 cavitation-datasets = { path = "../cavitation-datasets" }
+# Reads the PyTorch reference outputs stored beside a state dict in the `load_torch_cnn`
+# example; `cavitation-nn` already depends on it, so it adds nothing to the build.
+safetensors = "0.8.0"
 
 # The regression examples use the classic models, which the `ml` feature provides.
 [[example]]

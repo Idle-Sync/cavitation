@@ -197,19 +197,21 @@ pub use cavitation_nn;
 /// ```
 pub mod prelude {
     pub use cavitation_core::{
-        CustomOp, Error, Gate, GeluApprox, Graph, KeyErrors, ParamId, ParamStore, Real, Reduction,
-        Rng, Tape, Tensor, TensorView, Var, gradcheck, gradcheck_params,
+        Conv2dGeom, CustomOp, Error, Gate, GeluApprox, Graph, KeyErrors, ParamId, ParamStore,
+        Pool2dGeom, Real, Reduction, Rng, Tape, Tensor, TensorView, Var, gradcheck,
+        gradcheck_params,
     };
     #[cfg(feature = "inspect")]
     pub use cavitation_inspect::{Inspector, InspectorConfig};
     #[cfg(feature = "ml")]
     pub use cavitation_ml::{LinearModel, LinearRegression, LogisticModel, LogisticRegression};
     pub use cavitation_nn::{
-        Activation, ActivationLayer, Adagrad, Adam, AdamW, BadInput, Batch, BatchView, Batcher,
-        Celu, Dataset, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Flow, Gelu, Glu,
-        GradStats, Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks,
-        InferenceModel, Init, Layer, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid,
-        LogSoftmax, Loss, LrSchedule, Mish, ModelHandle, NeuronMask, OnNonFinite, Optimizer,
+        Activation, ActivationLayer, Adagrad, Adam, AdamW, AdaptiveAvgPool2d, AvgPool2d, BadInput,
+        Batch, BatchNorm2d, BatchView, Batcher, Celu, Conv2d, Dataset, Dropout, Elu, EpochReport,
+        Evaluation, Evaluator, FitConfig, Flatten, Flow, Gelu, Glu, GradStats, Hardsigmoid,
+        Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks, Identity, InferenceModel, Init,
+        Layer, LayerEvent, LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss,
+        LrSchedule, MaxPool2d, Mish, ModelHandle, NeuronMask, OnNonFinite, Optimizer,
         OptimizerConfig, Prelu, Relu, Relu6, RmsProp, Selu, Sequential, Sgd, Sigmoid, Silu,
         Softmax, Softplus, Softsign, Standardizer, StepControl, StepInfo, StepInputs, StepLog,
         StepProfile, StepRecord, Tanh, Targets, TargetsView, TensorInfo, Trace, Trainer,
