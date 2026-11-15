@@ -4,6 +4,8 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.3.2 (2026-11-15)
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
@@ -18,6 +20,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Data, examples, guide and benchmark
 
 - Guide chapter "Measuring a classifier" and the `classification_metrics` example: the confusion matrix and classification report of a digits network, ROC AUC and average precision for "is it a 9?", and the always-"no" baseline whose accuracy is 87.5% and recall 0 (#237).
+- The regression chapter of the guide points to `RegressionMetrics` for errors in the targets' units (MAE, RMSE) beside R² (#237).
 
 ## v0.3.1 (2026-11-15)
 
