@@ -8,10 +8,14 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 - More backward passes write a value's first gradient contribution instead of zeroing its buffer and adding. `max_pool2d`'s backward pass zeroes each block of planes on the thread pool just before adding to it, instead of zeroing the whole input gradient in one pass first; on an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's two poolings take 5.9–6.5 ms of backward time per training step instead of 9.5–10.4 (three interleaved rounds of `cifar-cnn --profile 9`, machine under load). `mul`, a broadcast `add` or `sub`, and `keep_where` write their first contribution straight into the gradient buffer instead of through a scratch buffer and a copy. The results are unchanged, bit for bit (#248).
 
+## v0.3.2 (2026-11-15)
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
 - `Evaluator::confusion` and the free `confusion_matrix` give a model's `ConfusionMatrix` on class targets, its accuracy equal to `evaluate`'s, with all-NaN rows counted as unpredicted. `Evaluator::class_scores` gives each row's softmax probability of a class (or the output itself for a one-output model) for `roc_auc` and `average_precision`. `confusion_matrix` is in the prelude (#237).
+- `metrics::RegressionMetrics`: mean absolute error, mean squared error, RMSE and R² per output of `[rows, outputs]` values and averaged over the outputs, as scikit-learn's `raw_values` and `uniform_average` (R² of a constant target column, or of one row, 1 or 0, as `force_finite`; scikit-learn gives NaN for one row). `metrics::log_loss` (probabilities clipped at `f32::EPSILON`; rows that are not probabilities are refused) and `metrics::top_k_accuracy` (ties ranked by the higher class index, as scikit-learn). Checked against scikit-learn 1.9.1 fixtures (#237).
+- `Evaluator::regression`: a model's `RegressionMetrics` on value targets, its mean R² equal to `evaluate`'s (#237).
 
 ### Classic machine learning (`cavitation-ml`)
 
@@ -20,6 +24,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Data, examples, guide and benchmark
 
 - Guide chapter "Measuring a classifier" and the `classification_metrics` example: the confusion matrix and classification report of a digits network, ROC AUC and average precision for "is it a 9?", and the always-"no" baseline whose accuracy is 87.5% and recall 0 (#237).
+- The regression chapter of the guide points to `RegressionMetrics` for errors in the targets' units (MAE, RMSE) beside R² (#237).
 
 ## v0.3.1 (2026-11-15)
 
