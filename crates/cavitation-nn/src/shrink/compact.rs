@@ -48,6 +48,23 @@ use crate::{Layer, Linear, Prelu, Sequential};
 /// differ by at most twice the masked network's carried bound, with `k` its own summed
 /// lengths.
 ///
+/// # Image models
+///
+/// A model with a `Conv2d`, a `BatchNorm2d` or a pooling is compacted by channel instead:
+/// each output channel a channel mask switches off ([`Sequential::set_channel_mask`]) is
+/// removed from the conv's weight and bias, from every `BatchNorm2d` (γ, β, running mean
+/// and variance) and pooling in its run, and from the layer that receives it: the input
+/// channels of the next `Conv2d`, or the channel's block of inputs of the `Linear` after a
+/// `Flatten`. Every other `Conv2d`, `BatchNorm2d`, `Linear` and `Prelu` is copied into the
+/// new store. The compacted model's outputs match the masked model's within the rounding
+/// of the sums it shortens (a removed channel adds exact zeros, but a sum over fewer terms
+/// is blocked differently by the GEMM and the direct convolution). There it returns
+/// [`Error::Unsupported`], naming the layer, for a mask that is not a whole-channel mask at
+/// the end of a conv's run (a neuron mask on a `Linear` of the model, say), for a run with
+/// a layer other than batch norm, a pooling, an activation, a one-slope `Prelu`, `Flatten`,
+/// `Dropout` or `Identity`, for channels that reach a layer other than a `Conv2d` or a
+/// `Linear` (or the model's output), and for a layer with parameters it cannot rebuild.
+///
 /// All of this holds for finite weights: a masked neuron whose outgoing weight is infinite
 /// or NaN gives `0 · ∞ = NaN` in the masked network, while the compacted network drops that
 /// weight and gives a number.
@@ -56,8 +73,6 @@ use crate::{Layer, Linear, Prelu, Sequential};
 ///
 /// [`Error::Unsupported`], naming the layer and what to do instead, for:
 ///
-/// - an image layer (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or
-///   `AdaptiveAvgPool2d`): compaction works on the neurons of dense networks;
 /// - a mask with no `Linear` after it, so that its neurons are the model's outputs;
 /// - a mask whose off neurons pass an element-wise layer with `f(0) ≠ 0` on the way to the
 ///   next `Linear` (a mask on a `Linear` or a `Tanh` followed by a `Sigmoid`, say), so that
@@ -114,7 +129,9 @@ pub fn compact<T: Real>(
     model: &Sequential<T>,
     params: &ParamStore<T>,
 ) -> Result<(Sequential<T>, ParamStore<T>), Error> {
-    super::refuse_image_layers(model, "compact")?;
+    if has_image_layers(model) {
+        return super::compact_image::compact_image(model, params);
+    }
     check_parameters(model)?;
     let owners = run_owners(model);
     let masks = placed_masks(model, &owners)?;
@@ -143,6 +160,16 @@ pub fn compact<T: Real>(
         }
     }
     Ok((out, store))
+}
+
+/// Whether `model` has an image layer: a `Conv2d`, a `BatchNorm2d` or a pooling.
+fn has_image_layers<T: Real>(model: &Sequential<T>) -> bool {
+    (0..model.len()).any(|i| {
+        let layer = model.layer(i);
+        layer.as_conv2d().is_some()
+            || layer.as_batch_norm2d().is_some()
+            || super::POOL_NAMES.contains(&layer.name())
+    })
 }
 
 /// Refuses, naming it, a layer with parameters that is neither a `Linear` nor a `Prelu`.
@@ -394,7 +421,7 @@ fn zeros_through<T: Real>(layer: &dyn Layer<T>, params: &ParamStore<T>, width: u
 /// The `Linear` at layer `index` rebuilt in `store` from the rows `rows` (every row if
 /// `None`) and the columns `cols` (every column if `None`) of its weight in `params`, and
 /// the same rows of its bias; a `Linear` without a bias is rebuilt without one.
-fn rebuild_linear<T: Real>(
+pub(super) fn rebuild_linear<T: Real>(
     index: usize,
     linear: &Linear,
     params: &ParamStore<T>,
@@ -456,7 +483,7 @@ fn rebuild_linear<T: Real>(
 /// The `Prelu` rebuilt in `store` with its slopes from `params`: only the slopes of the
 /// neurons in `kept` when it has one slope per neuron and `kept` is given (the run was
 /// checked to have one slope per neuron then), every slope otherwise.
-fn rebuild_prelu<T: Real>(
+pub(super) fn rebuild_prelu<T: Real>(
     prelu: &Prelu,
     params: &ParamStore<T>,
     store: &mut ParamStore<T>,

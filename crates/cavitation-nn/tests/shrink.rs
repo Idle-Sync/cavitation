@@ -2910,9 +2910,11 @@ fn train_found_size_keeps_layers_without_a_bias() {
     }
 }
 
-/// Every shrink tool refuses a model with an image layer, before doing anything, with
-/// `Error::Unsupported` naming the layer: each of the five built-in image layers, at layer
-/// 1 behind a `Linear`, in a small network on 1 × 4 × 4 images.
+/// Every neuron shrink tool but `compact` refuses a model with an image layer, before doing
+/// anything, with `Error::Unsupported` naming the layer: each of the five built-in image
+/// layers, at layer 1 behind a `Linear`, in a small network on 1 × 4 × 4 images. `compact`
+/// copies such a model with no mask, and refuses a neuron mask in it: it removes only
+/// channels from image models.
 #[test]
 fn image_layers_are_refused() {
     use cavitation_core::{Conv2dGeom, Pool2dGeom};
@@ -2966,7 +2968,14 @@ fn image_layers_are_refused() {
             "ablate",
             ablate(&net, &params, &data, &[2], Loss::CrossEntropy, 4).map(drop),
         );
-        refused("compact", compact(&net, &params).map(drop));
+        let (copy, _) = compact(&net, &params).unwrap();
+        assert_eq!(copy.len(), net.len(), "{name}");
+        let mut masked = net.clone();
+        masked.set_neuron_mask(2, NeuronMask::from_off(6, &[1]));
+        match compact(&masked, &params).map(drop) {
+            Err(Error::Unsupported(m)) => assert!(m.contains("not a whole-channel mask"), "{m}"),
+            other => panic!("compact on {name} with a neuron mask: {other:?}"),
+        }
         refused(
             "train_found_size",
             train_found_size(&net, &params, &data, &data, FromScratch::default()).map(drop),

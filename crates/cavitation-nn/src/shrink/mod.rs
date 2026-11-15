@@ -24,6 +24,7 @@
 mod ablate;
 mod activity;
 mod compact;
+mod compact_image;
 mod prune;
 mod scratch;
 
