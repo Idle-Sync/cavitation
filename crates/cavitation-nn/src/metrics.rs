@@ -47,7 +47,11 @@ use cavitation_core::Error;
 /// // Weighted: by each class's rows, 3 · 1.0 and 1 · 0.5 over 4.
 /// assert_eq!(m.precision_average(Average::Weighted), 0.875);
 /// ```
+///
+/// The enum is `#[non_exhaustive]`: scikit-learn has more averages (`binary`, `samples`), so
+/// a `match` on it outside this crate needs a wildcard arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Average {
     /// The plain mean of the classes' rates: every class counts the same, however rare.
     Macro,
@@ -550,11 +554,16 @@ fn check_beta(beta: f64) -> f64 {
 
 /// An error unless the targets and the predictions have the same length.
 fn check_lengths(targets: usize, predicted: usize) -> Result<(), Error> {
-    if targets == predicted {
+    check_pair(targets, "targets", predicted, "predictions")
+}
+
+/// An error unless `a` and `b`, named `a_name` and `b_name`, are equal.
+fn check_pair(a: usize, a_name: &str, b: usize, b_name: &str) -> Result<(), Error> {
+    if a == b {
         Ok(())
     } else {
         Err(Error::InvalidData(format!(
-            "metrics: {targets} targets but {predicted} predictions"
+            "metrics: {a} {a_name} but {b} {b_name}"
         )))
     }
 }
@@ -571,7 +580,7 @@ type Curve = (Vec<(u64, u64)>, u64, u64);
 ///
 /// As [`roc_auc`].
 fn curve(scores: &[f32], positive: &[bool]) -> Result<Curve, Error> {
-    check_lengths(positive.len(), scores.len())?;
+    check_pair(positive.len(), "labels", scores.len(), "scores")?;
     if let Some(i) = scores.iter().position(|s| s.is_nan()) {
         return Err(Error::InvalidData(format!("metrics: score {i} is NaN")));
     }
@@ -598,7 +607,8 @@ fn curve(scores: &[f32], positive: &[bool]) -> Result<Curve, Error> {
 /// The area under the ROC curve of a binary classifier's `scores` (higher meaning more
 /// likely positive) against which rows are `positive`, as scikit-learn's `roc_auc_score`:
 /// the trapezoid area under true positive rate against false positive rate, tied scores
-/// moving together. 0.5 is no better than chance, 1 a perfect ranking.
+/// moving together. 0.5 is no better than chance, 1 a perfect ranking. An infinite score
+/// ranks above (or below) every finite one; scikit-learn refuses infinite scores.
 ///
 /// # Errors
 ///
@@ -632,11 +642,13 @@ pub fn roc_auc(scores: &[f32], positive: &[bool]) -> Result<f64, Error> {
 /// `positive`, as scikit-learn's `average_precision_score`: the precision at each distinct
 /// score threshold, from the highest down, weighted by how much recall rose there,
 /// `Σ (Rₙ − Rₙ₋₁) · Pₙ`. It summarises the precision-recall curve without interpolating.
+/// Infinite scores rank as in [`roc_auc`].
 ///
 /// # Errors
 ///
-/// [`Error::InvalidData`] if the lengths differ, a score is NaN, or no row is positive
-/// (recall is then undefined).
+/// [`Error::InvalidData`] if the lengths differ, a score is NaN, or no row is positive.
+/// Recall is then undefined; scikit-learn warns and returns 0 there, which a caller could
+/// mistake for a real score, so this refuses instead.
 ///
 /// ```
 /// use cavitation_nn::metrics::average_precision;
@@ -746,6 +758,9 @@ mod tests {
             0.0
         );
         assert_eq!(roc_auc(&[-0.0, 0.0], &[true, false]).unwrap(), 0.5);
+        let inf = [f32::INFINITY, 0.0, f32::NEG_INFINITY];
+        assert_eq!(roc_auc(&inf, &[true, false, false]).unwrap(), 1.0);
+        assert_eq!(average_precision(&inf, &[false, true, false]).unwrap(), 0.5);
     }
 
     /// A negative or non-finite beta is refused.
