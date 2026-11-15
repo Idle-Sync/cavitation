@@ -246,3 +246,92 @@ fn short_buffers_are_refused() {
         assert!(result.is_err());
     });
 }
+
+/// The `dims` of one packed product with the same `m`, `n`, `k`, transposes and β.
+fn packed(d: &GemmDims) -> GemmDims {
+    GemmDims {
+        trans_a: d.trans_a,
+        trans_b: d.trans_b,
+        beta: d.beta,
+        ..GemmDims::new(d.m, d.n, d.k)
+    }
+}
+
+/// A batch of three products on strided sub-matrices: leading dimensions wider than the
+/// rows, offsets, per-product strides (B shared by every product in one case), β = 1, in all
+/// four transpose combinations. On exact values the whole of C's buffer must equal the CPU's:
+/// the products' outputs, and every element between them left as it was.
+#[test]
+fn strided_batched_products_are_exact() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 22);
+        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let (m, n, k) = (37u32, 29u32, 45u32);
+        for (t, (trans_a, trans_b)) in [(false, false), (false, true), (true, false), (true, true)]
+            .into_iter()
+            .enumerate()
+        {
+            let (a_rows, a_cols) = if trans_a { (k, m) } else { (m, k) };
+            let (b_rows, b_cols) = if trans_b { (n, k) } else { (k, n) };
+            let (lda, ldb, ldc) = (a_cols + 7, b_cols + 3, n + 5);
+            let dims = GemmDims {
+                trans_a,
+                trans_b,
+                beta: 1.0,
+                lda,
+                ldb,
+                ldc,
+                batch: 3,
+                a_offset: 11,
+                b_offset: 13,
+                c_offset: 17,
+                a_batch: a_rows * lda + 2,
+                // The first two cases share one B; the others give each product its own.
+                b_batch: if t < 2 { 0 } else { b_rows * ldb + 6 },
+                c_batch: m * ldc + 9,
+                ..GemmDims::new(m, n, k)
+            };
+            let a = exact_values(300 + t as u64, dims.a_extent() as usize);
+            let b = exact_values(400 + t as u64, dims.b_extent() as usize);
+            let c = exact_values(500 + t as u64, dims.c_extent() as usize + 23);
+            let mut want = c.clone();
+            for z in 0..dims.batch as usize {
+                let a0 = dims.a_offset as usize + z * dims.a_batch as usize;
+                let b0 = dims.b_offset as usize + z * dims.b_batch as usize;
+                let c0 = dims.c_offset as usize + z * dims.c_batch as usize;
+                let az: Vec<f32> = (0..a_rows as usize)
+                    .flat_map(|r| a[a0 + r * lda as usize..][..a_cols as usize].to_vec())
+                    .collect();
+                let bz: Vec<f32> = (0..b_rows as usize)
+                    .flat_map(|r| b[b0 + r * ldb as usize..][..b_cols as usize].to_vec())
+                    .collect();
+                let cz: Vec<f32> = (0..m as usize)
+                    .flat_map(|r| c[c0 + r * ldc as usize..][..n as usize].to_vec())
+                    .collect();
+                let (value, _) = reference(&az, &bz, &cz, &packed(&dims));
+                for r in 0..m as usize {
+                    for col in 0..n as usize {
+                        want[c0 + r * ldc as usize + col] = value[r * n as usize + col] as f32;
+                    }
+                }
+            }
+            let got = run(&mut kit, &gemm, dims, &a, &b, &c);
+            assert_exact(&got, &want, &format!("strided batch {dims:?}"));
+        }
+    });
+}
+
+/// Writing C into the buffer A or B is read from is refused when the product is prepared.
+#[test]
+fn aliasing_is_refused() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 16);
+        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let dims = GemmDims::new(8, 8, 8);
+        let (a, b) = (kit.zeros(64), kit.zeros(64));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gemm.call(&mut kit.steps, &mut kit.pool, dims, &a, &b, &a)
+        }));
+        assert!(result.is_err());
+    });
+}
