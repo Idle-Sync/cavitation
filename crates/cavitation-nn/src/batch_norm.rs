@@ -144,6 +144,11 @@ impl BatchNorm2d {
         })
     }
 
+    /// Values per channel of each image.
+    pub(crate) fn spatial(&self) -> usize {
+        self.spatial
+    }
+
     /// The number of channels.
     ///
     /// ```
