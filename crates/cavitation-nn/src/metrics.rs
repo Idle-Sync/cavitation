@@ -684,7 +684,8 @@ pub fn average_precision(scores: &[f32], positive: &[bool]) -> Result<f64, Error
 /// `uniform_average`, the mean over the outputs. Sums run in f64.
 ///
 /// R² of an output whose targets are all equal is 1 if every prediction is exact and 0
-/// otherwise, as scikit-learn's `force_finite=True`.
+/// otherwise, as scikit-learn's `force_finite=True`. One row is such a case here too, where
+/// scikit-learn warns that R² is not defined and returns NaN.
 ///
 /// ```
 /// use cavitation_nn::metrics::RegressionMetrics;
@@ -747,7 +748,9 @@ impl RegressionMetrics {
                 ("prediction", i - targets.len())
             };
             return Err(Error::InvalidData(format!(
-                "regression metrics: {what} {at} is not finite"
+                "regression metrics: the {what} of row {}, output {}, is not finite",
+                at / outputs,
+                at % outputs
             )));
         }
         let rows = targets.len() / outputs;
@@ -962,7 +965,9 @@ pub fn log_loss(probabilities: &[f32], classes: usize, labels: &[usize]) -> Resu
 /// The share of rows whose label is among the `k` highest of their `scores` (`[rows,
 /// classes]` row-major), as scikit-learn's `top_k_accuracy_score` with `labels =
 /// 0..classes`: among equal scores, the higher class index ranks first. `k = 1` is plain
-/// accuracy of the largest score, with that tie rule.
+/// accuracy of the largest score, with that tie rule, and a `k` of `classes` or more scores
+/// 1 (scikit-learn warns there). With 2 classes this ranks the two columns; scikit-learn's
+/// two-class path instead thresholds one score column, so the two agree from 3 classes on.
 ///
 /// # Errors
 ///
@@ -1139,7 +1144,15 @@ mod tests {
         assert_eq!((exact.r2(0), missed.r2(0)), (1.0, 0.0));
         assert!(RegressionMetrics::new(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], 2).is_err());
         assert!(RegressionMetrics::new(&[], &[], 1).is_err());
-        assert!(RegressionMetrics::new(&[1.0], &[f32::INFINITY], 1).is_err());
+        let e = RegressionMetrics::new(&[1.0, 2.0], &[1.0, f32::INFINITY], 1).unwrap_err();
+        assert!(
+            e.to_string().contains("prediction of row 1, output 0"),
+            "{e}"
+        );
+        // One row: the constant-column rule (scikit-learn returns NaN).
+        let one = RegressionMetrics::new(&[2.0], &[3.0], 1).unwrap();
+        assert_eq!(one.r2(0), 0.0);
+        assert_eq!(top_k_accuracy(&[0.1, 0.9, 0.5], 3, &[0], 3).unwrap(), 1.0);
     }
 
     /// A negative or non-finite beta is refused.
