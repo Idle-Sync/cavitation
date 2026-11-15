@@ -74,6 +74,7 @@ mod io;
 mod layer;
 mod linear;
 mod mask;
+pub mod metrics;
 mod optim;
 mod pooling;
 mod sequential;

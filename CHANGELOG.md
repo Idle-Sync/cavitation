@@ -10,6 +10,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `max_pool2d` and its backward pass run blocks of planes in parallel, and the forward pass reads only each window's taps inside the image, with a dedicated loop for 2 × 2 windows with stride 2. On an Intel Celeron N5105 at 4 threads, the forward passes of the `cifar-cnn` network's two poolings take 7 ms per training step instead of 70. The results are unchanged, bit for bit; the old loops are kept as `kernels::pooling::max_pool2d_reference`, and `kernels::pooling::planes_per_task` gives the block size (#201).
 - `batch_norm2d` and its backward pass run one task per channel on the thread pool. Each channel's sums keep their order, so the results are unchanged, bit for bit. On an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's four batch norms take 46 ms per training step instead of 74 (#201).
 
+### Layers, training and inference (`cavitation-nn`)
+
+- `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).
+
 ### Data, examples, guide and benchmark
 
 - `BENCHMARKS.md`: `mnist-cnn` and `cifar-cnn` results against PyTorch on an Intel Celeron N5105, an AMD Ryzen 7 2700X and an Apple M4, with accuracy and epoch time per seed.
