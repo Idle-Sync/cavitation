@@ -1,6 +1,7 @@
-// Dropout with a bit-packed mask, forward and backward alike: out = a · scale where bit i
-// (bit i % 32 of word i / 32) of the mask is set, 0 where it is clear. scale is 1 / (1 − p),
-// rounded in f32 on the host. The bindings match the element-wise kernels' layout, with the
+// Dropout with a bit-packed mask, forward and backward alike: out = a · m with m = scale where
+// bit i (bit i % 32 of word i / 32) of the mask is set and 0 where it is clear, as the CPU
+// computes it (so a dropped −3 is −0 and a dropped NaN stays NaN). scale is 1 / f32(1 − p), as
+// the CPU rounds it. The bindings match the element-wise kernels' layout, with the
 // mask in place of b.
 
 struct Params {
@@ -20,5 +21,5 @@ fn dropout(@builtin(workgroup_id) w: vec3<u32>, @builtin(num_workgroups) g: vec3
     let i = (w.x + w.y * g.x) * 256u + l;
     if (i >= params.n) { return; }
     let keep = ((mask[i / 32u] >> (i % 32u)) & 1u) != 0u;
-    out[i] = select(0.0, a[i] * params.scale, keep);
+    out[i] = a[i] * select(0.0, params.scale, keep);
 }

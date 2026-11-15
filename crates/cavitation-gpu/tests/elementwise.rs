@@ -96,11 +96,15 @@ fn one_rounding_operations_give_the_cpus_bits() {
         let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
         let mut a = exact_values(1, n);
         let mut b = exact_values(2, n);
-        a[..SPECIAL.len()].copy_from_slice(&SPECIAL);
-        b[SPECIAL.len()..2 * SPECIAL.len()].copy_from_slice(&SPECIAL);
-        for (i, &s) in SPECIAL.iter().enumerate() {
-            b[i] = [2.0, -1.0][i % 2];
-            a[SPECIAL.len() + i] = s;
+        // Every pair of special values, then each special against an ordinary value.
+        let k = SPECIAL.len();
+        for (i, &x) in SPECIAL.iter().enumerate() {
+            for (j, &y) in SPECIAL.iter().enumerate() {
+                a[i * k + j] = x;
+                b[i * k + j] = y;
+            }
+            a[k * k + i] = x;
+            b[k * k + i] = [2.0, -1.0][i % 2];
         }
         let alpha = 0.25f32;
         let cases: [(Elementwise, CpuTwin); 7] = [
@@ -138,19 +142,23 @@ fn one_rounding_operations_give_the_cpus_bits() {
     });
 }
 
-/// Dropout keeps exactly the elements whose mask bits are set, scaled by the f32 `1/(1 − p)`
-/// in one rounding, and zeroes the rest.
+/// Dropout multiplies each element by `1/f32(1 − p)` where its mask bit is set and by 0 where it
+/// is clear, as the CPU does: a dropped −3 is −0, a dropped NaN or infinity is NaN.
 #[test]
 fn dropout_follows_its_mask() {
     for_each_gpu(|gpu| {
         let n = 100_003;
         let mut kit = Kit::new(gpu, 4 * n as u64);
         let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
-        let x = seeded_values(3, n, -4.0, 4.0);
+        let mut x = seeded_values(3, n, -4.0, 4.0);
+        x[..SPECIAL.len()].copy_from_slice(&SPECIAL);
+        x[SPECIAL.len()] = -3.0;
         let mut rng = common::Seeded::new(4);
         let words: Vec<u32> = (0..n.div_ceil(32)).map(|_| rng.next_u64() as u32).collect();
         let mask_as_f32: Vec<f32> = words.iter().map(|w| f32::from_bits(*w)).collect();
-        let scale = (1.0f64 / (1.0 - 0.3)) as f32;
+        // The CPU's scale: 1 / f32(1 − p), which differs from f32(1 / (1 − p)) for some p.
+        let p = 0.025f32;
+        let scale = 1.0 / (1.0 - p);
         // The mask goes up as raw words: Kit::upload copies the bytes unchanged.
         let got = run(
             &mut kit,
@@ -163,13 +171,15 @@ fn dropout_follows_its_mask() {
         );
         let want: Vec<f32> = (0..n)
             .map(|i| {
-                if (words[i / 32] >> (i % 32)) & 1 == 1 {
-                    x[i] * scale
+                x[i] * if (words[i / 32] >> (i % 32)) & 1 == 1 {
+                    scale
                 } else {
                     0.0
                 }
             })
             .collect();
+        // The specials meet both a kept and a dropped bit somewhere in the first words.
+        assert!(want[..SPECIAL.len() + 1].iter().any(|v| v.is_nan()));
         assert_exact(&got, &want, "dropout");
     });
 }
@@ -203,6 +213,13 @@ fn tape_reference(
 fn sweep(seed: u64) -> Vec<f32> {
     let mut v: Vec<f32> = (-640..=640).map(|i| i as f32 / 64.0).collect();
     v.extend(seeded_values(seed, 50_000, -8.0, 8.0));
+    // The tails and the exponential's clamp: where tanh and GELU saturate, and where the
+    // sigmoid's e^-|x| reaches the subnormal range and the clamp at -104. The tails stop at
+    // ±1e12, where x³ still fits in f32: beyond, GELU's f32 formulas overflow to NaN on the CPU
+    // and the GPU alike, where the f64 reference stays finite.
+    v.extend([
+        -1e12, -50.0, -20.0, 20.0, 50.0, 1e12, -87.0, -90.0, -104.0, -110.0, 87.0, 104.0,
+    ]);
     v
 }
 
@@ -284,18 +301,43 @@ fn gelu_twins() {
             let (want, grad) = tape_reference(&x, &g, |t, v| t.gelu(v, approx));
             // The size of the terms: 0.5·|x|·(1 + |inner|) forward, and for the derivative
             // its two terms plus the inner slope times |x|, each bounded loosely by |x| + 1.
+            // The size of the terms: |x| for the product and the inner function's error scaled
+            // by its slope, |x| · |u| · s(u) with s = sech²(u) (tanh form) or the Gaussian
+            // e^(-u²) (erf form), which vanish in the tails; the backward pass adds the
+            // derivative's terms on the same pattern.
+            let inner = |v: f64| -> (f64, f64) {
+                match approx {
+                    GeluApprox::Tanh => {
+                        let u = 0.797_884_560_802_865_4 * (v + 0.044715 * v.powi(3));
+                        (u, 1.0 / u.cosh().powi(2))
+                    }
+                    _ => {
+                        let u = v / std::f64::consts::SQRT_2;
+                        (u, (-u * u).exp())
+                    }
+                }
+            };
             let size_f: Vec<f64> = x
                 .iter()
-                .map(|&v| 0.5 * f64::from(v).abs() * 2.0 + f64::from(v).powi(2))
+                .map(|&v| {
+                    let v = f64::from(v);
+                    let (u, s) = inner(v);
+                    v.abs() + v.abs() * u.abs().max(1.0) * s
+                })
                 .collect();
             let size_b: Vec<f64> = x
                 .iter()
                 .zip(&g)
                 .map(|(&v, &gv)| {
-                    f64::from(gv).abs()
-                        * (1.0
-                            + 2.0 * f64::from(v).abs()
-                            + f64::from(v).powi(2) * (1.0 + 0.2 * f64::from(v).powi(2)))
+                    let v = f64::from(v);
+                    let (u, s) = inner(v);
+                    // tanh's absolute error (a few u, |t| <= 1) reaches the derivative through
+                    // 0.5·(1 + t) and 0.5·x·(1 − t²)·du, even where t has saturated to ±1.
+                    let du = match approx {
+                        GeluApprox::Tanh => 0.797_884_560_802_865_4 * (1.0 + 0.134_145 * v * v),
+                        _ => 0.0,
+                    };
+                    f64::from(gv).abs() * (1.0 + v.abs() * du + (1.0 + v * v) * (1.0 + u * u) * s)
                 })
                 .collect();
             let y = run(&mut kit, &kernels, forward, &x, None, 0.0, 0.0);

@@ -71,7 +71,8 @@ pub enum Elementwise {
     GeluErf,
     /// `b` times `Φ(a) + a · φ(a)`, the derivative of GELU's erf form at the input `a`.
     GeluErfBackward,
-    /// `a · scale` where the mask in `b` has the element's bit set, 0 where it is clear:
+    /// `a · m`, `m` = `scale` where the mask in `b` has the element's bit set and 0 where it is
+    /// clear (so a dropped −3 is −0 and a dropped NaN stays NaN):
     /// dropout forward, and its backward pass on the gradient with the same mask.
     Dropout,
 }
@@ -243,13 +244,15 @@ impl ElementwiseKernels {
 
     /// Prepares `op` over `n` elements of `a` (and `b`, when [`Elementwise::takes_b`])
     /// into `out`, with `alpha` (for [`Elementwise::Scale`] and the leaky ReLUs) and `scale`
-    /// (for [`Elementwise::Dropout`], `1 / (1 − p)` rounded in f32): its uniform, taken from
+    /// (for [`Elementwise::Dropout`], `1 / f32(1 − p)` as the CPU rounds it): its uniform, taken from
     /// `pool` and uploaded in a step of its own, and its bind group. Made once, when a model
-    /// is compiled. An operation that does not read `b` binds `a` in its place.
+    /// is compiled. An operation that does not read `b` binds `a` in its place. `out` must be
+    /// a different buffer from `a` and `b`: wgpu does not let one buffer be read and written in
+    /// one dispatch.
     ///
     /// # Panics
     ///
-    /// If `n` is 0; if `a` or `out` holds fewer than `n` f32s, or `b` fewer than `n` (or, as a
+    /// If `n` is 0; if `out` is `a` or `b`; if `a` or `out` holds fewer than `n` f32s, or `b` fewer than `n` (or, as a
     /// mask, fewer than `ceil(n / 32)` words); or if `op` takes `b` and none is given.
     ///
     /// # Examples
@@ -295,6 +298,14 @@ impl ElementwiseKernels {
         } else {
             a
         };
+        assert!(
+            out.buffer() != a.buffer() && out.buffer() != b.buffer(),
+            "{op:?} cannot write to a buffer it reads: give out its own buffer"
+        );
+        let pipeline = Elementwise::ALL
+            .iter()
+            .position(|&o| o == op)
+            .expect("every operation has a pipeline");
         let params = pool.take(
             PARAMS_BYTES,
             wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -330,6 +341,7 @@ impl ElementwiseKernels {
         });
         ElementwiseCall {
             op,
+            pipeline,
             n,
             params,
             group,
@@ -343,12 +355,8 @@ impl ElementwiseKernels {
     ///
     /// See [`ElementwiseKernels`].
     pub fn record(&self, step: &mut Step<'_>, call: &ElementwiseCall) {
-        let index = Elementwise::ALL
-            .iter()
-            .position(|&op| op == call.op)
-            .expect("every operation has a pipeline");
         step.dispatch_split(
-            &self.pipelines[index],
+            &self.pipelines[call.pipeline],
             &call.group,
             call.n.div_ceil(WORKGROUP),
         );
@@ -365,6 +373,8 @@ impl ElementwiseKernels {
 pub struct ElementwiseCall {
     /// The operation.
     op: Elementwise,
+    /// Its pipeline's index in [`ElementwiseKernels`]'s list.
+    pipeline: usize,
     /// The number of elements.
     n: u32,
     /// The `Params` uniform, from the pool.

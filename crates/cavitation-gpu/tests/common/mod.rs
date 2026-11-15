@@ -99,15 +99,16 @@ pub fn gemm_bound(k: usize, abs_products: f64) -> f64 {
     sum_bound(k, abs_products)
 }
 
-/// Asserts that `got` equals `want` bit for bit, after flushing `want`'s subnormals (a NaN
-/// matches any NaN); on failure, names `what`, the number of mismatches and the first few
+/// Asserts that `got` equals `want` bit for bit, or `want` with its subnormals flushed to zero
+/// (GPUs that flush and GPUs that keep subnormals both pass; a NaN matches any NaN); on failure, names `what`, the number of mismatches and the first few
 /// with both values and their bits.
 pub fn assert_exact(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: lengths differ");
     let mut mismatches = Vec::new();
     for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
-        let w = flush(w);
-        let same = g.to_bits() == w.to_bits() || (g.is_nan() && w.is_nan());
+        let same = g.to_bits() == w.to_bits()
+            || g.to_bits() == flush(w).to_bits()
+            || (g.is_nan() && w.is_nan());
         if !same {
             mismatches.push(i);
         }
