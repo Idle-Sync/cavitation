@@ -102,6 +102,11 @@ impl<T: Real> Layer<T> for Dropout {
     fn inference(&self, _params: &ParamValues<f32>) -> Option<InferenceLayer> {
         Some(InferenceLayer::Identity)
     }
+
+    /// The drop probability `p`.
+    fn dropout_form(&self, _: crate::layer::private::Token) -> Option<f64> {
+        Some(self.p)
+    }
 }
 
 /// Defines a layer that passes its input through unchanged, named `$text`.
@@ -218,6 +223,61 @@ mod tests {
         let (a, b) = masks(0);
         assert_ne!(a, b);
         assert_eq!(masks(3), (a, b));
+    }
+
+    /// `Dropout` answers `dropout_form` with its probability and each other built-in layer
+    /// listed here with `None`, so a device executor finds the dropout layers among those
+    /// that compile to `Identity` for inference, as `Flatten` and `Identity` also do.
+    #[test]
+    fn only_dropout_answers_dropout_form() {
+        use crate::layer::private::Token;
+        use crate::*;
+        use cavitation_core::{Conv2dGeom, Gate, Pool2dGeom};
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let pool = Pool2dGeom::new(2, (4, 4), (2, 2)).unwrap();
+        let conv = Conv2dGeom::new(2, 2, (4, 4), (3, 3)).unwrap();
+        let others: Vec<Box<dyn Layer<f32>>> = vec![
+            Box::new(Linear::new(&mut params, 3, 2, &mut rng)),
+            Box::new(Conv2d::new(&mut params, conv, &mut rng)),
+            Box::new(BatchNorm2d::new(&mut params, 2, (4, 4))),
+            Box::new(MaxPool2d::new(pool)),
+            Box::new(AvgPool2d::new(pool)),
+            Box::new(AdaptiveAvgPool2d::new(2, (4, 4), (2, 2)).unwrap()),
+            Box::new(Prelu::new(&mut params, 2)),
+            Box::new(Glu {
+                gate: Gate::Sigmoid,
+            }),
+            Box::new(Softmax),
+            Box::new(LogSoftmax),
+            Box::new(ActivationLayer::new(Relu)),
+            Box::new(Relu),
+            Box::new(Relu6),
+            Box::new(LeakyRelu::default()),
+            Box::new(Elu::default()),
+            Box::new(Celu::default()),
+            Box::new(Selu),
+            Box::new(Gelu::default()),
+            Box::new(Silu),
+            Box::new(Mish),
+            Box::new(Softplus::default()),
+            Box::new(Softsign),
+            Box::new(Hardtanh::default()),
+            Box::new(Hardsigmoid),
+            Box::new(Hardswish),
+            Box::new(LogSigmoid),
+            Box::new(Tanh),
+            Box::new(Sigmoid),
+            Box::new(Flatten),
+            Box::new(Identity),
+        ];
+        for layer in &others {
+            assert_eq!(layer.dropout_form(Token(())), None, "{}", layer.name());
+        }
+        for p in [0.0, 0.2, 0.5] {
+            let d: Box<dyn Layer<f32>> = Box::new(Dropout::new(p).unwrap());
+            assert_eq!(d.dropout_form(Token(())), Some(p));
+        }
     }
 
     /// Dropout, Flatten and Identity compile to steps that change nothing: a network with
