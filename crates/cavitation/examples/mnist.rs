@@ -86,6 +86,7 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Box<dyn std::error::Error>
             },
         )),
         validation: None,
+        early_stopping: None,
     };
     fit(&net, &mut params, train, config)?;
     let acc = accuracy(&net, &params, test, 256);

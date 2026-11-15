@@ -1006,6 +1006,7 @@ impl Run<'_, '_, '_> {
             health: Health::quiet(),
             on_epoch: None,
             validation: None,
+            early_stopping: None,
         };
         fit(self.model, self.params, self.train, config).map(|_| ())
     }

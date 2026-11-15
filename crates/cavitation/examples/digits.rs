@@ -62,6 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )),
         validation: None,
+        early_stopping: None,
     };
     fit(&net, &mut params, &train, config)?;
 

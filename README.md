@@ -56,7 +56,7 @@ With either feature on, `cavitation::prelude` also has its main types: `LinearRe
 
 Each level is built from the one below it, so you can start with `fit` and open it up as far as you want.
 
-**1. `fit`.** Give it a network, its parameters, a dataset and a configuration. It shuffles, batches, trains and checks the run's health.
+**1. `fit`.** Give it a network, its parameters, a dataset and a configuration. It shuffles, batches, trains and checks the run's health. With a validation set it can also stop once a measure stops improving and end with the best epoch's weights (`FitConfig::early_stopping`), and lower the learning rate when the measure stalls (`LrSchedule::ReduceOnPlateau`, PyTorch's `ReduceLROnPlateau`).
 
 ```rust
 use cavitation::prelude::*;

@@ -67,7 +67,7 @@ pub struct GradientConfig<'s> {
     /// objective.
     pub optimizer: OptimizerConfig,
     /// How the learning rate changes from step to step or epoch to epoch, with the
-    /// optimiser's rate as its peak.
+    /// optimiser's rate as its peak. [`LrSchedule::ReduceOnPlateau`] is not supported here.
     pub schedule: LrSchedule,
     /// The seed that shuffles the rows each epoch; `None` keeps the data's order. With a
     /// full batch, shuffling changes only the order of the sums.
@@ -302,8 +302,9 @@ pub(crate) struct Setup {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidData`] if `config.batch` is 0; the health checks' errors, such as
-/// [`Error::NonFinite`], during training.
+/// [`Error::InvalidData`] if `config.batch` is 0; [`Error::Unsupported`] for
+/// [`LrSchedule::ReduceOnPlateau`], which needs per-epoch measures this loop does not
+/// make; the health checks' errors, such as [`Error::NonFinite`], during training.
 pub(crate) fn train(
     data: &Dataset,
     config: GradientConfig,
@@ -312,6 +313,11 @@ pub(crate) fn train(
     if config.batch == 0 {
         return Err(Error::InvalidData(
             "GradientConfig: the batch size must be at least 1".to_string(),
+        ));
+    }
+    if matches!(config.schedule, LrSchedule::ReduceOnPlateau { .. }) {
+        return Err(Error::Unsupported(
+            "GradientConfig: LrSchedule::ReduceOnPlateau needs cavitation_nn::fit".to_string(),
         ));
     }
     let rows = data.len();
@@ -343,6 +349,7 @@ pub(crate) fn train(
     let mut batch = Batch::new(data, size);
     let mut history = History {
         epochs: Vec::with_capacity(config.epochs.min(1024)),
+        ..History::default()
     };
     let initial_lr = optimizer.learning_rate();
     let steps_per_epoch = batcher.batches().count();
@@ -594,7 +601,8 @@ mod tests {
         }
     }
 
-    /// A zero batch, class targets and a negative `alpha` are `InvalidData`.
+    /// A zero batch, class targets and a negative `alpha` are `InvalidData`; the plateau
+    /// schedule is `Unsupported`.
     #[test]
     fn bad_settings_are_errors() {
         let d = data(10);
@@ -606,6 +614,14 @@ mod tests {
             .fit_gradient(&d, zero)
             .unwrap_err();
         assert!(err.to_string().contains("batch size"), "{err}");
+        let plateau = GradientConfig {
+            schedule: LrSchedule::reduce_on_plateau(cavitation_nn::Monitor::TrainingLoss),
+            ..quiet()
+        };
+        let err = LinearRegression::default()
+            .fit_gradient(&d, plateau)
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
         let classes = Dataset {
             x: d.x.clone(),
             targets: Targets::Classes(vec![0; 10]),
