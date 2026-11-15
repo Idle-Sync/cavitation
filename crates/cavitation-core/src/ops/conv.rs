@@ -220,9 +220,17 @@ mod tests {
             (1, 2, (3, 3), (2, 2), (1, 1), (3, 2), (1, 1)),
             // Stride and dilation above 1 on the same axis.
             (2, 2, (9, 8), (3, 2), (2, 2), (1, 1), (2, 3)),
-            // 288 · 1,024 column values per image: 7 images per chunk, so the 9 images of a
-            // `conv2d_matches_direct_loops` batch span two chunks, the second short.
+            // 288 · 1,024 column values per image, more than `COLUMN_BUDGET`: each image in
+            // bands of 11 output rows, the last of 10.
             (32, 2, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)),
+            // 144 · 45 column values per output row: bands of 18 and 17 rows, with stride,
+            // padding and dilation on both axes, so windows near a band's edge read rows
+            // the next band reads too.
+            (16, 2, (70, 90), (3, 3), (2, 2), (2, 1), (2, 1)),
+            // 72 · 330 column values per image: 5 whole images per chunk. In a batch of 96
+            // each of the 16 groups holds 6 images, so a group is a chunk of 5 and a chunk
+            // of 1.
+            (8, 3, (20, 33), (3, 3), (2, 1), (1, 1), (1, 1)),
         ];
         cases
             .into_iter()
@@ -239,13 +247,15 @@ mod tests {
         (0..n).map(|_| rng.range(-1.0, 1.0)).collect()
     }
 
-    /// In f64 the tape's output and gradients match the direct loops within rounding, on
-    /// every geometry, with and without a bias.
+    /// In f64 the tape's output and gradients match the direct loops within rounding
+    /// (1e-12 of each value's size, plus 1e-12), on every geometry, with and without a bias.
     #[test]
     fn conv2d_matches_direct_loops() {
         for (k, g) in geometries().iter().enumerate() {
             for with_bias in [true, false] {
-                let batch = if images_per_chunk(g, 9) < 9 { 9 } else { 3 };
+                // 96 images (16 groups of 6) where a chunk can hold several whole images, so
+                // chunks of several images and short last chunks run; else 9.
+                let batch = if images_per_chunk(g, 96) > 1 { 96 } else { 9 };
                 let x = values(batch * g.in_width(), k as u64);
                 let wv = values(g.weight_len(), 10 + k as u64);
                 let bv = values(g.out_channels(), 20 + k as u64);
@@ -281,7 +291,9 @@ mod tests {
                 let close = |a: &[f64], b: &[f64], what: &str| {
                     for (i, (p, q)) in a.iter().zip(b).enumerate() {
                         assert!(
-                            (p - q).abs() < 1e-12,
+                            // Relative to the value: a weight gradient of the 96-image
+                            // batch sums tens of thousands of products.
+                            (p - q).abs() < 1e-12 * (1.0 + q.abs()),
                             "geometry {k} {what}[{i}]: {p} against {q}"
                         );
                     }

@@ -4,8 +4,11 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.3.1 (2026-11-15)
+
 ### Tensors and autograd (`cavitation-core`)
 
+- Convolutions keep each thread's column matrix within 512 KB (`kernels::conv::COLUMN_BUDGET`, was 2 MB), so four threads' columns fit in the caches the cores share on a small CPU. An image whose columns are larger is unrolled in bands of output rows (`kernels::conv::rows_per_chunk`), forward and backward. On an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's four convolutions take 529–539 ms per training step instead of 586–652, and the whole step about 671 ms instead of 726–784 (two interleaved rounds of `cifar-cnn --profile 9`). An AMD Ryzen 7 2700X's `cifar-cnn` epoch goes from 85.6 s to 84.8 s; an Apple M4's is unchanged. The results are the same for any thread count as before, but where a convolution's chunks changed (a banded image, or fewer whole images per chunk), its weight and input gradients add their parts in a different grouping, so their last bits can differ from v0.3's, within the GEMM's error bound (#201).
 - A GEMM called from inside a thread-pool task, such as a convolution group's, is planned for the one thread it runs on, rather than split for the thread count asked for into tasks that then run one after another. The results are unchanged, bit for bit. On an Intel Celeron N5105 at 4 threads, the weight gradient of the `cifar-cnn` network's first convolution takes 15 ms instead of 26 (#201).
 - `max_pool2d` and its backward pass run blocks of planes in parallel, and the forward pass reads only each window's taps inside the image, with a dedicated loop for 2 × 2 windows with stride 2. On an Intel Celeron N5105 at 4 threads, the forward passes of the `cifar-cnn` network's two poolings take 7 ms per training step instead of 70. The results are unchanged, bit for bit; the old loops are kept as `kernels::pooling::max_pool2d_reference`, and `kernels::pooling::planes_per_task` gives the block size (#201).
 - `batch_norm2d` and its backward pass run one task per channel on the thread pool. Each channel's sums keep their order, so the results are unchanged, bit for bit. On an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's four batch norms take 46 ms per training step instead of 74 (#201).
