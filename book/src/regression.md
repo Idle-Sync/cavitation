@@ -136,3 +136,5 @@ R² of the exact OLS fit:
 ```
 
 The two routes agree to every printed digit. The test R², 0.6029, is a little below the train R², 0.6176, which is what a fitted model usually shows on rows it has not seen. About 60% of the variation in concrete strength is explained by these eight inputs and a straight line; the rest is what a line cannot see, which is where a network with hidden layers starts to earn its keep.
+
+R² is a ratio, so it does not say how large the errors are in MPa. `Evaluator::regression` gives that too: `RegressionMetrics` holds the mean absolute error, the mean squared error, its root (RMSE, in the targets' units) and R², for each output and averaged over the outputs, as scikit-learn's `mean_absolute_error`, `mean_squared_error`, `root_mean_squared_error` and `r2_score` compute them. The chapter "Measuring a classifier" covers the classification side.
