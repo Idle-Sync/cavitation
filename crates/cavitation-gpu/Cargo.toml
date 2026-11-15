@@ -22,6 +22,10 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "parki
 # on native backends.
 pollster = "1.0.1"
 
+[dev-dependencies]
+# The CPU tape the bias add's twin is checked against (tests/reduce.rs).
+cavitation-core = { path = "../cavitation-core" }
+
 # Counts host allocations in warm steps; it installs its own global allocator, so it runs
 # alone, without the test harness.
 [[test]]
