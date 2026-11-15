@@ -34,6 +34,11 @@ jobs:
           key: ${{ matrix.kernel }}
       - name: Test
         run: cargo test --workspace --release --all-features --no-fail-fast
+      - name: GPU probe (draft, do not merge)
+        continue-on-error: true
+        run: |
+          cargo run --release -p cavitation-gpu --example gpu_probe
+          cargo test --release -p cavitation-gpu --test device -- --nocapture
       - name: Examples
         run: |
           cargo run --release --example linear_regression -p cavitation
@@ -68,6 +73,11 @@ jobs:
           key: ${{ matrix.kernel }}
       - name: Test
         run: cargo test --workspace --release --all-features --no-fail-fast
+      - name: GPU probe (draft, do not merge)
+        continue-on-error: true
+        run: |
+          cargo run --release -p cavitation-gpu --example gpu_probe
+          cargo test --release -p cavitation-gpu --test device -- --nocapture
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
@@ -95,6 +105,11 @@ jobs:
           key: ${{ matrix.kernel }}
       - name: Test
         run: cargo test --workspace --release --all-features --no-fail-fast
+      - name: GPU probe (draft, do not merge)
+        continue-on-error: true
+        run: |
+          cargo run --release -p cavitation-gpu --example gpu_probe
+          cargo test --release -p cavitation-gpu --test device -- --nocapture
       - name: Check the forced kernel level
         run: |
           cargo run --release -p cavitation-bench -- info | tee info.txt
