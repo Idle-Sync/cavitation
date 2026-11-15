@@ -22,7 +22,7 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "parki
 # on native backends.
 pollster = "1.0.1"
 # Pool2dGeom, the geometry the pooling kernels take.
-cavitation-core = { path = "../cavitation-core", version = "0.3.1" }
+cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
 
 # Counts host allocations in warm steps; it installs its own global allocator, so it runs
 # alone, without the test harness.
