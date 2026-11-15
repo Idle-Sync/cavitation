@@ -1,11 +1,14 @@
 //! Compaction of image models: [`compact`](super::compact) on a model with `Conv2d` layers
 //! removes the output channels its channel masks switch off, from the conv, the layers of
-//! its run and the layer that receives them.
+//! its run and the layer that receives them, and the neurons the neuron masks of its dense
+//! layers switch off, as it does for a dense network.
 
 use cavitation_core::kernels::pooling::Pool2dGeom;
 use cavitation_core::{Conv2dGeom, Error, ParamStore, Real, Rng};
 
-use super::compact::{rebuild_linear, rebuild_prelu};
+use super::compact::{
+    check_narrowed_run, kept_neurons, placed_masks, rebuild_linear, rebuild_prelu, run_owners,
+};
 use crate::inference::InferenceLayer;
 use std::sync::Arc;
 
@@ -31,8 +34,17 @@ pub(super) fn compact_image<T: Real>(
     model: &Sequential<T>,
     params: &ParamStore<T>,
 ) -> Result<(Sequential<T>, ParamStore<T>), Error> {
-    check_layers(model)?;
+    let owners = run_owners(model);
+    check_layers(model, &owners)?;
     let narrowed = narrowed_convs(model, params)?;
+    // The dense layers' neuron masks, checked and resolved as for a dense network.
+    let placed = placed_masks(model, &owners, true)?;
+    for (&linear, masked) in &placed {
+        check_narrowed_run(model, params, linear, masked)?;
+    }
+    let keep = kept_neurons(model, params, &placed)?;
+    // The neurons kept of the `Linear` whose run holds layer `i`, if it loses any.
+    let kept_of = |i: usize| owners[i].and_then(|owner| keep[owner].as_deref());
     let mut store = ParamStore::<T>::new_generic();
     let mut out = Sequential::<T>::new_generic();
     // For each layer, the `Narrowed` whose run it is in, if any.
@@ -41,7 +53,7 @@ pub(super) fn compact_image<T: Real>(
     // inputs layer `i` keeps.
     let feeding = |i: usize| narrowed.iter().find(|n| n.end + 1 == i);
     let no_params = ParamStore::new().values;
-    for i in 0..model.len() {
+    for (i, rows) in keep.iter().enumerate() {
         let layer = model.layer(i);
         let own = narrowed.iter().find(|n| n.conv == i);
         if let Some(conv) = layer.as_conv2d() {
@@ -52,22 +64,27 @@ pub(super) fn compact_image<T: Real>(
             let kept = in_run(i).map(|n| n.kept.as_slice());
             out = out.push(rebuild_batch_norm(bn, params, &mut store, kept)?);
         } else if let Some(linear) = layer.as_linear() {
-            let cols: Option<Vec<usize>> = feeding(i).map(|n| {
-                n.kept
-                    .iter()
-                    .flat_map(|&c| c * n.plane..(c + 1) * n.plane)
-                    .collect()
-            });
+            // The columns kept: a conv's kept channels as blocks of inputs after a flatten,
+            // or the on neurons of the `Linear` whose run ends just before.
+            let cols: Option<Vec<usize>> = match feeding(i) {
+                Some(n) => Some(
+                    n.kept
+                        .iter()
+                        .flat_map(|&c| c * n.plane..(c + 1) * n.plane)
+                        .collect(),
+                ),
+                None => i.checked_sub(1).and_then(kept_of).map(<[usize]>::to_vec),
+            };
             out = out.push(rebuild_linear(
                 i,
                 linear,
                 params,
                 &mut store,
-                None,
+                rows.as_deref(),
                 cols.as_deref(),
             )?);
         } else if let Some(prelu) = layer.as_prelu() {
-            out = out.push(rebuild_prelu(prelu, params, &mut store, None));
+            out = out.push(rebuild_prelu(prelu, params, &mut store, kept_of(i)));
         } else if let Some(n) = in_run(i)
             && let Some(pool) = layer.inference(&no_params).and_then(|l| narrow_pool(&l, n))
         {
@@ -80,9 +97,10 @@ pub(super) fn compact_image<T: Real>(
 }
 
 /// Refuses, naming it, a layer with parameters that compaction cannot rebuild, and a mask
-/// that is not a whole-channel mask at the end of a conv's run.
-fn check_layers<T: Real>(model: &Sequential<T>) -> Result<(), Error> {
-    for i in 0..model.len() {
+/// outside every `Linear`'s run (`owners`) that is not a whole-channel mask at the end of a
+/// conv's run. The masks in a `Linear`'s run are checked as for a dense network.
+fn check_layers<T: Real>(model: &Sequential<T>, owners: &[Option<usize>]) -> Result<(), Error> {
+    for (i, owner) in owners.iter().enumerate() {
         let layer = model.layer(i);
         let rebuilt = layer.as_conv2d().is_some()
             || layer.as_batch_norm2d().is_some()
@@ -96,7 +114,7 @@ fn check_layers<T: Real>(model: &Sequential<T>) -> Result<(), Error> {
             )));
         }
         let Some(mask) = model.mask(i) else { continue };
-        if mask.off().next().is_none() {
+        if mask.off().next().is_none() || owner.is_some() {
             continue;
         }
         let conv = (0..=i)
@@ -110,9 +128,9 @@ fn check_layers<T: Real>(model: &Sequential<T>) -> Result<(), Error> {
         if !whole {
             return Err(Error::Unsupported(format!(
                 "compact: layer {i} ({}) carries a mask that is not a whole-channel mask at the \
-                 end of a Conv2d's run; in a model with image layers compact removes only \
-                 channels switched off with set_channel_mask; clear the mask with \
-                 clear_mask({i}) first",
+                 end of a Conv2d's run; in a model with image layers compact removes the \
+                 channels switched off with set_channel_mask and the neurons of its Linear \
+                 layers; clear the mask with clear_mask({i}) first",
                 layer.name()
             )));
         }
@@ -475,6 +493,44 @@ mod tests {
         agree(&net, &params, 25, 4);
     }
 
+    /// conv → ReLU → flatten → linear → Prelu (a slope per neuron) → linear, with neurons
+    /// of the hidden linear off, alone and with channels of the conv off: the dense head
+    /// loses its neurons as in a dense network, and the Prelu its slopes.
+    #[test]
+    fn dense_head_neurons() {
+        use crate::Prelu;
+        for channels_off in [vec![], vec![1]] {
+            let mut params = ParamStore::new();
+            let mut rng = Rng::seed(5);
+            let mut net = Sequential::new()
+                .push(Conv2d::new(
+                    &mut params,
+                    Conv2dGeom::new(1, 3, (5, 5), (3, 3)).unwrap(),
+                    &mut rng,
+                ))
+                .push(Relu)
+                .push(Flatten)
+                .push(Linear::new(&mut params, 27, 6, &mut rng))
+                .push(Prelu::new(&mut params, 6))
+                .push(Linear::new(&mut params, 6, 2, &mut rng));
+            scramble(&mut params, 9);
+            net.set_neuron_mask(3, NeuronMask::from_off(6, &[0, 4]));
+            if !channels_off.is_empty() {
+                net.set_channel_mask(0, NeuronMask::from_off(3, &channels_off));
+            }
+            agree(&net, &params, 25, 4);
+            let (small, small_params) = compact(&net, &params).unwrap();
+            let hidden = small.linear(3).unwrap();
+            assert_eq!(
+                (hidden.inputs(), hidden.outputs()),
+                (9 * (3 - channels_off.len()), 4)
+            );
+            assert_eq!(small.linear(5).unwrap().inputs(), 4);
+            let slopes = small.layer(4).as_prelu().unwrap().weight();
+            assert_eq!(small_params.value(slopes).data().len(), 4);
+        }
+    }
+
     /// A `Prelu` with a slope per value in a narrowed conv's run is refused, naming it;
     /// one with a single slope is kept.
     #[test]
@@ -523,9 +579,10 @@ mod tests {
             matches!(compact(&net, &params), Err(Error::Unsupported(m)) if m.contains("not a whole-channel mask"))
         );
         net.clear_mask(2);
-        net.set_neuron_mask(3, NeuronMask::from_off(4, &[1]));
+        // A neuron mask on the last Linear: its neurons are the model's outputs.
+        net.set_neuron_mask(5, NeuronMask::from_off(2, &[1]));
         assert!(
-            matches!(compact(&net, &params), Err(Error::Unsupported(m)) if m.contains("not a whole-channel mask"))
+            matches!(compact(&net, &params), Err(Error::Unsupported(m)) if m.contains("no Linear layer follows it"))
         );
         let mut params = ParamStore::new();
         let mut last = Sequential::new()

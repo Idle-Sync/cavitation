@@ -55,15 +55,19 @@ use crate::{Layer, Linear, Prelu, Sequential};
 /// removed from the conv's weight and bias, from every `BatchNorm2d` (γ, β, running mean
 /// and variance) and pooling in its run, and from the layer that receives it: the input
 /// channels of the next `Conv2d`, or the channel's block of inputs of the `Linear` after a
-/// `Flatten`. Every other `Conv2d`, `BatchNorm2d`, `Linear` and `Prelu` is copied into the
-/// new store. The compacted model's outputs match the masked model's within the rounding
-/// of the sums it shortens (a removed channel adds exact zeros, but a sum over fewer terms
-/// is blocked differently by the GEMM and the direct convolution). There it returns
-/// [`Error::Unsupported`], naming the layer, for a mask that is not a whole-channel mask at
-/// the end of a conv's run (a neuron mask on a `Linear` of the model, say), for a run with
-/// a layer other than batch norm, a pooling, an activation, a one-slope `Prelu`, `Flatten`,
-/// `Dropout` or `Identity`, for channels that reach a layer other than a `Conv2d` or a
-/// `Linear` (or the model's output), and for a layer with parameters it cannot rebuild.
+/// `Flatten`. The neurons the neuron masks of its `Linear` layers switch off
+/// ([`Sequential::set_neuron_mask`]) are removed as in a dense network, so a shrunk dense
+/// head compacts with its convs. Every other `Conv2d`, `BatchNorm2d`, `Linear` and `Prelu`
+/// is copied into the new store. The compacted model's outputs match the masked model's
+/// within the rounding of the sums it shortens (a removed channel adds exact zeros, but a
+/// sum over fewer terms is blocked differently by the GEMM and the direct convolution).
+/// There it returns [`Error::Unsupported`], naming the layer, for a mask outside every
+/// `Linear`'s run that is not a whole-channel mask at the end of a conv's run (a mask set
+/// with [`Sequential::set_mask`] on the conv itself, say), for a neuron mask of a `Linear`
+/// in the cases listed under Errors below, for a run with a layer other than batch norm, a
+/// pooling, an activation, a one-slope `Prelu`, `Flatten`, `Dropout` or `Identity`, for
+/// channels that reach a layer other than a `Conv2d` or a `Linear` (or the model's output),
+/// and for a layer with parameters it cannot rebuild.
 ///
 /// All of this holds for finite weights: a masked neuron whose outgoing weight is infinite
 /// or NaN gives `0 · ∞ = NaN` in the masked network, while the compacted network drops that
@@ -134,7 +138,7 @@ pub fn compact<T: Real>(
     }
     check_parameters(model)?;
     let owners = run_owners(model);
-    let masks = placed_masks(model, &owners)?;
+    let masks = placed_masks(model, &owners, false)?;
     for (&linear, masked) in &masks {
         check_narrowed_run(model, params, linear, masked)?;
     }
@@ -218,7 +222,7 @@ pub(super) fn unvouched_layer<T: Real>(model: &Sequential<T>, linear: usize) -> 
 /// For each layer, the `Linear` whose neurons its output holds: the layer itself for a
 /// `Linear`, the `Linear` before it for a layer in the run of element-wise layers after one
 /// (up to [`Sequential::neuron_layer`]), and `None` otherwise.
-fn run_owners<T: Real>(model: &Sequential<T>) -> Vec<Option<usize>> {
+pub(super) fn run_owners<T: Real>(model: &Sequential<T>) -> Vec<Option<usize>> {
     let mut owners = vec![None; model.len()];
     for (linear, _) in model.linears() {
         for owner in &mut owners[linear..=model.neuron_layer(linear)] {
@@ -231,10 +235,13 @@ fn run_owners<T: Real>(model: &Sequential<T>) -> Vec<Option<usize>> {
 /// The layers whose masks switch some neuron off, grouped by the `Linear` whose neurons
 /// they mask, in layer order, after checking that each one sits in the run of element-wise
 /// layers of a hidden `Linear` that leads to the next `Linear` and fits its width. Masks
-/// with every neuron on are left out: they remove nothing.
-fn placed_masks<T: Real>(
+/// with every neuron on are left out: they remove nothing. With `image`, masks on layers
+/// outside every `Linear`'s run are left out too: in an image model those are channel
+/// masks, which the image compaction checks itself.
+pub(super) fn placed_masks<T: Real>(
     model: &Sequential<T>,
     owners: &[Option<usize>],
+    image: bool,
 ) -> Result<BTreeMap<usize, Vec<usize>>, Error> {
     let n = model.len();
     let mut placed: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
@@ -242,7 +249,7 @@ fn placed_masks<T: Real>(
         let Some(mask) = model.mask(m) else {
             continue;
         };
-        if mask.off().next().is_none() {
+        if mask.off().next().is_none() || (image && owner.is_none()) {
             continue;
         }
         let name = model.layer(m).name();
@@ -300,7 +307,7 @@ fn linear_width<T: Real>(model: &Sequential<T>, linear: usize) -> usize {
 /// the layers `masked`): every layer after it up to the next `Linear` must be an activation
 /// or a `Prelu` with one slope or one per neuron, and the next `Linear` must take as many
 /// inputs as the `Linear` has neurons.
-fn check_narrowed_run<T: Real>(
+pub(super) fn check_narrowed_run<T: Real>(
     model: &Sequential<T>,
     params: &ParamStore<T>,
     linear: usize,
@@ -344,7 +351,7 @@ fn check_narrowed_run<T: Real>(
 /// them off (`None` for an unmasked `Linear` and every other layer), after checking that
 /// every removed neuron reaches the next `Linear` as 0: each layer after the last mask in
 /// its run that switches it off must map 0 to 0 at its position.
-fn kept_neurons<T: Real>(
+pub(super) fn kept_neurons<T: Real>(
     model: &Sequential<T>,
     params: &ParamStore<T>,
     masks: &BTreeMap<usize, Vec<usize>>,
