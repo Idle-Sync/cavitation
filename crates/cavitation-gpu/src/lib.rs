@@ -19,6 +19,9 @@
 //! - [`StepEncoder`], [`Step`] and [`StepOutput`]: one step's uploads, dispatches and
 //!   readbacks recorded in one command encoder and submitted once, through staging and
 //!   readback buffers made once, with GPU timestamps per span when profiling.
+//! - [`kernels::Gemm`]: the tiled matrix product `C = A·B + β·C` with either operand
+//!   transposed, within `2(k + 3) · u · Σ|terms|` of the exact product and exact on small
+//!   integers.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
@@ -50,6 +53,7 @@
 
 mod buffer;
 mod device;
+pub mod kernels;
 mod pipeline;
 mod step;
 
