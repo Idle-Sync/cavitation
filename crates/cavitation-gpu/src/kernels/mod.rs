@@ -4,9 +4,11 @@ mod batch_norm;
 mod bindings;
 mod gemm;
 mod health;
+mod loss;
 mod reduce;
 
 pub use batch_norm::{BatchNorm2d, BatchNormBackward, BatchNormForward, BatchStats, RunningUpdate};
 pub use gemm::{Gemm, GemmCall, GemmDims};
 pub use health::{DeadRelu, DeadReluCall, FiniteFlag, FiniteFlagCall, SumSquares, SumSquaresCall};
+pub use loss::{CrossEntropyCall, MeanSquaredError, MseCall, SoftmaxCrossEntropy};
 pub use reduce::{BiasAdd, BiasAddCall, ChannelDims, ChannelSums, ChannelSumsCall};

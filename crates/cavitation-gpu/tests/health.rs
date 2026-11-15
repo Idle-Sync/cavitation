@@ -314,7 +314,9 @@ fn dead_relu_twin() {
                     .iter()
                     .map(|&v| if v < 0.0 { -0.0 } else { 0.0 })
                     .collect();
-                let mut marks = [0.5f32, f32::NAN, f32::from_bits(1), 3.0].into_iter().cycle();
+                let mut marks = [0.5f32, f32::NAN, f32::from_bits(1), 3.0]
+                    .into_iter()
+                    .cycle();
                 let c = channels as usize;
                 let inner = dims.inner as usize;
                 for k in (0..c).filter(|k| k % 3 != 1) {
