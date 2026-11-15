@@ -1464,8 +1464,9 @@ fn fit_validation_cnn_steady_state() -> usize {
     AFTER.load(Ordering::Relaxed)
 }
 
-/// `fit` for 6 epochs on 1,000 of the centred rows at batch 128 with `Health::quiet()`
-/// (the dead-ReLU report on, sent to a sink that drops it), on the 50k network with half of
+/// `fit` for 6 epochs on 1,000 of the centred rows at batch 128 with `Health::default()`
+/// (the dead-ReLU report on) and a sink that counts the dead-neuron reports, on the 50k
+/// network with half of
 /// its first layer's biases at −100: those 128 ReLU neurons output 0 for every sample, so
 /// each epoch reports them. From the third epoch on, nothing is allocated, the report
 /// included (its list of dead neurons is lent and taken back).
