@@ -24,6 +24,11 @@ pollster = "1.0.1"
 # Pool2dGeom, the geometry the pooling kernels take.
 cavitation-core = { path = "../cavitation-core", version = "0.3.1" }
 
+[dev-dependencies]
+# The CPU optimisers the optimiser kernel's twin is pinned to. It depends on this crate only
+# behind its own `gpu` feature, which the tests leave off.
+cavitation-nn = { path = "../cavitation-nn" }
+
 # Counts host allocations in warm steps; it installs its own global allocator, so it runs
 # alone, without the test harness.
 [[test]]

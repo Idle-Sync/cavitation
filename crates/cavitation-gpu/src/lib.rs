@@ -22,6 +22,9 @@
 //! - [`kernels::MaxPool2d`] and [`kernels::AvgPool2d`]: max and average pooling, forward
 //!   and backward, max pooling bit for bit with the CPU's (winners, ties and NaNs) and
 //!   average pooling within a stated rounding bound.
+//! - [`kernels::OptimizerKernel`] and [`kernels::OptimizerRule`]: SGD (with momentum and
+//!   weight decay), Adam and AdamW over a model's parameters in one dispatch, with
+//!   per-parameter update counts, skipped when the step's finite flag is set.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
