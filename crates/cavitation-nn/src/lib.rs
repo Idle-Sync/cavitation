@@ -106,5 +106,6 @@ pub use train::{
     Batch, BatchView, Batcher, Dataset, EarlyStopping, EpochReport, Evaluation, Evaluator,
     FitConfig, Flow, History, Loss, LrSchedule, ModelHandle, Monitor, OptimizerConfig,
     Standardizer, StepControl, StepInfo, StepLog, StepProfile, StepRecord, Targets, TargetsView,
-    Threshold, Trainer, TrainerHandle, accuracy, evaluate, fit, fit_controlled, fit_with_hooks,
+    Threshold, Trainer, TrainerHandle, accuracy, confusion_matrix, evaluate, fit, fit_controlled,
+    fit_with_hooks,
 };
