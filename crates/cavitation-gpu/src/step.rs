@@ -78,7 +78,7 @@ struct Timestamps {
 ///
 /// With [`set_profiling`](StepEncoder::set_profiling) on and timestamps available, each
 /// [`Step::span`] runs in compute passes of its own with timestamps at their beginnings and
-/// ends, and [`StepOutput::spans`] gives each span's GPU time, added up over its passes. A
+/// ends, and [`StepOutput::spans`] gives each span's GPU time, the sum of its passes' times. A
 /// profiled step has a pass boundary per span, so its timings describe a step structured
 /// for profiling. Without profiling, dispatches share passes and spans only label them.
 ///
@@ -893,31 +893,24 @@ impl<'a> Step<'a> {
     }
 }
 
-/// Sets each span's GPU time to the sum of its passes' times, from the resolved timestamp
-/// `ticks` (two per pass, in pass order) and the nanoseconds per tick. A span with no timed
-/// pass, or with a pass whose end tick is before its beginning, keeps `None`.
+/// Sets each span's GPU time from the resolved timestamp `ticks` (two per pass, in pass
+/// order) and the nanoseconds per tick: the sum of its timed passes' own times, each from
+/// the pass's beginning to its end. Only the two timestamps of one pass are compared: on
+/// Metal, timestamps of passes separated by a copy are not on one timeline (a later pass can
+/// end before an earlier one begins), so a span split by an upload is timed by its passes
+/// alone and the copy between them is not counted. A pass whose end is before its beginning
+/// counts as 0. A span with no timed pass keeps `None`.
 fn add_span_times(
     spans: &mut [(&'static str, Option<f64>)],
     passes: &[usize],
     ticks: &[[u8; 8]],
     period: f64,
 ) {
-    let mut broken = vec![false; spans.len()];
     for (pass, &span) in passes.iter().enumerate() {
         let begin = u64::from_le_bytes(ticks[2 * pass]);
         let end = u64::from_le_bytes(ticks[2 * pass + 1]);
-        if end < begin {
-            broken[span] = true;
-            continue;
-        }
-        let time = (end - begin) as f64 * period;
-        let total = spans[span].1.get_or_insert(0.0);
-        *total += time;
-    }
-    for (span, is_broken) in spans.iter_mut().zip(broken) {
-        if is_broken {
-            span.1 = None;
-        }
+        let time = end.saturating_sub(begin) as f64 * period;
+        *spans[span].1.get_or_insert(0.0) += time;
     }
 }
 
@@ -966,8 +959,8 @@ impl<'a> StepOutput<'a> {
         self.bytes
     }
 
-    /// The step's spans in order, each with its GPU time in nanoseconds (added up over its
-    /// passes) when the step was profiled and the device has timestamps, `None`
+    /// The step's spans in order, each with its GPU time in nanoseconds (the sum of its passes'
+    /// times) when the step was profiled and the device has timestamps, `None`
     /// otherwise.
     ///
     /// # Examples
@@ -1059,14 +1052,15 @@ mod tests {
         assert_eq!(round_up(12, 8), 16);
     }
 
-    /// A span's time is the sum of its passes; a span without a pass, or with a pass whose
-    /// ticks run backwards, has none.
+    /// A span's time is the sum of its passes' own times, whatever the order of timestamps
+    /// across passes; a backwards pass counts as 0, and a span without a pass has none.
     #[test]
-    fn span_times_add_up_over_passes() {
+    fn span_times_add_their_passes() {
         let mut spans = vec![("a", None), ("b", None), ("c", None), ("d", None)];
-        // Passes: a, a, b, d; d's ticks run backwards.
+        // Passes: a, a, b, d. a's second pass is timed before its first, as Metal can
+        // report across a copy; d's ticks run backwards.
         let passes = [0, 0, 1, 3];
-        let raw: [u64; 8] = [100, 110, 200, 230, 300, 301, 500, 400];
+        let raw: [u64; 8] = [500, 510, 100, 130, 300, 301, 500, 400];
         let ticks: Vec<[u8; 8]> = raw.iter().map(|t| t.to_le_bytes()).collect();
         add_span_times(&mut spans, &passes, &ticks, 2.0);
         assert_eq!(
@@ -1075,7 +1069,7 @@ mod tests {
                 ("a", Some(80.0)),
                 ("b", Some(2.0)),
                 ("c", None),
-                ("d", None)
+                ("d", Some(0.0))
             ]
         );
     }

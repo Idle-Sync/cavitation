@@ -131,9 +131,9 @@ const MAX_BACKWARD: Shader = Shader {
         entry!(),
         max_geometry!(),
         "
-        @group(0) @binding(0) var<storage, read> dy: array<f32>;
+        @group(0) @binding(0) var<storage, read> grad_out: array<f32>;
         @group(0) @binding(1) var<storage, read> winners: array<u32>;
-        @group(0) @binding(2) var<storage, read_write> dx: array<f32>;
+        @group(0) @binding(2) var<storage, read_write> grad_in: array<f32>;
 
         // The first output along an axis whose window can reach padded position `p`.
         fn first_output(p: u32, reach: u32, stride: u32) -> u32 {
@@ -151,52 +151,53 @@ const MAX_BACKWARD: Shader = Shader {
             let y1 = min(py / SH, OH - 1u);
             let x0 = first_output(px, (KW - 1u) * DW, SW);
             let x1 = min(px / SW, OW - 1u);
-            var acc = dx[j];
+            var acc = grad_in[j];
             for (var oy = y0; oy <= y1; oy = oy + 1u) {
                 for (var ox = x0; ox <= x1; ox = ox + 1u) {
                     let o = (plane * OH + oy) * OW + ox;
-                    if (winners[o] == pos) { acc = acc + dy[o]; }
+                    if (winners[o] == pos) { acc = acc + grad_out[o]; }
                 }
             }
-            dx[j] = acc;
+            grad_in[j] = acc;
         }
         "
     ),
 };
 
 /// The average-pooling geometry as `override` constants, and the window and divisor shared
-/// by the forward and backward kernels: along one axis, the in-image rows (or columns)
-/// `lo..hi` of output `o`'s window and the length counted with the padding, as `avg_window`
-/// in the CPU kernel computes them.
+/// by the forward and backward kernels. Positions are in padded coordinates (the image's
+/// row `r` is `r + P`), so every index is unsigned: along one axis, output `o`'s window
+/// starts at `o · S`, ends at the padded image's edge or `K` later, and covers the image
+/// from `lo` to `hi`, as `avg_window` in the CPU kernel computes it.
 macro_rules! avg_common {
     () => {
         "
-        override H: i32;
-        override W: i32;
-        override OH: i32;
-        override OW: i32;
-        override KH: i32;
-        override KW: i32;
-        override SH: i32;
-        override SW: i32;
-        override PH: i32;
-        override PW: i32;
+        override H: u32;
+        override W: u32;
+        override OH: u32;
+        override OW: u32;
+        override KH: u32;
+        override KW: u32;
+        override SH: u32;
+        override SW: u32;
+        override PH: u32;
+        override PW: u32;
         override COUNT_PAD: bool;
-        override DIVISOR: i32;
+        override DIVISOR: u32;
 
-        struct Window { lo: i32, hi: i32, counted: i32 }
-
-        fn window(o: i32, k: i32, s: i32, p: i32, size: i32) -> Window {
-            let start = o * s - p;
-            let end = min(start + k, size + p);
-            let lo = max(start, 0);
-            return Window(lo, max(min(end, size), lo), end - start);
+        // Along one axis: the window's length counting the padding, and its first and
+        // one-past-last in-image positions (padded coordinates).
+        fn window(o: u32, k: u32, s: u32, p: u32, size: u32) -> vec3<u32> {
+            let start = o * s;
+            let end = min(start + k, size + 2u * p);
+            let lo = max(start, p);
+            return vec3<u32>(end - start, lo, max(min(end, size + p), lo));
         }
 
-        fn divisor(r: Window, c: Window) -> f32 {
-            if (DIVISOR != 0) { return f32(DIVISOR); }
-            if (COUNT_PAD) { return f32(r.counted * c.counted); }
-            return f32((r.hi - r.lo) * (c.hi - c.lo));
+        fn divisor(r: vec3<u32>, c: vec3<u32>) -> f32 {
+            if (DIVISOR != 0u) { return f32(DIVISOR); }
+            if (COUNT_PAD) { return f32(r.x * c.x); }
+            return f32((r.z - r.y) * (c.z - c.y));
         }
         "
     };
@@ -214,15 +215,15 @@ const AVG_FORWARD: Shader = Shader {
         @group(0) @binding(1) var<storage, read_write> out: array<f32>;
 
         fn body(i: u32) {
-            let ox = i32(i % u32(OW));
-            let oy = i32((i / u32(OW)) % u32(OH));
-            let base = i32(i / u32(OW * OH)) * H * W;
+            let ox = i % OW;
+            let oy = (i / OW) % OH;
+            let base = (i / (OW * OH)) * H * W;
             let r = window(oy, KH, SH, PH, H);
             let c = window(ox, KW, SW, PW, W);
             var acc = 0.0;
-            for (var y = r.lo; y < r.hi; y = y + 1) {
-                for (var xx = c.lo; xx < c.hi; xx = xx + 1) {
-                    acc = acc + x[base + y * W + xx];
+            for (var y = r.y; y < r.z; y = y + 1u) {
+                for (var xx = c.y; xx < c.z; xx = xx + 1u) {
+                    acc = acc + x[base + (y - PH) * W + xx - PW];
                 }
             }
             out[i] = acc / divisor(r, c);
@@ -240,30 +241,33 @@ const AVG_BACKWARD: Shader = Shader {
         entry!(),
         avg_common!(),
         "
-        @group(0) @binding(0) var<storage, read> dy: array<f32>;
-        @group(0) @binding(1) var<storage, read_write> dx: array<f32>;
+        @group(0) @binding(0) var<storage, read> grad_out: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> grad_in: array<f32>;
 
-        // The outputs along an axis whose window covers in-image position `p`.
-        fn covering(p: i32, k: i32, s: i32, pad: i32, outs: i32) -> vec2<i32> {
-            let first = max(p + pad - k + s, 0) / s;
-            return vec2<i32>(first, min((p + pad) / s, outs - 1));
+        // The first output along an axis whose window can reach padded position `p`.
+        fn first_output(p: u32, reach: u32, stride: u32) -> u32 {
+            return select(0u, (p - reach + stride - 1u) / stride, p > reach);
         }
 
         fn body(j: u32) {
-            let col = i32(j % u32(W));
-            let row = i32((j / u32(W)) % u32(H));
-            let plane = i32(j / u32(W * H));
-            let ys = covering(row, KH, SH, PH, OH);
-            let xs = covering(col, KW, SW, PW, OW);
-            var acc = dx[j];
-            for (var oy = ys.x; oy <= ys.y; oy = oy + 1) {
+            let col = j % W;
+            let row = (j / W) % H;
+            let plane = j / (W * H);
+            let py = row + PH;
+            let px = col + PW;
+            let y0 = first_output(py, KH - 1u, SH);
+            let y1 = min(py / SH, OH - 1u);
+            let x0 = first_output(px, KW - 1u, SW);
+            let x1 = min(px / SW, OW - 1u);
+            var acc = grad_in[j];
+            for (var oy = y0; oy <= y1; oy = oy + 1u) {
                 let r = window(oy, KH, SH, PH, H);
-                for (var ox = xs.x; ox <= xs.y; ox = ox + 1) {
+                for (var ox = x0; ox <= x1; ox = ox + 1u) {
                     let c = window(ox, KW, SW, PW, W);
-                    acc = acc + dy[(plane * OH + oy) * OW + ox] / divisor(r, c);
+                    acc = acc + grad_out[(plane * OH + oy) * OW + ox] / divisor(r, c);
                 }
             }
-            dx[j] = acc;
+            grad_in[j] = acc;
         }
         "
     ),
@@ -702,9 +706,9 @@ impl AvgPool2d {
     /// # Panics
     ///
     /// As the CPU's `avg_pool2d`, if the geometry is dilated or `divisor_override` is 0;
-    /// also if `batch` is 0, a batch holds 2³¹ or more inputs or outputs, the divisor
-    /// override does not fit in an `i32`, or an axis's padded size plus its window and stride
-    /// does not.
+    /// also if `batch` is 0, a batch holds more than 2³¹ inputs or outputs, the window's size
+    /// or the divisor override does not fit in a `u32`, or an axis's padded size plus its
+    /// window and stride does not.
     ///
     /// ```
     /// use cavitation_core::Pool2dGeom;
@@ -737,18 +741,13 @@ impl AvgPool2d {
             divisor_override != Some(0),
             "avg_pool2d: the divisor override must not be 0"
         );
-        check_axes("avg_pool2d", geom, i32::MAX as usize);
+        check_axes("avg_pool2d", geom, u32::MAX as usize);
         let (kh, kw) = geom.kernel();
         assert!(
-            [
-                kh * kw,
-                divisor_override.unwrap_or(0),
-                batch * geom.in_width(),
-                batch * geom.out_width(),
-            ]
-            .iter()
-            .all(|&v| v <= i32::MAX as usize),
-            "avg_pool2d: the sizes do not fit the kernel's i32 indices: {geom:?}, batch {batch}"
+            kh.checked_mul(kw).is_some_and(|n| n <= u32::MAX as usize)
+                && divisor_override.unwrap_or(0) <= u32::MAX as usize,
+            "avg_pool2d: the window or divisor does not fit the kernel's u32s: {geom:?}, \
+             divisor {divisor_override:?}"
         );
         let outputs = total(batch * geom.out_width());
         let inputs = total(batch * geom.in_width());
