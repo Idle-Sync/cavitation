@@ -574,10 +574,10 @@ fn max_pool_2x2<T: Real>(geom: &Pool2dGeom, x: &[T], out: &mut [T], winners: &mu
 
 /// The plain loops of [`max_pool2d`], its reference twin: the same results, every tap checked
 /// against the image as it is read. Max pooling of `batch` images `x` into `out`, as
-/// PyTorch's CPU kernel computes it: each
-/// output is the largest value of its window, the taps read in row-major order with a later
-/// one winning when `value > best` or `value` is NaN (so a NaN wins, and the last NaN of a
-/// window wins over an earlier one), padding never winning. `winners`, if given, receives
+/// PyTorch's CPU kernel computes it: each output is the largest value of its window, the
+/// taps read in row-major order with a later one winning when `value > best` or `value` is
+/// NaN (so a NaN wins, and the last NaN of a window wins over an earlier one), padding never
+/// winning. `winners`, if given, receives
 /// for each output the position of its winner within its input plane (`row · width +
 /// column`), which the backward pass sends the gradient to.
 ///
@@ -1184,8 +1184,9 @@ mod tests {
     }
 
     /// The fast max pooling gives the reference twin's bits and winners, for f32 and f64,
-    /// with and without winners, and the backward pass gives a plain loop's sums, on 2 × 2 windows (odd sizes included) and on geometries
-    /// with stride, padding, dilation and `ceil_mode`, over batches of more planes than one task takes. The values are drawn
+    /// with and without winners, and the backward pass gives a plain loop's sums, on 2 × 2
+    /// windows (odd sizes included) and on geometries with stride, padding, dilation and
+    /// `ceil_mode`, over batches of more planes than one task takes. The values are drawn
     /// from a few levels, so windows hold ties, and some are NaN or infinite.
     #[test]
     fn max_pool2d_matches_reference() {
