@@ -379,6 +379,34 @@ fn activations_keep_nan_and_infinities() {
     });
 }
 
+/// Far in the tails, where x² or the tanh argument's slope overflows, both GELU backward
+/// passes take the derivative's limit as the CPU does (#268): exactly 1 for large positive x
+/// and 0 for large negative x, up to ±∞, so the gradient is g or g · 0, never NaN. NaN still
+/// gives NaN.
+#[test]
+fn gelu_backward_takes_its_limits() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 12);
+        let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
+        let big = [1e12f32, 1e13, 1e20, 3e38, f32::MAX, f32::INFINITY];
+        let x: Vec<f32> = big.iter().flat_map(|&v| [v, -v]).collect();
+        let g: Vec<f32> = (0..x.len())
+            .map(|i| if i % 4 < 2 { 1.5 } else { -0.75 })
+            .collect();
+        let want: Vec<f32> = x
+            .iter()
+            .zip(&g)
+            .map(|(&x, &g)| g * if x > 0.0 { 1.0 } else { 0.0 })
+            .collect();
+        for op in [Elementwise::GeluTanhBackward, Elementwise::GeluErfBackward] {
+            let got = run(&mut kit, &kernels, op, &x, Some(&g), 0.0, 0.0);
+            assert_exact(&got, &want, &format!("{op:?} in the tails"));
+            let nan = run(&mut kit, &kernels, op, &[f32::NAN], Some(&[1.0]), 0.0, 0.0);
+            assert!(nan[0].is_nan(), "{op:?} of NaN");
+        }
+    });
+}
+
 /// A missing `b` and a short buffer are refused when the operation is prepared.
 #[test]
 fn misuse_is_refused() {

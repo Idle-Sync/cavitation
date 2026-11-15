@@ -246,8 +246,16 @@ fn gelu_tanh_backward(@builtin(workgroup_id) w: vec3<u32>, @builtin(num_workgrou
     let x = a[i];
     let x2 = x * x;
     let t = tanh_one(SQRT_2_OVER_PI * (x + GELU_CUBIC * x2 * x));
+    // Where tanh saturates, 1 - t² is exactly 0 and the second term is dropped: 0 for any finite
+    // du, and its limit where x² or du overflows (0 · ∞ would be NaN), as the CPU does.
+    let first = 0.5 * (1.0 + t);
+    let flat = 1.0 - t * t;
+    if (flat == 0.0) {
+        out[i] = b[i] * first;
+        return;
+    }
     let du = SQRT_2_OVER_PI * (1.0 + 3.0 * GELU_CUBIC * x2);
-    out[i] = b[i] * (0.5 * (1.0 + t) + 0.5 * x * (1.0 - t * t) * du);
+    out[i] = b[i] * (first + 0.5 * x * flat * du);
 }
 
 // GELU, erf form: 0.5 · x · (1 + erf(x / sqrt 2)).
@@ -267,5 +275,11 @@ fn gelu_erf_backward(@builtin(workgroup_id) w: vec3<u32>, @builtin(num_workgroup
     let x = a[i];
     let cdf = 0.5 * (1.0 + erf_one(x * FRAC_1_SQRT_2));
     let pdf = FRAC_1_SQRT_2PI * exp(-(0.5 * x * x));
+    // Where the density underflows to 0 the x · φ term is dropped, as the CPU does: 0 for any
+    // finite x, and its limit where x is infinite.
+    if (pdf == 0.0) {
+        out[i] = b[i] * cdf;
+        return;
+    }
     out[i] = b[i] * (cdf + x * pdf);
 }
