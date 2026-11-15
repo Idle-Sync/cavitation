@@ -46,12 +46,17 @@ Every run uses 4 threads (`CAVITATION_THREADS=4`, and `torch.set_num_threads(4)`
 - On machine B, cifar-cnn seed 1 overlapped Windows background maintenance (.NET native-image compilation and antivirus scans) from epoch 7 of Cavitation's half through PyTorch's half. Cavitation's epochs 7–10 took 115–120 s, against 112–113 s before.
 - On machine C, a background program used 30–45% of one core during the runs. The PyTorch build there reports `mkldnn False`.
 
+## PyTorch as a fixed baseline
+
+The PyTorch numbers above are the baseline for each machine and seed. With the same network, data, seed, batch size, epochs, learning rate, thread count and PyTorch version, PyTorch's run would be the same again, so a later measurement of Cavitation runs only Cavitation's half (`--ours-only`) and compares it with these rows. A new PyTorch version, or a change to the benchmark's settings, needs a new baseline. Compare epoch times only on a machine as quiet as it was for the baseline row.
+
 ## Running them
 
 ```sh
 scripts/data/get-cifar10.sh                       # CIFAR-10 into data/cifar10/
 cargo run --release -p cavitation-bench -- mnist-cnn --seed 0 --python <python with torch>
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --python <python with torch>
+cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --ours-only   # Cavitation's half only
 ```
 
 The PyTorch side is `scripts/bench/torch_cnn.py`; `scripts/fixtures/requirements.txt` lists what its Python needs. Each run writes `result.json` under `target/bench/cnn/<benchmark>-seed<N>/`.
