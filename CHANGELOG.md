@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Data, examples, guide and benchmark
+
+- `BENCHMARKS.md`: `mnist-cnn` and `cifar-cnn` results against PyTorch on an Intel Celeron N5105, an AMD Ryzen 7 2700X and an Apple M4, with accuracy and epoch time per seed.
+
 ## v0.3.0 (2026-11-15)
 
 ### Breaking changes
