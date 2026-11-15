@@ -6,6 +6,7 @@
 
 mod common;
 
+use cavitation_gpu::PooledBuffer;
 use cavitation_gpu::kernels::{Gemm, GemmDims};
 use common::{Kit, U, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values};
 
@@ -232,18 +233,99 @@ fn runs_are_identical() {
     });
 }
 
-/// A buffer too small for its matrix is refused when the GEMM is prepared.
+/// A buffer too small for its matrix, offsets, leading dimensions and batch included, is
+/// refused when the GEMM is prepared, and the same buffers are accepted for the packed shape.
 #[test]
 fn short_buffers_are_refused() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 16);
         let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
-        let dims = GemmDims::new(8, 8, 8);
-        let (a, b, small) = (kit.zeros(64), kit.zeros(64), kit.zeros(32));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            gemm.call(&mut kit.steps, &mut kit.pool, dims, &a, &b, &small)
-        }));
-        assert!(result.is_err());
+        let (a, b, c) = (kit.zeros(64), kit.zeros(64), kit.zeros(64));
+        let small = kit.zeros(32);
+        let packed = GemmDims::new(8, 8, 8);
+        gemm.call(&mut kit.steps, &mut kit.pool, packed, &a, &b, &c)
+            .release(&mut kit.pool);
+        let refuses = |kit: &mut Kit, dims: GemmDims, c: &PooledBuffer| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gemm.call(&mut kit.steps, &mut kit.pool, dims, &a, &b, c)
+            }));
+            assert!(result.is_err(), "{dims:?} was accepted");
+        };
+        refuses(&mut kit, packed, &small);
+        refuses(&mut kit, GemmDims { lda: 9, ..packed }, &c);
+        refuses(
+            &mut kit,
+            GemmDims {
+                a_offset: 1,
+                ..packed
+            },
+            &c,
+        );
+        refuses(&mut kit, GemmDims { ldb: 9, ..packed }, &c);
+        refuses(&mut kit, GemmDims { ldc: 9, ..packed }, &c);
+        // Three products with their own A and C, 64 elements apart, need 192 of each.
+        let three = GemmDims {
+            batch: 3,
+            a_batch: 64,
+            c_batch: 64,
+            ..packed
+        };
+        refuses(&mut kit, three, &c);
+        refuses(
+            &mut kit,
+            GemmDims {
+                a_batch: 0,
+                ..three
+            },
+            &c,
+        );
+    });
+}
+
+/// C's rows overlapping (`ldc` below `n`), or a batch's Cs overlapping, is refused: the
+/// products' writes would race.
+#[test]
+fn overlapping_outputs_are_refused() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 16);
+        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let (a, b, c) = (kit.zeros(64), kit.zeros(64), kit.zeros(1024));
+        let shared = GemmDims {
+            batch: 3,
+            ..GemmDims::new(8, 8, 8)
+        };
+        for dims in [
+            GemmDims {
+                ldc: 7,
+                ..GemmDims::new(8, 8, 8)
+            },
+            shared,
+            GemmDims {
+                c_batch: 1,
+                ..shared
+            },
+            GemmDims {
+                c_batch: 63,
+                ..shared
+            },
+        ] {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gemm.call(&mut kit.steps, &mut kit.pool, dims, &a, &b, &c)
+            }));
+            assert!(result.is_err(), "{dims:?} was accepted");
+        }
+        gemm.call(
+            &mut kit.steps,
+            &mut kit.pool,
+            GemmDims {
+                c_batch: 64,
+                ..shared
+            },
+            &a,
+            &b,
+            &c,
+        )
+        .release(&mut kit.pool);
     });
 }
 

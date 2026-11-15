@@ -64,7 +64,7 @@ pub struct GemmDims {
     pub lda: u32,
     /// The distance between `B`'s stored rows, in elements; 0 for packed.
     pub ldb: u32,
-    /// The distance between `C`'s rows, in elements; 0 for packed (`n`).
+    /// The distance between `C`'s rows, in elements; 0 for packed (`n`), and never below `n`.
     pub ldc: u32,
     /// The number of products, along the grid's z axis; 1 for one.
     pub batch: u32,
@@ -78,7 +78,9 @@ pub struct GemmDims {
     pub a_batch: u32,
     /// The elements between consecutive products' `B`; 0 shares one `B`.
     pub b_batch: u32,
-    /// The elements between consecutive products' `C`.
+    /// The elements between consecutive products' `C`. With `batch` above 1 it must keep the
+    /// products' `C`s apart, at least `(m − 1) · ldc + n`: products run in parallel, so
+    /// two writing one element would race.
     pub c_batch: u32,
 }
 
@@ -298,7 +300,7 @@ impl GemmDims {
 /// `ld` apart, the first at `offset` and each next one `stride` further.
 fn extent(offset: u32, stride: u32, batch: u32, rows: u32, cols: u32, ld: u32) -> u64 {
     let last = u64::from(batch.max(1) - 1) * u64::from(stride);
-    u64::from(offset) + last + u64::from(rows - 1) * u64::from(ld) + u64::from(cols)
+    u64::from(offset) + last + u64::from(rows.saturating_sub(1)) * u64::from(ld) + u64::from(cols)
 }
 /// The tiled GEMM: its four pipelines (one per pair of transposes) and the bind group layout
 /// they share, built once. [`call`](Gemm::call) prepares one GEMM on given buffers, made once
@@ -420,8 +422,11 @@ impl Gemm {
     /// # Panics
     ///
     /// If a buffer is shorter than its matrix (offsets, leading dimensions and batch
-    /// included), if a dimension is 0, or if `C`'s buffer is `A`'s or `B`'s: wgpu does not let one
-    /// buffer be read and written in one dispatch.
+    /// included), if a dimension is 0, if `C`'s rows or a batch's `C`s overlap (`ldc` below
+    /// `n`, or `c_batch` below `(m − 1) · ldc + n` with `batch` above 1), or if `C`'s buffer is
+    /// `A`'s or `B`'s: wgpu does not let one buffer be read and written in one dispatch. A
+    /// leading dimension of `A` or `B` below its stored row's length is allowed: rows that
+    /// share elements are only read.
     ///
     /// # Examples
     ///
@@ -454,6 +459,16 @@ impl Gemm {
         assert!(
             dims.m > 0 && dims.n > 0 && dims.k > 0,
             "a GEMM needs every dimension above 0, not {dims:?}"
+        );
+        let ldc = dims.ldc_used();
+        assert!(
+            ldc >= dims.n,
+            "C's rows overlap: ldc {ldc} is below n for {dims:?}"
+        );
+        let c_size = u64::from(dims.m - 1) * u64::from(ldc) + u64::from(dims.n);
+        assert!(
+            dims.batch <= 1 || u64::from(dims.c_batch) >= c_size,
+            "the batch's Cs overlap: c_batch must be at least {c_size} for {dims:?}"
         );
         for (name, buffer, len) in [
             ("A", a, dims.a_extent()),
