@@ -1,0 +1,18 @@
+{
+ "sklearn_version": "1.9.1",
+ "kind": "scores",
+ "scores": [
+  0.8999999761581421,
+  0.800000011920929,
+  0.30000001192092896,
+  0.10000000149011612
+ ],
+ "positive": [
+  false,
+  false,
+  true,
+  true
+ ],
+ "roc_auc": 0.0,
+ "average_precision": 0.41666666666666663
+}
