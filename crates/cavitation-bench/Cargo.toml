@@ -18,3 +18,9 @@ cavitation-datasets = { path = "../cavitation-datasets" }
 # The inspector, whose cost the `inspect` run measures.
 cavitation-inspect = { path = "../cavitation-inspect" }
 cavitation-nn = { path = "../cavitation-nn" }
+# The GPU, for `gemm-gpu`, behind the `gpu` feature (off by default).
+cavitation-gpu = { path = "../cavitation-gpu", optional = true }
+
+[features]
+# The GPU benchmarks (`gemm-gpu`); they add wgpu to the build.
+gpu = ["dep:cavitation-gpu"]
