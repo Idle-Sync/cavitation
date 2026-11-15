@@ -368,25 +368,41 @@ pub(super) fn binary_backward<T: Real>(
             T::ONE
         };
         if kind == Kind::Mul {
-            let mut dst = ctx.scratch(sv.len());
-            sum_product_to(&mut dst, &sv, (ctx.value(other), &sc), &so, out_grad);
-            if let Some(slot) = ctx.slot(v) {
-                slot.add_from(&dst);
-            }
-            ctx.release(dst);
+            let c = ctx.value(other);
+            contribute(ctx, v, sv.len(), |dst| {
+                sum_product_to(dst, &sv, (c, &sc), &so, out_grad);
+            });
         } else if sv == so {
             if let Some(slot) = ctx.slot(v) {
                 slot.add_scaled_from(out_grad, sign);
             }
         } else {
-            let mut dst = ctx.scratch(sv.len());
-            sum_to(&mut dst, &sv, &so, out_grad, sign);
-            if let Some(slot) = ctx.slot(v) {
-                slot.add_from(&dst);
-            }
-            ctx.release(dst);
+            contribute(ctx, v, sv.len(), |dst| {
+                sum_to(dst, &sv, &so, out_grad, sign)
+            });
         }
     }
+}
+
+/// Gives `v` the contribution `write` produces, where `write` fills every element of the
+/// slice it gets. On `v`'s first contribution `write` fills the gradient buffer itself;
+/// after that it fills a pooled scratch buffer, which is then added, so the sums keep the
+/// order of computing the contribution whole and adding it.
+fn contribute<T: Real>(ctx: &mut BackwardCtx<'_, T>, v: Var, len: usize, write: impl Fn(&mut [T])) {
+    let mut scratch = ctx.scratch(len);
+    if let Some(slot) = ctx.slot(v) {
+        slot.update_with(|buf, beta| {
+            if beta == T::ZERO {
+                write(buf);
+            } else {
+                write(&mut scratch);
+                for (d, &s) in buf.iter_mut().zip(&scratch) {
+                    *d += s;
+                }
+            }
+        });
+    }
+    ctx.release(scratch);
 }
 
 /// `v` where `keep` is non-zero, exactly 0 where it is 0.
@@ -416,12 +432,10 @@ pub(super) fn keep_where_backward<T: Real>(
         return;
     }
     let (sx, sk) = (ctx.shape(x), ctx.shape(keep));
-    let mut dst = ctx.scratch(sx.len());
-    apply(select, out_grad, ctx.value(keep), (&sx, &sk, &sx), &mut dst);
-    if let Some(slot) = ctx.slot(x) {
-        slot.add_from(&dst);
-    }
-    ctx.release(dst);
+    let k = ctx.value(keep);
+    contribute(ctx, x, sx.len(), |dst| {
+        apply(select, out_grad, k, (&sx, &sk, &sx), dst);
+    });
 }
 
 /// Backward of `a * s`: the output gradient times `s`.

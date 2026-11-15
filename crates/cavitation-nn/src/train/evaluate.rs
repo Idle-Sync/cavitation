@@ -463,6 +463,58 @@ impl Evaluator {
         true
     }
 
+    /// Replaces the mask on the output of layer `layer` with `mask` for the evaluations from
+    /// now on, as [`InferenceModel::set_mask`] does: the route for a mask that is not a
+    /// `Linear`'s neuron mask, such as a channel mask (see
+    /// [`Sequential::set_channel_mask`]). Only this evaluator changes; its clones keep their
+    /// own masks.
+    ///
+    /// The layer must have a mask in the model the evaluator was made or refreshed from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if layer `layer` has no mask, and
+    /// [`Error::InvalidData`] if `mask`'s width differs from the mask there (each message
+    /// names the layer); the evaluator is then unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{Conv2dGeom, Error, ParamStore, Rng};
+    /// use cavitation_nn::{Conv2d, Evaluator, Loss, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let geom = Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap();
+    /// let mut net = Sequential::new()
+    ///     .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+    ///     .push(Relu);
+    /// net.set_channel_mask(0, NeuronMask::all_on(2));
+    /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 8).unwrap();
+    /// // Channel 1 off: its four positions at the ReLU.
+    /// assert!(evaluator.set_mask(1, &NeuronMask::from_off(8, &[4, 5, 6, 7])).is_ok());
+    /// assert!(matches!(evaluator.set_mask(0, &NeuronMask::all_on(8)), Err(Error::Unsupported(_))));
+    /// ```
+    pub fn set_mask(&mut self, layer: usize, mask: &NeuronMask) -> Result<(), Error> {
+        let Some(old) = (layer < self.model.len())
+            .then(|| self.model.mask(layer))
+            .flatten()
+        else {
+            return Err(Error::Unsupported(format!(
+                "evaluator: layer {layer} has no mask; put one on it before making the \
+                 evaluator"
+            )));
+        };
+        if old.width() != mask.width() {
+            return Err(Error::InvalidData(format!(
+                "evaluator: a mask of width {} for layer {layer}, whose mask has width {}",
+                mask.width(),
+                old.width()
+            )));
+        }
+        if let Engine::Compiled(compiled) = &mut self.engine {
+            compiled.set_mask(layer, mask)?;
+        }
+        self.model.copy_mask(layer, mask);
+        Ok(())
+    }
+
     /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
     /// neuron `mask` turns off outputs exactly 0, after the activations that follow the
     /// `Linear` (at [`Sequential::neuron_layer`]), from the next

@@ -1,0 +1,38 @@
+# Package manifest for cavitation-gpu: GPU access through wgpu for the cavitation neural network library.
+
+[package]
+name = "cavitation-gpu"
+description = "GPU access through wgpu (Vulkan, Metal, DX12) for the cavitation neural network library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# The GPU API: adapters, devices, buffers and compute pipelines on Vulkan, Metal and DX12,
+# with WGSL shaders compiled by its own naga. The default features also build the OpenGL
+# backend and the browser's WebGPU; neither is used (OpenGL adapters are left out when
+# choosing one), so only the three native backends and WGSL are turned on.
+wgpu = { version = "30.0.2", default-features = false, features = ["std", "parking_lot", "wgsl", "dx12", "metal", "vulkan"] }
+# Blocks on wgpu's futures (adapter and device requests), which finish without an executor
+# on native backends.
+pollster = "1.0.1"
+# Pool2dGeom, the geometry the pooling kernels take.
+cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
+
+[dev-dependencies]
+# The CPU optimisers the optimiser kernel's twin is pinned to (tests/optimizer.rs). nn
+# depends on this crate behind its `gpu` feature, which an all-features build turns on: a
+# dev-only cycle, sound because the test passes only numbers between the two crates.
+cavitation-nn = { path = "../cavitation-nn" }
+
+# Counts host allocations in warm steps; it installs its own global allocator, so it runs
+# alone, without the test harness.
+[[test]]
+name = "step_alloc"
+harness = false
+

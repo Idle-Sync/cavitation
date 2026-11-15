@@ -10,6 +10,7 @@ members = [
     "crates/cavitation-bench",
     "crates/cavitation-ml",
     "crates/cavitation-inspect",
+    "crates/cavitation-gpu",
 ]
 
 [workspace.package]

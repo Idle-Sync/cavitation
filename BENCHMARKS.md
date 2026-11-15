@@ -70,4 +70,4 @@ cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --ours-only   # Ca
 cargo run --release -p cavitation-bench -- cifar-cnn --profile 15            # time per layer, no training run
 ```
 
-The PyTorch side is `scripts/bench/torch_cnn.py`; `scripts/fixtures/requirements.txt` lists what its Python needs. Each run writes `result.json` under `target/bench/cnn/<benchmark>-seed<N>/`.
+The PyTorch side is `scripts/bench/torch_cnn.py`; `scripts/fixtures/requirements.txt` lists what its Python needs. Each run writes its results to `target/bench/cnn/<benchmark>-seed<N>/result.json`.

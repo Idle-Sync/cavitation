@@ -5,8 +5,9 @@ use cavitation_core::{ParamId, ParamValues, Real, Tape, Var};
 use crate::{Activation, BatchNorm2d, Conv2d, InferenceLayer, Linear, Prelu};
 
 /// Keeps the layer downcasts closed: only this crate can name `Token`, so only this crate's
-/// `Linear`, `Prelu`, `Conv2d` and `BatchNorm2d` can override [`Layer::linear_form`],
-/// [`Layer::prelu_form`], [`Layer::conv2d_form`] and [`Layer::batch_norm2d_form`].
+/// `Linear`, `Prelu`, `Conv2d`, `BatchNorm2d` and `Dropout` can override
+/// [`Layer::linear_form`], [`Layer::prelu_form`], [`Layer::conv2d_form`],
+/// [`Layer::batch_norm2d_form`] and [`Layer::dropout_form`].
 pub(crate) mod private {
     /// The argument of the sealed [`Layer`](super::Layer) hooks; only this crate can make one.
     #[derive(Clone, Copy, Debug)]
@@ -207,6 +208,15 @@ pub trait Layer<T: Real>: Send + Sync {
     /// [`linear_form`](Self::linear_form) is.
     #[doc(hidden)]
     fn batch_norm2d_form(&self, _: private::Token) -> Option<&BatchNorm2d> {
+        None
+    }
+
+    /// This layer's drop probability, if it is a [`Dropout`](crate::Dropout): the sealed hook
+    /// a device executor reads to apply dropout itself, since `Dropout` compiles to
+    /// [`InferenceLayer::Identity`] for inference. Closed to other crates as
+    /// [`linear_form`](Self::linear_form) is, so no other layer can claim to drop values.
+    #[doc(hidden)]
+    fn dropout_form(&self, _: private::Token) -> Option<f64> {
         None
     }
 
