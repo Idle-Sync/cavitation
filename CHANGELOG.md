@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### Tensors and autograd (`cavitation-core`)
 
 - More backward passes write a value's first gradient contribution instead of zeroing its buffer and adding. `max_pool2d`'s backward pass zeroes each block of planes on the thread pool just before adding to it, instead of zeroing the whole input gradient in one pass first; on an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's two poolings take 5.9–6.5 ms of backward time per training step instead of 9.5–10.4 (three interleaved rounds of `cifar-cnn --profile 9`, machine under load). `mul`, a broadcast `add` or `sub`, and `keep_where` write their first contribution straight into the gradient buffer instead of through a scratch buffer and a copy. The results are unchanged, bit for bit (#248).
+- The derivative of `gelu` is no longer NaN at very large |x|: the tanh form's backward pass gave `0 · ∞ = NaN` in f32 once `x²` overflowed (|x| from about 1.8e19), and the exact form at ±∞. Where the second term's small factor is exactly 0 (`tanh` saturated, or the density underflowed) the term is now dropped, which gives the derivative's limits, 1 and 0. Every other value keeps its bits (#268).
 
 ### GPU
 
