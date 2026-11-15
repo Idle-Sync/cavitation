@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- More backward passes write a value's first gradient contribution instead of zeroing its buffer and adding. `max_pool2d`'s backward pass zeroes each block of planes on the thread pool just before adding to it, instead of zeroing the whole input gradient in one pass first; on an Intel Celeron N5105 at 4 threads, the `cifar-cnn` network's two poolings take 5.9–6.5 ms of backward time per training step instead of 9.5–10.4 (three interleaved rounds of `cifar-cnn --profile 9`, machine under load). `mul`, a broadcast `add` or `sub`, and `keep_where` write their first contribution straight into the gradient buffer instead of through a scratch buffer and a copy. The results are unchanged, bit for bit (#248).
+
 ### Layers, training and inference (`cavitation-nn`)
 
 - `metrics`: classification metrics as scikit-learn computes them. `ConfusionMatrix` (from labels, or with rows that have no prediction) gives accuracy, per-class precision, recall, F1 and F-beta (F2 and any other beta) and their macro, weighted and micro averages, and prints as a confusion table with a classification report. `roc_auc` and `average_precision` score a binary classifier's outputs, ties grouped. A rate with a zero denominator is 0 (`zero_division=0`), and the averages cover the classes among the targets or the predictions, as scikit-learn's defaults. Checked against scikit-learn 1.9.1 fixtures (#237).

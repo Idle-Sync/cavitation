@@ -666,6 +666,25 @@ pub fn max_pool2d_backward<T: Real>(
     winners: &[usize],
     dx: &mut [T],
 ) {
+    max_pool2d_backward_into(geom, batch, dy, winners, dx, false);
+}
+
+/// [`max_pool2d_backward`], or with `overwrite` the same into a `dx` of any contents: each
+/// task zeroes its own planes just before adding to them, so the zeroing runs on the thread
+/// pool while the planes are in cache, instead of as a separate pass over the whole buffer.
+/// The result is the same bits as zeroing `dx` first and adding.
+///
+/// # Panics
+///
+/// As [`max_pool2d_backward`].
+pub(crate) fn max_pool2d_backward_into<T: Real>(
+    geom: &Pool2dGeom,
+    batch: usize,
+    dy: &[T],
+    winners: &[usize],
+    dx: &mut [T],
+    overwrite: bool,
+) {
     let (oh, ow) = geom.out_size();
     let (h, w) = geom.input;
     check_len("the output gradient", dy.len(), batch * geom.out_width());
@@ -682,6 +701,9 @@ pub fn max_pool2d_backward<T: Real>(
             // SAFETY: task `t.index` alone covers planes `first..first + n`, inside the batch, so
             // its part of `dx` is its own.
             let dx = unsafe { dxs.slice(first * h * w, n * h * w) };
+            if overwrite {
+                dx.fill(T::ZERO);
+            }
             for (p, plane) in dx.chunks_exact_mut(h * w).enumerate() {
                 let g = &dy[(first + p) * oh * ow..][..oh * ow];
                 let at = &winners[(first + p) * oh * ow..][..oh * ow];
@@ -1213,6 +1235,12 @@ mod tests {
                 plain[i / (oh * ow) * plane + at] += d;
             }
             assert_eq!(bits(&fast), bits(&plain), "{g:?} backward");
+            // Overwriting a buffer of NaN gives the bits of adding into zeros.
+            let mut over = vec![T::from_f64(f64::NAN); x.len()];
+            max_pool2d_backward_into(g, batch, &dy, &wb, &mut over, true);
+            let mut zeroed = vec![T::ZERO; x.len()];
+            max_pool2d_backward(g, batch, &dy, &wb, &mut zeroed);
+            assert_eq!(bits(&over), bits(&zeroed), "{g:?} backward overwrite");
         }
         let mut rng = crate::Rng::seed(9);
         let geoms = [
