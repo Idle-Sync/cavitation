@@ -64,12 +64,6 @@ fn run(train: &Dataset, test: &Dataset) -> Result<(), Error> {
             lr: 1e-3,
             weight_decay: 0.0,
         },
-        // The dead-ReLU report counts each position of a convolution's output as a neuron,
-        // and the blank border of a digit leaves many positions at 0 for a whole epoch.
-        health: Health {
-            dead_relu: false,
-            ..Health::default()
-        },
         on_epoch: Some(Box::new(|report, net, params| {
             println!(
                 "epoch {}: mean loss {:.4}, test accuracy {:.2}%, {:.1} s",
