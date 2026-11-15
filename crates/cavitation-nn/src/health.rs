@@ -671,8 +671,9 @@ struct ReluLayer {
 }
 
 /// Values per channel of the output of layer `relu` when an image layer comes before it
-/// through element-wise layers only: a `Conv2d`'s output channels or a `BatchNorm2d`'s
-/// channels dividing `width`. `None` for a dense layer.
+/// through element-wise and pooling layers only: a `Conv2d`'s output channels or a
+/// `BatchNorm2d`'s channels dividing `width`. Pooling keeps the NCHW channel order, so the
+/// channel count before it still splits the ReLU's width. `None` for a dense layer.
 fn channel_size(model: &Sequential, relu: usize, width: usize) -> Option<usize> {
     let mut j = relu;
     while j > 0 {
@@ -682,7 +683,7 @@ fn channel_size(model: &Sequential, relu: usize, width: usize) -> Option<usize> 
             conv.geom().out_channels()
         } else if let Some(bn) = layer.as_batch_norm2d() {
             bn.channels()
-        } else if layer.is_elementwise() {
+        } else if layer.is_elementwise() || is_pooling(layer.name()) {
             continue;
         } else {
             return None;
@@ -691,6 +692,12 @@ fn channel_size(model: &Sequential, relu: usize, width: usize) -> Option<usize> 
             .then(|| width / channels);
     }
     None
+}
+
+/// Whether a layer named `name` is one of the crate's poolings, which keep each channel's
+/// values together: max, average and adaptive average pooling.
+fn is_pooling(name: &str) -> bool {
+    matches!(name, "max_pool2d" | "avg_pool2d" | "adaptive_avg_pool2d")
 }
 
 /// Runs the [`Health`] checks during training. [`Trainer`](crate::Trainer) and
@@ -1869,6 +1876,68 @@ mod tests {
                 layer: 1,
                 width: 32,
                 neurons: (16..32).collect()
+            }]
+        );
+    }
+
+    /// A pooling between the convolution and the ReLU keeps the count per channel: with one
+    /// lit pixel per image, channel 0 is live at one pooled position and flat at the other
+    /// three, and only channel 1 (bias −100) is reported dead.
+    #[test]
+    fn dead_relu_after_conv_and_pooling_counts_channels() {
+        use crate::{Conv2d, Flatten, MaxPool2d};
+        use cavitation_core::Conv2dGeom;
+        use cavitation_core::kernels::pooling::Pool2dGeom;
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(3);
+        let conv = Conv2d::new(
+            &mut params,
+            Conv2dGeom::new(1, 2, (4, 4), (1, 1)).unwrap(),
+            &mut rng,
+        );
+        params
+            .value_mut(conv.weight())
+            .data_mut()
+            .copy_from_slice(&[1.0, 0.0]);
+        params
+            .value_mut(conv.bias().unwrap())
+            .data_mut()
+            .copy_from_slice(&[0.0, -100.0]);
+        let net = Sequential::new()
+            .push(conv)
+            .push(MaxPool2d::new(Pool2dGeom::new(2, (4, 4), (2, 2)).unwrap()))
+            .push(Relu)
+            .push(Flatten)
+            .push(Linear::new(&mut params, 8, 1, &mut rng));
+        let mut x = vec![0.0f32; 8 * 16];
+        for (n, image) in x.as_chunks_mut::<16>().0.iter_mut().enumerate() {
+            image[4 + 1] = 1.0 + n as f32;
+        }
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[8, 16]).unwrap(),
+            targets: Targets::Values(Tensor::full(&[8, 1], 0.5f32)),
+        };
+        let (seen, sink) = collecting_sink();
+        let config = FitConfig {
+            epochs: 1,
+            batch: 4,
+            optimizer: OptimizerConfig::Sgd {
+                lr: 1e-3,
+                momentum: 0.0,
+                weight_decay: 0.0,
+            },
+            loss: Loss::Mse,
+            health: health(OnNonFinite::Stop, sink),
+            ..FitConfig::default()
+        };
+        fit(&net, &mut params, &data, config).unwrap();
+        assert_eq!(
+            dead_reports(&seen),
+            [Warning::DeadNeurons {
+                epoch: 1,
+                layer: 2,
+                width: 8,
+                neurons: (4..8).collect()
             }]
         );
     }

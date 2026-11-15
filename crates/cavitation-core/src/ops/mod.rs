@@ -31,6 +31,7 @@ pub(crate) use activation::{
 };
 pub use batch_norm::RunningStats;
 pub use custom::CustomOp;
+pub use dropout::dropout_mask;
 use elementwise::Kind;
 pub(crate) use erf::{erf_f32, erf_f64};
 pub use glu::Gate;
