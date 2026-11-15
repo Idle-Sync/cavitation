@@ -4,7 +4,11 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
-### Training health (`cavitation-nn`)
+### GPU
+
+- A new crate, `cavitation-gpu`, reached through the `gpu` feature of `cavitation` (re-exported as `cavitation::cavitation_gpu`) or of `cavitation-nn`, both off by default; a default build has no wgpu in it. `Gpu::new()` opens the best hardware GPU on Vulkan, Metal or DX12 through wgpu 30 (Metal on macOS; Vulkan, then DX12 on Windows; Vulkan elsewhere), preferring a discrete GPU and trying the next adapter if a device fails to open, and returns `None` when there is none; software renderers, CPU and virtual adapters, paravirtual devices and OpenGL are left out. `Gpu::with_backend` asks for one backend and `Gpu::open` says why none could be opened. The device has up to 32 KiB of workgroup memory (less if the adapter has less) and GPU timestamps when the adapter offers them; `Gpu::info()` describes the adapter, driver and limits, and prints them through `Display`. `CAVITATION_GPU_BACKEND` (`vulkan`, `dx12` or `metal`) restricts every `Gpu` to one backend, and `CAVITATION_GPU_REQUIRED=1` turns a missing GPU into a panic, for test runs that must use the GPU. On DX12, shaders compile with DXC when `dxcompiler.dll` loads and with FXC otherwise; `WGPU_DX12_COMPILER=dxc` requires DXC.
+
+### Layers, training and inference (`cavitation-nn`)
 
 - The dead-ReLU report counts by channel through a pooling layer too: in `Conv2d → MaxPool2d → ReLU` (or an average pooling there), a channel is reported dead only when every pooled position of it is, as it already was with batch norm or other element-wise layers in between. Before, such a ReLU fell back to counting each position, so the flat positions of a live channel came back as dead (#222).
 
