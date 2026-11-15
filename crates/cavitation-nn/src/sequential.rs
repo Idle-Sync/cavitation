@@ -773,6 +773,155 @@ impl<T: Real> Sequential<T> {
         }
     }
 
+    /// The index of the layer whose output holds the channels of the `Conv2d` at layer
+    /// `conv`, as the next layer receives them: the last layer of the run after it that keeps
+    /// each channel's values in place (a `BatchNorm2d`, a pooling, or an element-wise layer,
+    /// which includes `Flatten` and `Identity`), or the `Conv2d` itself when the layer after
+    /// it is none of these. A channel mask goes on that layer, so that an off channel is 0
+    /// there whatever batch norm (whose output at 0 is β) and the activations give.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `conv` is not a `Conv2d`; the message names the index and the
+    /// layer's kind.
+    ///
+    /// ```
+    /// use cavitation_core::{Conv2dGeom, ParamStore, Rng};
+    /// use cavitation_core::kernels::pooling::Pool2dGeom;
+    /// use cavitation_nn::{BatchNorm2d, Conv2d, Linear, MaxPool2d, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let geom = Conv2dGeom::new(1, 4, (6, 6), (3, 3)).unwrap();
+    /// let net = Sequential::new()
+    ///     .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+    ///     .push(BatchNorm2d::new(&mut params, 4, (4, 4)))
+    ///     .push(Relu)
+    ///     .push(MaxPool2d::new(Pool2dGeom::new(4, (4, 4), (2, 2)).unwrap()))
+    ///     .push(Linear::new(&mut params, 16, 2, &mut Rng::seed(1)));
+    /// assert_eq!(net.channel_layer(0), 3);
+    /// ```
+    pub fn channel_layer(&self, conv: usize) -> usize {
+        self.check_conv(conv);
+        let mut layer = conv;
+        while self.layers.get(layer + 1).is_some_and(|next| {
+            next.is_elementwise()
+                || next.as_batch_norm2d().is_some()
+                || crate::shrink::POOL_NAMES.contains(&next.name())
+        }) {
+            layer += 1;
+        }
+        layer
+    }
+
+    /// The output channels of the `Conv2d` at layer `conv` and the values per channel at
+    /// [`channel_layer`](Self::channel_layer)'s output.
+    fn channel_shape(&self, conv: usize) -> (usize, usize) {
+        let end = self.channel_layer(conv);
+        let geom = self.layers[conv]
+            .as_conv2d()
+            .expect("channel_layer checked the conv")
+            .geom();
+        let mut width = geom.out_width();
+        for layer in &self.layers[conv + 1..=end] {
+            width = layer.output_width(width);
+        }
+        let channels = geom.out_channels();
+        (channels, width / channels)
+    }
+
+    /// Puts `mask`, one bit per output channel of the `Conv2d` at layer `conv`, on the
+    /// layer [`channel_layer`](Self::channel_layer) names, as a mask on its values that
+    /// repeats each channel's bit over the channel's positions there, replacing any mask
+    /// there. An off channel then sends 0 at every position to the next layer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `conv` is not a `Conv2d` (the message names the index and the
+    /// layer's kind); if `mask`'s width is not the conv's output channels (the message
+    /// names the conv and both widths); or if the conv itself, or a layer between it and
+    /// the layer that holds its channels, carries a mask set with [`set_mask`](Self::set_mask),
+    /// so that one channel set never carries two masks (clear that one with
+    /// [`clear_mask`](Self::clear_mask) first).
+    ///
+    /// ```
+    /// use cavitation_core::{Conv2dGeom, ParamStore, Rng};
+    /// use cavitation_nn::{Conv2d, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let geom = Conv2dGeom::new(1, 3, (4, 4), (3, 3)).unwrap();
+    /// let mut net = Sequential::new()
+    ///     .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+    ///     .push(Relu);
+    /// net.set_channel_mask(0, NeuronMask::from_off(3, &[1]));
+    /// // Each channel is 2 x 2 at the ReLU: channel 1's four values are off.
+    /// let values = net.mask(1).unwrap();
+    /// assert_eq!(values.off().collect::<Vec<_>>(), [4, 5, 6, 7]);
+    /// assert_eq!(net.channel_mask(0).unwrap().off().collect::<Vec<_>>(), [1]);
+    /// ```
+    pub fn set_channel_mask(&mut self, conv: usize, mask: NeuronMask) {
+        let (channels, plane) = self.channel_shape(conv);
+        assert!(
+            mask.width() == channels,
+            "sequential: the channel mask on conv layer {conv} has width {}, but the layer \
+             has {channels} output channels",
+            mask.width()
+        );
+        let off: Vec<usize> = mask
+            .off()
+            .flat_map(|c| c * plane..(c + 1) * plane)
+            .collect();
+        let layer = self.channel_layer(conv);
+        if let Some(other) = (conv..layer).find(|&l| self.masks[l].is_some()) {
+            panic!(
+                "sequential: the channels of the conv layer {conv} are masked at layer \
+                 {layer}, but layer {other} has a mask set with set_mask; clear it with \
+                 clear_mask({other}) first, so that one channel set carries one mask"
+            );
+        }
+        self.masks[layer] = Some(LayerMask::new(NeuronMask::from_off(channels * plane, &off)));
+    }
+
+    /// The channel view of the mask on [`channel_layer`](Self::channel_layer) of the
+    /// `Conv2d` at layer `conv`: one bit per output channel, off when every value of that
+    /// channel is off there. `None` when that layer has no mask, or one whose width does not
+    /// cover the conv's channels there.
+    ///
+    /// # Panics
+    ///
+    /// Panics if layer `conv` is not a `Conv2d`; the message names the index and the
+    /// layer's kind.
+    ///
+    /// ```
+    /// use cavitation_core::{Conv2dGeom, ParamStore, Rng};
+    /// use cavitation_nn::{Conv2d, NeuronMask, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let geom = Conv2dGeom::new(1, 2, (3, 3), (3, 3)).unwrap();
+    /// let mut net = Sequential::new().push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)));
+    /// assert!(net.channel_mask(0).is_none());
+    /// net.set_channel_mask(0, NeuronMask::from_off(2, &[0]));
+    /// assert!(!net.channel_mask(0).unwrap().is_on(0));
+    /// ```
+    pub fn channel_mask(&self, conv: usize) -> Option<NeuronMask> {
+        let (channels, plane) = self.channel_shape(conv);
+        let values = &self.masks[self.channel_layer(conv)].as_ref()?.mask;
+        if values.width() != channels * plane {
+            return None;
+        }
+        let off: Vec<usize> = (0..channels)
+            .filter(|&c| (c * plane..(c + 1) * plane).all(|j| !values.is_on(j)))
+            .collect();
+        Some(NeuronMask::from_off(channels, &off))
+    }
+
+    /// Panics, naming the index and the layer's kind, if layer `conv` is not a `Conv2d`.
+    fn check_conv(&self, conv: usize) {
+        self.check_layer(conv, "address channels of");
+        let layer = &self.layers[conv];
+        assert!(
+            layer.as_conv2d().is_some(),
+            "sequential: layer {conv} is a {} layer, not a conv2d layer",
+            layer.name()
+        );
+    }
+
     /// Panics, naming the index and the layer's kind, if layer `linear` is not a `Linear`.
     fn check_linear(&self, linear: usize) {
         self.check_layer(linear, "address neurons of");
@@ -977,6 +1126,118 @@ mod tests {
         Init, Layer, Linear, NeuronMask, Optimizer, Prelu, Relu, Sequential, Sgd, Sigmoid, Tanh,
         Trace,
     };
+
+    /// conv(1 → 3, 5 × 5, 3 × 3) → BatchNorm2d → ReLU → conv(3 → 2, 1 × 1), with batch
+    /// norm's β at 1 so that a channel zeroed before it would come out as 1.
+    fn channel_net(params: &mut ParamStore) -> Sequential {
+        use crate::{BatchNorm2d, Conv2d};
+        use cavitation_core::Conv2dGeom;
+        let mut rng = Rng::seed(4);
+        let bn = BatchNorm2d::new(params, 3, (3, 3));
+        params.value_mut(bn.bias().unwrap()).data_mut().fill(1.0);
+        Sequential::new()
+            .push(Conv2d::new(
+                params,
+                Conv2dGeom::new(1, 3, (5, 5), (3, 3)).unwrap(),
+                &mut rng,
+            ))
+            .push(bn)
+            .push(Relu)
+            .push(Conv2d::new(
+                params,
+                Conv2dGeom::new(3, 2, (3, 3), (1, 1)).unwrap(),
+                &mut rng,
+            ))
+    }
+
+    /// A channel mask lands at the end of the conv's run (after batch norm and the ReLU),
+    /// sends 0 at every position of the off channel there although batch norm's β is 1, and
+    /// leaves the other channels and their bits as they were.
+    #[test]
+    fn channel_mask_zeroes_the_channel_after_its_run() {
+        let mut params = ParamStore::new();
+        let mut net = channel_net(&mut params);
+        assert_eq!(net.channel_layer(0), 2);
+        assert_eq!(net.channel_layer(3), 3);
+        let x: Vec<f32> = (0..2 * 25).map(|i| (i % 7) as f32 / 3.0 - 1.0).collect();
+        let run = |net: &Sequential| {
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&params.values);
+            let xv = tape.input(Tensor::from_vec(x.clone(), &[2, 25]).unwrap().view());
+            let mut trace = Trace::new();
+            net.forward_traced(&mut tape, xv, &mut trace);
+            tape.value(trace.output(2)).data().to_vec()
+        };
+        let before = run(&net);
+        net.set_channel_mask(0, NeuronMask::from_off(3, &[1]));
+        assert!(net.mask(2).is_some() && net.mask(0).is_none() && net.mask(1).is_none());
+        assert_eq!(net.channel_mask(0).unwrap().off().collect::<Vec<_>>(), [1]);
+        let after = run(&net);
+        for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+            let channel = (i % 27) / 9;
+            if channel == 1 {
+                assert_eq!(a.to_bits(), 0.0f32.to_bits(), "value {i}");
+                assert!(*b > 0.0, "value {i} was live before the mask");
+            } else {
+                assert_eq!(a.to_bits(), b.to_bits(), "value {i}");
+            }
+        }
+    }
+
+    /// A pooling between the conv and the ReLU is part of the run, and so is a `Flatten`
+    /// after them; the channel's positions there are the pooled ones.
+    #[test]
+    fn channel_run_crosses_pooling() {
+        use crate::{Conv2d, Flatten, MaxPool2d};
+        use cavitation_core::Conv2dGeom;
+        use cavitation_core::kernels::pooling::Pool2dGeom;
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new()
+            .push(Conv2d::new(
+                &mut params,
+                Conv2dGeom::new(1, 2, (4, 4), (1, 1)).unwrap(),
+                &mut Rng::seed(0),
+            ))
+            .push(MaxPool2d::new(Pool2dGeom::new(2, (4, 4), (2, 2)).unwrap()))
+            .push(Relu)
+            .push(Flatten);
+        assert_eq!(net.channel_layer(0), 3);
+        net.set_channel_mask(0, NeuronMask::from_off(2, &[0]));
+        assert_eq!(net.mask(3).unwrap().off().collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(net.mask(3).unwrap().width(), 8);
+    }
+
+    /// A channel mask of the wrong width names the conv and both widths.
+    #[test]
+    #[should_panic(
+        expected = "the channel mask on conv layer 0 has width 2, but the layer has 3 output channels"
+    )]
+    fn channel_mask_of_wrong_width_panics() {
+        let mut params = ParamStore::new();
+        let mut net = channel_net(&mut params);
+        net.set_channel_mask(0, NeuronMask::all_on(2));
+    }
+
+    /// A mask set with `set_mask` inside the conv's run is refused, so that one channel set
+    /// never carries two masks.
+    #[test]
+    #[should_panic(
+        expected = "layer 1 has a mask set with set_mask; clear it with clear_mask(1) first"
+    )]
+    fn channel_mask_refuses_a_mask_inside_the_run() {
+        let mut params = ParamStore::new();
+        let mut net = channel_net(&mut params);
+        net.set_mask(1, NeuronMask::from_off(27, &[0, 1, 2]));
+        net.set_channel_mask(0, NeuronMask::from_off(3, &[2]));
+    }
+
+    /// Addressing the channels of a layer that is not a conv names its kind.
+    #[test]
+    #[should_panic(expected = "layer 2 is a relu layer, not a conv2d layer")]
+    fn channels_of_a_non_conv_panic() {
+        let mut params = ParamStore::new();
+        channel_net(&mut params).channel_layer(2);
+    }
 
     /// The digits-shaped network, 64 → 32 → 10, with its parameters in `params`.
     fn digits_net(params: &mut ParamStore) -> Sequential {

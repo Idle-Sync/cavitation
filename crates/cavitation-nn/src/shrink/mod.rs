@@ -41,7 +41,7 @@ use cavitation_core::{Error, Real};
 use crate::Sequential;
 
 /// The names of the built-in image layers that have no downcast: the three poolings.
-const POOL_NAMES: [&str; 3] = ["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
+pub(crate) const POOL_NAMES: [&str; 3] = ["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
 
 /// [`Error::Unsupported`] from `tool` if `model` has an image layer (`Conv2d`,
 /// `BatchNorm2d`, or a pooling layer, found by its name), naming the first one: the tools
