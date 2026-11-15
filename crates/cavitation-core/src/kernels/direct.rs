@@ -159,13 +159,24 @@ pub(super) struct WeightJob {
     pub(super) w: usize,
 }
 
-/// The sum of `lanes` as a tree: each half summed the same way, then the two halves added.
-/// One value is itself.
+/// The sum of `lanes` as a tree: each half summed the same way, then the two halves added;
+/// one value is itself. Written out for the kernels' four and eight lanes, so that it
+/// inlines into their loops.
+#[inline(always)]
 pub(super) fn tree_sum(lanes: &[f32]) -> f32 {
+    match *lanes {
+        [a, b, c, d] => (a + b) + (c + d),
+        [a, b, c, d, e, f, g, h] => ((a + b) + (c + d)) + ((e + f) + (g + h)),
+        _ => tree_sum_any(lanes),
+    }
+}
+
+/// [`tree_sum`] for any number of values.
+fn tree_sum_any(lanes: &[f32]) -> f32 {
     match lanes.len() {
         0 => 0.0,
         1 => lanes[0],
-        n => tree_sum(&lanes[..n / 2]) + tree_sum(&lanes[n / 2..]),
+        n => tree_sum_any(&lanes[..n / 2]) + tree_sum_any(&lanes[n / 2..]),
     }
 }
 
