@@ -39,6 +39,14 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
   - **Bounds:** each kernel's bound assumes every multiply-add may round twice, and WGSL's division (2.5 ulp) and `inverseSqrt` (2 ulp). A non-zero eps that is subnormal in f32, which the GPU would flush, is refused.
   - **Checks:** against the tape on an `f64` store end to end, and bit for bit on integers for the four sums, on an Apple M4 (Metal). Shapes run up to the CIFAR network's `(128, 32, 1024)`.
   - **Also:** `ChannelSums::call` takes an `accumulate` flag, which adds the sums to the output instead of overwriting it, for a gradient with several sources. Its uniform is now 32 bytes.
+- The losses and the health values a training step reads back, on the GPU.
+  - **Losses:** `kernels::SoftmaxCrossEntropy` (integer labels, the mean over the batch) and `kernels::MeanSquaredError` (the mean over every value), as the tape computes them with `Reduction::Mean`, with their gradients. Each writes its loss as one `f32` word at a word offset of an output buffer, so a step's results pack into one small readback.
+  - **Cross-entropy bounds:** they allow WGSL's `exp` (3 + 2|x| ulp) and `log`, and subtractions in either order. A row with a NaN or infinite logit, or a label not below the classes, gives NaN.
+  - **MSE:** the gradient is the CPU's bits on normal values.
+  - **`kernels::SumSquares`:** each gradient tensor's sum of squares in a flat gradient buffer, one word each, for the gradient-norm checks.
+  - **`kernels::FiniteFlag`:** the step's finite flag, a `u32` at word 0 of its own buffer that the optimiser and the running statistics read. It is set when the loss or any gradient value is NaN or infinite, tested by bits, so a gradient whose sum of squares overflows leaves it clear.
+  - **`kernels::DeadRelu`:** one "ever non-zero" bit per neuron, or per channel after a convolution, OR-ed into a buffer that lasts through an epoch.
+  - **Checks:** exact against the CPU's rules for the flag and the bits; within the bound of a sum for the sums of squares; against the tape for the losses, on an Apple M4 (Metal).
 
 ### Layers, training and inference (`cavitation-nn`)
 

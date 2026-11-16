@@ -2,9 +2,12 @@
 //! `cavitation_core::kernels`.
 
 mod batch_norm;
+mod bindings;
 mod conv;
 mod elementwise;
 mod gemm;
+mod health;
+mod loss;
 mod optimizer;
 mod pooling;
 mod reduce;
@@ -13,6 +16,8 @@ pub use batch_norm::{BatchNorm2d, BatchNormBackward, BatchNormForward, BatchStat
 pub use conv::{ConvCall, ConvDims, ConvForward, ConvInputGrad};
 pub use elementwise::{Elementwise, ElementwiseCall, ElementwiseKernels};
 pub use gemm::{Gemm, GemmCall, GemmDims};
+pub use health::{DeadRelu, DeadReluCall, FiniteFlag, FiniteFlagCall, SumSquares, SumSquaresCall};
+pub use loss::{CrossEntropyCall, MeanSquaredError, MseCall, SoftmaxCrossEntropy};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AvgPool2d, MaxPool2d};
 pub use reduce::{BiasAdd, BiasAddCall, ChannelDims, ChannelSums, ChannelSumsCall};
