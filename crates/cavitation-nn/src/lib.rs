@@ -62,15 +62,12 @@
 //! assert!((answer - 0.25).abs() < 0.1, "{answer}");
 //! ```
 
-// The `gpu` feature's dependency, which no item in this crate uses yet; this keeps it from
-// being reported as unused.
-#[cfg(feature = "gpu")]
-use cavitation_gpu as _;
-
 mod activation;
 mod batch_norm;
 mod conv;
 mod dropout;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod health;
 mod hooks;
 mod inference;
@@ -96,6 +93,8 @@ pub use activation::{
 pub use batch_norm::BatchNorm2d;
 pub use conv::Conv2d;
 pub use dropout::{Dropout, Flatten, Identity};
+#[cfg(feature = "gpu")]
+pub use gpu::GpuModel;
 pub use health::{BadInput, Health, HealthMonitor, OnNonFinite, StepInputs, Warning, WarningKind};
 pub use hooks::{HookId, Hooks, LayerEvent};
 pub use inference::{InferenceLayer, InferenceModel};
