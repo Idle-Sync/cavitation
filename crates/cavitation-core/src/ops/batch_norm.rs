@@ -285,10 +285,11 @@ impl<T: Real> Tape<'_, T> {
     }
 }
 
-/// Backward of `batch_norm2d` and `batch_norm2d_relu` (`out` is the node, whose value, ReLU's
-/// output, gives the fused ReLU's derivative). With `x̂ = (x − mean) · inv` and `g = dy · γ` per channel over
-/// its `m` values: `dβ = Σ dy`, `dγ = Σ dy · x̂`, and `dx = inv · g` with the running
-/// statistics, else `dx = inv / m · (m · g − Σ g − x̂ · Σ g · x̂)` through the batch's.
+/// Backward of `batch_norm2d` and `batch_norm2d_relu`. With `x̂ = (x − mean) · inv` and
+/// `g = dy · γ` per channel over its `m` values: `dβ = Σ dy`, `dγ = Σ dy · x̂`, and
+/// `dx = inv · g` with the running statistics, else `dx = inv / m · (m · g − Σ g − x̂ · Σ g ·
+/// x̂)` through the batch's. With the fused ReLU, `dy` is first multiplied by ReLU's
+/// derivative at `out`'s value, ReLU's output.
 // The op's five fields, the node, the gradient and the context; a struct would only rename them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn backward<T: Real>(
