@@ -291,9 +291,9 @@ impl<T: Real> Tape<'_, T> {
 const BLOCK: usize = 256;
 
 /// `out[k] = dy[k] · ReLU'(y[k])`, the product ReLU's own backward pass writes. A loop of its
-/// own, so it compiles to a vector select: inside batch norm's sums, which keep their order
-/// and so cannot be vectorised, the derivative would be a branch on the sign of each value,
-/// mispredicted about half the time.
+/// own, so it compiles to a vector select. On x86, inside batch norm's ordered sums (which
+/// cannot be vectorised without changing the bits) the same product cost more than this
+/// pass, measured with the derivative both as written and as a comparison turned into 0 or 1.
 fn relu_masked<T: Real>(out: &mut [T], dy: &[T], y: &[T]) {
     for ((o, &g), &v) in out.iter_mut().zip(dy).zip(y) {
         *o = g * relu_derivative(v);
@@ -412,10 +412,27 @@ pub(super) fn backward<T: Real>(
                 if let Some(st) = &st {
                     // SAFETY: task `c` alone writes channel `c`'s values of each image.
                     let d = unsafe { st.slice(at, spatial) };
-                    relu_masked(d, &out_grad[at..][..spatial], &yv[at..][..spatial]);
-                    for (&g, &v) in d.iter().zip(&xv[at..][..spatial]) {
-                        s += g;
-                        sx += g * ((v - mean) * inv);
+                    let xs = &xv[at..][..spatial];
+                    let (dys, ys) = (&out_grad[at..][..spatial], &yv[at..][..spatial]);
+                    if cfg!(target_arch = "aarch64") {
+                        // One loop. On aarch64 the mask compiles to selects, and the ordered
+                        // sums are bound by their additions' latency, so the mask and the
+                        // store fit in its shadow (measured on an Apple M4).
+                        for (((d, &dy), &y), &v) in d.iter_mut().zip(dys).zip(ys).zip(xs) {
+                            let g = dy * relu_derivative(y);
+                            *d = g;
+                            s += g;
+                            sx += g * ((v - mean) * inv);
+                        }
+                    } else {
+                        // The mask first, a loop of its own that vectorises, then the sums:
+                        // on x86 the mask inside the scalar sum loop costs more than its own
+                        // pass (measured on an Intel Celeron N5105).
+                        relu_masked(d, dys, ys);
+                        for (&g, &v) in d.iter().zip(xs) {
+                            s += g;
+                            sx += g * ((v - mean) * inv);
+                        }
                     }
                 } else {
                     let mut block = [T::ZERO; BLOCK];
