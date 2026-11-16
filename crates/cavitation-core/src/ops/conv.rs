@@ -2,8 +2,9 @@
 //!
 //! In f32, a 3 × 3 convolution with stride 1 and padding 1 runs its forward pass and its
 //! input gradient as a direct convolution ([`conv3x3_direct`], [`conv3x3_direct_input_grad`])
-//! where [`direct_runs`] accepts it at the current kernel level. Everything else, and every
-//! weight gradient, cuts the batch into groups of images ([`groups`]) run in parallel; each
+//! where [`direct_runs`] accepts it at the current kernel level, and its weight gradient
+//! directly ([`conv3x3_direct_weight_grad`]) where [`direct_weight_grad_runs`] accepts it.
+//! Everything else cuts the batch into groups of images ([`groups`]) run in parallel; each
 //! group copies its images' windows into column matrices and multiplies them by the weight
 //! with the GEMM of the current kernel level (`Real::gemm`), by [`conv2d_forward`] and
 //! [`conv2d_backward`]. Nothing is kept between the forward and the backward pass, which
@@ -13,7 +14,8 @@
 use crate::graph::{BackwardCtx, Var};
 use crate::kernels::conv::{
     Conv2dGeom, conv2d_backward, conv2d_forward, conv2d_scratch, conv3x3_direct,
-    conv3x3_direct_input_grad, direct_input_grad_runs, direct_runs, direct_scratch, groups,
+    conv3x3_direct_input_grad, conv3x3_direct_weight_grad, direct_input_grad_runs, direct_runs,
+    direct_scratch, direct_weight_grad_runs, direct_weight_grad_scratch, groups,
 };
 use crate::kernels::{self, MatMut, MatRef};
 use crate::ops::Op;
@@ -130,7 +132,9 @@ impl<T: Real> Tape<'_, T> {
 /// The scratch a convolution of `batch` images of `geom` takes on `threads` threads, by
 /// whichever path runs it.
 fn scratch_len(geom: &Conv2dGeom, batch: usize, threads: usize) -> usize {
-    conv2d_scratch(geom, batch, threads).max(direct_scratch(geom, threads))
+    conv2d_scratch(geom, batch, threads)
+        .max(direct_scratch(geom, threads))
+        .max(direct_weight_grad_scratch(geom, threads))
 }
 
 /// `v` as f32 values, when `T` is f32.
@@ -154,7 +158,9 @@ fn gemm<T: Real>(a: MatRef<'_, T>, b: MatRef<'_, T>, beta: T, c: MatMut<'_, T>) 
 
 /// Backward of `conv2d`: `db` sums the output gradient; the input gradient and one partial
 /// weight gradient per group come from [`conv2d_backward`], and the partials are added up in
-/// group order, so every gradient is the same for any thread count.
+/// group order, so every gradient is the same for any thread count. In f32 the direct
+/// kernels take the input gradient and the weight gradient where they accept the geometry;
+/// their results do not depend on the thread count either.
 pub(super) fn backward<T: Real>(
     x: Var,
     weight: Var,
@@ -186,7 +192,25 @@ pub(super) fn backward<T: Real>(
     }
     let threads = kernels::threads();
     let mut scratch = ctx.scratch(scratch_len(&geom, batch, threads));
-    if ctx.takes_grad(weight) {
+    let level = kernels::level();
+    if ctx.takes_grad(weight)
+        && direct_weight_grad_runs(level, &geom)
+        && TypeId::of::<T>() == TypeId::of::<f32>()
+    {
+        if let Some(slot) = ctx.slot(weight) {
+            slot.update_with(|buf, beta| {
+                if let (Some(xs), Some(dy), Some(dw), Some(sc)) = (
+                    as_f32(xv),
+                    as_f32(out_grad),
+                    as_f32_mut(&mut *buf),
+                    as_f32_mut(&mut scratch),
+                ) {
+                    let add = beta != T::ZERO;
+                    conv3x3_direct_weight_grad(level, &geom, batch, xs, dy, dw, add, sc, threads);
+                }
+            });
+        }
+    } else if ctx.takes_grad(weight) {
         let count = groups(batch);
         let mut parts = ctx.scratch(count * cout * kl);
         if let Some(slot) = ctx.slot(weight) {
@@ -219,7 +243,6 @@ pub(super) fn backward<T: Real>(
     {
         slot.update_with(|buf, beta| {
             let add = beta != T::ZERO;
-            let level = kernels::level();
             if direct_input_grad_runs(level, &geom)
                 && let (Some(dy), Some(ws), Some(dx), Some(sc)) = (
                     as_f32(out_grad),
