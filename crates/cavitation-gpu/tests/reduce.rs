@@ -281,8 +281,8 @@ fn refusals() {
             bias(ChannelDims::new(1 << 16, 1 << 16, 1), &a, &b)
                 .contains("more than the 2147483648")
         );
-        assert!(bias(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor: needs 65 f32s"));
-        assert!(bias(ChannelDims::new(1, 65, 1), &a, &b).contains("the bias: needs 65 f32s"));
+        assert!(bias(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor needs 65 values"));
+        assert!(bias(ChannelDims::new(1, 65, 1), &a, &b).contains("the bias needs 65 values"));
         assert!(bias(ChannelDims::new(1, 1, 64), &a, &a).contains("different buffers"));
         let wrapping = ChannelDims::new(65_536, 65_537, 4_294_901_761);
         assert_eq!(wrapping.len(), u64::MAX);
@@ -304,8 +304,8 @@ fn refusals() {
         assert!(
             sum(ChannelDims::new(1 << 16, 1 << 16, 1), &a, &b).contains("more than the 2147483648")
         );
-        assert!(sum(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor: needs 65 f32s"));
-        assert!(sum(ChannelDims::new(1, 2, 32), &a, &one).contains("the output: needs 2 f32s"));
+        assert!(sum(ChannelDims::new(1, 1, 65), &a, &b).contains("the tensor needs 65 values"));
+        assert!(sum(ChannelDims::new(1, 2, 32), &a, &one).contains("the output needs 2 values"));
         assert!(sum(ChannelDims::new(1, 1, 64), &a, &a).contains("different buffers"));
     });
 }

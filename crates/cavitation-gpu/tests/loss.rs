@@ -26,6 +26,13 @@ fn kit(gpu: &Gpu, values: usize) -> Kit {
     Kit::new(gpu, 4 * values as u64 + 65_536)
 }
 
+/// The relative error of a sum of `len` terms in the per-channel sums' fixed tree, in units of
+/// `u`: each term passes through at most 15 + 8 + (chunks − 1) additions, whatever order a
+/// compiler picks within a lane.
+fn depth(len: usize) -> f64 {
+    22.0 + len.div_ceil(4096) as f64
+}
+
 /// `b` with an allowance for rounding the result it bounds.
 fn second(b: f64) -> f64 {
     b * (1.0 + 16.0 * U)
@@ -130,11 +137,11 @@ fn ce_bounds(batch: usize, classes: usize, logits: &[f32], labels: &[u32]) -> (f
             let p = t.exp();
             let onehot = if j == label { 1.0 } else { 0.0 };
             let inner = order(z[j]) + d + (6.0 + 4.0 * t.abs()) * U;
-            grad.push(second(p * inner / b + 2.0 * U * (p - onehot).abs() / b) + FLOOR / b);
+            grad.push(second(p * inner / b + 3.0 * U * (p - onehot).abs() / b) + FLOOR / b);
         }
     }
     let mean = losses / b;
-    let loss = second((row_bounds + sum_bound(batch, losses)) / b + 5.0 * U * mean)
+    let loss = second((row_bounds + depth(batch) * U * losses) / b + 5.0 * U * mean)
         + 2.0 * batch as f64 * FLOOR;
     (loss, grad)
 }
@@ -220,6 +227,32 @@ fn cross_entropy_twin() {
     });
 }
 
+/// Rows `[0, z]` labelled 1 for `z` from −15 to −7: the label's probability is far below 1/2,
+/// so `p − 1` rounds, and its gradient takes three roundings on `p − onehot`. Each gradient is
+/// within its bound of the tape's.
+#[test]
+fn cross_entropy_label_far_below_the_max() {
+    for_each_gpu(|gpu| {
+        let batch = 1000u32;
+        let mut kit = kit(gpu, 2000);
+        let ce = SoftmaxCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+        let flag = FiniteFlag::new(gpu, &mut kit.cache).unwrap();
+        let z: Vec<f32> = (0..batch)
+            .flat_map(|i| [0.0, -15.0 + 8.0 * i as f32 / batch as f32])
+            .collect();
+        let y = vec![1u32; batch as usize];
+        let (loss, grad, _) = gpu_ce(&mut kit, (&ce, &flag), (batch, 2), &z, &y);
+        let (want_loss, want_grad) = tape_ce(batch as usize, 2, &z, &y);
+        let (loss_bound, grad_bound) = ce_bounds(batch as usize, 2, &z, &y);
+        assert_within(&[loss], &[want_loss], |_| loss_bound, "the loss");
+        let worst = assert_within(&grad, &want_grad, |i| grad_bound[i], "the gradient");
+        println!(
+            "labels far below the max: worst {:.3} of its bound",
+            worst.ratio()
+        );
+    });
+}
+
 /// A row with a NaN, +∞ or −∞ logit, or a label not below the classes, gives a NaN loss and a
 /// NaN gradient row, so the loss is NaN and the finite flag set. The other rows' gradients
 /// are the bits of a run without the bad row.
@@ -237,7 +270,8 @@ fn cross_entropy_bad_rows_set_the_flag() {
         for (name, at, value, label) in [
             ("a NaN logit", 7, f32::NAN, 4),
             ("a +inf logit", 5, f32::INFINITY, 4),
-            ("a -inf logit off the label", 9, f32::NEG_INFINITY, 4),
+            ("a -inf logit off the label", 8, f32::NEG_INFINITY, 4),
+            ("a -inf logit on the label", 9, f32::NEG_INFINITY, 4),
             ("label 5 of 5 classes", 6, z[6], 5),
         ] {
             let (mut zb, mut yb) = (z.clone(), y.clone());
@@ -281,7 +315,7 @@ fn gpu_mse(kit: &mut Kit, mse: &MeanSquaredError, pred: &[f32], target: &[f32]) 
 }
 
 /// The mean squared error against the tape: the gradient bit for bit against an `f32`
-/// store's, and the loss within `((2(n + 2) + 3)·u·Σ d²)/n + 5u·loss` of an `f64` store's, for
+/// store's, and the loss within `(25 + chunks)·u·Σ d² / n + 5u·loss` of an `f64` store's, for
 /// 1, 37, 4,097, 100,000 and 2²⁴ + 1,000 values (more than one grid row of workgroups).
 #[test]
 fn mse_twin() {
@@ -317,9 +351,8 @@ fn mse_twin() {
                 .map(|(&p, &t)| (f64::from(p) - f64::from(t)).powi(2))
                 .sum();
             let want = squares / n as f64;
-            let bound =
-                second((sum_bound(n, squares) + 3.0 * U * squares) / n as f64 + 5.0 * U * want)
-                    + 3.0 * FLOOR;
+            let relative = (depth(n) + 3.0) * U * squares / n as f64;
+            let bound = second(relative + 5.0 * U * want) + 3.0 * FLOOR;
             let worst = assert_within(
                 &[loss],
                 &[want],

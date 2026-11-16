@@ -28,7 +28,6 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
   - **`kernels::FiniteFlag`:** the step's finite flag, a `u32` at word 0 of its own buffer that the optimiser and the running statistics read. It is set when the loss or any gradient value is NaN or infinite, tested by bits, so a gradient whose sum of squares overflows leaves it clear.
   - **`kernels::DeadRelu`:** one "ever non-zero" bit per neuron, or per channel after a convolution, OR-ed into a buffer that lasts through an epoch.
   - **Checks:** exact against the CPU's rules for the flag and the bits; within the bound of a sum for the sums of squares; against the tape for the losses, on an Apple M4 (Metal).
-  - **Per-channel sums:** they can now start partway into their input, write at a word offset, and divide by a count.
 
 ### Layers, training and inference (`cavitation-nn`)
 

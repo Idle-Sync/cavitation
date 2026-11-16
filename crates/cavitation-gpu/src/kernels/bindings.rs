@@ -94,9 +94,9 @@ pub(crate) fn check_len(kernel: &str, what: &str, buffer: &PooledBuffer, values:
     );
 }
 
-/// Panics, naming the `kernel`, unless the buffer it writes, `written` (named), is none of the buffers
-/// `read` (named) that it is used with: wgpu refuses a dispatch that writes a buffer it also
-/// reads, and an alias between them is a mistake in the caller either way.
+/// Panics, naming the `kernel`, unless the buffer it writes, `written` (named), is none of
+/// the buffers `read` (named) that it is used with: wgpu refuses a dispatch that writes a
+/// buffer it also reads, and an alias between them is a mistake in the caller either way.
 pub(crate) fn check_distinct(
     kernel: &str,
     written: (&str, &PooledBuffer),

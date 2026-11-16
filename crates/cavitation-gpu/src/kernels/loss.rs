@@ -21,8 +21,10 @@ const WORKGROUP: u32 = 256;
 /// Bytes of each kernel's uniform: four words.
 const UNIFORM_BYTES: u64 = 16;
 
-/// The most values a loss's input may hold: the per-channel sums of one channel take at most
-/// 65,535 chunks of 4,096.
+/// The most values a loss's input may hold. The mean squared error's sum is one channel of
+/// the per-channel sums, which take at most 65,535 chunks of 4,096. The cross-entropy's
+/// logits are never summed and only need `u32` indices, but share the limit so both losses
+/// take the same sizes.
 const MAX_VALUES: u64 = 65_535 * 4_096;
 
 /// Softmax cross-entropy, one thread per row: the row's loss `ln Σ e^(z − max) − (z_label −
@@ -145,10 +147,12 @@ fn reciprocal(n: u64) -> f32 {
 /// - **A row's loss:** within `2u·(|z_label| + |max| + ln S) + Δ`: its two subtractions in
 ///   either order, as a compiler may reassociate them.
 /// - **The loss:** the row losses' bounds summed and divided by the batch, plus
-///   `2(B + 2)·u·Σℓ / B` and `5u` of itself for the division.
+///   `(22 + chunks)·u·Σℓ / B` for the sum (each row loss passes through at most 15 + 8 +
+///   (chunks − 1) additions of the fixed tree, in any order within a lane) and `5u` of
+///   itself for the division.
 /// - **A gradient:** with `t_j = x_j − ln S` and `p_j = e^(t_j)`, within
-///   `w·p_j·(2u·(|z_j| + |max| + ln S) + Δ + (6 + 4|t_j|)·u) + 2u·|p_j − onehot|/B` of
-///   `(p_j − onehot)/B`.
+///   `w·p_j·(2u·(|z_j| + |max| + ln S) + Δ + (6 + 4|t_j|)·u) + 3u·|p_j − onehot|/B` of
+///   `(p_j − onehot)/B`: the subtraction of the onehot, `w`'s own rounding and the product.
 ///
 /// Each bound adds 2⁻¹²⁶ for every value that may be flushed.
 ///
@@ -342,10 +346,11 @@ impl CrossEntropyCall {
 /// gradient `2 · (p − t) · (1/n)`.
 ///
 /// The gradient takes one subtraction, an exact doubling and one product, so on normal values
-/// it is the CPU's, bit for bit. The loss's sum runs in the per-channel sums' fixed tree.
-/// Against the exact mean of the same `f32` values it is within
-/// `((2(n + 2) + 3)·u·Σ (p − t)²) / n` plus `5u` of itself for the division, and
-/// `3n · 2⁻¹²⁶ / n` for flushes. A NaN or infinite value gives a NaN or infinite loss, and a
+/// it is the CPU's, bit for bit. The loss's sum runs in the per-channel sums' fixed tree, so
+/// each square passes through at most 15 + 8 + (chunks − 1) additions (in any order within a
+/// lane) for `chunks = ⌈n / 4096⌉`. Against the exact mean of the same `f32` values it is
+/// within `(25 + chunks)·u·Σ (p − t)² / n` (the 3 for the difference and the square), plus
+/// `5u` of itself for the division and `4 · 2⁻¹²⁶` for flushes. A NaN or infinite value gives a NaN or infinite loss, and a
 /// difference large enough to overflow its square gives an infinite loss with a finite
 /// gradient. The finite flag tests the loss, so it catches both.
 ///

@@ -415,8 +415,8 @@ fn refusals() {
             })
         };
         assert!(sum((&g, 0, 0), &out, 0).contains("at least one value"));
-        assert!(sum((&g, 10, 7), &out, 0).contains("the tensor: needs 17 f32s"));
-        assert!(sum((&g, 0, 16), &out, 4).contains("the output: needs 5 f32s"));
+        assert!(sum((&g, 10, 7), &out, 0).contains("the tensor needs 17 values"));
+        assert!(sum((&g, 0, 16), &out, 4).contains("the output needs 5 values"));
         assert!(sum((&g, 0, 16), &g, 0).contains("different buffers"));
         let mut finite =
             |loss: (&PooledBuffer, u32), grads: &[(&PooledBuffer, u32, u32)], f: &PooledBuffer| {
@@ -430,7 +430,7 @@ fn refusals() {
             finite((&out, 0), &[(&g, 0, 4), (&one, 0, 1)], &one)
                 .contains("the flag and gradient 1 must be different")
         );
-        assert!(finite((&out, 0), &[(&g, 12, 8)], &one).contains("needs 20 f32s"));
+        assert!(finite((&out, 0), &[(&g, 12, 8)], &one).contains("needs 20 values"));
         let mut bits = |dims: ChannelDims, y: &PooledBuffer, out: &PooledBuffer, offset: u32| {
             message(&mut || {
                 let _ = dead.call(&mut kit.steps, &mut kit.pool, dims, y, out, offset, false);

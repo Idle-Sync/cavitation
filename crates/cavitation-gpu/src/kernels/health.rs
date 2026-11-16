@@ -350,16 +350,26 @@ impl FiniteFlag {
                 "{what}: the flag and gradient {k} must be different buffers"
             );
         }
-        let counts = pool.take(4 * grads.len().max(1) as u64, wgpu::BufferUsages::STORAGE);
-        let tensors: Vec<ChannelSumsCall> = grads
+        let shapes: Vec<ChannelDims> = grads
             .iter()
             .enumerate()
             .map(|(k, &(buffer, start, len))| {
+                let dims = flat(what, start, len);
+                let values = u64::from(start) + u64::from(len);
+                check_len(what, &format!("gradient {k}"), buffer, values);
+                dims
+            })
+            .collect();
+        let counts = pool.take(4 * grads.len().max(1) as u64, wgpu::BufferUsages::STORAGE);
+        let tensors: Vec<ChannelSumsCall> = grads
+            .iter()
+            .zip(shapes)
+            .enumerate()
+            .map(|(k, (&(buffer, start, _), dims))| {
                 let to = SumsTo {
                     offset: k as u32,
                     ..SumsTo::new(&counts)
                 };
-                let dims = flat(what, start, len);
                 self.counts
                     .call(steps, pool, what, dims, (buffer, start), &[], to)
             })
@@ -534,10 +544,9 @@ impl DeadRelu {
         let words = DeadRelu::words(dims.channels);
         check_len(what, "output", out, u64::from(offset) + u64::from(words));
         check_distinct(what, ("output", out), &[("ReLU output", y)]);
-        let counts = pool.take(
-            4 * u64::from(dims.channels.max(1)),
-            wgpu::BufferUsages::STORAGE,
-        );
+        dims.check(what);
+        check_len(what, "ReLU output", y, dims.len());
+        let counts = pool.take(4 * u64::from(dims.channels), wgpu::BufferUsages::STORAGE);
         let sums = self
             .counts
             .call(steps, pool, what, dims, (y, 0), &[], SumsTo::new(&counts));
