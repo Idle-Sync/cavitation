@@ -34,6 +34,9 @@
 //!   stride, padding, dilation and a bias, within the GEMM's bound of the CPU reference.
 //! - [`kernels::ConvInputGrad`]: the convolution's input gradient, gathered as an implicit
 //!   GEMM through the same core, within the GEMM's bound of the CPU reference.
+//! - [`kernels::ConvWeightGrad`]: the convolution's weight gradient, an implicit GEMM through
+//!   the same core summed in fixed blocks added in order, within the blocked sum's bound of the
+//!   CPU reference.
 //! - [`kernels::BiasAdd`] and [`kernels::ChannelSums`]: a bias added per channel, with the
 //!   CPU's bits, and each channel's sum in a fixed tree, over `[outer][channels][inner]` tensors (an
 //!   `M × N` matrix or an NCHW batch).
