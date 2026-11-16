@@ -62,7 +62,7 @@ fn gpu_bias_add(
 /// The GPU's channel sums of `x`.
 fn gpu_sums(kit: &mut Kit, kernel: &ChannelSums, dims: ChannelDims, x: &[f32]) -> Vec<f32> {
     let (xb, out) = (kit.upload(x), kit.zeros(dims.channels as usize));
-    let call = kernel.call(&mut kit.steps, &mut kit.pool, dims, &xb, &out);
+    let call = kernel.call(&mut kit.steps, &mut kit.pool, dims, &xb, &out, false);
     let mut step = kit.steps.begin();
     kernel.record(&mut step, &call);
     let _ = step.finish();
@@ -174,6 +174,42 @@ fn channel_sums_exact_twin() {
     });
 }
 
+/// Accumulating channel sums add to the output's old values instead of overwriting them, on
+/// small integers bit for bit: one chunk, several chunks, and more than one merge workgroup.
+#[test]
+fn channel_sums_accumulate() {
+    for_each_gpu(|gpu| {
+        for (s, dims) in [
+            ChannelDims::new(2, 7, 9),
+            ChannelDims::new(3, 4, 5000),
+            ChannelDims::rows(3, 300),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut kit = kit(gpu, dims);
+            let kernel = ChannelSums::new(gpu, &mut kit.cache).unwrap();
+            let x = exact_values(55 + s as u64, dims.len() as usize);
+            let old = exact_values(57 + s as u64, dims.channels as usize);
+            let mut want = old.clone();
+            for (i, v) in x.iter().enumerate() {
+                want[channel(dims, i)] += v;
+            }
+            let (xb, out) = (kit.upload(&x), kit.upload(&old));
+            let call = kernel.call(&mut kit.steps, &mut kit.pool, dims, &xb, &out, true);
+            let mut step = kit.steps.begin();
+            kernel.record(&mut step, &call);
+            let _ = step.finish();
+            assert_exact(
+                &kit.read(&out),
+                &want,
+                &format!("accumulated channel sums {dims:?}"),
+            );
+            call.release(&mut kit.pool);
+        }
+    });
+}
+
 /// Channel sums on seeded values, against the exact (`f64`) sums of the same `f32` values:
 /// each within `2(L + 2) · u · Σ|x| + (2L − 1) · 2⁻¹²⁶` for `L = outer · inner` values; and the
 /// same bits on a second run, the tree being fixed.
@@ -255,7 +291,7 @@ fn refusals() {
                        x: &cavitation_gpu::PooledBuffer,
                        y: &cavitation_gpu::PooledBuffer| {
             message(&mut || {
-                let _ = sums.call(&mut kit.steps, &mut kit.pool, dims, x, y);
+                let _ = sums.call(&mut kit.steps, &mut kit.pool, dims, x, y, false);
             })
         };
         assert!(sum(ChannelDims::new(1, 0, 1), &a, &b).contains("above 0"));
@@ -299,7 +335,7 @@ fn buffers_longer_than_the_tensor() {
         assert_exact(&got[..n], &want, "bias add with a long buffer");
         let sums = ChannelSums::new(gpu, &mut kit.cache).unwrap();
         let (xb, out) = (kit.upload(&x), kit.pool.take(4 * 10, TENSOR));
-        let call = sums.call(&mut kit.steps, &mut kit.pool, dims, &xb, &out);
+        let call = sums.call(&mut kit.steps, &mut kit.pool, dims, &xb, &out, false);
         let mut step = kit.steps.begin();
         step.upload(out.buffer(), 0, &[0x40; 40]);
         sums.record(&mut step, &call);

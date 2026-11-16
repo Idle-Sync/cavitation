@@ -37,6 +37,9 @@
 //! - [`kernels::BiasAdd`] and [`kernels::ChannelSums`]: a bias added per channel, with the
 //!   CPU's bits, and each channel's sum in a fixed tree, over `[outer][channels][inner]` tensors (an
 //!   `M × N` matrix or an NCHW batch).
+//! - [`kernels::BatchNorm2d`]: 2-D batch normalisation as `Tape::batch_norm2d` computes it,
+//!   forward and backward, from the batch's statistics or running ones, and the running
+//!   statistics' update, skipped when the step's finite flag is set.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
