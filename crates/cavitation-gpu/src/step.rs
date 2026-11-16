@@ -1,5 +1,6 @@
 //! The step encoder: everything one training or inference step sends to the GPU, recorded
-//! in one command encoder and submitted once. Uploads go through a mapped staging buffer,
+//! in one command encoder and submitted once; a profiled step's timestamps resolve in a
+//! second submission after it. Uploads go through a mapped staging buffer,
 //! results come back through one readback buffer, dispatches can be split over two
 //! dimensions, and when profiling each named span is timed on the GPU.
 
@@ -790,22 +791,41 @@ impl<'a> Step<'a> {
             read_end: user_bytes,
             ..
         } = self;
-        let mut encoder = encoder.expect("the step is being recorded");
+        let encoder = encoder.expect("the step is being recorded");
         let passes = steps.passes.len() as u64;
         let timestamp_at = round_up(steps.sizes.readback_bytes, ALIGN);
-        if let Some(t) = steps.timestamps.as_ref().filter(|_| passes > 0) {
-            encoder.resolve_query_set(&t.queries, 0..(2 * passes) as u32, &t.resolve, 0);
-            encoder.copy_buffer_to_buffer(
+        // The timestamps resolve in a submission of their own, after the step's has
+        // finished: on Metal, a resolve in the step's own command buffer, or in a second one
+        // submitted with it, reads the counter samples of the step before.
+        let resolve = steps.timestamps.as_ref().filter(|_| passes > 0).map(|t| {
+            let mut resolve =
+                steps
+                    .gpu
+                    .device()
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("cavitation timestamp resolve"),
+                    });
+            resolve.resolve_query_set(&t.queries, 0..(2 * passes) as u32, &t.resolve, 0);
+            resolve.copy_buffer_to_buffer(
                 &t.resolve,
                 0,
                 &steps.readback,
                 timestamp_at,
                 16 * passes,
             );
-        }
+            resolve.finish()
+        });
         steps.staging_mapped.store(false, Ordering::Release);
         steps.staging.unmap();
         steps.gpu.queue().submit([encoder.finish()]);
+        if let Some(resolve) = resolve {
+            steps
+                .gpu
+                .device()
+                .poll(wgpu::PollType::wait_indefinitely())
+                .expect("wait for the step");
+            steps.gpu.queue().submit([resolve]);
+        }
         steps.submitted += 1;
         let flag = Arc::clone(&steps.staging_mapped);
         steps
