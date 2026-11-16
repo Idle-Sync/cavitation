@@ -13,7 +13,10 @@ mod pooling;
 mod reduce;
 
 pub use batch_norm::{BatchNorm2d, BatchNormBackward, BatchNormForward, BatchStats, RunningUpdate};
-pub use conv::{ConvCall, ConvDims, ConvForward, ConvInputGrad};
+pub use conv::{
+    ConvCall, ConvDims, ConvForward, ConvInputGrad, ConvWeightGrad, ConvWeightGradCall,
+    WEIGHT_GRAD_BLOCK,
+};
 pub use elementwise::{Elementwise, ElementwiseCall, ElementwiseKernels};
 pub use gemm::{Gemm, GemmCall, GemmDims};
 pub use health::{DeadRelu, DeadReluCall, FiniteFlag, FiniteFlagCall, SumSquares, SumSquaresCall};
