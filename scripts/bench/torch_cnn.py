@@ -9,12 +9,14 @@
 # the same files the Rust side reads (MNIST's IDX files, CIFAR-10's binary batches), each
 # pixel divided by 255.
 #
-# With `--device cuda` the model, the data and the batch order live on the GPU, and each
-# training step is timed between two `torch.cuda.synchronize()` calls. After the epoch lines,
-# one more `torch` line gives the median step time over every epoch but the first (the
-# warm-up). `torch.backends.cudnn.benchmark` stays at its default, False, unless
-# `--cudnn-benchmark` is given; the `torch` line says which. The CPU default prints exactly
-# what it printed before.
+# With `--device cuda` (NVIDIA) or `--device mps` (Apple) the model, the data and the batch
+# order live on the GPU, and each training step is timed between two synchronize calls.
+# After the epoch lines, one more `torch` line gives the median step time over every epoch
+# but the first (the warm-up). `torch.backends.cudnn.benchmark` stays at its default, False,
+# unless `--cudnn-benchmark` is given (CUDA only); the `torch` line says which.
+# `--deterministic` turns on `torch.use_deterministic_algorithms(True)` (and, on CUDA,
+# `cudnn.deterministic`, with `CUBLAS_WORKSPACE_CONFIG=:4096:8` set before CUDA starts). The
+# CPU default prints exactly what it printed before.
 #
 #   python3 -I scripts/bench/torch_cnn.py --mode train --net cifar --data-dir data/cifar10 \
 #       --init target/bench/cnn/cifar-cnn-seed0/init.safetensors \
@@ -132,18 +134,33 @@ def main():
     parser.add_argument("--rows", type=int, required=True, help="train on the first this many rows")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0, help="seeds the dropout masks")
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--device", choices=["cpu", "cuda", "mps"], default="cpu")
+    parser.add_argument(
+        "--deterministic", action="store_true", help="with a GPU device: PyTorch's deterministic algorithms only"
+    )
     parser.add_argument(
         "--cudnn-benchmark", action="store_true", help="with --device cuda: let cuDNN pick its fastest algorithms"
     )
     args = parser.parse_args()
     cuda = args.device == "cuda"
+    mps = args.device == "mps"
+    gpu = cuda or mps
     if args.cudnn_benchmark and not cuda:
         raise ValueError("--cudnn-benchmark needs --device cuda")
+    if args.deterministic and not gpu:
+        raise ValueError("--deterministic needs --device cuda or mps")
     if cuda:
+        if args.deterministic:
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         if not torch.cuda.is_available():
             raise RuntimeError("--device cuda: this PyTorch build sees no CUDA GPU")
         torch.backends.cudnn.benchmark = args.cudnn_benchmark
+        torch.backends.cudnn.deterministic = args.deterministic
+    if mps and not torch.backends.mps.is_available():
+        raise RuntimeError("--device mps: this PyTorch build sees no MPS GPU")
+    if args.deterministic:
+        torch.use_deterministic_algorithms(True)
+    synchronize = torch.cuda.synchronize if cuda else (torch.mps.synchronize if mps else None)
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     (x, y), (tx, ty) = (load_cifar if args.net == "cifar" else load_mnist)(args.data_dir)
@@ -155,16 +172,19 @@ def main():
     if len(order) != args.epochs * args.rows:
         raise ValueError(f"{args.order}: {len(order)} entries, not {args.epochs} epochs of {args.rows}")
     order = torch.from_numpy(order).reshape(args.epochs, args.rows)
-    if cuda:
-        device = torch.device("cuda")
+    if gpu:
+        device = torch.device(args.device)
         model = model.to(device)
         x, y, tx, ty, order = (t.to(device) for t in (x, y, tx, ty, order))
+    if cuda:
         print(
             f"torch {torch.__version__}, cuda {torch.version.cuda}, cudnn {torch.backends.cudnn.version()}, "
             f"gpu {torch.cuda.get_device_name(0)}, driver {driver_version()}, "
-            f"cudnn.benchmark {torch.backends.cudnn.benchmark}",
+            f"cudnn.benchmark {torch.backends.cudnn.benchmark}, deterministic {args.deterministic}",
             flush=True,
         )
+    if mps:
+        print(f"torch {torch.__version__}, mps, deterministic {args.deterministic}", flush=True)
     print(
         f"torch {torch.__version__}, {torch.get_num_threads()} threads, "
         f"cpu {torch.backends.cpu.get_cpu_capability()}, mkldnn {torch.backends.mkldnn.is_available()}",
@@ -179,15 +199,15 @@ def main():
         start = time.perf_counter()
         for i in range(0, args.rows, args.batch):
             idx = order[epoch, i : i + args.batch]
-            if cuda:
-                torch.cuda.synchronize()
+            if gpu:
+                synchronize()
                 begin = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(x[idx]), y[idx])
             loss.backward()
             optimizer.step()
-            if cuda:
-                torch.cuda.synchronize()
+            if gpu:
+                synchronize()
                 if epoch > 0:
                     step_times.append(time.perf_counter() - begin)
             total += loss.item()
@@ -195,7 +215,7 @@ def main():
         seconds = time.perf_counter() - start
         acc = accuracy(model, tx, ty)
         print(f"epoch {epoch + 1} {total / steps:.6f} {acc:.6f} {seconds:.6f}", flush=True)
-    if cuda and step_times:
+    if gpu and step_times:
         print(
             f"torch step median {1000 * statistics.median(step_times):.3f} ms over {len(step_times)} steps "
             f"(epochs 2 to {args.epochs})",
