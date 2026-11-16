@@ -18,7 +18,9 @@
 //!   and `override` values, with a count of the pipelines built.
 //! - [`StepEncoder`], [`Step`] and [`StepOutput`]: one step's uploads, dispatches and
 //!   readbacks recorded in one command encoder and submitted once, through staging and
-//!   readback buffers made once, with GPU timestamps per span when profiling.
+//!   readback buffers made once, with GPU timestamps per pass, per run of copies where the
+//!   device can write them between passes, and per span when profiling ([`Timing`] names
+//!   what is not timed).
 //! - [`kernels::ElementwiseKernels`]: add, multiply, scale, ReLU, leaky ReLU, tanh, the
 //!   sigmoid, GELU (both forms) forward and backward, and dropout with a bit-packed mask.
 //! - [`kernels::MaxPool2d`] and [`kernels::AvgPool2d`]: max and average pooling, forward
@@ -97,7 +99,10 @@ mod step;
 pub use buffer::{BufferPool, PooledBuffer};
 pub use device::{Backend, Gpu, GpuError, GpuInfo};
 pub use pipeline::{PipelineCache, Shader};
-pub use step::{MAX_WORKGROUPS_PER_DIMENSION, Step, StepEncoder, StepOutput, StepSizes};
+pub use step::{
+    MAX_WORKGROUPS_PER_DIMENSION, Step, StepEncoder, StepOutput, StepSizes, Timed, TimedKind,
+    Timing,
+};
 /// The wgpu crate this one is built on, for the types [`Gpu::device`] and [`Gpu::queue`]
 /// work with.
 ///

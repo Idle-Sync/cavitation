@@ -129,7 +129,11 @@ fn time(gpu: &Gpu, o: &Options) -> Result<(), String> {
                 run(&mut steps);
             }
             let mut times: Vec<f64> = (0..TIMED)
-                .map(|_| run(&mut steps).ok_or("the GPU gave no timestamps"))
+                .map(|_| {
+                    run(&mut steps).ok_or(
+                        "the GPU gave no timestamps, or a pass's end read before its beginning",
+                    )
+                })
                 .collect::<Result<_, _>>()?;
             times.sort_by(f64::total_cmp);
             let median = (times[TIMED / 2 - 1] + times[TIMED / 2]) / 2.0;

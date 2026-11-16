@@ -268,6 +268,11 @@ pub struct GpuInfo {
     pub driver_info: String,
     /// Whether GPU timestamps are available (`TIMESTAMP_QUERY` was offered and requested).
     pub timestamps: bool,
+    /// Whether timestamps can also be written on the command encoder between passes
+    /// (`TIMESTAMP_QUERY_INSIDE_ENCODERS` was offered and requested), so a profiled step
+    /// times its copies too. wgpu offers it on Vulkan and DX12, and on Metal not on Apple
+    /// GPUs.
+    pub encoder_timestamps: bool,
     /// On DX12, the shader compiler setting in force: `auto` (DXC when `dxcompiler.dll`
     /// loads, FXC otherwise), `dxc` or `fxc`, from `WGPU_DX12_COMPILER`. `None` on other
     /// backends.
@@ -299,6 +304,11 @@ impl fmt::Display for GpuInfo {
             f,
             "gpu timestamps: {}",
             if self.timestamps { "yes" } else { "no" }
+        )?;
+        writeln!(
+            f,
+            "gpu encoder timestamps: {}",
+            if self.encoder_timestamps { "yes" } else { "no" }
         )?;
         let l = &self.limits;
         write!(
@@ -588,15 +598,20 @@ fn open_device(adapter: &wgpu::Adapter, dx12_compiler: &str) -> Result<Gpu, Stri
     let adapter_info = adapter.get_info();
     let backend = Backend::from_wgpu(adapter_info.backend)
         .expect("only Vulkan, DX12 and Metal adapters are eligible");
-    let timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+    let offered = adapter.features();
+    let timestamps = offered.contains(wgpu::Features::TIMESTAMP_QUERY);
+    let encoder_timestamps =
+        timestamps && offered.contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
+    let mut required_features = wgpu::Features::empty();
+    required_features.set(wgpu::Features::TIMESTAMP_QUERY, timestamps);
+    required_features.set(
+        wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+        encoder_timestamps,
+    );
     let limits = requested_limits(&adapter.limits());
     let descriptor = wgpu::DeviceDescriptor {
         label: Some("cavitation"),
-        required_features: if timestamps {
-            wgpu::Features::TIMESTAMP_QUERY
-        } else {
-            wgpu::Features::empty()
-        },
+        required_features,
         required_limits: limits.clone(),
         ..Default::default()
     };
@@ -611,6 +626,7 @@ fn open_device(adapter: &wgpu::Adapter, dx12_compiler: &str) -> Result<Gpu, Stri
         driver: adapter_info.driver,
         driver_info: adapter_info.driver_info,
         timestamps,
+        encoder_timestamps,
         dx12_compiler: (backend == Backend::Dx12).then(|| dx12_compiler.to_string()),
         limits,
     };
