@@ -144,6 +144,58 @@ final test mean absolute error 0.80°
 
 After 8 epochs the network reads the angle within 0.8° on average, from images it has not seen. A known-result test, `steering_known_result`, requires this run to stay below 1.5°.
 
+## Shrinking a CNN
+
+The shrink tools of [Shrinking a network](shrinking.md) work on CNNs. The units of a `Conv2d` are its output channels, as the units of a `Linear` are its neurons:
+
+- `net.set_channel_mask(conv, mask)` switches whole channels off. The mask goes on the last layer of the conv's run (its batch norm, activations and poolings, up to the next conv, `Flatten` or `Linear`), which `net.channel_layer(conv)` names, so an off channel is 0 everywhere after it, whatever batch norm's β is.
+- `shrink::channel_activity` measures each channel over a data set, and `shrink::ablate_channels` ranks the channels by what each one's absence costs.
+- `shrink::compact` removes the off channels from the conv's weight and bias, from the batch norms and poolings of its run, and from the layer that receives them: the input channels of the next conv, or the channel's block of inputs of the `Linear` after a `Flatten`. It removes the off neurons of the `Linear` layers in the same pass.
+- `shrink::shrink` shrinks every `Conv2d` by channel and every hidden `Linear` by neuron, unless `ShrinkConfig::layers` lists the ones to shrink.
+
+`shrink_mnist_cnn` trains the network above on the first 12,000 training digits for 5 epochs and holds out the next 3,000, which it never trains on, for the stop rule:
+
+```rust,ignore
+{{#include ../../crates/cavitation/examples/shrink_mnist_cnn.rs:split}}
+```
+
+It shrinks the two convolutions and the two hidden `Linear` layers together, retraining for one epoch after each step and keeping the latest step that loses at most half an accuracy point on the held-out digits:
+
+```rust,ignore
+{{#include ../../crates/cavitation/examples/shrink_mnist_cnn.rs:shrink}}
+```
+
+`kept` lists each layer's units in order of layer index: the channels of the two convolutions (of 6 and 16), then the neurons of the two hidden `Linear` layers (of 120 and 84). `parameters` is the size of the network once `compact` removes the off units. On an Intel Celeron N5105 (kernel level `sse4.2`, 4 threads, with other work running on the machine) the run took 95 seconds and printed:
+
+```text
+trained: 61706 parameters, test 96.63%
+unpruned: validation 95.67%
+ 10.0% removed: kept [6, 15, 108, 76], 52083 parameters, validation 96.73%, met true
+ 20.0% removed: kept [5, 13, 96, 68], 40350 parameters, validation 97.20%, met true
+ 30.0% removed: kept [5, 12, 84, 59], 32541 parameters, validation 96.80%, met true
+ 40.0% removed: kept [4, 10, 72, 51], 23429 parameters, validation 97.07%, met true
+ 50.0% removed: kept [3, 8, 60, 42], 15738 parameters, validation 96.87%, met true
+ 60.0% removed: kept [3, 7, 48, 34], 11074 parameters, validation 95.93%, met true
+ 70.0% removed: kept [2, 5, 36, 26], 6075 parameters, validation 92.57%, met false
+ 75.0% removed: kept [2, 4, 30, 21], 4157 parameters, validation 93.70%, met false
+compacted: 3 and 7 channels, 48 and 34 neurons, 11074 parameters, test 96.62%
+11 epochs each: pruned test 96.62%, same size from new random weights 96.89%
+```
+
+Five epochs on 12,000 digits leave the network short of what it can learn, so the early steps' retraining raises the validation accuracy above the unpruned network's. The step at 60% keeps 3 and 7 channels and 48 and 34 neurons, 11,074 parameters of 61,706, and is the last within half a point. The next two miss, and the run stops after two misses in a row. `compact` builds that network:
+
+```rust,ignore
+{{#include ../../crates/cavitation/examples/shrink_mnist_cnn.rs:compact}}
+```
+
+As in the dense case, the size is what the run finds. `train_found_size` trains a network of that size from new random weights, for as many epochs as the pruned one had in all, and measures both on the test set:
+
+```rust,ignore
+{{#include ../../crates/cavitation/examples/shrink_mnist_cnn.rs:scratch}}
+```
+
+Here the fresh network does a little better on the test set, 96.89% against 96.62%, so on this run shrinking found a good size rather than good weights. The fresh convolutions start as `Conv2d::new` starts them, and the batch norms, if the network has any, start again.
+
 ## What is not here yet
 
-The shrink tools work on dense networks and refuse a model with an image layer; shrinking a CNN by channel is a later feature. Batch norm runs as its own step in `InferenceModel` rather than folded into the convolution before it, which keeps the compiled model's outputs equal to the tape's.
+Batch norm runs as its own step in `InferenceModel` rather than folded into the convolution before it, which keeps the compiled model's outputs equal to the tape's.

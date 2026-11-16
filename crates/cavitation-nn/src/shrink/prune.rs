@@ -1,6 +1,7 @@
 //! The shrink tool: [`shrink`] removes the neurons of a trained network's hidden `Linear`
-//! layers a step at a time, retrains after each step, and keeps the smallest network that
-//! still meets a criterion measured on a validation set.
+//! layers and the output channels of its `Conv2d` layers a step at a time, retrains after
+//! each step, and keeps the smallest network that still meets a criterion measured on a
+//! validation set.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -8,8 +9,10 @@ use std::fmt;
 use cavitation_core::{Error, ParamStore, Rng};
 
 use super::ablate::{check_hidden, points_lost};
-use super::compact::{foreign_parameters, linear_after_run, unvouched_layer};
-use super::{LayerActivity, activity, neurons_on};
+use super::activity::position_means;
+use super::compact::{foreign_parameters, has_image_layers, linear_after_run, unvouched_layer};
+use super::compact_image::{foreign_image_parameters, unvouched_channel_layer};
+use super::{activity, channel_activity, channels_on, compact, neurons_on};
 use crate::train::check_dataset;
 use crate::{
     Dataset, Evaluation, FitConfig, Flow, Health, Loss, LrSchedule, NeuronMask, OptimizerConfig,
@@ -22,16 +25,17 @@ const EVAL_BATCH: usize = 256;
 /// The whole network in basis points: 10,000 bp is 100%.
 const FULL_BP: u32 = 10_000;
 
-/// How [`shrink`] orders the neurons of a layer for removal: each neuron gets a score, and
-/// the lowest scores go first (ties by neuron index, lowest first; a NaN score, whatever
-/// its sign bit, sorts above every number, so it goes last). Every ranking is computed
-/// again at each step, on the network as the previous step's retraining left it.
+/// How [`shrink`] orders the units of a layer for removal (the neurons of a `Linear`, the
+/// output channels of a `Conv2d`): each unit gets a score, and the lowest scores go first
+/// (ties by index, lowest first; a NaN score, whatever its sign bit, sorts above every
+/// number, so it goes last). Every ranking is computed again at each step, on the network
+/// as the previous step's retraining left it.
 ///
 /// ```
 /// use cavitation_nn::shrink::{RankContext, Ranking, ShrinkConfig};
-/// // Score each neuron by its mean |activation| times its index (an example only).
+/// // Score each unit by its mean |activation| times its index (an example only).
 /// let custom = Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
-///     ctx.on.iter().map(|&j| ctx.activity.mean_abs[j] * j as f64).collect()
+///     ctx.on.iter().map(|&j| ctx.mean_abs[j] * j as f64).collect()
 /// }));
 /// let config = ShrinkConfig { ranking: custom, ..ShrinkConfig::default() };
 /// assert!(matches!(config.ranking, Ranking::Custom(_)));
@@ -39,19 +43,20 @@ const FULL_BP: u32 = 10_000;
 /// ```
 #[non_exhaustive]
 pub enum Ranking<'s> {
-    /// The Euclidean norm of the neuron's outgoing weights: its column in the weight of the
-    /// `Linear` that follows its layer. A neuron whose output the next layer barely uses
-    /// goes first. This needs a `Linear` right after the neurons' run of element-wise
-    /// layers.
+    /// The Euclidean norm of the unit's outgoing weights. For a neuron, its column in the
+    /// weight of the `Linear` that follows its layer's run; for a channel, its input
+    /// channel's weights (every output channel and kernel tap) in the next `Conv2d`, or its
+    /// block of columns in the `Linear` after a `Flatten`. A unit the next layer barely uses
+    /// goes first.
     OutNorm,
-    /// The neuron's mean absolute output on the training rows
-    /// ([`LayerActivity::mean_abs`]).
+    /// The unit's mean absolute output on the training rows ([`RankContext::mean_abs`]),
+    /// over every position for a channel.
     Activity,
-    /// A random order from this seed: the same seed removes the same neurons on every run.
+    /// A random order from this seed: the same seed removes the same units on every run.
     Random(u64),
     /// Your own scores: the function gets a [`RankContext`] for one layer and returns one
     /// score for each entry of [`RankContext::on`], in that order. It is called only for
-    /// a layer that loses neurons at the step. It is `Send` and may borrow for `'s`.
+    /// a layer that loses units at the step. It is `Send` and may borrow for `'s`.
     // The boxed callback is the plainest type for this variant; an alias would only hide it.
     #[allow(clippy::type_complexity)]
     Custom(Box<dyn FnMut(&RankContext<'_>) -> Vec<f64> + Send + 's>),
@@ -70,24 +75,28 @@ impl fmt::Debug for Ranking<'_> {
 }
 
 /// What a [`Ranking::Custom`] function sees for one layer at one step: the network as it
-/// is (after the previous step's retraining, before this step removes anything) and its
-/// activity on the training rows.
+/// is (after the previous step's retraining, before this step removes anything) and the
+/// activity of the layer's units (neurons of a `Linear`, output channels of a `Conv2d`) on
+/// the training rows, read where each unit's output is final, as
+/// [`activity`](super::activity()) and [`channel_activity`](super::channel_activity())
+/// measure it.
 ///
 /// It is `#[non_exhaustive]`, so a later release can add a field without breaking your
 /// code: read its fields in your ranking function.
 ///
 /// ```
 /// use cavitation_nn::shrink::{RankContext, Ranking};
-/// // Rank by firing share, and break ties by the outgoing weights' sum of squares.
+/// // For a Linear: rank by firing share, and break ties by the outgoing weights' sum of
+/// // squares.
 /// fn by_firing(ctx: &RankContext<'_>) -> Vec<f64> {
-///     let next = ctx.model.linear(ctx.model.neuron_layer(ctx.linear) + 1).unwrap();
+///     let next = ctx.model.linear(ctx.model.neuron_layer(ctx.layer) + 1).unwrap();
 ///     let w = ctx.params.value(next.weight()).data();
 ///     let width = next.inputs();
 ///     ctx.on
 ///         .iter()
 ///         .map(|&j| {
 ///             let norm: f64 = w.iter().skip(j).step_by(width).map(|&v| f64::from(v * v)).sum();
-///             ctx.activity.firing[j] + 1e-6 * norm
+///             ctx.firing[j] + 1e-6 * norm
 ///         })
 ///         .collect()
 /// }
@@ -96,17 +105,24 @@ impl fmt::Debug for Ranking<'_> {
 /// ```
 #[non_exhaustive]
 pub struct RankContext<'a> {
-    /// The index of the `Linear` layer whose neurons are ranked.
-    pub linear: usize,
-    /// The neurons of that layer that are on, in increasing order: the ones to score.
+    /// The index of the layer whose units are ranked: a `Linear` (its neurons) or a
+    /// `Conv2d` (its output channels).
+    pub layer: usize,
+    /// The units of that layer that are on, in increasing order: the ones to score.
     pub on: &'a [usize],
     /// The network, with its masks as they are.
     pub model: &'a Sequential,
     /// The network's parameters.
     pub params: &'a ParamStore,
-    /// The layer's activity on the training rows, one value per neuron of the layer (the
-    /// neurons that are off read 0).
-    pub activity: &'a LayerActivity,
+    /// Each unit's mean output on the training rows (over every position, for a channel).
+    /// One value per unit of the layer; the units that are off read 0.
+    pub mean: &'a [f64],
+    /// Each unit's mean absolute output.
+    pub mean_abs: &'a [f64],
+    /// The share of each unit's outputs above 0: for a ReLU network, how often it fires.
+    pub firing: &'a [f64],
+    /// Each unit's largest output.
+    pub max: &'a [f64],
 }
 
 /// When a step of [`shrink`] is good enough, against the unpruned network's measures on
@@ -237,7 +253,8 @@ impl Default for RetrainConfig {
 }
 
 /// How [`shrink`] runs. Taken by value, because it can hold callbacks. Levels are in whole
-/// basis points of each layer's width: 1 bp is 0.01%, 10,000 bp the whole layer.
+/// basis points of each layer's width (its neurons, or its output channels): 1 bp is
+/// 0.01%, 10,000 bp the whole layer.
 ///
 /// The callbacks ([`on_step`](Self::on_step) and a [`Ranking::Custom`] function) are
 /// `Send` and may borrow for the lifetime `'s`, as [`FitConfig`](crate::FitConfig)'s are: an
@@ -245,18 +262,18 @@ impl Default for RetrainConfig {
 /// a configuration can move to another thread (with owned callbacks, or borrowing ones
 /// inside [`std::thread::scope`]).
 ///
-/// The default shrinks every hidden `Linear`, removes first the neurons whose output is 0
-/// on every training row (for a ReLU, those that never fire) and then the lowest
-/// out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
+/// The default shrinks every hidden `Linear` and every `Conv2d` whose channels reach a
+/// `Conv2d` or a `Linear`, removes first the units whose output is 0 on every training row
+/// (for a ReLU, those that never fire) and then the lowest out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
 /// 9,500, retrains as [`RetrainConfig::default`], keeps the latest step that loses at most
 /// 1 accuracy point (class targets), and stops after 2 misses in a row. It does not fold
-/// removed neurons' mean outputs into the next bias. It has no validation set: set
+/// removed units' mean outputs into the next layer's bias. It has no validation set: set
 /// [`validation`](Self::validation).
 ///
 /// ```
 /// use cavitation_nn::shrink::{Ranking, ShrinkConfig};
 /// let config = ShrinkConfig::default();
-/// assert!(config.linears.is_empty() && config.dead_first && !config.fold_means);
+/// assert!(config.layers.is_empty() && config.dead_first && !config.fold_means);
 /// assert!(matches!(config.ranking, Ranking::OutNorm));
 /// assert_eq!(
 ///     (config.step_bp, config.fine_from_bp, config.fine_step_bp, config.max_removed_bp),
@@ -267,28 +284,41 @@ impl Default for RetrainConfig {
 /// assert!(!config.keep_checkpoints && config.on_step.is_none());
 /// ```
 pub struct ShrinkConfig<'s> {
-    /// The `Linear` layers to shrink, by layer index; empty (the default) shrinks every
-    /// hidden `Linear` (each one with another `Linear` after it). A layer listed twice is
-    /// shrunk once.
-    pub linears: Vec<usize>,
-    /// The order in which each layer's neurons are removed.
+    /// The layers to shrink, by layer index: a `Linear` loses neurons, a `Conv2d` output
+    /// channels ([`Sequential::set_channel_mask`]). Empty (the default) shrinks every hidden
+    /// `Linear` (each one with another `Linear` after it) and every `Conv2d` whose channels
+    /// reach a `Conv2d` or a `Linear` ([`Sequential::channel_layer`] names the end of their
+    /// run). A layer listed twice is shrunk once.
+    pub layers: Vec<usize>,
+    /// The order in which each layer's units are removed.
     pub ranking: Ranking<'s>,
-    /// Whether neurons whose output is 0 on every training row (for a ReLU, neurons that
-    /// never fire) go before the ranking's order; removing them changes nothing. On by
-    /// default.
+    /// Whether units whose output is 0 on every training row (for a ReLU, units that never
+    /// fire) go before the ranking's order; removing them changes nothing. On by default.
     pub dead_first: bool,
-    /// Whether each removed neuron's mean output on the training rows is folded into the
-    /// bias of the `Linear` that receives it, `b[i] += W[i, j] · mean_j`, so that the next
-    /// layer still gets the neuron's average contribution. The mean is measured at each
-    /// step, before retraining, on the network as it stands once the step has removed the
-    /// neurons of the listed layers before this one (and folded theirs), read where the
-    /// neuron's output is final ([`LayerActivity::mean`]). For a neuron whose output is the
-    /// same on every row the fold is exact: the network's outputs do not change, within
-    /// rounding. The fold changes the parameters, so it is in the step's checkpoint and in
-    /// the network the run keeps. It costs one extra pass over the training rows per step
-    /// for each listed layer after the first that loses neurons at that step, to measure its
-    /// means anew. The fold needs a bias to fold into, so with it on, [`shrink`] refuses a
-    /// listed layer whose next `Linear` has none. Off by default.
+    /// Whether each removed unit's mean output on the training rows is folded into the
+    /// bias of the layer that receives it, so that the next layer still gets the unit's
+    /// average contribution:
+    ///
+    /// - a neuron into the next `Linear`, `b[i] += W[i, j] · mean_j`;
+    /// - a channel into the next `Conv2d`, `b[o] += mean_c · Σ_taps W[o, c, taps]`, with
+    ///   `mean_c` its mean over positions ([`ChannelActivity::mean`](super::ChannelActivity::mean));
+    ///   that conv must have no padding, where a border output would read zeros in place of
+    ///   the channel;
+    /// - a channel into the `Linear` after a `Flatten`, each position with its own mean,
+    ///   `b[i] += Σ_p W[i, c·plane + p] · mean_{c,p}`.
+    ///
+    /// The means are measured at each step, before retraining, on the network as it stands
+    /// once the step has removed the units of the listed layers before this one (and folded
+    /// theirs), read where the unit's output is final
+    /// ([`LayerActivity::mean`](super::LayerActivity::mean) for a neuron). For a unit whose
+    /// output is the same on every row (and, for a channel, at every position) the fold is
+    /// exact: the network's outputs do not change, within rounding. The fold changes the
+    /// parameters, so it is in the step's checkpoint and in the network the run keeps. It
+    /// costs one extra pass over the training rows per step for each listed layer after the
+    /// first that loses units at that step, and for each `Conv2d` whose channels reach a
+    /// `Linear`, to measure its means anew. The fold needs a bias to fold into, so with it
+    /// on, [`shrink`] refuses a listed layer whose receiving layer has none, and a listed
+    /// `Conv2d` whose channels reach a `Conv2d` with padding. Off by default.
     pub fold_means: bool,
     /// The step between levels, in basis points, up to `fine_from_bp`. Default 1,000.
     pub step_bp: u32,
@@ -322,13 +352,13 @@ pub struct ShrinkConfig<'s> {
 }
 
 impl Default for ShrinkConfig<'_> {
-    /// Every hidden `Linear`, neurons whose output is 0 on every training row first and
-    /// then out-norm, levels 1,000 to 7,000
+    /// Every hidden `Linear` and `Conv2d`, units whose output is 0 on every training row
+    /// first and then out-norm, levels 1,000 to 7,000
     /// bp by 1,000 and on to 9,500 by 500, patience 2, the default criterion, no validation
     /// set, the default retraining, no checkpoints, no callback.
     fn default() -> Self {
         ShrinkConfig {
-            linears: Vec::new(),
+            layers: Vec::new(),
             ranking: Ranking::OutNorm,
             dead_first: true,
             fold_means: false,
@@ -350,7 +380,7 @@ impl fmt::Debug for ShrinkConfig<'_> {
     /// Writes every setting; the callback shows only whether there is one.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ShrinkConfig")
-            .field("linears", &self.linears)
+            .field("layers", &self.layers)
             .field("ranking", &self.ranking)
             .field("dead_first", &self.dead_first)
             .field("fold_means", &self.fold_means)
@@ -392,20 +422,24 @@ impl fmt::Debug for ShrinkConfig<'_> {
 pub struct ShrinkStep {
     /// The level: the share of each layer's width removed, in basis points.
     pub removed_bp: u32,
-    /// The neurons left on in each shrunk `Linear`, in the order of
-    /// [`ShrinkConfig::linears`] (or of the model's hidden `Linear`s when that is empty).
+    /// The units left on in each shrunk layer (neurons of a `Linear`, output channels of a
+    /// `Conv2d`), in the order of [`ShrinkConfig::layers`] (or, when that is empty, of the
+    /// layers it stands for, in order of index).
     pub kept: Vec<usize>,
-    /// The number of parameters the network has once its off neurons are removed for good
+    /// The number of parameters the network has once its off units are removed for good
     /// with [`compact`](super::compact()). When the report has a
-    /// [`ShrinkWarning::NotCompactable`], `compact` refuses the network: the count is then
-    /// what the network's on neurons use, and the network runs only masked.
+    /// [`ShrinkWarning::NotCompactable`], `compact` refuses the network, which runs only
+    /// masked: the count then leaves out the off neurons of its `Linear` layers and nothing
+    /// else.
     pub parameters: usize,
     /// The retrained network's measures on the validation set.
     pub validation: Evaluation,
     /// Whether the step meets the criterion.
     pub met: bool,
-    /// With [`ShrinkConfig::keep_checkpoints`], the step's network: each shrunk `Linear`'s
-    /// neuron mask (by layer index) and the parameters after retraining.
+    /// With [`ShrinkConfig::keep_checkpoints`], the step's network: each shrunk layer's
+    /// mask by layer index (a neuron mask for a `Linear`, for
+    /// [`Sequential::set_neuron_mask`]; a channel mask for a `Conv2d`, for
+    /// [`Sequential::set_channel_mask`]) and the parameters after retraining.
     pub checkpoint: Option<(Vec<(usize, NeuronMask)>, ParamStore)>,
 }
 
@@ -434,7 +468,7 @@ pub enum ShrinkWarning {
         /// The allowed drop, [`Criterion::AccuracyDrop`]'s `points`.
         threshold: f64,
     },
-    /// Switching neurons off works on this network, so the run and its measures are sound,
+    /// Switching units off works on this network, so the run and its measures are sound,
     /// but [`compact`](super::compact()) cannot rebuild the result as a smaller dense
     /// network: use the chosen network masked. Given at the start of the run.
     NotCompactable {
@@ -452,7 +486,7 @@ impl fmt::Display for ShrinkWarning {
             ShrinkWarning::NotCompactable { layer, ref reason } => write!(
                 f,
                 "layer {layer}: {reason}, so compact cannot rebuild the shrunk network; it \
-                 runs masked, with every off neuron's work still done"
+                 runs masked, with every off unit's work still done"
             ),
             ShrinkWarning::SmallValidation {
                 rows,
@@ -517,40 +551,43 @@ pub struct ShrinkReport {
     pub warnings: Vec<ShrinkWarning>,
 }
 
-/// Shrinks the hidden `Linear` layers of `model`: removes neurons a step at a time, by
-/// switching them off with neuron masks, retrains after each step, measures the network
-/// on a validation set, and keeps the latest step whose measures still meet the criterion.
+/// Shrinks the hidden `Linear` layers and the `Conv2d` layers of `model`: removes neurons
+/// and output channels (the units) a step at a time, by switching them off with neuron
+/// and channel masks, retrains after each step, measures the network on a validation set,
+/// and keeps the latest step whose measures still meet the criterion.
 ///
 /// The levels are `step_bp, 2·step_bp, …` below `fine_from_bp`, then `fine_from_bp` and
 /// `fine_step_bp` increments below `max_removed_bp`, and `max_removed_bp` last (the
 /// default: 1,000 to 7,000 by 1,000, then 7,500 to 9,500 by 500). At each level each
-/// listed `Linear` of width `w` keeps `max(1, ceil(w · (10,000 − level) / 10,000))` neurons
-/// (neurons already off count as removed). Each step:
+/// listed layer of width `w` (neurons, or output channels) keeps
+/// `max(1, ceil(w · (10,000 − level) / 10,000))` units (units already off count as
+/// removed). Each step:
 ///
 /// 1. measures every listed layer's activity on the training rows
-///    ([`activity()`](super::activity())) and ranks its neurons that are on, on the
-///    network as the previous step left it;
-/// 2. switches off, in each layer, the neurons it must lose: with
+///    ([`activity()`](super::activity()) for a `Linear`,
+///    [`channel_activity()`](super::channel_activity()) for a `Conv2d`) and ranks its units
+///    that are on, on the network as the previous step left it;
+/// 2. switches off, in each layer, the units it must lose: with
 ///    [`dead_first`](ShrinkConfig::dead_first), first those whose output is 0 on every
 ///    training row, then the lowest-ranked. With [`fold_means`](ShrinkConfig::fold_means),
-///    the layers are taken in order of index, and before a layer's neurons go their mean
+///    the layers are taken in order of index, and before a layer's units go their mean
 ///    outputs, measured on the network with the earlier layers already shrunk, are folded
-///    into the next `Linear`'s bias;
+///    into the bias of the layer that receives them;
 /// 3. retrains the network on the training rows as [`ShrinkConfig::retrain`] says, with a
-///    fresh optimiser (masked neurons pass no gradient, so they stay off);
+///    fresh optimiser (masked units pass no gradient, so they stay off);
 /// 4. measures it on the validation set, records the step, and calls `on_step`
 ///    ([`Flow::Stop`] ends the run).
 ///
 /// The run also ends after [`patience`](ShrinkConfig::patience) misses in a row, or after
 /// the last level. The step kept is the latest one that met the criterion, not the one
 /// before the first miss: a later step can recover what an earlier one lost. On return
-/// `model` and `params` hold the kept step's network: its neuron masks on the listed
-/// `Linear`s and its retrained parameters. If no step met the criterion they are as they
-/// were given. Call [`compact`](super::compact()) on the result for the smaller dense
-/// network that runs faster. When `compact` would refuse the network (a layer of your own
-/// with parameters, or an element-wise layer of your own after a shrunk `Linear`), the run
-/// still works and the report starts with a [`ShrinkWarning::NotCompactable`]: the result
-/// can be used masked, but not compacted.
+/// `model` and `params` hold the kept step's network: its masks on the listed layers and
+/// its retrained parameters. If no step met the criterion they are as they were given.
+/// Call [`compact`](super::compact()) on the result for the smaller network that runs
+/// faster. When `compact` would refuse the network (a layer of your own with parameters,
+/// or an element-wise layer of your own after a shrunk layer), the run still works and the
+/// report starts with a [`ShrinkWarning::NotCompactable`]: the result can be used masked,
+/// but not compacted.
 ///
 /// What the run finds is a size and a network of that size. A network of the same size
 /// trained from scratch may match the pruned one or fall short of it, depending on the
@@ -558,35 +595,37 @@ pub struct ShrinkReport {
 /// [`train_found_size`](super::train_found_size()), and compare before you settle on the
 /// pruned network. The guide's chapter on shrinking does this for the digits network.
 ///
-/// Neurons the model already has off in a neuron mask stay off. The masks the run sets
-/// are neuron masks, by `Linear` ([`Sequential::set_neuron_mask`]); masks on other layers
-/// are left as they are. The baseline and every step are measured with the loss in
-/// [`RetrainConfig::loss`], 256 rows at a time; a warning is added when one validation row
-/// is worth more than half of an [`AccuracyDrop`](Criterion::AccuracyDrop)'s points.
+/// Units the model already has off stay off. The masks the run sets are neuron masks, by
+/// `Linear` ([`Sequential::set_neuron_mask`]), and channel masks, by `Conv2d`
+/// ([`Sequential::set_channel_mask`]); masks on other layers are left as they are. The
+/// baseline and every step are measured with the loss in [`RetrainConfig::loss`], 256 rows
+/// at a time; a warning is added when one validation row is worth more than half of an
+/// [`AccuracyDrop`](Criterion::AccuracyDrop)'s points.
 ///
 /// # Errors
-///
-/// Returns [`Error::Unsupported`], naming the layer, if the model has an image layer
-/// (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or `AdaptiveAvgPool2d`): the shrink
-/// tools work on the neurons of dense networks.
 ///
 /// Returns [`Error::InvalidData`], before changing anything, if
 /// [`ShrinkConfig::validation`] is `None`; if the training data or a given validation set
 /// is not a matrix of inputs with at least one row and one target per row (the message
 /// says which); if a [`Validation::Carve`] share is not above 0
-/// and below 1 or leaves either part without rows; if the model has no hidden `Linear`
-/// (no `Linear` with another `Linear` after it) or a listed layer is not one; if
+/// and below 1 or leaves either part without rows; if the model has nothing to shrink (no
+/// `Linear` with another `Linear` after it and no `Conv2d` whose channels reach a `Conv2d`
+/// or a `Linear`), or a listed layer is neither a hidden `Linear` nor a `Conv2d`; if
 /// [`ShrinkConfig::criterion`] is `None` for value targets, or an `AccuracyDrop` is given
 /// for value targets, or the criterion's number is NaN; if `step_bp` or `fine_step_bp` is
 /// 0, `max_removed_bp` is 0 or above 10,000, `patience` is `Some(0)` or the retraining
-/// batch is 0; if a listed layer's neuron mask does not have its width; if
-/// [`fold_means`](ShrinkConfig::fold_means) is on and the `Linear` after a listed layer has
-/// no bias to fold into; and as [`evaluate`] does for the validation set. Returns [`Error::Unsupported`] if a listed
-/// `Linear`, or a layer between it and the layer that holds its neurons, carries a mask
-/// set with [`Sequential::set_mask`] (clear it and mask by `Linear` instead), and if the
-/// layer after a listed `Linear`'s neurons is not a `Linear` (a `Softmax` or a `Glu`, say),
-/// where a switched-off neuron still has an effect, so that masking it does not remove
-/// it. During the run, returns the errors of [`activity()`](super::activity())
+/// batch is 0; if a listed layer's mask does not have its width; if
+/// [`fold_means`](ShrinkConfig::fold_means) is on and the layer that receives a listed
+/// layer's units has no bias to fold into, or is a `Conv2d` with padding after a listed
+/// `Conv2d`; and as [`evaluate`] does for the
+/// validation set. Returns [`Error::Unsupported`] if a listed layer, or a layer between it
+/// and the layer that holds its units, carries a mask set with [`Sequential::set_mask`]
+/// (clear it and mask by `Linear` or by `Conv2d` instead), if the mask at the end of a
+/// listed `Conv2d`'s run is not a whole-channel mask, and if the layer after a listed
+/// layer's run is not a `Linear` (for a `Linear`: a `Softmax` or a `Glu`, say) or neither a
+/// `Conv2d` nor a `Linear` (for a `Conv2d`), where a switched-off unit still has an effect,
+/// so that masking it does not remove it. During the run, returns the errors of
+/// [`activity()`](super::activity()), [`channel_activity()`](super::channel_activity())
 /// and [`fit`] (an [`Error::NonFinite`] from a NaN or infinite loss or gradient among
 /// them), and [`Error::InvalidData`] if a [`Ranking::Custom`] function returns the wrong
 /// number of scores; `model` and `params` are then put back as they were given.
@@ -657,13 +696,12 @@ pub(crate) fn run(
     mut config: ShrinkConfig<'_>,
     measure: &mut Measure<'_>,
 ) -> Result<ShrinkReport, Error> {
-    super::refuse_image_layers(model, "shrink")?;
     let (train, validation) = split(train, config.validation.take())?;
-    let linears = hidden_linears(model, &config.linears)?;
-    check_masks(model, &linears)?;
-    let mut warnings = check_layout(model, &linears)?;
+    let targets = targets(model, &config.layers)?;
+    check_masks(model, &targets)?;
+    let mut warnings = check_layout(model, params, &targets)?;
     if config.fold_means {
-        check_fold_biases(model, &linears)?;
+        check_fold_biases(model, &targets)?;
     }
     let criterion = criterion(config.criterion, &train.targets)?;
     check_numbers(&config)?;
@@ -685,9 +723,10 @@ pub(crate) fn run(
         }
     }
     let baseline = measure(model, params, &validation)?;
-    let original_masks: Vec<Option<NeuronMask>> = linears
+    // The mask on the layer that holds each target's units, as given.
+    let original_masks: Vec<Option<NeuronMask>> = targets
         .iter()
-        .map(|&l| model.neuron_mask(l).cloned())
+        .map(|t| model.mask(t.end(model)).cloned())
         .collect();
     let original_params = params.clone();
     let mut run = Run {
@@ -695,7 +734,7 @@ pub(crate) fn run(
         params,
         train: &train,
         validation: &validation,
-        linears: &linears,
+        targets: &targets,
         criterion,
         baseline,
         config: &mut config,
@@ -704,10 +743,11 @@ pub(crate) fn run(
     let outcome = run.steps(&levels);
     let (model, params) = (run.model, run.params);
     let restore = |model: &mut Sequential, params: &mut ParamStore| {
-        for (&linear, mask) in linears.iter().zip(&original_masks) {
+        for (target, mask) in targets.iter().zip(&original_masks) {
+            let end = target.end(model);
             match mask {
-                Some(mask) => model.set_neuron_mask(linear, mask.clone()),
-                None => model.clear_neuron_mask(linear),
+                Some(mask) => model.set_mask(end, mask.clone()),
+                None => model.clear_mask(end),
             }
         }
         *params = original_params.clone();
@@ -721,8 +761,8 @@ pub(crate) fn run(
     };
     let chosen = match best {
         Some(Best { step, masks, store }) => {
-            for (linear, mask) in masks {
-                model.set_neuron_mask(linear, mask);
+            for (target, (_, mask)) in targets.iter().zip(masks) {
+                target.set(model, mask);
             }
             *params = store;
             Some(step)
@@ -740,11 +780,138 @@ pub(crate) fn run(
     })
 }
 
+/// What a layer [`shrink`] shrinks loses: the neurons of a `Linear` or the output channels
+/// of a `Conv2d`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unit {
+    /// The neurons of a `Linear`, masked with `set_neuron_mask`.
+    Neurons,
+    /// The output channels of a `Conv2d`, masked with `set_channel_mask`.
+    Channels,
+}
+
+/// A layer [`shrink`] shrinks: its index and what it loses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Target {
+    /// The layer's index.
+    layer: usize,
+    /// What it loses.
+    unit: Unit,
+}
+
+impl Target {
+    /// The layer's units: a `Linear`'s outputs, a `Conv2d`'s output channels.
+    fn width(&self, model: &Sequential) -> usize {
+        match self.unit {
+            Unit::Neurons => model.linear(self.layer).expect("a Linear").outputs(),
+            Unit::Channels => model.channel_shape(self.layer).0,
+        }
+    }
+
+    /// The layer that holds the units as the next layer receives them, where their mask
+    /// goes: [`Sequential::neuron_layer`] or [`Sequential::channel_layer`].
+    fn end(&self, model: &Sequential) -> usize {
+        match self.unit {
+            Unit::Neurons => model.neuron_layer(self.layer),
+            Unit::Channels => model.channel_layer(self.layer),
+        }
+    }
+
+    /// Which units are on.
+    fn on(&self, model: &Sequential) -> Vec<bool> {
+        match self.unit {
+            Unit::Neurons => neurons_on(model, self.layer),
+            Unit::Channels => channels_on(model, self.layer),
+        }
+    }
+
+    /// Puts `mask`, one bit per unit, on the layer.
+    fn set(&self, model: &mut Sequential, mask: NeuronMask) {
+        match self.unit {
+            Unit::Neurons => model.set_neuron_mask(self.layer, mask),
+            Unit::Channels => model.set_channel_mask(self.layer, mask),
+        }
+    }
+
+    /// The word for one unit, for messages.
+    fn kind(&self) -> &'static str {
+        match self.unit {
+            Unit::Neurons => "linear",
+            Unit::Channels => "conv",
+        }
+    }
+}
+
+/// One layer's activity on the training rows, per unit, as [`RankContext`] shows it.
+struct UnitStats {
+    /// The mean output.
+    mean: Vec<f64>,
+    /// The mean absolute output.
+    mean_abs: Vec<f64>,
+    /// The share of outputs above 0.
+    firing: Vec<f64>,
+    /// The largest output.
+    max: Vec<f64>,
+}
+
+/// The activity of each of `targets` on `data`, in their order: one pass for the `Linear`
+/// targets and one for the `Conv2d` targets (each left out when there are none).
+fn unit_stats(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    targets: &[Target],
+) -> Result<Vec<UnitStats>, Error> {
+    let of = |unit: Unit| -> Vec<usize> {
+        targets
+            .iter()
+            .filter(|t| t.unit == unit)
+            .map(|t| t.layer)
+            .collect()
+    };
+    let (linears, convs) = (of(Unit::Neurons), of(Unit::Channels));
+    let mut neurons = if linears.is_empty() {
+        Vec::new()
+    } else {
+        activity(model, params, data, &linears, EVAL_BATCH)?
+    }
+    .into_iter();
+    let mut channels = if convs.is_empty() {
+        Vec::new()
+    } else {
+        channel_activity(model, params, data, &convs, EVAL_BATCH)?
+    }
+    .into_iter();
+    Ok(targets
+        .iter()
+        .map(|t| match t.unit {
+            Unit::Neurons => {
+                let a = neurons.next().expect("one activity per Linear target");
+                UnitStats {
+                    mean: a.mean,
+                    mean_abs: a.mean_abs,
+                    firing: a.firing,
+                    max: a.max,
+                }
+            }
+            Unit::Channels => {
+                let a = channels.next().expect("one activity per Conv2d target");
+                UnitStats {
+                    mean: a.mean,
+                    mean_abs: a.mean_abs,
+                    firing: a.firing,
+                    max: a.max,
+                }
+            }
+        })
+        .collect())
+}
+
 /// The latest step that met the criterion: its index, masks and parameters.
 struct Best {
     /// The step's index in the report.
     step: usize,
-    /// Each shrunk `Linear`'s neuron mask.
+    /// Each shrunk layer's mask, by layer index, in the order of the targets.
     masks: Vec<(usize, NeuronMask)>,
     /// The parameters after the step's retraining.
     store: ParamStore,
@@ -760,8 +927,8 @@ struct Run<'r, 'm, 'c> {
     train: &'r Dataset,
     /// The rows to measure each step on.
     validation: &'r Dataset,
-    /// The `Linear` layers to shrink.
-    linears: &'r [usize],
+    /// The layers to shrink.
+    targets: &'r [Target],
     /// When a step is good enough.
     criterion: Criterion,
     /// The unpruned network's measures on the validation set.
@@ -776,11 +943,7 @@ impl Run<'_, '_, '_> {
     /// Runs the steps at `levels` until the last, `Flow::Stop` or the patience runs out,
     /// and returns them with the latest step that met the criterion.
     fn steps(&mut self, levels: &[u32]) -> Result<(Vec<ShrinkStep>, Option<Best>), Error> {
-        let widths: Vec<usize> = self
-            .linears
-            .iter()
-            .map(|&l| self.model.linear(l).expect("a hidden Linear").outputs())
-            .collect();
+        let widths: Vec<usize> = self.targets.iter().map(|t| t.width(self.model)).collect();
         let mut rng = Rng::seed(match self.config.ranking {
             Ranking::Random(seed) => seed,
             _ => 0,
@@ -789,23 +952,18 @@ impl Run<'_, '_, '_> {
         let mut best = None;
         let mut misses = 0;
         for &level in levels {
-            let stats = activity(
-                self.model,
-                self.params,
-                self.train,
-                self.linears,
-                EVAL_BATCH,
-            )?;
-            let mut masks = Vec::with_capacity(self.linears.len());
-            for (k, &linear) in self.linears.iter().enumerate() {
+            let stats = unit_stats(self.model, self.params, self.train, self.targets)?;
+            let mut masks = Vec::with_capacity(self.targets.len());
+            for (k, &target) in self.targets.iter().enumerate() {
                 let keep = kept_at(widths[k], level);
-                masks.push((linear, self.mask_for(linear, keep, &stats[k], &mut rng)?));
+                let mask = self.mask_for(target, keep, &stats[k], &mut rng)?;
+                masks.push((target.layer, mask));
             }
             if self.config.fold_means {
                 self.fold_and_mask(&masks, &stats)?;
             } else {
-                for (linear, mask) in &masks {
-                    self.model.set_neuron_mask(*linear, mask.clone());
+                for (target, (_, mask)) in self.targets.iter().zip(&masks) {
+                    target.set(self.model, mask.clone());
                 }
             }
             self.retrain()?;
@@ -848,82 +1006,153 @@ impl Run<'_, '_, '_> {
     }
 
     /// Sets the step's `masks`, one listed layer at a time in order of layer index, and
-    /// before each folds the mean output of every neuron the mask newly switches off into
-    /// the bias of the next `Linear`: `b[i] += Σⱼ W[i, j] · mean_j`, summed in `f64` and
-    /// rounded once. The means of the first layer that loses neurons are `stats`, measured
-    /// before the step changed anything; those of a later layer are measured again, on the
-    /// network with the earlier layers' masks and folds in place. A mean of exactly 0 (a
-    /// dead neuron) adds nothing, even against an infinite weight.
+    /// before each folds the mean output of every unit the mask newly switches off into
+    /// the bias of the layer that receives it, summed in `f64` and rounded once:
+    ///
+    /// - a neuron into the next `Linear`, `b[i] += Σⱼ W[i, j] · mean_j`;
+    /// - a channel into the next `Conv2d` (which has no padding), `b[o] += Σ_c mean_c ·
+    ///   Σ_taps W[o, c, taps]`, with `mean_c` its mean over positions and rows;
+    /// - a channel into the `Linear` after a `Flatten`, `b[i] += Σ_c Σ_p W[i, c·plane + p] ·
+    ///   mean_{c,p}`, with `mean_{c,p}` the mean of each of its positions over the rows,
+    ///   measured for this fold.
+    ///
+    /// The means of the first layer that loses units are `stats`, measured before the step
+    /// changed anything; those of a later layer are measured again, on the network with the
+    /// earlier layers' masks and folds in place. A mean of exactly 0 (a dead unit) adds
+    /// nothing, even against an infinite weight.
     fn fold_and_mask(
         &mut self,
         masks: &[(usize, NeuronMask)],
-        stats: &[LayerActivity],
+        stats: &[UnitStats],
     ) -> Result<(), Error> {
         let mut order: Vec<usize> = (0..masks.len()).collect();
         order.sort_by_key(|&k| masks[k].0);
         let mut changed = false;
         for k in order {
-            let (linear, ref mask) = masks[k];
-            let before = neurons_on(self.model, linear);
+            let target = self.targets[k];
+            let mask = &masks[k].1;
+            let before = target.on(self.model);
             let removed: Vec<usize> = (0..before.len())
                 .filter(|&j| before[j] && !mask.is_on(j))
                 .collect();
             if !removed.is_empty() {
-                let measured;
-                let mean = if changed {
-                    measured =
-                        activity(self.model, self.params, self.train, &[linear], EVAL_BATCH)?;
-                    &measured[0].mean
-                } else {
-                    &stats[k].mean
-                };
-                let next = linear_after_run(self.model, linear)
-                    .expect("check_layout found a Linear after each run");
-                let bias = next
-                    .bias()
+                let increments = self.fold_increments(target, &removed, &stats[k], changed)?;
+                let bias = receiver_bias(self.model, target)
                     .expect("check_fold_biases found a bias after each run");
-                let (inputs, weight) = (next.inputs(), next.weight());
-                let increments: Vec<f64> = self
-                    .params
-                    .value(weight)
-                    .data()
-                    .chunks_exact(inputs)
-                    .map(|row| {
-                        removed
-                            .iter()
-                            .filter(|&&j| mean[j] != 0.0)
-                            .map(|&j| f64::from(row[j]) * mean[j])
-                            .sum()
-                    })
-                    .collect();
                 let b = self.params.value_mut(bias).data_mut();
                 for (b, increment) in b.iter_mut().zip(increments) {
                     *b = (f64::from(*b) + increment) as f32;
                 }
                 changed = true;
             }
-            self.model.set_neuron_mask(linear, mask.clone());
+            target.set(self.model, mask.clone());
         }
         Ok(())
     }
 
-    /// The neuron mask of the `Linear` at `linear` that keeps `keep` of its neurons (or
-    /// every neuron on, if no more than `keep` are on): its on neurons ranked, dead ones
-    /// first with `dead_first`, and the first ones in that order switched off.
+    /// What [`fold_and_mask`](Self::fold_and_mask) adds to each entry of the receiving
+    /// layer's bias for the units `removed` of `target`: their means (from `stats`, or
+    /// measured again when `remeasure`) times their outgoing weights.
+    fn fold_increments(
+        &self,
+        target: Target,
+        removed: &[usize],
+        stats: &UnitStats,
+        remeasure: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let next_at = target.end(self.model) + 1;
+        let train = self.train;
+        if target.unit == Unit::Channels && self.model.linear(next_at).is_some() {
+            // A channel into a `Linear`: each of its positions has its own weights, so its
+            // own mean.
+            let means = position_means(self.model, self.params, train, target.layer, EVAL_BATCH)?;
+            let plane = self.model.channel_shape(target.layer).1;
+            let next = self.model.linear(next_at).expect("just checked");
+            let w = self.params.value(next.weight()).data();
+            return Ok(w
+                .chunks_exact(next.inputs())
+                .map(|row| {
+                    removed
+                        .iter()
+                        .flat_map(|&c| c * plane..(c + 1) * plane)
+                        .filter(|&j| means[j] != 0.0)
+                        .map(|j| f64::from(row[j]) * means[j])
+                        .sum()
+                })
+                .collect());
+        }
+        let measured;
+        let mean: &[f64] = if remeasure {
+            measured = match target.unit {
+                Unit::Neurons => {
+                    activity(self.model, self.params, train, &[target.layer], EVAL_BATCH)?
+                        .remove(0)
+                        .mean
+                }
+                Unit::Channels => {
+                    channel_activity(self.model, self.params, train, &[target.layer], EVAL_BATCH)?
+                        .remove(0)
+                        .mean
+                }
+            };
+            &measured
+        } else {
+            &stats.mean
+        };
+        if let Some(conv) = self.model.layer(next_at).as_conv2d() {
+            // A channel into a `Conv2d` without padding: every output reads every tap of the
+            // channel, so the channel's mean times the sum of its taps.
+            let g = conv.geom();
+            let (kh, kw) = g.kernel();
+            let (taps, ins) = (kh * kw, g.in_channels());
+            let w = self.params.value(conv.weight()).data();
+            return Ok((0..g.out_channels())
+                .map(|o| {
+                    removed
+                        .iter()
+                        .filter(|&&c| mean[c] != 0.0)
+                        .map(|&c| {
+                            let taps_sum: f64 = w[(o * ins + c) * taps..][..taps]
+                                .iter()
+                                .map(|&v| f64::from(v))
+                                .sum();
+                            taps_sum * mean[c]
+                        })
+                        .sum()
+                })
+                .collect());
+        }
+        let next = linear_after_run(self.model, target.layer)
+            .expect("check_layout found a Linear after each run");
+        let w = self.params.value(next.weight()).data();
+        Ok(w.chunks_exact(next.inputs())
+            .map(|row| {
+                removed
+                    .iter()
+                    .filter(|&&j| mean[j] != 0.0)
+                    .map(|&j| f64::from(row[j]) * mean[j])
+                    .sum()
+            })
+            .collect())
+    }
+
+    /// The mask of `target` that keeps `keep` of its units (or every unit on, if no more
+    /// than `keep` are on): its on units ranked, dead ones first with `dead_first`, and the
+    /// first ones in that order switched off.
     fn mask_for(
         &mut self,
-        linear: usize,
+        target: Target,
         keep: usize,
-        stats: &LayerActivity,
+        stats: &UnitStats,
         rng: &mut Rng,
     ) -> Result<NeuronMask, Error> {
-        let flags = neurons_on(self.model, linear);
+        let flags = target.on(self.model);
         let on: Vec<usize> = (0..flags.len()).filter(|&j| flags[j]).collect();
         let mut mask = NeuronMask::from_on(flags.len(), &on);
         if on.len() <= keep {
             return Ok(mask);
         }
-        let scores = self.scores(linear, &on, stats, rng)?;
+        let scores = self.scores(target, &on, stats, rng)?;
         let dead_first = self.config.dead_first;
         let dead = |i: usize| dead_first && stats.mean_abs[on[i]] == 0.0;
         let mut order: Vec<usize> = (0..on.len()).collect();
@@ -940,47 +1169,36 @@ impl Run<'_, '_, '_> {
         Ok(mask)
     }
 
-    /// The ranking's score of each neuron in `on` of the `Linear` at `linear`.
+    /// The ranking's score of each unit in `on` of `target`.
     fn scores(
         &mut self,
-        linear: usize,
+        target: Target,
         on: &[usize],
-        stats: &LayerActivity,
+        stats: &UnitStats,
         rng: &mut Rng,
     ) -> Result<Vec<f64>, Error> {
         let scores = match &mut self.config.ranking {
-            Ranking::OutNorm => {
-                let next = linear_after_run(self.model, linear)
-                    .expect("check_layout found a Linear after each run");
-                let (w, inputs) = (self.params.value(next.weight()).data(), next.inputs());
-                on.iter()
-                    .map(|&j| {
-                        let sum: f64 = w
-                            .iter()
-                            .skip(j)
-                            .step_by(inputs)
-                            .map(|&v| f64::from(v) * f64::from(v))
-                            .sum();
-                        sum.sqrt()
-                    })
-                    .collect()
-            }
+            Ranking::OutNorm => out_norms(self.model, self.params, target, on),
             Ranking::Activity => on.iter().map(|&j| stats.mean_abs[j]).collect(),
             Ranking::Random(_) => on.iter().map(|_| rng.uniform_f64()).collect(),
             Ranking::Custom(rank) => {
                 let scores = rank(&RankContext {
-                    linear,
+                    layer: target.layer,
                     on,
                     model: self.model,
                     params: self.params,
-                    activity: stats,
+                    mean: &stats.mean,
+                    mean_abs: &stats.mean_abs,
+                    firing: &stats.firing,
+                    max: &stats.max,
                 });
                 if scores.len() != on.len() {
                     return Err(Error::InvalidData(format!(
-                        "shrink: the custom ranking returned {} scores for the linear layer \
-                         {linear}, which has {} neurons on; return one score per entry of \
-                         RankContext::on",
+                        "shrink: the custom ranking returned {} scores for the {} layer {}, \
+                         which has {} units on; return one score per entry of RankContext::on",
                         scores.len(),
+                        target.kind(),
+                        target.layer,
                         on.len()
                     )));
                 }
@@ -1010,6 +1228,52 @@ impl Run<'_, '_, '_> {
         };
         fit(self.model, self.params, self.train, config).map(|_| ())
     }
+}
+
+/// The Euclidean norm of the outgoing weights of each unit in `on` of `target`: a neuron's
+/// column in the next `Linear`; a channel's input channel in the next `Conv2d` (every
+/// output channel and tap), or its block of columns in the next `Linear`. Summed in `f64`.
+/// `check_layout` found the receiving layer.
+fn out_norms(model: &Sequential, params: &ParamStore, target: Target, on: &[usize]) -> Vec<f64> {
+    let norm = |values: &mut dyn Iterator<Item = f32>| -> f64 {
+        values
+            .map(|v| f64::from(v) * f64::from(v))
+            .sum::<f64>()
+            .sqrt()
+    };
+    let next_at = target.end(model) + 1;
+    if let Some(conv) = model.layer(next_at).as_conv2d() {
+        let g = conv.geom();
+        let (kh, kw) = g.kernel();
+        let (taps, ins) = (kh * kw, g.in_channels());
+        let w = params.value(conv.weight()).data();
+        return on
+            .iter()
+            .map(|&c| {
+                norm(
+                    &mut (0..g.out_channels())
+                        .flat_map(|o| w[(o * ins + c) * taps..][..taps].iter().copied()),
+                )
+            })
+            .collect();
+    }
+    let next = model
+        .linear(next_at)
+        .expect("check_layout found a Conv2d or a Linear after each run");
+    let (w, inputs) = (params.value(next.weight()).data(), next.inputs());
+    let plane = match target.unit {
+        Unit::Neurons => 1,
+        Unit::Channels => model.channel_shape(target.layer).1,
+    };
+    on.iter()
+        .map(|&j| {
+            norm(
+                &mut w
+                    .chunks_exact(inputs)
+                    .flat_map(|row| row[j * plane..(j + 1) * plane].iter().copied()),
+            )
+        })
+        .collect()
 }
 
 /// The rows to retrain on and the validation set, from `train` and the config's
@@ -1083,110 +1347,228 @@ fn carved_rows(share: f64, n: usize) -> usize {
     }
 }
 
-/// The `Linear` layers to shrink: `listed` without repeats, each checked to be a hidden
-/// `Linear`, or every hidden `Linear` of `model` when `listed` is empty.
-fn hidden_linears(model: &Sequential, listed: &[usize]) -> Result<Vec<usize>, Error> {
+/// Whether the channels of the `Conv2d` at layer `conv` reach a `Conv2d` or a `Linear`,
+/// the layers compaction can remove them from.
+fn channels_received(model: &Sequential, conv: usize) -> bool {
+    let next = model.channel_layer(conv) + 1;
+    next < model.len() && (model.layer(next).as_conv2d().is_some() || model.linear(next).is_some())
+}
+
+/// The layers to shrink: `listed` without repeats, each checked to be a hidden `Linear` or
+/// a `Conv2d`, or, when `listed` is empty, every hidden `Linear` of `model` and every
+/// `Conv2d` whose channels reach a `Conv2d` or a `Linear`, in order of index.
+fn targets(model: &Sequential, listed: &[usize]) -> Result<Vec<Target>, Error> {
+    let conv = |layer| Target {
+        layer,
+        unit: Unit::Channels,
+    };
+    let linear = |layer| Target {
+        layer,
+        unit: Unit::Neurons,
+    };
     if listed.is_empty() {
-        let all: Vec<usize> = model
-            .linears()
-            .map(|(i, _)| i)
-            .filter(|&i| (i + 1..model.len()).any(|l| model.linear(l).is_some()))
+        let all: Vec<Target> = (0..model.len())
+            .filter_map(|i| {
+                if model.linear(i).is_some() {
+                    (i + 1..model.len())
+                        .any(|l| model.linear(l).is_some())
+                        .then(|| linear(i))
+                } else if model.layer(i).as_conv2d().is_some() {
+                    channels_received(model, i).then(|| conv(i))
+                } else {
+                    None
+                }
+            })
             .collect();
         if all.is_empty() {
             return Err(Error::InvalidData(
                 "shrink: the model has no hidden layer to shrink: a hidden layer is a Linear \
-                 with another Linear after it, and the last Linear's neurons are the model's \
-                 outputs"
+                 with another Linear after it (the last Linear's neurons are the model's \
+                 outputs), or a Conv2d whose channels reach a Conv2d or a Linear"
                     .to_string(),
             ));
         }
         return Ok(all);
     }
-    let mut chosen = Vec::with_capacity(listed.len());
-    for &linear in listed {
-        check_hidden(model, linear, "shrink")?;
-        if !chosen.contains(&linear) {
-            chosen.push(linear);
+    let mut chosen: Vec<Target> = Vec::with_capacity(listed.len());
+    for &layer in listed {
+        let target = if layer < model.len() && model.layer(layer).as_conv2d().is_some() {
+            conv(layer)
+        } else if layer < model.len() && model.linear(layer).is_some() {
+            check_hidden(model, layer, "shrink")?;
+            linear(layer)
+        } else {
+            return Err(Error::InvalidData(format!(
+                "shrink: layer {layer} is neither a Linear nor a Conv2d layer"
+            )));
+        };
+        if !chosen.contains(&target) {
+            chosen.push(target);
         }
     }
     Ok(chosen)
 }
 
-/// Refuses a mask the run cannot work with on a listed `Linear`'s run: one set with
-/// `set_mask` on the `Linear` or a layer before the one that holds its neurons
-/// (`Unsupported`), or a neuron mask of the wrong width (`InvalidData`).
-fn check_masks(model: &Sequential, linears: &[usize]) -> Result<(), Error> {
-    for &linear in linears {
-        let end = model.neuron_layer(linear);
-        for layer in linear..end {
-            if model.mask(layer).is_some() {
+/// Refuses a mask the run cannot work with on a listed layer's run: one set with
+/// `set_mask` on the layer or a layer before the one that holds its units
+/// (`Unsupported`), a mask there that is not a whole-channel mask for a `Conv2d`
+/// (`Unsupported`), or a mask of the wrong width (`InvalidData`).
+fn check_masks(model: &Sequential, targets: &[Target]) -> Result<(), Error> {
+    for &target in targets {
+        let (layer, end) = (target.layer, target.end(model));
+        let setter = match target.unit {
+            Unit::Neurons => "set_neuron_mask",
+            Unit::Channels => "set_channel_mask",
+        };
+        for l in layer..end {
+            if model.mask(l).is_some() {
                 return Err(Error::Unsupported(format!(
-                    "shrink: layer {layer} ({}) carries a mask set with set_mask, inside the \
-                     run of the linear layer {linear}, whose neurons the tool masks at layer \
-                     {end}; clear it with clear_mask({layer}) and mask those neurons with \
-                     set_neuron_mask({linear}, mask) instead",
-                    model.layer(layer).name()
+                    "shrink: layer {l} ({}) carries a mask set with set_mask, inside the run of \
+                     the {} layer {layer}, whose units the tool masks at layer {end}; clear it \
+                     with clear_mask({l}) and mask those units with {setter}({layer}, mask) \
+                     instead",
+                    model.layer(l).name(),
+                    target.kind()
                 )));
             }
         }
-        let width = model.linear(linear).expect("a hidden Linear").outputs();
-        if let Some(mask) = model.mask(end)
-            && mask.width() != width
-        {
-            return Err(Error::InvalidData(format!(
-                "shrink: the mask on layer {end} has width {}, but the linear layer {linear} \
-                 outputs width {width}",
-                mask.width()
-            )));
+        let Some(mask) = model.mask(end) else {
+            continue;
+        };
+        match target.unit {
+            Unit::Neurons => {
+                let width = target.width(model);
+                if mask.width() != width {
+                    return Err(Error::InvalidData(format!(
+                        "shrink: the mask on layer {end} has width {}, but the linear layer \
+                         {layer} outputs width {width}",
+                        mask.width()
+                    )));
+                }
+            }
+            Unit::Channels => {
+                let (channels, plane) = model.channel_shape(layer);
+                if mask.width() != channels * plane {
+                    return Err(Error::InvalidData(format!(
+                        "shrink: the mask on layer {end} has width {}, but the conv layer \
+                         {layer}'s {channels} channels are {} values there",
+                        mask.width(),
+                        channels * plane
+                    )));
+                }
+                let whole = model
+                    .channel_mask(layer)
+                    .is_some_and(|m| model.channel_values(layer, &m) == *mask);
+                if !whole {
+                    return Err(Error::Unsupported(format!(
+                        "shrink: the mask on layer {end} ({}) switches off part of a channel of \
+                         the conv layer {layer}, which the tool masks by whole channels; clear \
+                         it with clear_mask({end}) and mask whole channels with \
+                         set_channel_mask({layer}, mask) instead",
+                        model.layer(end).name()
+                    )));
+                }
+            }
         }
     }
     Ok(())
 }
 
-/// Checks, before any training, that switching off a neuron of each listed `Linear`
-/// removes it: its neurons must reach the next `Linear` through element-wise layers only
-/// (`Unsupported` otherwise, naming the layer they reach). Returns a
-/// [`ShrinkWarning::NotCompactable`] for each layer [`compact`](super::compact()) would
-/// refuse in the result: a layer of your own with parameters anywhere, or an element-wise
-/// layer in a listed run that is neither an activation nor a `Prelu`. These are the
-/// layout checks `compact` makes.
-fn check_layout(model: &Sequential, linears: &[usize]) -> Result<Vec<ShrinkWarning>, Error> {
+/// Checks, before any training, that switching off a unit of each listed layer removes
+/// it: a `Linear`'s neurons must reach the next `Linear` through element-wise layers only,
+/// a `Conv2d`'s channels a `Conv2d` or a `Linear` through its run (`Unsupported`
+/// otherwise, naming the layer they reach). Returns a [`ShrinkWarning::NotCompactable`]
+/// for each layer [`compact`](super::compact()) would refuse in the result: a layer of
+/// your own with parameters anywhere, or a layer in a listed run that compaction cannot
+/// follow (for a `Linear`, an element-wise layer that is neither an activation nor a
+/// `Prelu`; for a `Conv2d`, a layer other than batch norm, a pooling, an activation, a
+/// one-slope `Prelu`, `Flatten`, `Dropout` or `Identity`). These are the layout checks
+/// `compact` makes.
+fn check_layout(
+    model: &Sequential,
+    params: &ParamStore,
+    targets: &[Target],
+) -> Result<Vec<ShrinkWarning>, Error> {
     let mut warnings = Vec::new();
-    for &linear in linears {
-        if linear_after_run(model, linear).is_none() {
-            let next = model.neuron_layer(linear) + 1;
-            return Err(Error::Unsupported(format!(
-                "shrink: the neurons of the linear layer {linear} reach layer {next} ({}), \
-                 which is not a Linear, so switching one off does not remove it (a softmax \
-                 still counts a 0 input, a GLU still passes half of a value whose gate is 0); \
-                 shrink only Linear layers whose run of element-wise layers leads to the next \
-                 Linear, listed in ShrinkConfig::linears",
-                model.layer(next).name()
-            )));
-        }
-        if let Some(layer) = unvouched_layer(model, linear) {
-            warnings.push(ShrinkWarning::NotCompactable {
-                layer,
-                reason: format!(
-                    "the element-wise layer {} after the linear layer {linear} is neither an \
-                     activation (a built-in or an ActivationLayer) nor a Prelu, and compact \
-                     cannot tell whether it treats every position alike",
-                    model.layer(layer).name()
-                ),
-            });
+    for &target in targets {
+        let layer = target.layer;
+        let next = target.end(model) + 1;
+        let reached = || {
+            if next < model.len() {
+                format!("layer {next} ({})", model.layer(next).name())
+            } else {
+                "the model's output".to_string()
+            }
+        };
+        match target.unit {
+            Unit::Neurons => {
+                if linear_after_run(model, layer).is_none() {
+                    return Err(Error::Unsupported(format!(
+                        "shrink: the neurons of the linear layer {layer} reach {}, which is \
+                         not a Linear, so switching one off does not remove it (a softmax \
+                         still counts a 0 input, a GLU still passes half of a value whose gate \
+                         is 0); shrink only Linear layers whose run of element-wise layers \
+                         leads to the next Linear, listed in ShrinkConfig::layers",
+                        reached()
+                    )));
+                }
+                if let Some(l) = unvouched_layer(model, layer) {
+                    warnings.push(ShrinkWarning::NotCompactable {
+                        layer: l,
+                        reason: format!(
+                            "the element-wise layer {} after the linear layer {layer} is \
+                             neither an activation (a built-in or an ActivationLayer) nor a \
+                             Prelu, and compact cannot tell whether it treats every position \
+                             alike",
+                            model.layer(l).name()
+                        ),
+                    });
+                }
+            }
+            Unit::Channels => {
+                if !channels_received(model, layer) {
+                    return Err(Error::Unsupported(format!(
+                        "shrink: the channels of the conv layer {layer} reach {}, which is \
+                         neither a Conv2d nor a Linear, so switching one off does not remove \
+                         it; shrink only Conv2d layers whose channels reach a Conv2d or a \
+                         Linear, listed in ShrinkConfig::layers",
+                        reached()
+                    )));
+                }
+                if let Some(l) = unvouched_channel_layer(model, params, layer) {
+                    warnings.push(ShrinkWarning::NotCompactable {
+                        layer: l,
+                        reason: format!(
+                            "the layer {} is in the run of the conv layer {layer}, and compact \
+                             cannot tell whether it treats every channel alike",
+                            model.layer(l).name()
+                        ),
+                    });
+                }
+            }
         }
     }
-    if let Some(layer) = foreign_parameters(model) {
-        // One warning per layer: a layer of your own can be both element-wise and have
+    let foreign = if has_image_layers(model) {
+        foreign_image_parameters(model)
+    } else {
+        foreign_parameters(model)
+    };
+    if let Some(layer) = foreign {
+        // One warning per layer: a layer of your own can be both in a run and have
         // parameters, and its parameters are the reason that decides.
         warnings.retain(|warning| {
             !matches!(warning, ShrinkWarning::NotCompactable { layer: l, .. } if *l == layer)
         });
+        let rebuilt = if has_image_layers(model) {
+            "a Conv2d, a BatchNorm2d, a Linear nor a Prelu"
+        } else {
+            "a Linear nor a Prelu"
+        };
         warnings.push(ShrinkWarning::NotCompactable {
             layer,
             reason: format!(
-                "the layer {} has parameters and is neither a Linear nor a Prelu, and compact \
-                 cannot move them to a new store",
+                "the layer {} has parameters and is neither {rebuilt}, and compact cannot move \
+                 them to a new store",
                 model.layer(layer).name()
             ),
         });
@@ -1194,17 +1576,50 @@ fn check_layout(model: &Sequential, linears: &[usize]) -> Result<Vec<ShrinkWarni
     Ok(warnings)
 }
 
-/// Refuses, with `InvalidData`, a listed `Linear` whose next `Linear` has no bias, which
-/// [`ShrinkConfig::fold_means`] would have to fold the removed neurons' means into. Runs
-/// after `check_layout`, which found a `Linear` after each listed run.
-fn check_fold_biases(model: &Sequential, linears: &[usize]) -> Result<(), Error> {
-    for &linear in linears {
-        let next_at = model.neuron_layer(linear) + 1;
-        let next = linear_after_run(model, linear).expect("check_layout found a Linear");
-        if next.bias().is_none() {
+/// The bias of the layer that receives the units of `target`: the next `Linear` after a
+/// `Linear`'s run, or the `Conv2d` or `Linear` after a `Conv2d`'s run; `None` if it has
+/// none (or the layer is neither, which `check_layout` refused).
+fn receiver_bias(model: &Sequential, target: Target) -> Option<cavitation_core::ParamId> {
+    let next = target.end(model) + 1;
+    if next >= model.len() {
+        return None;
+    }
+    match model.layer(next).as_conv2d() {
+        Some(conv) => conv.bias(),
+        None => model.linear(next).and_then(|l| l.bias()),
+    }
+}
+
+/// Refuses, with `InvalidData`, a listed layer whose receiving layer has no bias, which
+/// [`ShrinkConfig::fold_means`] would have to fold the removed units' means into, and a
+/// listed `Conv2d` whose channels reach a `Conv2d` with padding, where the border outputs
+/// read zeros for some taps and no bias can stand for the channel's mean. Runs after
+/// `check_layout`, which found the receiving layer of each listed run.
+fn check_fold_biases(model: &Sequential, targets: &[Target]) -> Result<(), Error> {
+    for &target in targets {
+        let (layer, kind) = (target.layer, target.kind());
+        let next_at = target.end(model) + 1;
+        if let Some(conv) = model.layer(next_at).as_conv2d()
+            && conv.geom().padding() != (0, 0)
+        {
             return Err(Error::InvalidData(format!(
-                "shrink: fold_means folds the means of the linear layer {linear}'s removed \
-                 neurons into the bias of the linear layer {next_at}, which has no bias; turn \
+                "shrink: fold_means would fold the means of the conv layer {layer}'s removed \
+                 channels into the bias of the conv layer {next_at}, whose padding {:?} makes \
+                 its border outputs read zeros where the channel was, so no bias stands for the \
+                 channel's mean; turn fold_means off, or leave layer {layer} out of \
+                 ShrinkConfig::layers",
+                conv.geom().padding()
+            )));
+        }
+        if receiver_bias(model, target).is_none() {
+            let receiver = if model.layer(next_at).as_conv2d().is_some() {
+                "conv"
+            } else {
+                "linear"
+            };
+            return Err(Error::InvalidData(format!(
+                "shrink: fold_means folds the means of the {kind} layer {layer}'s removed units \
+                 into the bias of the {receiver} layer {next_at}, which has no bias; turn \
                  fold_means off, or give that layer a bias"
             )));
         }
@@ -1297,8 +1712,18 @@ fn kept_at(width: usize, level: u32) -> usize {
 /// [`compact`](super::compact()) removes them: each `Linear` keeps the rows of its on
 /// neurons and the columns of the on neurons of the `Linear` before it, a `Prelu` with one
 /// slope per neuron keeps the slopes of the on ones, and every other parameter counts in
-/// full.
+/// full. For a model with image layers that `compact` accepts, the count is that of the
+/// network `compact` builds, which also leaves out the off channels; when it refuses, the
+/// count above.
 fn parameter_count(model: &Sequential, params: &ParamStore) -> usize {
+    if has_image_layers(model)
+        && let Ok((small, store)) = compact(model, params)
+    {
+        return (0..small.len())
+            .flat_map(|i| small.layer(i).parameters())
+            .map(|(_, id)| store.value(id).data().len())
+            .sum();
+    }
     // For each layer in the run of a `Linear`, that `Linear`'s width and on count.
     let mut runs: Vec<Option<(usize, usize)>> = vec![None; model.len()];
     for (linear, layer) in model.linears() {

@@ -21,10 +21,16 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "parki
 # Blocks on wgpu's futures (adapter and device requests), which finish without an executor
 # on native backends.
 pollster = "1.0.1"
+# Pool2dGeom, the geometry the pooling kernels take; the tests also use its f64 tape as the
+# reference for the activation twins (tanh, the sigmoid and GELU) and their gradients, and
+# for the bias add (tests/reduce.rs).
+cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
 
 [dev-dependencies]
-# The CPU tape the bias add's twin is checked against (tests/reduce.rs).
-cavitation-core = { path = "../cavitation-core" }
+# The CPU optimisers the optimiser kernel's twin is pinned to (tests/optimizer.rs). nn
+# depends on this crate behind its `gpu` feature, which an all-features build turns on: a
+# dev-only cycle, sound because the test passes only numbers between the two crates.
+cavitation-nn = { path = "../cavitation-nn" }
 
 # Counts host allocations in warm steps; it installs its own global allocator, so it runs
 # alone, without the test harness.

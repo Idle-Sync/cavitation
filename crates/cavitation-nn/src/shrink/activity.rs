@@ -60,10 +60,6 @@ pub struct LayerActivity {
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unsupported`], naming the layer, if the model has an image layer
-/// (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or `AdaptiveAvgPool2d`): the shrink
-/// tools work on the neurons of dense networks.
-///
 /// Returns [`Error::InvalidData`] if `batch` is 0, if `data.x` is not a matrix with at
 /// least one row, if its width is not the model's input width, or if an entry of
 /// `linears` is not the index of a `Linear` layer (the message names it).
@@ -100,42 +96,233 @@ pub fn activity(
     linears: &[usize],
     batch: usize,
 ) -> Result<Vec<LayerActivity>, Error> {
-    super::refuse_image_layers(model, "activity")?;
+    check_data(data, batch, "activity")?;
+    let mut layers = Vec::with_capacity(linears.len());
+    for &linear in linears {
+        if model.linear(linear).is_none() {
+            return Err(Error::InvalidData(format!(
+                "activity: layer {linear} is not a Linear layer"
+            )));
+        }
+        layers.push(model.neuron_layer(linear));
+    }
+    let (sums, rows) = per_value(model, params, data, &layers, batch, "activity")?;
+    let n = rows as f64;
+    Ok(linears
+        .iter()
+        .zip(&layers)
+        .zip(sums)
+        .map(|((&linear, &layer), v)| {
+            let width = model.linear(linear).expect("checked above").outputs();
+            let v = v.unwrap_or_else(|| Sums::new(width));
+            LayerActivity {
+                linear,
+                layer,
+                mean: v.sum.iter().map(|s| s / n).collect(),
+                mean_abs: v.abs.iter().map(|s| s / n).collect(),
+                firing: v.firing.iter().map(|s| s / n).collect(),
+                max: v.max,
+            }
+        })
+        .collect())
+}
+
+/// How the channels of one `Conv2d` behaved over a data set, from [`channel_activity`]:
+/// one value per output channel in each list, over every position of the channel and every
+/// row, read where the channel's values are final, as the next layer receives them (at
+/// [`Sequential::channel_layer`], after batch norm, the activations and any pooling, and
+/// after any mask there).
+///
+/// It is `#[non_exhaustive]`, so a later release can add a statistic without breaking your
+/// code: read its fields, and get one from [`channel_activity`].
+///
+/// ```
+/// use cavitation_core::{Conv2dGeom, ParamStore, Rng, Tensor};
+/// use cavitation_nn::shrink::{ChannelActivity, channel_activity};
+/// use cavitation_nn::{Conv2d, Dataset, Relu, Sequential, Targets};
+/// let mut params = ParamStore::new();
+/// let geom = Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap();
+/// let net = Sequential::new()
+///     .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+///     .push(Relu);
+/// let data = Dataset { x: Tensor::zeros(&[4, 9]), targets: Targets::Classes(vec![0; 4]) };
+/// let stats: Vec<ChannelActivity> = channel_activity(&net, &params, &data, &[0], 4).unwrap();
+/// assert_eq!((stats[0].conv, stats[0].layer, stats[0].mean.len()), (0, 1, 2));
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ChannelActivity {
+    /// The index of the `Conv2d` layer.
+    pub conv: usize,
+    /// The index of the layer whose output was read: [`Sequential::channel_layer`] of the
+    /// conv.
+    pub layer: usize,
+    /// The mean of each channel's values over its positions and the rows.
+    pub mean: Vec<f64>,
+    /// The mean of each channel's absolute values.
+    pub mean_abs: Vec<f64>,
+    /// The share of each channel's values (positions times rows) above 0: for a ReLU
+    /// network, how often the channel fires.
+    pub firing: Vec<f64>,
+    /// The largest value of each channel, or −∞ for a data set the channel never saw.
+    pub max: Vec<f64>,
+}
+
+/// Measures each output channel of the `Conv2d` layers `convs` over `data`, in batches of
+/// `batch` rows, through the compiled model (or on the tape, for a model with a layer that
+/// has no inference form), as [`activity`] does for the neurons of `Linear` layers. One
+/// [`ChannelActivity`] per entry of `convs`, in order.
+///
+/// # Errors
+///
+/// [`Error::InvalidData`] when a layer of `convs` is not a `Conv2d`, when `batch` is 0,
+/// when `data` has no rows or its inputs are not `[rows, features]` or do not fit the
+/// model.
+///
+/// ```
+/// use cavitation_core::{Conv2dGeom, ParamStore, Rng, Tensor};
+/// use cavitation_nn::shrink::channel_activity;
+/// use cavitation_nn::{Conv2d, Dataset, Relu, Sequential, Targets};
+/// let mut params = ParamStore::new();
+/// let geom = Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap();
+/// let conv = Conv2d::new(&mut params, geom, &mut Rng::seed(0));
+/// // Channel 1's bias far below 0: after the ReLU it never fires.
+/// params.value_mut(conv.bias().unwrap()).data_mut()[1] = -100.0;
+/// let net = Sequential::new().push(conv).push(Relu);
+/// let data = Dataset { x: Tensor::full(&[4, 9], 0.5f32), targets: Targets::Classes(vec![0; 4]) };
+/// let stats = channel_activity(&net, &params, &data, &[0], 2).unwrap();
+/// assert_eq!(stats[0].firing[1], 0.0);
+/// ```
+pub fn channel_activity(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    convs: &[usize],
+    batch: usize,
+) -> Result<Vec<ChannelActivity>, Error> {
+    check_data(data, batch, "channel_activity")?;
+    let mut layers = Vec::with_capacity(convs.len());
+    for &conv in convs {
+        if conv >= model.len() || model.layer(conv).as_conv2d().is_none() {
+            return Err(Error::InvalidData(format!(
+                "channel_activity: layer {conv} is not a Conv2d layer"
+            )));
+        }
+        layers.push(model.channel_layer(conv));
+    }
+    let (sums, rows) = per_value(model, params, data, &layers, batch, "channel_activity")?;
+    Ok(convs
+        .iter()
+        .zip(&layers)
+        .zip(sums)
+        .map(|((&conv, &layer), v)| {
+            let (channels, plane) = model.channel_shape(conv);
+            let v = v.unwrap_or_else(|| Sums::new(channels * plane));
+            let n = (rows * plane) as f64;
+            let fold = |vals: &[f64]| -> Vec<f64> {
+                vals.chunks_exact(plane.max(1))
+                    .map(|c| c.iter().sum::<f64>() / n)
+                    .collect()
+            };
+            ChannelActivity {
+                conv,
+                layer,
+                mean: fold(&v.sum),
+                mean_abs: fold(&v.abs),
+                firing: fold(&v.firing),
+                max: v
+                    .max
+                    .chunks_exact(plane.max(1))
+                    .map(|c| c.iter().copied().fold(f64::NEG_INFINITY, f64::max))
+                    .collect(),
+            }
+        })
+        .collect())
+}
+
+/// The data set's `(rows, features)`, or [`Error::InvalidData`] prefixed `"{op}: "` when
+/// `batch` is 0, the inputs are not `[rows, features]` or there are no rows.
+fn check_data(data: &Dataset, batch: usize, op: &str) -> Result<(usize, usize), Error> {
     if batch == 0 {
-        return Err(Error::InvalidData(
-            "activity: the batch size is 0".to_string(),
-        ));
+        return Err(Error::InvalidData(format!("{op}: the batch size is 0")));
     }
     let &[rows, features] = data.x.shape().dims() else {
         return Err(Error::InvalidData(format!(
-            "activity: the inputs must have shape [rows, features], found {:?}",
+            "{op}: the inputs must have shape [rows, features], found {:?}",
             data.x.shape().dims()
         )));
     };
     if rows == 0 {
-        return Err(Error::InvalidData(
-            "activity: the data set has no rows".to_string(),
-        ));
+        return Err(Error::InvalidData(format!(
+            "{op}: the data set has no rows"
+        )));
     }
-    if linears.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut stats = Vec::with_capacity(linears.len());
-    for &linear in linears {
-        let Some(layer) = model.linear(linear) else {
-            return Err(Error::InvalidData(format!(
-                "activity: layer {linear} is not a Linear layer"
-            )));
-        };
-        let width = layer.outputs();
-        stats.push(LayerActivity {
-            linear,
-            layer: model.neuron_layer(linear),
-            mean: vec![0.0; width],
-            mean_abs: vec![0.0; width],
+    Ok((rows, features))
+}
+
+/// Running sums of one layer's output values over a data set: per value, the sum, the sum
+/// of absolute values, the count above 0 and the maximum.
+struct Sums {
+    /// The sum of each value.
+    sum: Vec<f64>,
+    /// The sum of each value's magnitude.
+    abs: Vec<f64>,
+    /// How many times each value was above 0.
+    firing: Vec<f64>,
+    /// Each value's maximum so far.
+    max: Vec<f64>,
+}
+
+impl Sums {
+    /// Sums of `width` values over no rows.
+    fn new(width: usize) -> Sums {
+        Sums {
+            sum: vec![0.0; width],
+            abs: vec![0.0; width],
             firing: vec![0.0; width],
             max: vec![f64::NEG_INFINITY; width],
-        });
+        }
+    }
+}
+
+/// The mean of each value at [`Sequential::channel_layer`] of the `Conv2d` at layer
+/// `conv` over the rows of `data`, run in batches of `batch` rows: one mean per channel and
+/// position, channel by channel (`channels × plane` values). What `shrink`'s `fold_means`
+/// folds into a `Linear` after a `Flatten`.
+pub(super) fn position_means(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    conv: usize,
+    batch: usize,
+) -> Result<Vec<f64>, Error> {
+    let layer = model.channel_layer(conv);
+    let (sums, rows) = per_value(model, params, data, &[layer], batch, "shrink")?;
+    let (channels, plane) = model.channel_shape(conv);
+    let sums = sums
+        .into_iter()
+        .next()
+        .flatten()
+        .unwrap_or_else(|| Sums::new(channels * plane));
+    Ok(sums.sum.iter().map(|s| s / rows as f64).collect())
+}
+
+/// Runs `data` through `model` in batches of `batch` rows and keeps [`Sums`] of the output
+/// of each of `layers` (in order; `None` for a layer whose output was never seen), with the
+/// row count. Uses the compiled model, or the tape for a model with a layer that has no
+/// inference form. Errors are prefixed `"{op}: "`.
+fn per_value(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    layers: &[usize],
+    batch: usize,
+    op: &str,
+) -> Result<(Vec<Option<Sums>>, usize), Error> {
+    let (rows, features) = check_data(data, batch, op)?;
+    let mut sums: Vec<Option<Sums>> = layers.iter().map(|_| None).collect();
+    if layers.is_empty() {
+        return Ok((sums, rows));
     }
     let x = data.x.data();
     let rows_of = |start: usize| {
@@ -146,27 +333,28 @@ pub fn activity(
         )
         .expect("the rows hold (end - start) × features values")
     };
+    let mut add = |layer: usize, out: TensorView<'_, f32>| {
+        for (s, _) in sums.iter_mut().zip(layers).filter(|(_, l)| **l == layer) {
+            accumulate(s, out);
+        }
+    };
     match InferenceModel::compile(model, params) {
         Ok(mut compiled) => {
             if features != compiled.input_width() {
                 return Err(Error::InvalidData(format!(
-                    "activity: the inputs are [{rows}, {features}], but the model takes width {}",
+                    "{op}: the inputs are [{rows}, {features}], but the model takes width {}",
                     compiled.input_width()
                 )));
             }
             for start in (0..rows).step_by(batch) {
-                compiled.infer_batch_observed(rows_of(start), &mut |layer, out| {
-                    for s in stats.iter_mut().filter(|s| s.layer == layer) {
-                        accumulate(s, out);
-                    }
-                });
+                compiled.infer_batch_observed(rows_of(start), &mut |layer, out| add(layer, out));
             }
         }
         // A layer with no inference form, or an input width only the data can tell: run
         // on the tape, reading each layer's output from the trace.
         Err(Error::Unsupported(_)) => {
             check_widths(model, data).map_err(|e| match e {
-                Error::InvalidData(msg) => Error::InvalidData(format!("activity: {msg}")),
+                Error::InvalidData(msg) => Error::InvalidData(format!("{op}: {msg}")),
                 other => other,
             })?;
             let mut graph = Graph::new();
@@ -175,39 +363,33 @@ pub fn activity(
                 let mut tape = graph.tape(&params.values);
                 let input = tape.input(rows_of(start));
                 model.forward_traced(&mut tape, input, &mut trace);
-                for s in &mut stats {
-                    accumulate(s, tape.value(trace.output(s.layer)));
+                for (k, &layer) in layers.iter().enumerate() {
+                    if layers[..k].contains(&layer) {
+                        continue;
+                    }
+                    add(layer, tape.value(trace.output(layer)));
                 }
             }
         }
         Err(e) => return Err(e),
     }
-    let n = rows as f64;
-    for s in &mut stats {
-        for v in s
-            .mean
-            .iter_mut()
-            .chain(&mut s.mean_abs)
-            .chain(&mut s.firing)
-        {
-            *v /= n;
-        }
-    }
-    Ok(stats)
+    Ok((sums, rows))
 }
 
-/// Adds the rows of `out` (one column per neuron of `s`) to the running sums in `s`: the
-/// sum, the sum of absolute values and the count above 0, and the maximum so far.
-fn accumulate(s: &mut LayerActivity, out: TensorView<'_, f32>) {
-    let width = s.mean.len();
+/// Adds the rows of `out` (one column per value) to the running sums in `s`, made on the
+/// first batch: the sum, the sum of absolute values and the count above 0, and the maximum
+/// so far.
+fn accumulate(s: &mut Option<Sums>, out: TensorView<'_, f32>) {
+    let width = out.shape().dims().last().copied().unwrap_or(0);
+    let s = s.get_or_insert_with(|| Sums::new(width));
     if width == 0 {
         return;
     }
     for row in out.data().chunks_exact(width) {
         for (j, &v) in row.iter().enumerate() {
             let v = f64::from(v);
-            s.mean[j] += v;
-            s.mean_abs[j] += v.abs();
+            s.sum[j] += v;
+            s.abs[j] += v.abs();
             if v > 0.0 {
                 s.firing[j] += 1.0;
             }
@@ -466,5 +648,87 @@ mod tests {
                 other => panic!("{want}: expected InvalidData, got {other:?}"),
             }
         }
+    }
+
+    /// `channel_activity` on conv → BatchNorm2d → ReLU → max pool → conv agrees with the
+    /// statistics of each channel's pooled values read from the trace, and an off channel
+    /// reads as never firing.
+    #[test]
+    fn channel_activity_matches_the_trace() {
+        use crate::{BatchNorm2d, Conv2d, MaxPool2d, Relu};
+        use cavitation_core::Conv2dGeom;
+        use cavitation_core::kernels::pooling::Pool2dGeom;
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(8);
+        let mut net = Sequential::new()
+            .push(Conv2d::new(
+                &mut params,
+                Conv2dGeom::new(2, 4, (6, 6), (3, 3)).unwrap(),
+                &mut rng,
+            ))
+            .push(BatchNorm2d::new(&mut params, 4, (4, 4)))
+            .push(Relu)
+            .push(MaxPool2d::new(Pool2dGeom::new(4, (4, 4), (2, 2)).unwrap()))
+            .push(Conv2d::new(
+                &mut params,
+                Conv2dGeom::new(4, 3, (2, 2), (1, 1)).unwrap(),
+                &mut rng,
+            ));
+        net.set_channel_mask(0, NeuronMask::from_off(4, &[2]));
+        let rows = 7;
+        let x: Vec<f32> = (0..rows * 72)
+            .map(|_| rng.uniform_f32() * 2.0 - 1.0)
+            .collect();
+        let data = Dataset {
+            x: Tensor::from_vec(x.clone(), &[rows, 72]).unwrap(),
+            targets: Targets::Classes(vec![0; rows]),
+        };
+        let stats = channel_activity(&net, &params, &data, &[0, 4], 3).unwrap();
+        assert_eq!((stats[0].conv, stats[0].layer, stats[1].layer), (0, 3, 4));
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let input = tape.input(Tensor::from_vec(x, &[rows, 72]).unwrap().view());
+        let mut trace = Trace::new();
+        net.forward_traced(&mut tape, input, &mut trace);
+        for (s, (layer, plane)) in stats.iter().zip([(3, 4), (4, 4)]) {
+            let out = tape.value(trace.output(layer)).data().to_vec();
+            let width = out.len() / rows;
+            for c in 0..width / plane {
+                let vals: Vec<f64> = out
+                    .chunks_exact(width)
+                    .flat_map(|r| r[c * plane..(c + 1) * plane].iter().map(|&v| f64::from(v)))
+                    .collect();
+                let n = vals.len() as f64;
+                let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * (1.0 + b.abs());
+                assert!(
+                    close(s.mean[c], vals.iter().sum::<f64>() / n),
+                    "layer {layer} channel {c}"
+                );
+                assert!(close(
+                    s.mean_abs[c],
+                    vals.iter().map(|v| v.abs()).sum::<f64>() / n
+                ));
+                assert!(close(
+                    s.firing[c],
+                    vals.iter().filter(|&&v| v > 0.0).count() as f64 / n
+                ));
+                assert_eq!(
+                    s.max[c],
+                    vals.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+                );
+            }
+        }
+        assert_eq!((stats[0].firing[2], stats[0].max[2]), (0.0, 0.0));
+    }
+
+    /// A layer that is not a conv is refused, naming it.
+    #[test]
+    fn channel_activity_refuses_a_non_conv() {
+        let mut params = ParamStore::new();
+        let net = digits(&mut params, 1);
+        let err = channel_activity(&net, &params, &data(4, 1), &[0], 4).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(m) if m.contains("layer 0 is not a Conv2d")));
+        let err = channel_activity(&net, &params, &data(4, 1), &[99], 4).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(m) if m.contains("layer 99 is not a Conv2d")));
     }
 }
