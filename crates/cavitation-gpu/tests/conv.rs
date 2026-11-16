@@ -1,12 +1,16 @@
-//! The GPU convolution forward pass against its CPU twin, `conv2d_reference` in f64 on the
-//! same f32 inputs: bit for bit on small integers, and within the GEMM's bound
-//! `2(k + 3) · u · (Σ|w·x| + |bias|)` on seeded values, over the CPU tests' geometries, the
-//! CIFAR and MNIST networks' convolutions, and shapes that span several tiles.
+//! The GPU convolution against its CPU twins in f64 on the same f32 inputs, over the CPU
+//! tests' geometries, the CIFAR and MNIST networks' convolutions, and shapes that span several
+//! tiles:
+//!
+//! - **Forward pass:** against `conv2d_reference`, bit for bit on small integers and within
+//!   the GEMM's bound `2(k + 3) · u · (Σ|w·x| + |bias|)` on seeded values.
+//! - **Input gradient:** against `conv2d_backward_reference`'s `dx`, bit for bit on small
+//!   integers and within `2(k + 3) · u · Σ|w·dy|`, `k` = out·kh·kw, on seeded values.
 
 mod common;
 
-use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_reference};
-use cavitation_gpu::kernels::{ConvDims, ConvForward};
+use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_backward_reference, conv2d_reference};
+use cavitation_gpu::kernels::{ConvDims, ConvForward, ConvInputGrad};
 use common::{Kit, U, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values};
 
 /// The CPU geometry with the same shape as `dims`.
@@ -68,10 +72,12 @@ const NETWORKS: [Shape; 6] = [
     (6, 16, (14, 14), (5, 5), (1, 1), (0, 0), (1, 1)),
 ];
 
-/// Shapes past one tile in every direction: more than 64 output channels, an image of more
-/// than 64 positions whose rows do not divide 64, and a k that is not a multiple of 16.
-const SPANNING: [Shape; 3] = [
+/// Shapes past one tile in every direction: more than 64 output channels, more than 64 input
+/// channels (the input gradient's rows), an image of more than 64 positions whose rows do not
+/// divide 64, and a k that is not a multiple of 16.
+const SPANNING: [Shape; 4] = [
     (5, 130, (11, 13), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (130, 5, (11, 13), (3, 3), (1, 1), (1, 1), (1, 1)),
     (7, 65, (20, 9), (3, 2), (2, 1), (2, 0), (1, 2)),
     (3, 70, (9, 70), (1, 5), (1, 3), (0, 2), (1, 1)),
 ];
@@ -124,11 +130,17 @@ fn run(
     got
 }
 
+/// A shape whose windows leave input positions uncovered on both axes: stride 3 with
+/// dilation 2 down (rows 1, 4 and 7 are never read) and stride 2 across (columns 0, 2, 4 and
+/// 6 meet no tap), so their input gradients are 0.
+const GAPS: Shape = (2, 3, (9, 8), (2, 1), (3, 2), (0, 1), (2, 1));
+
 /// Every shape at `batch`, the network shapes at a batch of 4.
 fn all_shapes() -> Vec<ConvDims> {
     let mut out: Vec<ConvDims> = CPU_GEOMETRIES.iter().map(|&s| dims(3, s)).collect();
     out.extend(NETWORKS.iter().map(|&s| dims(4, s)));
     out.extend(SPANNING.iter().map(|&s| dims(2, s)));
+    out.push(dims(2, GAPS));
     out
 }
 
@@ -243,6 +255,164 @@ fn refusals() {
         for (d, x, w, bias, out) in cases {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 conv.call(&mut kit.steps, &mut kit.pool, d, x, w, bias, out)
+            }));
+            assert!(result.is_err(), "{d:?} was accepted");
+        }
+    });
+}
+
+/// The f64 input gradient for the weight `w` and the output gradients `dy`, and the same for
+/// their absolute values (Σ|w·dy| for each input value).
+fn grad_reference(d: &ConvDims, w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>) {
+    let g = geom(d);
+    let batch = d.batch as usize;
+    let wide = |v: &[f32]| v.iter().map(|&a| f64::from(a)).collect::<Vec<f64>>();
+    let abs = |v: &[f32]| v.iter().map(|&a| f64::from(a).abs()).collect::<Vec<f64>>();
+    let x = vec![0.0; d.x_len() as usize];
+    let gradient = |w: &[f64], dy: &[f64]| {
+        let mut dx = vec![0.0; d.x_len() as usize];
+        let mut dw = vec![0.0; d.weight_len() as usize];
+        let mut db = vec![0.0; d.out_channels as usize];
+        conv2d_backward_reference(&g, batch, &x, w, dy, &mut dx, &mut dw, &mut db);
+        dx
+    };
+    (gradient(&wide(w), &wide(dy)), gradient(&abs(w), &abs(dy)))
+}
+
+/// The GPU's input gradient for `w` and `dy`, written over a buffer of NaNs (so every value
+/// is shown to be written).
+fn run_grad(kit: &mut Kit, grad: &ConvInputGrad, d: ConvDims, w: &[f32], dy: &[f32]) -> Vec<f32> {
+    let (wb, dyb) = (kit.upload(w), kit.upload(dy));
+    let dx = kit.upload(&vec![f32::NAN; d.x_len() as usize]);
+    let call = grad.call(&mut kit.steps, &mut kit.pool, d, &wb, &dyb, &dx);
+    let mut step = kit.steps.begin();
+    grad.record(&mut step, &call);
+    let _ = step.finish();
+    let got = kit.read(&dx);
+    call.release(&mut kit.pool);
+    for buffer in [wb, dyb, dx] {
+        kit.pool.give(buffer);
+    }
+    got
+}
+
+/// On values from {-2, -1, 1, 2}, every input gradient is a small integer, so the GPU gives
+/// the f64 reference's value exactly, 0 included where no window covers a position (the
+/// `GAPS` shape).
+#[test]
+fn input_grad_exact_twins() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 24);
+        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        for (s, d) in all_shapes().into_iter().enumerate() {
+            let seed = 1000 + 10 * s as u64;
+            let w = exact_values(seed, d.weight_len() as usize);
+            let dy = exact_values(seed + 1, d.out_len() as usize);
+            let (want, _) = grad_reference(&d, &w, &dy);
+            let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+            assert_exact(
+                &run_grad(&mut kit, &grad, d, &w, &dy),
+                &want,
+                &format!("conv input gradient exact {d:?}"),
+            );
+        }
+    });
+}
+
+/// On seeded values in [-1, 1), each input gradient is within `2(k + 3) · u · Σ|w·dy|` of the
+/// f64 reference, `k` = out·kh·kw.
+#[test]
+fn input_grad_rounding_twins() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 24);
+        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        for (s, d) in all_shapes().into_iter().enumerate() {
+            let seed = 1500 + 10 * s as u64;
+            let w = seeded_values(seed, d.weight_len() as usize, -1.0, 1.0);
+            let dy = seeded_values(seed + 1, d.out_len() as usize, -1.0, 1.0);
+            let (want, size) = grad_reference(&d, &w, &dy);
+            let got = run_grad(&mut kit, &grad, d, &w, &dy);
+            let k = f64::from(d.out_channels * d.kernel.0 * d.kernel.1);
+            let worst = assert_within(
+                &got,
+                &want,
+                |i| 2.0 * (k + 3.0) * U * size[i],
+                &format!("conv input gradient rounding {d:?}"),
+            );
+            println!(
+                "input gradient {d:?}: worst error {:.4} of its bound",
+                worst.ratio()
+            );
+        }
+    });
+}
+
+/// The same inputs give the same input gradient, bit for bit, on a second run.
+#[test]
+fn input_grad_runs_are_identical() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 24);
+        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        let d = dims(4, NETWORKS[1]);
+        let w = seeded_values(9, d.weight_len() as usize, -1.0, 1.0);
+        let dy = seeded_values(10, d.out_len() as usize, -1.0, 1.0);
+        let first = run_grad(&mut kit, &grad, d, &w, &dy);
+        let second = run_grad(&mut kit, &grad, d, &w, &dy);
+        assert_exact(&second, &first, "the input gradient on a second run");
+    });
+}
+
+/// Misuse of the input gradient is refused when it is prepared: a window that does not fit, a
+/// zero stride, short buffers, and an input gradient that is also the weight or `dy`.
+#[test]
+fn input_grad_refusals() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 16);
+        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        let good = ConvDims::new(2, 2, 3, (5, 5), (3, 3));
+        let (w, dy, dx) = (kit.zeros(54), kit.zeros(54), kit.zeros(100));
+        let small = kit.zeros(53);
+        grad.call(&mut kit.steps, &mut kit.pool, good, &w, &dy, &dx)
+            .release(&mut kit.pool);
+        let cases: Vec<(ConvDims, &_, &_, &_)> = vec![
+            (ConvDims::new(2, 2, 3, (2, 2), (3, 3)), &w, &dy, &dx),
+            (
+                ConvDims {
+                    stride: (0, 1),
+                    ..good
+                },
+                &w,
+                &dy,
+                &dx,
+            ),
+            (
+                ConvDims {
+                    dilation: (1, 0),
+                    ..good
+                },
+                &w,
+                &dy,
+                &dx,
+            ),
+            (ConvDims { batch: 0, ..good }, &w, &dy, &dx),
+            (
+                ConvDims {
+                    padding: (1, 1),
+                    ..ConvDims::new(1, 1, 1, (0, 0), (1, 1))
+                },
+                &w,
+                &dy,
+                &dx,
+            ),
+            (good, &small, &dy, &dx),
+            (good, &w, &small, &dx),
+            (good, &w, &dy, &small),
+            (good, &dx, &dy, &dx),
+            (good, &w, &dx, &dx),
+        ];
+        for (d, w, dy, dx) in cases {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                grad.call(&mut kit.steps, &mut kit.pool, d, w, dy, dx)
             }));
             assert!(result.is_err(), "{d:?} was accepted");
         }
