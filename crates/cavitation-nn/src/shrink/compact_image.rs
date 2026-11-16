@@ -100,19 +100,15 @@ pub(super) fn compact_image<T: Real>(
 /// outside every `Linear`'s run (`owners`) that is not a whole-channel mask at the end of a
 /// conv's run. The masks in a `Linear`'s run are checked as for a dense network.
 fn check_layers<T: Real>(model: &Sequential<T>, owners: &[Option<usize>]) -> Result<(), Error> {
+    if let Some(i) = foreign_image_parameters(model) {
+        return Err(Error::Unsupported(format!(
+            "compact: layer {i} ({}) has parameters, and only Conv2d, BatchNorm2d, Linear and \
+             Prelu layers can be rebuilt in the new store",
+            model.layer(i).name()
+        )));
+    }
     for (i, owner) in owners.iter().enumerate() {
         let layer = model.layer(i);
-        let rebuilt = layer.as_conv2d().is_some()
-            || layer.as_batch_norm2d().is_some()
-            || layer.as_linear().is_some()
-            || layer.as_prelu().is_some();
-        if !rebuilt && !layer.parameters().is_empty() {
-            return Err(Error::Unsupported(format!(
-                "compact: layer {i} ({}) has parameters, and only Conv2d, BatchNorm2d, Linear \
-                 and Prelu layers can be rebuilt in the new store",
-                layer.name()
-            )));
-        }
         let Some(mask) = model.mask(i) else { continue };
         if mask.off().next().is_none() || owner.is_some() {
             continue;
@@ -138,6 +134,46 @@ fn check_layers<T: Real>(model: &Sequential<T>, owners: &[Option<usize>]) -> Res
     Ok(())
 }
 
+/// The first layer of `model` with parameters that is not a `Conv2d`, a `BatchNorm2d`, a
+/// `Linear` or a `Prelu`: compaction cannot move its parameters to a new store. One of the
+/// layout checks of image compaction, shared with the shrink tool.
+pub(super) fn foreign_image_parameters<T: Real>(model: &Sequential<T>) -> Option<usize> {
+    (0..model.len()).find(|&i| {
+        let layer = model.layer(i);
+        let rebuilt = layer.as_conv2d().is_some()
+            || layer.as_batch_norm2d().is_some()
+            || layer.as_linear().is_some()
+            || layer.as_prelu().is_some();
+        !rebuilt && !layer.parameters().is_empty()
+    })
+}
+
+/// The first layer in the run of the `Conv2d` at layer `conv` that compaction cannot
+/// narrow: one that is not a `BatchNorm2d`, a pooling, an activation, a `Prelu` with one
+/// slope, `Flatten`, `Identity` or `Dropout`. One of the layout checks of image
+/// compaction, shared with the shrink tool.
+pub(super) fn unvouched_channel_layer<T: Real>(
+    model: &Sequential<T>,
+    params: &ParamStore<T>,
+    conv: usize,
+) -> Option<usize> {
+    (conv + 1..=model.channel_layer(conv)).find(|&l| {
+        let layer = model.layer(l);
+        let pool = super::POOL_NAMES.contains(&layer.name());
+        let passes = matches!(layer.name(), "flatten" | "identity" | "dropout");
+        // A Prelu with one slope treats every channel alike; one with a slope per value
+        // would need its slopes narrowed too.
+        let one_slope = layer
+            .as_prelu()
+            .is_some_and(|p| params.value(p.weight()).data().len() == 1);
+        !(layer.as_batch_norm2d().is_some()
+            || pool
+            || passes
+            || layer.activation().is_some()
+            || one_slope)
+    })
+}
+
 /// The convs that lose channels, after checking that each one's run can follow and that a
 /// `Conv2d`, or a `Linear` after a flatten, receives the channels.
 fn narrowed_convs<T: Real>(
@@ -153,29 +189,14 @@ fn narrowed_convs<T: Real>(
             continue;
         }
         let end = model.channel_layer(conv);
-        for l in conv + 1..=end {
-            let layer = model.layer(l);
-            let pool = super::POOL_NAMES.contains(&layer.name());
-            let passes = matches!(layer.name(), "flatten" | "identity" | "dropout");
-            // A Prelu with one slope treats every channel alike; one with a slope per
-            // value would need its slopes narrowed too.
-            let one_slope = layer
-                .as_prelu()
-                .is_some_and(|p| params.value(p.weight()).data().len() == 1);
-            if !(layer.as_batch_norm2d().is_some()
-                || pool
-                || passes
-                || layer.activation().is_some()
-                || one_slope)
-            {
-                return Err(Error::Unsupported(format!(
-                    "compact: layer {l} ({}) is in the run of the conv layer {conv}, and compact \
-                     cannot tell whether it treats every channel alike once channels are \
-                     removed; use batch norm, a pooling, an activation, Flatten, Dropout or \
-                     Identity there, or clear the channel mask of layer {conv}",
-                    layer.name()
-                )));
-            }
+        if let Some(l) = unvouched_channel_layer(model, params, conv) {
+            return Err(Error::Unsupported(format!(
+                "compact: layer {l} ({}) is in the run of the conv layer {conv}, and compact \
+                 cannot tell whether it treats every channel alike once channels are \
+                 removed; use batch norm, a pooling, an activation, Flatten, Dropout or \
+                 Identity there, or clear the channel mask of layer {conv}",
+                model.layer(l).name()
+            )));
         }
         let next = end + 1;
         let receives = (next < model.len())

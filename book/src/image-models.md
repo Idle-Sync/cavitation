@@ -146,4 +146,4 @@ After 8 epochs the network reads the angle within 0.8° on average, from images 
 
 ## What is not here yet
 
-The shrink tools work on dense networks and refuse a model with an image layer; shrinking a CNN by channel is a later feature. Batch norm runs as its own step in `InferenceModel` rather than folded into the convolution before it, which keeps the compiled model's outputs equal to the tape's.
+The shrink tools work on CNNs too: `shrink::shrink` removes the output channels of each `Conv2d` as it removes the neurons of a hidden `Linear`, and `shrink::compact` rebuilds the narrower network ([Shrinking a network](shrinking.md) shows the tools on a dense network). Batch norm runs as its own step in `InferenceModel` rather than folded into the convolution before it, which keeps the compiled model's outputs equal to the tape's.
