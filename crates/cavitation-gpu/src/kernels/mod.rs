@@ -6,12 +6,14 @@ mod elementwise;
 mod gemm;
 mod optimizer;
 mod pooling;
+mod reduce;
 
 pub use conv::{ConvCall, ConvDims, ConvForward, ConvInputGrad};
 pub use elementwise::{Elementwise, ElementwiseCall, ElementwiseKernels};
 pub use gemm::{Gemm, GemmCall, GemmDims};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AvgPool2d, MaxPool2d};
+pub use reduce::{BiasAdd, BiasAddCall, ChannelDims, ChannelSums, ChannelSumsCall};
 
 use crate::{PooledBuffer, StepEncoder, wgpu};
 
