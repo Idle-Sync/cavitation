@@ -24,7 +24,7 @@ pollster = "1.0.1"
 # Pool2dGeom, the geometry the pooling kernels take; the tests also use its f64 tape as the
 # reference for the activation twins (tanh, the sigmoid and GELU) and their gradients, and
 # for the bias add (tests/reduce.rs).
-cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
+cavitation-core = { path = "../cavitation-core", version = "0.4.0" }
 
 [dev-dependencies]
 # The CPU optimisers the optimiser kernel's twin is pinned to (tests/optimizer.rs). nn
