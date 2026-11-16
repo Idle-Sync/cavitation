@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### GPU
+
+- The `cavitation-gpu` docs state the rounding its kernels assume: each f32 operation rounded to nearest, within `u = 2⁻²⁴`, with ties to even where a kernel matches the CPU bit for bit. WGSL leaves the rounding mode open, so on a backend that rounds another way each rounding's `u` becomes `2u`. A new test, `tests/rounding.rs`, checks f32 `+` and `*` on cases just above, just below and exactly at halfway points, and fails by name on a backend that does not round to nearest, ties to even (#288).
+
 ## v0.4.0 (2026-11-16)
 
 This release adds the `cavitation-gpu` crate, behind the `gpu` feature: device setup, buffer and pipeline reuse, one-submission steps, and GPU kernels for most of a training step (the GEMM, the convolution's forward pass and input gradient, pooling, element-wise layers, batch norm, the optimisers, the losses and the health values), each checked against its CPU twin. Training on the GPU through `fit` is not built yet: nothing in `cavitation-nn` runs these kernels, and the GPU model, trainer and device selection follow in 0.4.x releases. A default build has no wgpu in it. On the CPU, 3 × 3 convolutions run directly at the SIMD levels, and CNNs can now be shrunk by channel.
