@@ -98,8 +98,10 @@ impl<T: Real> Tape<'_, T> {
 
     /// Records [`batch_norm2d`](Self::batch_norm2d) followed by ReLU as one node: the same
     /// value, gradients and running statistics, bit for bit, as `batch_norm2d` then
-    /// [`relu`](Self::relu), in one pass over the output instead of two forward and two
-    /// backward. The node's value is ReLU's output; batch norm's own output is not kept.
+    /// [`relu`](Self::relu), with one pass over memory fewer in each direction: the forward
+    /// pass applies ReLU as it writes, and the backward pass masks the gradient inside batch
+    /// norm's own two passes instead of in a pass of ReLU's. The node's value is ReLU's
+    /// output; batch norm's own output is not kept.
     ///
     /// The backward pass multiplies the incoming gradient by ReLU's derivative at the node's
     /// value, which is positive exactly where ReLU's input was and NaN exactly where it was
@@ -285,6 +287,19 @@ impl<T: Real> Tape<'_, T> {
     }
 }
 
+/// Values per block when the fused ReLU's gradient is masked ahead of batch norm's loops.
+const BLOCK: usize = 256;
+
+/// `out[k] = dy[k] · ReLU'(y[k])`, the product ReLU's own backward pass writes. A loop of its
+/// own, so it compiles to a vector select: inside batch norm's sums, which keep their order
+/// and so cannot be vectorised, the derivative would be a branch on the sign of each value,
+/// mispredicted about half the time.
+fn relu_masked<T: Real>(out: &mut [T], dy: &[T], y: &[T]) {
+    for ((o, &g), &v) in out.iter_mut().zip(dy).zip(y) {
+        *o = g * relu_derivative(v);
+    }
+}
+
 /// Backward of `batch_norm2d` and `batch_norm2d_relu`. With `x̂ = (x − mean) · inv` and
 /// `g = dy · γ` per channel over its `m` values: `dβ = Σ dy`, `dγ = Σ dy · x̂`, and
 /// `dx = inv · g` with the running statistics, else `dx = inv / m · (m · g − Σ g − x̂ · Σ g ·
@@ -310,9 +325,6 @@ pub(super) fn backward<T: Real>(
     let (xv, sv) = (ctx.value(x), ctx.value(stats));
     let w = weight.map(|v| ctx.value(v));
     let yv = ctx.value(out);
-    // The gradient reaching batch norm's own output: `dy`, or with the fused ReLU `dy` times
-    // ReLU's derivative at the node's value, the product ReLU's backward pass would write.
-    let grad = |dy: T, y: T| if relu { dy * relu_derivative(y) } else { dy };
     // Per channel: Σ dy and Σ dy · x̂.
     let mut sums = ctx.scratch(2 * channels);
     let threads = kernels::threads();
@@ -323,14 +335,22 @@ pub(super) fn backward<T: Real>(
         let (mut s, mut sx) = (T::ZERO, T::ZERO);
         for n in 0..batch {
             let at = n * width + c * spatial;
-            for ((&g, &v), &y) in out_grad[at..][..spatial]
-                .iter()
-                .zip(&xv[at..][..spatial])
-                .zip(&yv[at..][..spatial])
-            {
-                let g = grad(g, y);
-                s += g;
-                sx += g * ((v - mean) * inv);
+            if relu {
+                let mut block = [T::ZERO; BLOCK];
+                for k0 in (0..spatial).step_by(BLOCK) {
+                    let len = BLOCK.min(spatial - k0);
+                    let (at, block) = (at + k0, &mut block[..len]);
+                    relu_masked(block, &out_grad[at..][..len], &yv[at..][..len]);
+                    for (&g, &v) in block.iter().zip(&xv[at..][..len]) {
+                        s += g;
+                        sx += g * ((v - mean) * inv);
+                    }
+                }
+            } else {
+                for (&g, &v) in out_grad[at..][..spatial].iter().zip(&xv[at..][..spatial]) {
+                    s += g;
+                    sx += g * ((v - mean) * inv);
+                }
             }
         }
         // SAFETY: task `c` alone writes elements `c` and `channels + c` of `sums`.
@@ -361,20 +381,35 @@ pub(super) fn backward<T: Real>(
                     let at = n * width + c * spatial;
                     // SAFETY: task `c` alone writes channel `c`'s values of each image.
                     let dst = unsafe { bufs.slice(at, spatial) };
-                    for (((d, &dy), &v), &y) in dst
-                        .iter_mut()
-                        .zip(&out_grad[at..][..spatial])
-                        .zip(&xv[at..][..spatial])
-                        .zip(&yv[at..][..spatial])
-                    {
-                        let gy = grad(dy, y) * g;
-                        let dx = if use_running {
-                            gy * inv
+                    // `dy` for each value of `dst`: the incoming gradient, or with the fused
+                    // ReLU that gradient masked, a block at a time.
+                    let mut block = [T::ZERO; BLOCK];
+                    let step = if relu { BLOCK } else { spatial.max(1) };
+                    for k0 in (0..spatial).step_by(step) {
+                        let len = step.min(spatial - k0);
+                        let at = at + k0;
+                        let dys: &[T] = if relu {
+                            relu_masked(
+                                &mut block[..len],
+                                &out_grad[at..][..len],
+                                &yv[at..][..len],
+                            );
+                            &block[..len]
                         } else {
-                            let xhat = (v - mean) * inv;
-                            inv / mf * (mf * gy - sg - xhat * sgx)
+                            &out_grad[at..][..len]
                         };
-                        *d = if beta == T::ZERO { dx } else { *d + dx };
+                        for ((d, &dy), &v) in
+                            dst[k0..][..len].iter_mut().zip(dys).zip(&xv[at..][..len])
+                        {
+                            let gy = dy * g;
+                            let dx = if use_running {
+                                gy * inv
+                            } else {
+                                let xhat = (v - mean) * inv;
+                                inv / mf * (mf * gy - sg - xhat * sgx)
+                            };
+                            *d = if beta == T::ZERO { dx } else { *d + dx };
+                        }
                     }
                 }
             });
@@ -529,10 +564,13 @@ mod tests {
     /// One fused-against-separate comparison in `T`: values, the gradients of the input, γ
     /// and β, and the running statistics after the update, all compared by bits.
     ///
-    /// Channel 0 holds values equal to its mean, so with β = 0 those outputs are exactly 0
-    /// (ReLU's derivative there is 0); channel 2 holds a NaN, which makes its statistics and
-    /// outputs NaN (the derivative is NaN). The loss is `Σ y · r` for fixed weights `r`.
-    fn fused_matches_separate<T: crate::Real>(training: bool) {
+    /// Channel 0 holds values equal to its mean and has β = 0, so those outputs are exactly
+    /// 0 (ReLU's derivative there is 0); channel 2 holds a NaN, which makes its statistics
+    /// and outputs NaN (the derivative is NaN); the other βs are not 0. With `affine` false
+    /// there is no γ or β. The loss is `Σ y · r + Σ x · q`: the second term, recorded after
+    /// the batch norm, gives `x` its first gradient, so the batch norm's backward pass adds
+    /// to it rather than writing it.
+    fn fused_matches_separate<T: crate::Real>(training: bool, affine: bool) {
         let (batch, channels, spatial) = (3, 3, 4);
         let len = batch * channels * spatial;
         let mut xs: Vec<T> = values(len, 7).into_iter().map(T::from_f64).collect();
@@ -545,6 +583,7 @@ mod tests {
         }
         xs[2 * spatial + 1] = T::from_f64(f64::NAN); // channel 2 of image 0
         let r: Vec<T> = values(len, 9).into_iter().map(T::from_f64).collect();
+        let q: Vec<T> = values(len, 11).into_iter().map(T::from_f64).collect();
         let run = |fused: bool| {
             let mut store = ParamStore::<T>::new_generic();
             let w = store.add(
@@ -554,7 +593,8 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let b = store.add(Tensor::from_vec(vec![T::ZERO; channels], &[channels]).unwrap());
+            let betas = [0.0, 0.3, -0.4].map(T::from_f64).to_vec();
+            let b = store.add(Tensor::from_vec(betas, &[channels]).unwrap());
             let stats = RunningStats {
                 mean: store
                     .add(Tensor::from_vec(vec![T::from_f64(0.25); channels], &[channels]).unwrap()),
@@ -570,12 +610,16 @@ mod tests {
             } else {
                 graph.tape(&store.values)
             };
-            let (xv, wv, bv) = (tape.param(xi), tape.param(w), tape.param(b));
-            let y = if fused {
-                tape.batch_norm2d_relu(xv, Some(wv), Some(bv), Some(stats), channels, spatial, 1e-5)
+            let xv = tape.param(xi);
+            let (wv, bv) = if affine {
+                (Some(tape.param(w)), Some(tape.param(b)))
             } else {
-                let bn =
-                    tape.batch_norm2d(xv, Some(wv), Some(bv), Some(stats), channels, spatial, 1e-5);
+                (None, None)
+            };
+            let y = if fused {
+                tape.batch_norm2d_relu(xv, wv, bv, Some(stats), channels, spatial, 1e-5)
+            } else {
+                let bn = tape.batch_norm2d(xv, wv, bv, Some(stats), channels, spatial, 1e-5);
                 tape.relu(bn)
             };
             let ys = tape.value(y).data().to_vec();
@@ -585,11 +629,19 @@ mod tests {
                     .view(),
             );
             let yr = tape.mul(y, rv);
-            let loss = tape.sum(yr);
+            let qv = tape.input(
+                Tensor::from_vec(q.clone(), &[batch, channels * spatial])
+                    .unwrap()
+                    .view(),
+            );
+            let xq = tape.mul(xv, qv);
+            let (a, c) = (tape.sum(yr), tape.sum(xq));
+            let loss = tape.add(a, c);
             tape.backward(loss, &mut store.grads);
             drop(tape);
             graph.apply_buffer_updates(&mut store.values);
-            let grads: Vec<Vec<T>> = [xi, w, b]
+            let ids = if affine { vec![xi, w, b] } else { vec![xi] };
+            let grads: Vec<Vec<T>> = ids
                 .iter()
                 .map(|&id| store.grad(id).data().to_vec())
                 .collect();
@@ -615,18 +667,22 @@ mod tests {
     }
 
     /// `batch_norm2d_relu` gives the bits of `batch_norm2d` then `relu`, in f32 and f64,
-    /// with batch statistics on a training tape.
+    /// with batch statistics on a training tape, with and without γ and β.
     #[test]
     fn fused_relu_matches_separate_in_training() {
-        fused_matches_separate::<f32>(true);
-        fused_matches_separate::<f64>(true);
+        for affine in [true, false] {
+            fused_matches_separate::<f32>(true, affine);
+            fused_matches_separate::<f64>(true, affine);
+        }
     }
 
     /// The same with the running statistics on an evaluation tape.
     #[test]
     fn fused_relu_matches_separate_in_evaluation() {
-        fused_matches_separate::<f32>(false);
-        fused_matches_separate::<f64>(false);
+        for affine in [true, false] {
+            fused_matches_separate::<f32>(false, affine);
+            fused_matches_separate::<f64>(false, affine);
+        }
     }
 
     /// The gradient check passes for the fused operation with batch statistics, for the

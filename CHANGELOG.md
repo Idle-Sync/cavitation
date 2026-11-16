@@ -6,7 +6,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Tensors and autograd (`cavitation-core`)
 
-- `Tape::batch_norm2d_relu` records batch normalisation followed by ReLU as one node. Its values, gradients and running statistics are the same bits as `batch_norm2d` then `relu`, from one pass over the output in each direction instead of two: the forward pass applies ReLU as it writes, and the backward pass multiplies the gradient by ReLU's derivative inside batch norm's own two passes.
+- `Tape::batch_norm2d_relu` records batch normalisation followed by ReLU as one node. Its values, gradients and running statistics are the same bits as `batch_norm2d` then `relu`, with one pass over memory fewer in each direction: the forward pass applies ReLU as it writes, and the backward pass multiplies the gradient by ReLU's derivative inside batch norm's own two passes.
 - At the NEON level the direct f32 weight gradient of a 3 × 3 convolution (stride 1, padding 1, dilation 1, width a multiple of 4) takes three output channels per pass, 27 accumulators, so each padded-input load feeds three fused multiply-adds, and runs for any number of input channels; it ran only for at most 4. Each sum's order is unchanged, so it still matches `conv3x3_direct_weight_grad_twin` bit for bit. On an Apple M4 at 4 threads (`CAVITATION_KERNEL=neon`, `cifar-cnn --profile 9`, batch 128, medians of interleaved runs), the backward passes of the `cifar-cnn` network's convolutions take 0.68, 12.76, 6.53 and 12.93 ms instead of 1.06, 16.26, 7.36 and 14.60 with im2col and the GEMM on the last three, and the whole step 67.4 ms instead of 73.8 (#284).
 
 ### GPU
