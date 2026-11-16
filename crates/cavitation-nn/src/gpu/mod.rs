@@ -12,5 +12,9 @@ mod forward;
 #[cfg(test)]
 mod forward_tests;
 mod model;
+mod trainer;
+#[cfg(test)]
+mod trainer_tests;
 
 pub use model::GpuModel;
+pub use trainer::{GpuOptimizerState, GpuTrainer};
