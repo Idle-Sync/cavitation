@@ -21,7 +21,8 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "parki
 # Blocks on wgpu's futures (adapter and device requests), which finish without an executor
 # on native backends.
 pollster = "1.0.1"
-# Pool2dGeom, the geometry the pooling kernels take.
+# Pool2dGeom, the geometry the pooling kernels take; the tests also use its f64 tape as the
+# reference for the activation twins (tanh, the sigmoid and GELU) and their gradients.
 cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
 
 [dev-dependencies]

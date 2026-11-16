@@ -19,6 +19,8 @@
 //! - [`StepEncoder`], [`Step`] and [`StepOutput`]: one step's uploads, dispatches and
 //!   readbacks recorded in one command encoder and submitted once, through staging and
 //!   readback buffers made once, with GPU timestamps per span when profiling.
+//! - [`kernels::ElementwiseKernels`]: add, multiply, scale, ReLU, leaky ReLU, tanh, the
+//!   sigmoid, GELU (both forms) forward and backward, and dropout with a bit-packed mask.
 //! - [`kernels::MaxPool2d`] and [`kernels::AvgPool2d`]: max and average pooling, forward
 //!   and backward, max pooling bit for bit with the CPU's (winners, ties and NaNs) and
 //!   average pooling within a stated rounding bound.
