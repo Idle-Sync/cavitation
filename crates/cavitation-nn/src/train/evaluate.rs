@@ -7,6 +7,7 @@ use cavitation_core::{Error, Graph, ParamStore, ParamValues, TensorView};
 
 use super::fit::{argmax, check_dataset, check_model_and_loss, check_widths};
 use super::{Dataset, Loss, Targets, TargetsView};
+use crate::metrics::{ConfusionMatrix, RegressionMetrics};
 use crate::{InferenceModel, NeuronMask, Sequential};
 
 /// What [`Evaluator::evaluate`] measures on a data set.
@@ -462,6 +463,58 @@ impl Evaluator {
         true
     }
 
+    /// Replaces the mask on the output of layer `layer` with `mask` for the evaluations from
+    /// now on, as [`InferenceModel::set_mask`] does: the route for a mask that is not a
+    /// `Linear`'s neuron mask, such as a channel mask (see
+    /// [`Sequential::set_channel_mask`]). Only this evaluator changes; its clones keep their
+    /// own masks.
+    ///
+    /// The layer must have a mask in the model the evaluator was made or refreshed from.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Unsupported`] if layer `layer` has no mask, and
+    /// [`Error::InvalidData`] if `mask`'s width differs from the mask there (each message
+    /// names the layer); the evaluator is then unchanged.
+    ///
+    /// ```
+    /// use cavitation_core::{Conv2dGeom, Error, ParamStore, Rng};
+    /// use cavitation_nn::{Conv2d, Evaluator, Loss, NeuronMask, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let geom = Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap();
+    /// let mut net = Sequential::new()
+    ///     .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+    ///     .push(Relu);
+    /// net.set_channel_mask(0, NeuronMask::all_on(2));
+    /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 8).unwrap();
+    /// // Channel 1 off: its four positions at the ReLU.
+    /// assert!(evaluator.set_mask(1, &NeuronMask::from_off(8, &[4, 5, 6, 7])).is_ok());
+    /// assert!(matches!(evaluator.set_mask(0, &NeuronMask::all_on(8)), Err(Error::Unsupported(_))));
+    /// ```
+    pub fn set_mask(&mut self, layer: usize, mask: &NeuronMask) -> Result<(), Error> {
+        let Some(old) = (layer < self.model.len())
+            .then(|| self.model.mask(layer))
+            .flatten()
+        else {
+            return Err(Error::Unsupported(format!(
+                "evaluator: layer {layer} has no mask; put one on it before making the \
+                 evaluator"
+            )));
+        };
+        if old.width() != mask.width() {
+            return Err(Error::InvalidData(format!(
+                "evaluator: a mask of width {} for layer {layer}, whose mask has width {}",
+                mask.width(),
+                old.width()
+            )));
+        }
+        if let Engine::Compiled(compiled) = &mut self.engine {
+            compiled.set_mask(layer, mask)?;
+        }
+        self.model.copy_mask(layer, mask);
+        Ok(())
+    }
+
     /// Replaces the mask on the neurons of the `Linear` at layer `linear` with `mask`: each
     /// neuron `mask` turns off outputs exactly 0, after the activations that follow the
     /// `Linear` (at [`Sequential::neuron_layer`]), from the next
@@ -733,6 +786,175 @@ impl Evaluator {
         .map(|_| ())
     }
 
+    /// The confusion matrix of the model's predictions on `data`, which must have class
+    /// targets: each row's prediction is its first largest output, as
+    /// [`evaluate`](Self::evaluate)'s accuracy counts it, and a row whose outputs are all
+    /// NaN has none. The matrix has one class per model output, and its
+    /// [`accuracy`](ConfusionMatrix::accuracy) equals `evaluate`'s.
+    ///
+    /// # Errors
+    ///
+    /// As [`misclassified`](Self::misclassified).
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`evaluate`](Self::evaluate) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 2, &mut Rng::seed(0)));
+    /// let data = Dataset {
+    ///     x: Tensor::zeros(&[4, 2]),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 1]),
+    /// };
+    /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 3).unwrap();
+    /// let m = evaluator.confusion(&data).unwrap();
+    /// // Every row predicts class 0: class 1's two rows are all missed.
+    /// assert_eq!((m.count(0, 0), m.count(1, 0), m.recall(1)), (2, 2, 0.0));
+    /// ```
+    pub fn confusion(&mut self, data: &Dataset) -> Result<ConfusionMatrix, Error> {
+        check_dataset(data)?;
+        if let Targets::Values(_) = data.targets {
+            return Err(Error::InvalidData(
+                "confusion needs class targets, but the data has value targets".to_string(),
+            ));
+        }
+        check_widths(&self.model, data)?;
+        let mut m = None;
+        self.run(data, false, None, |start, outputs, targets| {
+            let width = outputs.shape().dims()[1];
+            let m = m.get_or_insert_with(|| ConfusionMatrix::new(width));
+            if let TargetsView::Classes(labels) = targets {
+                for (i, (row, &label)) in outputs
+                    .data()
+                    .chunks_exact(width.max(1))
+                    .zip(labels)
+                    .enumerate()
+                {
+                    check_label(start + i, label, width)?;
+                    m.add(label, argmax(row));
+                }
+            }
+            Ok(())
+        })?;
+        Ok(m.expect("check_dataset refuses data with no rows, so run visits a batch"))
+    }
+
+    /// The regression errors of the model's outputs on `data`, which must have value
+    /// targets: [`RegressionMetrics`] per output (mean absolute and squared error, RMSE,
+    /// R²) and averaged. Its [`r2_mean`](RegressionMetrics::r2_mean) equals
+    /// [`evaluate`](Self::evaluate)'s R² to rounding: both give a constant target column
+    /// (or a single row) 1 or 0. Copies the outputs of every row, so it allocates once per
+    /// call.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidData`] if `data` has class targets or an output or a target is not
+    /// finite, and as
+    /// [`evaluate`](Self::evaluate) does for the data checks that do not involve the loss.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`evaluate`](Self::evaluate) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+    /// let x = Tensor::from_vec(vec![0.0f32, 1.0, 2.0], &[3, 1]).unwrap();
+    /// let y = Tensor::from_vec(vec![1.0f32, 2.0, 3.0], &[3, 1]).unwrap();
+    /// let data = Dataset { x, targets: Targets::Values(y) };
+    /// let mut evaluator = Evaluator::new(&net, &params, Loss::Mse, 2).unwrap();
+    /// let m = evaluator.regression(&data).unwrap();
+    /// let e = evaluator.evaluate(&data).unwrap();
+    /// assert!((m.r2_mean() - e.r2.unwrap()).abs() < 1e-12);
+    /// assert!(m.mae(0) >= 0.0);
+    /// ```
+    pub fn regression(&mut self, data: &Dataset) -> Result<RegressionMetrics, Error> {
+        check_dataset(data)?;
+        let Targets::Values(targets) = &data.targets else {
+            return Err(Error::InvalidData(
+                "regression needs value targets, but the data has class targets".to_string(),
+            ));
+        };
+        check_widths(&self.model, data)?;
+        let mut predicted = Vec::with_capacity(targets.data().len());
+        self.run(data, false, None, |_, outputs, targets| {
+            if let TargetsView::Values(values) = targets {
+                check_value_width(values, outputs.shape().dims()[1])?;
+            }
+            predicted.extend_from_slice(outputs.data());
+            Ok(())
+        })?;
+        RegressionMetrics::new(targets.data(), &predicted, targets.shape().dims()[1])
+    }
+
+    /// Fills `out` (cleared first) with each row's score for class `class`, for
+    /// [`roc_auc`](crate::metrics::roc_auc) and
+    /// [`average_precision`](crate::metrics::average_precision): the softmax probability of
+    /// `class` over the row's outputs, computed in f64 with the largest output taken out. For
+    /// a model with one output, `class` must be 0 and the score is that output itself: the
+    /// logit of the positive class, which ranks the rows as its sigmoid does. A row whose
+    /// outputs hold a NaN or an infinity scores NaN. Allocates nothing once `out` has room
+    /// for every row.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidData`] if `class` is not below the model's output width, and as
+    /// [`evaluate`](Self::evaluate) does for the data checks that do not involve the loss or
+    /// the targets.
+    ///
+    /// # Panics
+    ///
+    /// Panics as [`evaluate`](Self::evaluate) does.
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, Tensor};
+    /// use cavitation_nn::metrics::roc_auc;
+    /// use cavitation_nn::{Dataset, Evaluator, Linear, Loss, Sequential, Targets};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 1, 2, &mut Rng::seed(3)));
+    /// let x = Tensor::from_vec(vec![-2.0f32, -1.0, 1.0, 2.0], &[4, 1]).unwrap();
+    /// let data = Dataset { x, targets: Targets::Classes(vec![0, 0, 1, 1]) };
+    /// let mut evaluator = Evaluator::new(&net, &params, Loss::CrossEntropy, 4).unwrap();
+    /// let mut scores = Vec::new();
+    /// evaluator.class_scores(&data, 1, &mut scores).unwrap();
+    /// assert!(scores.iter().all(|s| (0.0..=1.0).contains(s)));
+    /// // A linear model ranks the rows by x one way or the other: AUC 1 or 0.
+    /// let auc = roc_auc(&scores, &[false, false, true, true]).unwrap();
+    /// assert!(auc == 1.0 || auc == 0.0);
+    /// ```
+    pub fn class_scores(
+        &mut self,
+        data: &Dataset,
+        class: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), Error> {
+        out.clear();
+        check_dataset(data)?;
+        check_widths(&self.model, data)?;
+        self.run(data, false, None, |_, outputs, _| {
+            let width = outputs.shape().dims()[1];
+            if class >= width {
+                return Err(Error::InvalidData(format!(
+                    "class_scores: class {class} is not below the model's {width} outputs"
+                )));
+            }
+            for row in outputs.data().chunks_exact(width.max(1)) {
+                out.push(if width == 1 {
+                    row[0]
+                } else {
+                    softmax_of(row, class)
+                });
+            }
+            Ok(())
+        })
+        .map(|_| ())
+    }
+
     /// Runs the model over `data` in order, `batch` rows at a time, calling `visit` with
     /// each batch's first row, its outputs and its targets, then (when `with_loss`)
     /// recording the batch's loss. Returns the row-weighted mean loss (0 without the loss),
@@ -845,6 +1067,51 @@ pub fn evaluate(
     batch: usize,
 ) -> Result<Evaluation, Error> {
     Evaluator::new(model, params, loss, batch)?.evaluate(data)
+}
+
+/// The softmax probability of entry `class` of `row`, in f64 with the largest entry taken
+/// out, rounded to f32; NaN if the row holds a NaN or an infinity.
+fn softmax_of(row: &[f32], class: usize) -> f32 {
+    if row.iter().any(|v| !v.is_finite()) {
+        return f32::NAN;
+    }
+    let top = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let total: f64 = row.iter().map(|&v| f64::from(v - top).exp()).sum();
+    (f64::from(row[class] - top).exp() / total) as f32
+}
+
+/// The confusion matrix of `model` on `data` (class targets), `batch` rows at a time:
+/// [`Evaluator::confusion`] on a new evaluator.
+///
+/// # Errors
+///
+/// Returns the errors of [`Evaluator::new`] and [`Evaluator::confusion`].
+///
+/// # Panics
+///
+/// Panics as [`Evaluator::new`] and [`Evaluator::confusion`] do.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_nn::metrics::Average;
+/// use cavitation_nn::{Dataset, Linear, Sequential, Targets, confusion_matrix};
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new().push(Linear::new(&mut params, 2, 3, &mut Rng::seed(0)));
+/// let data = Dataset { x: Tensor::zeros(&[6, 2]), targets: Targets::Classes(vec![0, 1, 2, 0, 1, 2]) };
+/// let m = confusion_matrix(&net, &params, &data, 4).unwrap();
+/// assert_eq!(m.total(), 6);
+/// println!("{m}");
+/// assert!(m.recall_average(Average::Macro) <= 1.0);
+/// ```
+pub fn confusion_matrix(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    batch: usize,
+) -> Result<ConfusionMatrix, Error> {
+    Evaluator::new(model, params, Loss::CrossEntropy, batch)?.confusion(data)
 }
 
 /// Returns [`Error::InvalidData`], naming the index, if an entry of `linears` is not the
@@ -1606,5 +1873,74 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
         assert_eq!(evaluator.evaluate(&data).unwrap(), fresh(&net, &params));
+    }
+
+    /// On each engine, the confusion matrix's accuracy is `evaluate`'s and its off-diagonal
+    /// counts are `misclassified`'s rows; the class scores are probabilities that sum to 1
+    /// over the classes, and the free `confusion_matrix` gives the same matrix.
+    #[test]
+    fn confusion_agrees_with_evaluate_and_misclassified() {
+        let (builtin, own, params, data) = both_engines();
+        for net in [&builtin, &own] {
+            let mut evaluator = Evaluator::new(net, &params, Loss::CrossEntropy, 64).unwrap();
+            let m = evaluator.confusion(&data).unwrap();
+            let e = evaluator.evaluate(&data).unwrap();
+            assert_eq!(Some(m.accuracy()), e.accuracy);
+            let mut wrong = Vec::new();
+            evaluator.misclassified(&data, &mut wrong).unwrap();
+            let classes = m.classes();
+            let off: u64 = (0..classes)
+                .flat_map(|t| (0..classes).filter(move |&p| p != t).map(move |p| (t, p)))
+                .map(|(t, p)| m.count(t, p))
+                .sum();
+            let none: u64 = (0..classes).map(|t| m.unpredicted(t)).sum();
+            assert_eq!((off + none) as usize, wrong.len());
+            assert_eq!(confusion_matrix(net, &params, &data, 17).unwrap(), m);
+            let mut sums = vec![0.0f64; data.len()];
+            let mut scores = Vec::new();
+            for class in 0..classes {
+                evaluator.class_scores(&data, class, &mut scores).unwrap();
+                for (s, &p) in sums.iter_mut().zip(&scores) {
+                    *s += f64::from(p);
+                }
+            }
+            assert!(sums.iter().all(|s| (s - 1.0).abs() < 1e-5), "{sums:?}");
+            assert!(evaluator.class_scores(&data, classes, &mut scores).is_err());
+        }
+    }
+
+    /// `regression` gives `evaluate`'s R² as its mean, its own MAE checks out by hand
+    /// against the outputs, and class targets are refused.
+    #[test]
+    fn regression_agrees_with_evaluate() {
+        let (net, params, data) = case(Loss::Mse, 120, 3);
+        let mut evaluator = Evaluator::new(&net, &params, Loss::Mse, 32).unwrap();
+        let m = evaluator.regression(&data).unwrap();
+        let e = evaluator.evaluate(&data).unwrap();
+        assert!((m.r2_mean() - e.r2.unwrap()).abs() < 1e-12);
+        let out = crate::InferenceModel::compile(&net, &params)
+            .unwrap()
+            .infer_batch(data.x.view())
+            .data()
+            .to_vec();
+        let Targets::Values(t) = &data.targets else {
+            unreachable!()
+        };
+        let width = t.shape().dims()[1];
+        let mae0: f64 = t
+            .data()
+            .chunks_exact(width)
+            .zip(out.chunks_exact(width))
+            .map(|(a, b)| (f64::from(a[0]) - f64::from(b[0])).abs())
+            .sum::<f64>()
+            / data.len() as f64;
+        assert!(
+            (m.mae(0) - mae0).abs() < 1e-9,
+            "{} against {mae0}",
+            m.mae(0)
+        );
+        let (cnet, cparams, cdata) = case(Loss::CrossEntropy, 30, 4);
+        let mut c = Evaluator::new(&cnet, &cparams, Loss::CrossEntropy, 8).unwrap();
+        assert!(c.regression(&cdata).is_err());
     }
 }

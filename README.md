@@ -291,7 +291,7 @@ Build it with [mdBook](https://rust-lang.github.io/mdBook/):
 mdbook serve book   # then open http://localhost:3000
 ```
 
-Status: in development. v0.3.1 is the latest tag in the repository; nothing is published on crates.io yet.
+Status: in development. v0.3.2 is the latest tag in the repository; nothing is published on crates.io yet.
 
 ## Licence
 

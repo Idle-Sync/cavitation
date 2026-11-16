@@ -211,7 +211,10 @@ pub(crate) fn gelu_value<T: Real>(x: T, approx: GeluApprox) -> T {
     }
 }
 
-/// The derivative of GELU at `x` in the given form.
+/// The derivative of GELU at `x` in the given form. Where the second term's small factor is
+/// exactly 0 (the density `phi(x)` underflowed, or `tanh` saturated so `1 - t²` is 0), the
+/// term is dropped: it is 0 for every finite factor, and its limit as `|x|` grows, where `x`
+/// or `du` overflows and the product would be `0 · ∞ = NaN`.
 pub(super) fn gelu_derivative<T: Real>(x: T, approx: GeluApprox) -> T {
     let half = T::from_f64(0.5);
     match approx {
@@ -219,14 +222,19 @@ pub(super) fn gelu_derivative<T: Real>(x: T, approx: GeluApprox) -> T {
             // Phi(x) + x * phi(x).
             let cdf = half * (T::ONE + (x * T::from_f64(FRAC_1_SQRT_2)).erf());
             let pdf = T::from_f64(FRAC_1_SQRT_2PI) * (-(half * x * x)).exp();
-            cdf + x * pdf
+            if pdf == T::ZERO { cdf } else { cdf + x * pdf }
         }
         GeluApprox::Tanh => {
             let x2 = x * x;
             let u = T::from_f64(SQRT_2_OVER_PI) * (x + T::from_f64(GELU_CUBIC) * x2 * x);
             let t = u.tanh();
+            let first = half * (T::ONE + t);
+            let flat = T::ONE - t * t;
+            if flat == T::ZERO {
+                return first;
+            }
             let du = T::from_f64(SQRT_2_OVER_PI) * (T::ONE + T::from_f64(3.0 * GELU_CUBIC) * x2);
-            half * (T::ONE + t) + half * x * (T::ONE - t * t) * du
+            first + half * x * flat * du
         }
     }
 }
@@ -1392,5 +1400,28 @@ mod tests {
             "{:?}",
             store.grad(s).data()
         );
+    }
+
+    /// GELU's derivative keeps its limits where `x²` overflows or the density underflows:
+    /// 1 for large positive `x`, 0 for large negative, in both forms and both precisions,
+    /// with no `0 · ∞ = NaN`; and the values that were finite before keep their bits.
+    #[test]
+    fn gelu_derivative_limits_at_large_x() {
+        use super::{GeluApprox, gelu_derivative};
+        for approx in [GeluApprox::Tanh, GeluApprox::Exact] {
+            for &x in &[1e12f32, 1e13, 1e20, 3e38, f32::INFINITY] {
+                assert_eq!(gelu_derivative(x, approx), 1.0, "{approx:?} at {x}");
+                assert_eq!(gelu_derivative(-x, approx), 0.0, "{approx:?} at {}", -x);
+            }
+            for &x in &[1e20f64, 1e200, f64::MAX, f64::INFINITY] {
+                assert_eq!(gelu_derivative(x, approx), 1.0, "{approx:?} at {x}");
+                assert_eq!(gelu_derivative(-x, approx), 0.0, "{approx:?} at {}", -x);
+            }
+            assert!(gelu_derivative(f32::NAN, approx).is_nan());
+        }
+        // Inside the range both factors are finite and the formula is unchanged: at x = -3
+        // the tanh form's second term is not 0.
+        let d = gelu_derivative(-3.0f32, GeluApprox::Tanh);
+        assert!(d < 0.0 && d > -0.02, "{d}");
     }
 }

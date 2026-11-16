@@ -5,6 +5,7 @@
 //! conversion to a one-layer [`Sequential`].
 
 use cavitation_core::{Error, ParamStore, Real, Tensor, TensorView};
+use cavitation_nn::metrics::ConfusionMatrix;
 use cavitation_nn::{Dataset, History, Sequential, Targets};
 
 use crate::gradient::{GradientConfig, Setup, StepLoss, train};
@@ -962,6 +963,54 @@ impl LogisticModel {
             })
             .count();
         Ok(right as f64 / rows as f64)
+    }
+
+    /// The confusion matrix of the model's predictions on `data` (class targets), each row
+    /// predicted as [`predict`](Self::predict) does; its
+    /// [`accuracy`](cavitation_nn::metrics::ConfusionMatrix::accuracy) is
+    /// [`score`](Self::score)'s.
+    ///
+    /// # Errors
+    ///
+    /// As [`score`](Self::score).
+    ///
+    /// # Panics
+    ///
+    /// As described on [`LogisticModel`]'s fields if they do not agree.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_core::Tensor;
+    /// use cavitation_ml::LogisticModel;
+    /// use cavitation_nn::{Dataset, Targets};
+    /// let model = LogisticModel {
+    ///     coef: Tensor::from_vec(vec![1.0], &[1, 1]).unwrap(),
+    ///     intercept: vec![0.0],
+    ///     classes: 2,
+    ///     iterations: 0,
+    ///     c: None,
+    /// };
+    /// let data = Dataset {
+    ///     x: Tensor::from_vec(vec![-1.0f32, 1.0, 2.0, -3.0], &[4, 1]).unwrap(),
+    ///     targets: Targets::Classes(vec![0, 1, 0, 0]),
+    /// };
+    /// let m = model.confusion(&data).unwrap();
+    /// // Rows 1 and 2 are predicted 1; row 2 is a 0.
+    /// assert_eq!((m.count(0, 0), m.count(0, 1), m.count(1, 1)), (2, 1, 1));
+    /// assert_eq!(m.accuracy(), model.score(&data).unwrap());
+    /// assert_eq!(m.precision(1), 0.5);
+    /// ```
+    pub fn confusion<T: Real>(&self, data: &Dataset<T>) -> Result<ConfusionMatrix, Error> {
+        let (_, labels) = self.checked(data, "confusion")?;
+        let (features, k) = self.dims("confusion");
+        let mut z = vec![0.0; k];
+        let mut m = ConfusionMatrix::new(self.classes);
+        for (row, &label) in data.x.data().chunks_exact(features.max(1)).zip(&labels) {
+            self.logits(row, &mut z);
+            m.add(label, Some(self.class_of(&z)));
+        }
+        Ok(m)
     }
 
     /// The objective the model's regression minimises, on `data`, in the form scikit-learn's

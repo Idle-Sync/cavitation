@@ -8,5 +8,6 @@
 - [Shrinking a network](shrinking.md)
 - [Watching a network train](inspector.md)
 - [Regression, exactly and by gradient](regression.md)
+- [Measuring a classifier](metrics.md)
 - [Coming from PyTorch](from-pytorch.md)
 - [Image models](image-models.md)
