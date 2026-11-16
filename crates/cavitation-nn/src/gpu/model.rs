@@ -10,9 +10,9 @@ use cavitation_gpu::{BufferPool, Gpu, PooledBuffer, StepEncoder, StepSizes, wgpu
 use crate::layer::private::Token;
 use crate::{ActivationKind, InferenceLayer, Layer, Sequential};
 
-/// The most rows a compiled batch may hold: the convolution kernels dispatch one row of
-/// workgroups per image, and a dispatch dimension holds at most 65,535.
-const MAX_BATCH: usize = 65_535;
+/// The most images a batch through a convolution may hold: the convolution kernels dispatch
+/// one row of workgroups per image, and a dispatch dimension holds at most 65,535.
+const MAX_CONV_BATCH: usize = 65_535;
 
 /// An element-wise activation the GPU runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -254,11 +254,13 @@ impl GpuModel {
     /// - [`Error::Unsupported`] if the model has no layers, or a layer is not one the GPU
     ///   runs (see [`GpuModel`]) or has parameters its GPU form does not use; the message
     ///   names the layer's index and name. Also if no layer fixes the input width, or a
-    ///   parameter or a batch of a layer's inputs or outputs is larger than the GPU binds.
-    /// - [`Error::InvalidData`] if `batch` is 0 or above 65,535, a layer's input width is not
-    ///   the width the layer before it outputs, a layer outputs another width than it
-    ///   reports, or a mask is not as wide as its layer's output; the message names the
-    ///   layer and both widths.
+    ///   parameter or a batch of a layer's inputs or outputs is larger than the GPU binds,
+    ///   the model has a convolution and `batch` is above 65,535, or the parameters, running
+    ///   statistics and masks together are larger than one GPU buffer.
+    /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
+    ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
+    ///   a mask is not as wide as its layer's output, or a batch count does not hold one
+    ///   value; the message names the layer (and both widths, where two differ).
     ///
     /// # Panics
     ///
@@ -266,7 +268,7 @@ impl GpuModel {
     ///
     /// # Examples
     ///
-    /// A layer the GPU does not run is refused by index and name, with or without a GPU:
+    /// A layer the GPU does not run is refused by index and name:
     ///
     /// ```
     /// use cavitation_core::{ParamStore, Rng};
@@ -306,15 +308,18 @@ impl GpuModel {
             }
         }
         let values = &params.values;
-        for &id in plan.params.iter().chain(&plan.buffers) {
-            let len = values.get(id).data().len();
-            if bytes(len) > largest {
-                return Err(Error::Unsupported(format!(
-                    "GpuModel::compile: parameter {} holds {} bytes, more than the {largest} \
-                     this GPU binds",
-                    id.position(),
-                    bytes(len)
-                )));
+        for i in 0..model.len() {
+            let layer = model.layer(i);
+            for (local, id) in layer.parameters().into_iter().chain(layer.buffers()) {
+                let len = values.get(id).data().len();
+                if bytes(len) > largest {
+                    return Err(Error::Unsupported(format!(
+                        "GpuModel::compile: layer {i} ({})'s {local} holds {} bytes, more than \
+                         the {largest} this GPU binds",
+                        layer.name(),
+                        bytes(len)
+                    )));
+                }
             }
         }
 
@@ -323,6 +328,14 @@ impl GpuModel {
             .map(|&id| round(bytes(values.get(id).data().len())))
             .sum();
         let mask_bytes: u64 = plan.masks.iter().map(|(_, w)| round(bytes(w.len()))).sum();
+        if state_bytes + mask_bytes > limits.max_buffer_size {
+            return Err(Error::Unsupported(format!(
+                "GpuModel::compile: the parameters, running statistics and masks hold {} bytes \
+                 together, more than the {} of one buffer on this GPU, which uploads them",
+                state_bytes + mask_bytes,
+                limits.max_buffer_size
+            )));
+        }
         let sizes = StepSizes {
             upload_bytes: (state_bytes + mask_bytes).max(8),
             readback_bytes: (state_bytes + mask_bytes).max(8),
@@ -501,10 +514,10 @@ impl Plan {
                 "GpuModel::compile: the model has no layers".to_string(),
             ));
         }
-        if batch == 0 || batch > MAX_BATCH {
-            return Err(Error::InvalidData(format!(
-                "GpuModel::compile: a batch holds 1 to {MAX_BATCH} rows, not {batch}"
-            )));
+        if batch == 0 {
+            return Err(Error::InvalidData(
+                "GpuModel::compile: a batch needs at least one row".to_string(),
+            ));
         }
         let mut slots = Slots::default();
         let mut kinds = Vec::with_capacity(model.len());
@@ -532,7 +545,18 @@ impl Plan {
                      its input has width {width}"
                 )));
             }
+            if matches!(kind, Kind::Conv2d { .. }) && batch > MAX_CONV_BATCH {
+                return Err(Error::Unsupported(format!(
+                    "GpuModel::compile: layer {i} ({name}) is a convolution, which takes at most \
+                     {MAX_CONV_BATCH} images per batch on the GPU, not {batch}"
+                )));
+            }
             let outputs = kind.output_width(width);
+            if outputs == 0 {
+                return Err(Error::InvalidData(format!(
+                    "GpuModel::compile: layer {i} ({name}) outputs width 0"
+                )));
+            }
             let reported = layer.output_width(width);
             if outputs != reported {
                 return Err(Error::InvalidData(format!(
@@ -666,9 +690,17 @@ fn kind(
             Some(r) => Some(Running {
                 mean: slots.slot(r.mean, Role::Buffer, i, name)?,
                 var: slots.slot(r.var, Role::Buffer, i, name)?,
-                count: (r.count)
-                    .map(|c| slots.slot(c, Role::Count, i, name))
-                    .transpose()?,
+                count: match r.count {
+                    Some(c) if params.values.get(c).data().len() != 1 => {
+                        return Err(Error::InvalidData(format!(
+                            "GpuModel::compile: layer {i} ({name})'s num_batches_tracked holds {} \
+                             values, not 1",
+                            params.values.get(c).data().len()
+                        )));
+                    }
+                    Some(c) => Some(slots.slot(c, Role::Count, i, name)?),
+                    None => None,
+                },
                 momentum: r.momentum,
             }),
             None => None,
@@ -696,12 +728,14 @@ fn kind(
             count_include_pad,
             divisor_override,
         }) => {
-            if geom.dilation() != (1, 1) || divisor_override == Some(0) {
+            if geom.dilation() != (1, 1) {
                 return refuse(&format!(
-                    "is an average pooling with dilation {:?} and divisor {divisor_override:?}; \
-                     it takes no dilation and a divisor of at least 1",
+                    "is an average pooling with dilation {:?}; it takes none",
                     geom.dilation()
                 ));
+            }
+            if divisor_override == Some(0) {
+                return refuse("is an average pooling with a divisor of 0");
             }
             return Ok(Kind::AvgPool2d {
                 geom,
@@ -720,11 +754,7 @@ fn kind(
         ActivationKind::Sigmoid => Act::Sigmoid,
         ActivationKind::Gelu(GeluApprox::Tanh) => Act::GeluTanh,
         ActivationKind::Gelu(GeluApprox::Exact) => Act::GeluErf,
-        other => {
-            return refuse(&format!(
-                "is a {other:?} activation, which the GPU does not run"
-            ));
-        }
+        _ => return refuse("is an activation the GPU does not run"),
     };
     Ok(Kind::Activation(act))
 }
@@ -921,7 +951,7 @@ mod tests {
                 Sequential::new()
                     .push(linear(&mut params, &mut rng))
                     .push(Elu::default()),
-                "unsupported: GpuModel::compile: layer 1 (elu) is a Elu(1.0) activation, which the GPU does not run",
+                "unsupported: GpuModel::compile: layer 1 (elu) is an activation the GPU does not run",
             ),
             (
                 Sequential::new()
@@ -950,15 +980,21 @@ mod tests {
             assert_eq!(err.to_string(), message);
         }
         let net = Sequential::new().push(linear(&mut params, &mut rng));
-        for batch in [0, 65_536] {
-            let err = Plan::build(&net, &params, batch).unwrap_err();
-            assert_eq!(
-                err.to_string(),
-                format!(
-                    "invalid data: GpuModel::compile: a batch holds 1 to 65535 rows, not {batch}"
-                )
-            );
-        }
+        let err = Plan::build(&net, &params, 0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid data: GpuModel::compile: a batch needs at least one row"
+        );
+        // Without a convolution, a batch may pass 65,535 rows; with one, it may not.
+        assert!(Plan::build(&net, &params, 65_536).is_ok());
+        let conv = Conv2dGeom::new(1, 1, (2, 2), (1, 1)).unwrap();
+        let net = Sequential::new().push(Conv2d::new(&mut params, conv, &mut rng));
+        let err = Plan::build(&net, &params, 65_536).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported: GpuModel::compile: layer 0 (conv2d) is a convolution, which takes at \
+             most 65535 images per batch on the GPU, not 65536"
+        );
     }
 
     /// The masks' bits repeat each row's for every row of the batch, low bit first.
@@ -999,7 +1035,11 @@ mod tests {
                 *v = o;
             }
         }
-        let count = *ids.last().unwrap();
+        let count = (net.layer(1).as_batch_norm2d())
+            .and_then(|bn| bn.running())
+            .and_then(|r| r.count)
+            .unwrap();
+        assert!(ids.contains(&count));
         params.value_mut(count).data_mut()[0] = 17.0;
         let want: Vec<Vec<u32>> = ids
             .iter()
