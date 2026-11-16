@@ -6,22 +6,23 @@ use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step
 
 /// The GEMM shader: 64 × 64 tiles of `C` per workgroup of 16 × 16 threads, 4 × 4 outputs per
 /// thread, k in steps of 16 through 8.25 KiB of workgroup memory (padded against bank
-/// conflicts); the transposes are `override` constants. Its head, default loaders and core
-/// are separate files, so a convolution can supply its own loaders.
+/// conflicts); the transposes are `override` constants. Its head, default loaders, default
+/// store and core are separate files, so a convolution can supply its own loaders and store.
 const GEMM: Shader = Shader {
     name: "gemm",
     source: concat!(
         include_str!("gemm_head.wgsl"),
         include_str!("gemm_load.wgsl"),
+        include_str!("gemm_store.wgsl"),
         include_str!("gemm_core.wgsl")
     ),
 };
 
 /// The side of the square tile of `C` one workgroup computes.
-const TILE: u32 = 64;
+pub(super) const TILE: u32 = 64;
 
 /// The bytes of the shader's `Dims` uniform: sixteen 4-byte fields.
-const DIMS_BYTES: u64 = 64;
+pub(super) const DIMS_BYTES: u64 = 64;
 
 /// The shape and layout of one GEMM, or of a batch of them, `C = A·B + β·C`.
 ///
@@ -268,7 +269,7 @@ impl GemmDims {
     }
 
     /// The shader's `Dims` uniform for these dimensions, leading dimensions resolved.
-    fn uniform(&self) -> [u8; DIMS_BYTES as usize] {
+    pub(super) fn uniform(&self) -> [u8; DIMS_BYTES as usize] {
         let words = [
             self.m,
             self.n,
