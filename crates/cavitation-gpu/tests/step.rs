@@ -326,3 +326,44 @@ fn unprofiled_spans_have_no_times() {
     let output = step.finish();
     assert_eq!(output.spans(), &[("a", None), ("b", None)]);
 }
+
+/// Each step's times are its own, not the step before's: steps alternate between a small
+/// and a large dispatch, 1,024 times the work, and the large steps' median time is above the
+/// small steps'. Read from a resolve in the step's own submission, Metal gave each step the
+/// previous step's times, which turns the medians around (small 348 µs, large 3.75 µs).
+/// Medians, and no wider margin, because the other tests in this file share the GPU and can
+/// stretch the small steps well past a few microseconds.
+#[test]
+fn span_times_belong_to_their_step() {
+    let Some(gpu) = gpu() else { return };
+    if !gpu.info().timestamps {
+        println!("no timestamps: not checked");
+        return;
+    }
+    let mut cache = PipelineCache::new(&gpu);
+    let pipeline = cache.get(COUNT, "main", &[]).expect("build");
+    let mut pool = BufferPool::new(&gpu);
+    let count = pool.take(4 << 22, TENSOR);
+    let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    steps.set_profiling(true);
+    let group = bind(&mut steps, &pipeline, &[&count]);
+    let mut time = |workgroups: u32| {
+        let mut step = steps.begin();
+        step.span("count");
+        step.dispatch_split(&pipeline, &group, workgroups);
+        step.finish().spans()[0].1.expect("timed")
+    };
+    let (mut small, mut large) = (Vec::new(), Vec::new());
+    for _ in 0..9 {
+        small.push(time(16));
+        large.push(time(1 << 14));
+    }
+    println!("small {small:?} ns; large {large:?} ns");
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (small, large) = (median(&mut small), median(&mut large));
+    assert!(large > small, "median small {small} ns, large {large} ns");
+    pool.give(count);
+}
