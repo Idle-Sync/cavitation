@@ -1581,12 +1581,24 @@ pub struct ConvTiming {
     pub forward: f64,
     /// Seconds for the forward and the backward pass.
     pub step: f64,
+    /// Seconds for the forward pass and the backward pass without the input's gradient (the
+    /// weight and bias gradients only), when asked for; `step` minus this is the input
+    /// gradient's time.
+    pub weights_step: Option<f64>,
 }
 
 /// Times `Tape::conv2d` with `geom` on `batch` seeded images at the current kernel level and
 /// thread count: 3 warm-up runs, then the median of `samples` runs of the forward pass and
-/// of the forward and backward passes.
-pub fn time_conv(geom: Conv2dGeom, batch: usize, first: bool, samples: usize) -> ConvTiming {
+/// of the forward and backward passes; with `parts`, also of the forward and backward passes
+/// with the images as an input that takes no gradient. `first` takes no input gradient in
+/// the full step either, as for a network's first layer.
+pub fn time_conv(
+    geom: Conv2dGeom,
+    batch: usize,
+    first: bool,
+    samples: usize,
+    parts: bool,
+) -> ConvTiming {
     let mut rng = Rng::seed(11);
     let mut params = ParamStore::new();
     let mut draw = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.range(-1.0, 1.0) as f32).collect() };
@@ -1604,7 +1616,7 @@ pub fn time_conv(geom: Conv2dGeom, batch: usize, first: bool, samples: usize) ->
     let xp = params.add(x.clone());
     let up = Tensor::from_vec(draw(batch * geom.out_width()), &[batch, geom.out_width()]).unwrap();
     let mut graph = cavitation_core::Graph::new();
-    let mut run = |backward: bool| -> f64 {
+    let mut run = |backward: bool, first: bool| -> f64 {
         let start = Instant::now();
         let mut tape = graph.tape(&params.values);
         let xv = if first {
@@ -1627,12 +1639,17 @@ pub fn time_conv(geom: Conv2dGeom, batch: usize, first: bool, samples: usize) ->
         t
     };
     for _ in 0..3 {
-        run(true);
+        run(true, first);
     }
-    let forward: Vec<f64> = (0..samples).map(|_| run(false)).collect();
-    let step: Vec<f64> = (0..samples).map(|_| run(true)).collect();
+    let forward: Vec<f64> = (0..samples).map(|_| run(false, first)).collect();
+    let step: Vec<f64> = (0..samples).map(|_| run(true, first)).collect();
+    let weights_step = parts.then(|| {
+        let times: Vec<f64> = (0..samples).map(|_| run(true, true)).collect();
+        median(&times)
+    });
     ConvTiming {
         forward: median(&forward),
         step: median(&step),
+        weights_step,
     }
 }

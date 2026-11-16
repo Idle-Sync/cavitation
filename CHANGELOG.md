@@ -21,6 +21,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- `cavitation-bench conv --parts` also prints each convolution's backward pass in two halves, the weight gradient and the input gradient, from a third timed step that takes no input gradient.
 - `scripts/bench/torch_cnn.py --device cuda` trains the PyTorch side of `mnist-cnn` and `cifar-cnn` on a CUDA GPU, from the same initial weights and batch order, with each step timed between `torch.cuda.synchronize()` calls and a median step time over every epoch but the first. `cudnn.benchmark` stays False unless `--cudnn-benchmark` is given. The CPU default's output is unchanged.
 
 ## v0.4.0 (2026-11-16)
