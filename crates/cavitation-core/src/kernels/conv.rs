@@ -840,8 +840,8 @@ fn workers(batch: usize, threads: usize) -> usize {
 }
 
 /// A pointer that tasks on several threads may hold at once, each using its own part. The
-/// convolutions here, max pooling (`super::pooling`) and batch normalisation
-/// (`ops::batch_norm`) use it.
+/// convolutions here, max pooling (`super::pooling`), batch normalisation
+/// (`ops::batch_norm`) and the convolution's bias gradient (`ops::conv`) use it.
 pub(crate) struct Parts<T>(pub(crate) *mut T);
 
 // SAFETY: `Parts` is only used by the functions below, by `pooling::max_pool2d` and its
