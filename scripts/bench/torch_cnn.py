@@ -9,13 +9,22 @@
 # the same files the Rust side reads (MNIST's IDX files, CIFAR-10's binary batches), each
 # pixel divided by 255.
 #
+# With `--device cuda` the model, the data and the batch order live on the GPU, and each
+# training step is timed between two `torch.cuda.synchronize()` calls. After the epoch lines,
+# one more `torch` line gives the median step time over every epoch but the first (the
+# warm-up). `torch.backends.cudnn.benchmark` stays at its default, False, unless
+# `--cudnn-benchmark` is given; the `torch` line says which. The CPU default prints exactly
+# what it printed before.
+#
 #   python3 -I scripts/bench/torch_cnn.py --mode train --net cifar --data-dir data/cifar10 \
 #       --init target/bench/cnn/cifar-cnn-seed0/init.safetensors \
 #       --order target/bench/cnn/cifar-cnn-seed0/order.bin --epochs 10 --batch 128 \
 #       --rows 50000 --threads 4 --seed 0
 import argparse
 import os
+import statistics
 import struct
+import subprocess
 import time
 
 import numpy as np
@@ -96,6 +105,21 @@ def accuracy(model, x, y):
     return right / len(x)
 
 
+def driver_version():
+    """The NVIDIA driver's version, from nvidia-smi, or "unknown"."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        )
+        return out.stdout.strip().splitlines()[0]
+    except (OSError, subprocess.SubprocessError, IndexError):
+        return "unknown"
+
+
 def main():
     parser = argparse.ArgumentParser(description="PyTorch side of cavitation-bench mnist-cnn and cifar-cnn")
     parser.add_argument("--mode", choices=["train"], required=True)
@@ -108,7 +132,18 @@ def main():
     parser.add_argument("--rows", type=int, required=True, help="train on the first this many rows")
     parser.add_argument("--threads", type=int, default=4)
     parser.add_argument("--seed", type=int, default=0, help="seeds the dropout masks")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument(
+        "--cudnn-benchmark", action="store_true", help="with --device cuda: let cuDNN pick its fastest algorithms"
+    )
     args = parser.parse_args()
+    cuda = args.device == "cuda"
+    if args.cudnn_benchmark and not cuda:
+        raise ValueError("--cudnn-benchmark needs --device cuda")
+    if cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda: this PyTorch build sees no CUDA GPU")
+        torch.backends.cudnn.benchmark = args.cudnn_benchmark
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     (x, y), (tx, ty) = (load_cifar if args.net == "cifar" else load_mnist)(args.data_dir)
@@ -120,6 +155,16 @@ def main():
     if len(order) != args.epochs * args.rows:
         raise ValueError(f"{args.order}: {len(order)} entries, not {args.epochs} epochs of {args.rows}")
     order = torch.from_numpy(order).reshape(args.epochs, args.rows)
+    if cuda:
+        device = torch.device("cuda")
+        model = model.to(device)
+        x, y, tx, ty, order = (t.to(device) for t in (x, y, tx, ty, order))
+        print(
+            f"torch {torch.__version__}, cuda {torch.version.cuda}, cudnn {torch.backends.cudnn.version()}, "
+            f"gpu {torch.cuda.get_device_name(0)}, driver {driver_version()}, "
+            f"cudnn.benchmark {torch.backends.cudnn.benchmark}",
+            flush=True,
+        )
     print(
         f"torch {torch.__version__}, {torch.get_num_threads()} threads, "
         f"cpu {torch.backends.cpu.get_cpu_capability()}, mkldnn {torch.backends.mkldnn.is_available()}",
@@ -128,20 +173,34 @@ def main():
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     loss_fn = nn.CrossEntropyLoss()
     model.train()
+    step_times = []
     for epoch in range(args.epochs):
         total, steps = 0.0, 0
         start = time.perf_counter()
         for i in range(0, args.rows, args.batch):
             idx = order[epoch, i : i + args.batch]
+            if cuda:
+                torch.cuda.synchronize()
+                begin = time.perf_counter()
             optimizer.zero_grad(set_to_none=True)
             loss = loss_fn(model(x[idx]), y[idx])
             loss.backward()
             optimizer.step()
+            if cuda:
+                torch.cuda.synchronize()
+                if epoch > 0:
+                    step_times.append(time.perf_counter() - begin)
             total += loss.item()
             steps += 1
         seconds = time.perf_counter() - start
         acc = accuracy(model, tx, ty)
         print(f"epoch {epoch + 1} {total / steps:.6f} {acc:.6f} {seconds:.6f}", flush=True)
+    if cuda and step_times:
+        print(
+            f"torch step median {1000 * statistics.median(step_times):.3f} ms over {len(step_times)} steps "
+            f"(epochs 2 to {args.epochs})",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
