@@ -289,6 +289,8 @@ impl<T: Real> Tape<'_, T> {
 /// output, gives the fused ReLU's derivative). With `x̂ = (x − mean) · inv` and `g = dy · γ` per channel over
 /// its `m` values: `dβ = Σ dy`, `dγ = Σ dy · x̂`, and `dx = inv · g` with the running
 /// statistics, else `dx = inv / m · (m · g − Σ g − x̂ · Σ g · x̂)` through the batch's.
+// The op's five fields, the node, the gradient and the context; a struct would only rename them.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn backward<T: Real>(
     x: Var,
     weight: Option<Var>,
@@ -606,7 +608,7 @@ mod tests {
             assert_eq!(bits(a), bits(b), "running statistic {k} (mean, variance)");
         }
         // The cases the test is for are there: exact zeros, positives, and NaN.
-        assert!(fused.0.iter().any(|v| *v == T::ZERO));
+        assert!(fused.0.contains(&T::ZERO));
         assert!(fused.0.iter().any(|v| *v > T::ZERO));
         assert!(fused.0.iter().any(|v| v.to_f64().is_nan()));
     }
