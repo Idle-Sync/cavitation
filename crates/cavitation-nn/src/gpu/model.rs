@@ -781,6 +781,8 @@ fn u32_bytes(words: &[u32]) -> Vec<u8> {
     words.iter().flat_map(|w| w.to_le_bytes()).collect()
 }
 
+/// Layer refusals, the plan's layout, the masks' bit packing and the uploads' exact round
+/// trip.
 #[cfg(test)]
 mod tests {
     use cavitation_core::{
