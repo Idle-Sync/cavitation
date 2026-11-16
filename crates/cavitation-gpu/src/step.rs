@@ -728,7 +728,8 @@ impl<'a> Step<'a> {
 
     /// Copies `len` bytes of `src` from `src_offset` into `dst` at `dst_offset` when the
     /// step runs, in order with the step's other commands: for moving values between
-    /// buffers on the GPU without a round trip through the host.
+    /// buffers on the GPU without a round trip through the host. When profiling with
+    /// encoder timestamps, it is timed with the step's other copies, as an upload is.
     ///
     /// # Panics
     ///
@@ -778,7 +779,7 @@ impl<'a> Step<'a> {
             dst.size()
         );
         assert!(src != dst, "a copy needs two different buffers");
-        self.end_pass();
+        self.begin_copies();
         self.encoder
             .as_mut()
             .expect("the step is being recorded")
