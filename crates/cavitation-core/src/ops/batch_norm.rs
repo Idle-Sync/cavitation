@@ -304,7 +304,9 @@ fn relu_masked<T: Real>(out: &mut [T], dy: &[T], y: &[T]) {
 /// `g = dy · γ` per channel over its `m` values: `dβ = Σ dy`, `dγ = Σ dy · x̂`, and
 /// `dx = inv · g` with the running statistics, else `dx = inv / m · (m · g − Σ g − x̂ · Σ g ·
 /// x̂)` through the batch's. With the fused ReLU, `dy` is first multiplied by ReLU's
-/// derivative at `out`'s value, ReLU's output.
+/// derivative at `out`'s value, ReLU's output: on `x`'s first gradient write the sums pass
+/// stores that product in `x`'s gradient buffer and the second pass turns it into `dx` in
+/// place; when `x` already has a gradient, each pass masks `dy` a block at a time.
 // The op's five fields, the node, the gradient and the context; a struct would only rename them.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn backward<T: Real>(
