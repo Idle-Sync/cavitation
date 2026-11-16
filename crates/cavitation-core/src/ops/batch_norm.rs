@@ -325,50 +325,69 @@ pub(super) fn backward<T: Real>(
     let (xv, sv) = (ctx.value(x), ctx.value(stats));
     let w = weight.map(|v| ctx.value(v));
     let yv = ctx.value(out);
-    // Per channel: Σ dy and Σ dy · x̂.
     let mut sums = ctx.scratch(2 * channels);
     let threads = kernels::threads();
-    let sp = Parts(sums.as_mut_ptr());
-    pool::run(threads, channels, &|t| {
-        let c = t.index;
-        let (mean, inv) = (sv[c], sv[channels + c]);
-        let (mut s, mut sx) = (T::ZERO, T::ZERO);
-        for n in 0..batch {
-            let at = n * width + c * spatial;
-            if relu {
-                let mut block = [T::ZERO; BLOCK];
-                for k0 in (0..spatial).step_by(BLOCK) {
-                    let len = BLOCK.min(spatial - k0);
-                    let (at, block) = (at + k0, &mut block[..len]);
-                    relu_masked(block, &out_grad[at..][..len], &yv[at..][..len]);
-                    for (&g, &v) in block.iter().zip(&xv[at..][..len]) {
+    let mf = T::from_f64(m as f64);
+    // Per channel: Σ dy and Σ dy · x̂, where `dy` is read from `src` (the incoming gradient,
+    // masked a block at a time with the fused ReLU) or, when `store` is given, masked into
+    // that buffer first and summed from there.
+    let sum_pass = |sums: &mut [T], store: Option<&mut [T]>| {
+        let sp = Parts(sums.as_mut_ptr());
+        let st = store.map(|s| Parts(s.as_mut_ptr()));
+        pool::run(threads, channels, &|t| {
+            let c = t.index;
+            let (mean, inv) = (sv[c], sv[channels + c]);
+            let (mut s, mut sx) = (T::ZERO, T::ZERO);
+            for n in 0..batch {
+                let at = n * width + c * spatial;
+                if let Some(st) = &st {
+                    // SAFETY: task `c` alone writes channel `c`'s values of each image.
+                    let d = unsafe { st.slice(at, spatial) };
+                    relu_masked(d, &out_grad[at..][..spatial], &yv[at..][..spatial]);
+                    for (&g, &v) in d.iter().zip(&xv[at..][..spatial]) {
+                        s += g;
+                        sx += g * ((v - mean) * inv);
+                    }
+                } else if relu {
+                    let mut block = [T::ZERO; BLOCK];
+                    for k0 in (0..spatial).step_by(BLOCK) {
+                        let len = BLOCK.min(spatial - k0);
+                        relu_masked(
+                            &mut block[..len],
+                            &out_grad[at + k0..][..len],
+                            &yv[at + k0..][..len],
+                        );
+                        for (&g, &v) in block[..len].iter().zip(&xv[at + k0..][..len]) {
+                            s += g;
+                            sx += g * ((v - mean) * inv);
+                        }
+                    }
+                } else {
+                    for (&g, &v) in out_grad[at..][..spatial].iter().zip(&xv[at..][..spatial]) {
                         s += g;
                         sx += g * ((v - mean) * inv);
                     }
                 }
-            } else {
-                for (&g, &v) in out_grad[at..][..spatial].iter().zip(&xv[at..][..spatial]) {
-                    s += g;
-                    sx += g * ((v - mean) * inv);
-                }
             }
-        }
-        // SAFETY: task `c` alone writes elements `c` and `channels + c` of `sums`.
-        unsafe {
-            sp.slice(c, 1)[0] = s;
-            sp.slice(channels + c, 1)[0] = sx;
-        }
-    });
-    for (v, offset) in [(bias, 0), (weight, channels)] {
-        if let Some(v) = v
-            && let Some(slot) = ctx.slot(v)
-        {
-            slot.add_from(&sums[offset..][..channels]);
-        }
-    }
+            // SAFETY: task `c` alone writes elements `c` and `channels + c` of `sums`.
+            unsafe {
+                sp.slice(c, 1)[0] = s;
+                sp.slice(channels + c, 1)[0] = sx;
+            }
+        });
+    };
+    let mut summed = false;
     if let Some(slot) = ctx.slot(x) {
         slot.update_with(|buf, beta| {
-            let mf = T::from_f64(m as f64);
+            // With the fused ReLU and the first gradient for `x`, the masked gradient is kept
+            // in `buf` by the sums pass and turned into `dx` in place, so it is masked once.
+            let in_place = relu && beta == T::ZERO;
+            if in_place {
+                sum_pass(&mut sums, Some(&mut *buf));
+            } else {
+                sum_pass(&mut sums, None);
+            }
+            summed = true;
             let bufs = Parts(buf.as_mut_ptr());
             let sums = &sums;
             pool::run(threads, channels, &|t| {
@@ -377,43 +396,60 @@ pub(super) fn backward<T: Real>(
                 let g = w.map_or(T::ONE, |w| w[c]);
                 // Σ (dy · γ) and Σ (dy · γ) · x̂ over the channel.
                 let (sg, sgx) = (sums[c] * g, sums[channels + c] * g);
+                let dx = |dy: T, v: T| {
+                    let gy = dy * g;
+                    if use_running {
+                        gy * inv
+                    } else {
+                        let xhat = (v - mean) * inv;
+                        inv / mf * (mf * gy - sg - xhat * sgx)
+                    }
+                };
                 for n in 0..batch {
                     let at = n * width + c * spatial;
                     // SAFETY: task `c` alone writes channel `c`'s values of each image.
                     let dst = unsafe { bufs.slice(at, spatial) };
-                    // `dy` for each value of `dst`: the incoming gradient, or with the fused
-                    // ReLU that gradient masked, a block at a time.
+                    let xs = &xv[at..][..spatial];
+                    if in_place {
+                        for (d, &v) in dst.iter_mut().zip(xs) {
+                            *d = dx(*d, v);
+                        }
+                        continue;
+                    }
                     let mut block = [T::ZERO; BLOCK];
                     let step = if relu { BLOCK } else { spatial.max(1) };
                     for k0 in (0..spatial).step_by(step) {
                         let len = step.min(spatial - k0);
-                        let at = at + k0;
                         let dys: &[T] = if relu {
                             relu_masked(
                                 &mut block[..len],
-                                &out_grad[at..][..len],
-                                &yv[at..][..len],
+                                &out_grad[at + k0..][..len],
+                                &yv[at + k0..][..len],
                             );
                             &block[..len]
                         } else {
-                            &out_grad[at..][..len]
+                            &out_grad[at + k0..][..len]
                         };
                         for ((d, &dy), &v) in
-                            dst[k0..][..len].iter_mut().zip(dys).zip(&xv[at..][..len])
+                            dst[k0..k0 + len].iter_mut().zip(dys).zip(&xs[k0..k0 + len])
                         {
-                            let gy = dy * g;
-                            let dx = if use_running {
-                                gy * inv
-                            } else {
-                                let xhat = (v - mean) * inv;
-                                inv / mf * (mf * gy - sg - xhat * sgx)
-                            };
+                            let dx = dx(dy, v);
                             *d = if beta == T::ZERO { dx } else { *d + dx };
                         }
                     }
                 }
             });
         });
+    }
+    if !summed {
+        sum_pass(&mut sums, None);
+    }
+    for (v, offset) in [(bias, 0), (weight, channels)] {
+        if let Some(v) = v
+            && let Some(slot) = ctx.slot(v)
+        {
+            slot.add_from(&sums[offset..][..channels]);
+        }
     }
     ctx.release(sums);
 }
@@ -567,10 +603,10 @@ mod tests {
     /// Channel 0 holds values equal to its mean and has β = 0, so those outputs are exactly
     /// 0 (ReLU's derivative there is 0); channel 2 holds a NaN, which makes its statistics
     /// and outputs NaN (the derivative is NaN); the other βs are not 0. With `affine` false
-    /// there is no γ or β. The loss is `Σ y · r + Σ x · q`: the second term, recorded after
-    /// the batch norm, gives `x` its first gradient, so the batch norm's backward pass adds
-    /// to it rather than writing it.
-    fn fused_matches_separate<T: crate::Real>(training: bool, affine: bool) {
+    /// there is no γ or β. The loss is `Σ y · r`, plus `Σ x · q` with `reuse_x`: that term,
+    /// recorded after the batch norm, gives `x` its first gradient, so the batch norm's
+    /// backward pass adds to it (the block path) rather than writing it (the in-place path).
+    fn fused_matches_separate<T: crate::Real>(training: bool, affine: bool, reuse_x: bool) {
         let (batch, channels, spatial) = (3, 3, 4);
         let len = batch * channels * spatial;
         let mut xs: Vec<T> = values(len, 7).into_iter().map(T::from_f64).collect();
@@ -629,14 +665,17 @@ mod tests {
                     .view(),
             );
             let yr = tape.mul(y, rv);
-            let qv = tape.input(
-                Tensor::from_vec(q.clone(), &[batch, channels * spatial])
-                    .unwrap()
-                    .view(),
-            );
-            let xq = tape.mul(xv, qv);
-            let (a, c) = (tape.sum(yr), tape.sum(xq));
-            let loss = tape.add(a, c);
+            let mut loss = tape.sum(yr);
+            if reuse_x {
+                let qv = tape.input(
+                    Tensor::from_vec(q.clone(), &[batch, channels * spatial])
+                        .unwrap()
+                        .view(),
+                );
+                let xq = tape.mul(xv, qv);
+                let c = tape.sum(xq);
+                loss = tape.add(loss, c);
+            }
             tape.backward(loss, &mut store.grads);
             drop(tape);
             graph.apply_buffer_updates(&mut store.values);
@@ -671,8 +710,10 @@ mod tests {
     #[test]
     fn fused_relu_matches_separate_in_training() {
         for affine in [true, false] {
-            fused_matches_separate::<f32>(true, affine);
-            fused_matches_separate::<f64>(true, affine);
+            for reuse_x in [false, true] {
+                fused_matches_separate::<f32>(true, affine, reuse_x);
+                fused_matches_separate::<f64>(true, affine, reuse_x);
+            }
         }
     }
 
@@ -680,8 +721,10 @@ mod tests {
     #[test]
     fn fused_relu_matches_separate_in_evaluation() {
         for affine in [true, false] {
-            fused_matches_separate::<f32>(false, affine);
-            fused_matches_separate::<f64>(false, affine);
+            for reuse_x in [false, true] {
+                fused_matches_separate::<f32>(false, affine, reuse_x);
+                fused_matches_separate::<f64>(false, affine, reuse_x);
+            }
         }
     }
 
