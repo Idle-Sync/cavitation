@@ -698,7 +698,11 @@ mod tests {
         let p = Options::parse(CIFAR, &args(&["--profile", "7"])).unwrap();
         assert_eq!(p.profile, Some(7));
         assert!(!p.no_fuse);
-        assert!(Options::parse(CIFAR, &args(&["--no-fuse"])).unwrap().no_fuse);
+        assert!(
+            Options::parse(CIFAR, &args(&["--no-fuse"]))
+                .unwrap()
+                .no_fuse
+        );
         assert!(Options::parse(CIFAR, &args(&["--profile", "0"])).is_err());
     }
 

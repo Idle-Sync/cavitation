@@ -418,7 +418,9 @@ impl<'h, T: Real> Hooks<'h, T> {
                 .find(|&i| trace.fused(i));
             if let Some(i) = fused {
                 panic!(
-                    "hooks: a hook watches layer {}, but the trace fused layer {i} ({}) with                      the ReLU after it, so its own output was not kept; call                      `hooks.keep_outputs(&mut trace)` before `forward_traced`",
+                    "hooks: a hook watches layer {}, but the trace fused layer {i} ({}) with \
+                     the ReLU after it, so its own output was not kept; call \
+                     `hooks.keep_outputs(&mut trace)` before `forward_traced`",
                     entry.layer,
                     model.layer(i).name()
                 );
