@@ -341,7 +341,7 @@ impl OptimizerRule {
 ///
 /// - **SGD without weight decay or momentum:** the value `p' = p − lr·g` is one `fma`,
 ///   within `u·|p'|`, one rounding, where the backend fuses it (measured on Metal, Vulkan
-///   and both DX12 compilers); within `u·(|p'| + lr·|g|)` where it does not.
+///   and both DX12 compilers); within `u·|p'| + u·(1 + u)·lr·|g|` where it does not.
 /// - **SGD with either:** for the step `s = g + wd·p`, the buffer `b = μ·b_old + s` (`b = s`
 ///   on a parameter's first update or without momentum) and
 ///   `e_b = u·(|b| + μ·|b_old| + |s| + |wd·p|)`, the momentum buffer within `e_b` and the
