@@ -8,7 +8,7 @@ mod optimizer;
 mod pooling;
 mod reduce;
 
-pub use conv::{ConvCall, ConvDims, ConvForward};
+pub use conv::{ConvCall, ConvDims, ConvForward, ConvInputGrad};
 pub use elementwise::{Elementwise, ElementwiseCall, ElementwiseKernels};
 pub use gemm::{Gemm, GemmCall, GemmDims};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
