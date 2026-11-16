@@ -62,6 +62,17 @@
 //! `fxc` forces FXC. DXC builds a large shader in about a second where FXC can take tens of
 //! seconds.
 //!
+//! # Rounding
+//!
+//! The kernels' error bounds, in units of `u = 2⁻²⁴`, take each f32 operation WGSL calls
+//! correctly rounded to be rounded to nearest, so within `u` of its exact result, and the
+//! kernels stated to match the CPU bit for bit take ties to even as well, as the CPU
+//! rounds. WGSL leaves the rounding mode open: a correctly rounded result may be either
+//! float beside the exact one, up to `2u` off. The test suite checks round to nearest, ties
+//! to even, on its own (`tests/rounding.rs`). On a backend that rounds another way, a
+//! bound's `u` for each rounding becomes `2u`, and a bit-for-bit match can be off by one
+//! ulp per rounding.
+//!
 //! # Examples
 //!
 //! Without a GPU, [`Gpu::new`] returns `None` and the example does nothing:

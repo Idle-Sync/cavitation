@@ -17,6 +17,13 @@
 //! "Exact" covers normal numbers only: GPUs flush subnormal results to zero (measured on
 //! Vulkan and DX12), so [`assert_exact`] flushes the reference's subnormals before
 //! comparing, and [`FLOOR`] covers a flushed result in the rounding twin.
+//!
+//! The suite requires **round to nearest, ties to even**: the rounding bounds take one
+//! rounding to be within [`U`] of its exact result, and the twins that compare a rounded
+//! result with the CPU's bits need the CPU's ties. WGSL leaves the rounding mode open (a
+//! correctly rounded result may be either float beside the exact one, up to `2u` off), so
+//! this is a requirement on the backend, not a WGSL guarantee. `tests/rounding.rs` checks
+//! it on its own, so a backend that rounds another way fails there by name.
 
 #![allow(dead_code)]
 
@@ -24,8 +31,8 @@ use cavitation_gpu::{
     Backend, BufferPool, Gpu, PipelineCache, PooledBuffer, StepEncoder, StepSizes, wgpu,
 };
 
-/// f32's unit roundoff, 2^-24: the largest relative error of one correctly rounded
-/// operation.
+/// f32's unit roundoff, 2^-24: the largest relative error of one operation rounded to
+/// nearest, which the suite requires of the backend (`tests/rounding.rs`).
 pub const U: f64 = 1.0 / 16_777_216.0;
 
 /// The absolute floor every rounding bound carries, 2^-126, the smallest normal f32: a

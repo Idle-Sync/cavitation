@@ -7,6 +7,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 ### GPU
 
 - `OptimizerKernel`'s docs give plain SGD's value bound, where the backend rounds its `fma` twice, as `u·|p'| + u·(1 + u)·lr·|g|`; it was stated as `u·(|p'| + lr·|g|)`, which leaves out the second-order term (#287).
+- The `cavitation-gpu` docs state the rounding its kernels assume: each f32 operation rounded to nearest, within `u = 2⁻²⁴`, with ties to even where a kernel matches the CPU bit for bit. WGSL leaves the rounding mode open, so on a backend that rounds another way each rounding's `u` becomes `2u`. A new test, `tests/rounding.rs`, checks f32 `+` and `*` on cases just above, just below and exactly at halfway points, and fails by name on a backend that does not round to nearest, ties to even (#288).
 
 ## v0.4.0 (2026-11-16)
 
