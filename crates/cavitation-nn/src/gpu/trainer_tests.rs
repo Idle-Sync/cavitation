@@ -264,7 +264,25 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
         for (layer, o, a, b) in flips.iter().take(20) {
             println!("  layer {layer}, output {o}: f64 window's top two {a:e}, {b:e}");
         }
-        // The GPU's parameters are in first-use order, which is the state order here.
+        // The GPU's parameters are in first-use order, which is the parameter order here.
+        assert_eq!(
+            (names.len(), want.len()),
+            (got.len(), got.len()),
+            "{what}: parameter counts"
+        );
+        let ids: Vec<_> = t
+            .net
+            .parameter_names()
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert!(
+            got.iter().map(|(id, _)| *id).eq(ids),
+            "{what}: parameter order"
+        );
+        // A flipped winner sends a gradient to another input, which no tolerance covers, so
+        // with flips only the layers after the last max pooling are asserted.
+        let after_pools = pooled.last().map_or(0, |(layer, _)| layer + 1);
         let mut worst = (0.0f64, String::new());
         let largest = want.iter().flatten().map(|v| v.abs()).fold(0.0, f64::max);
         for ((name, w), (_, g)) in names.iter().zip(&want).zip(&got) {
@@ -276,9 +294,8 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
                 .map(|(&a, &b)| (f64::from(a) - b).abs())
                 .fold(0.0, f64::max);
             let ratio = off / tolerance;
-            // A flipped winner sends a gradient to another input, which no tolerance covers:
-            // with flips the differences are listed, not asserted.
-            if flips.is_empty() {
+            let layer: usize = name.split('.').next().and_then(|l| l.parse().ok()).unwrap();
+            if flips.is_empty() || layer >= after_pools {
                 assert!(
                     ratio <= 1.0,
                     "{what}: {name}: off by {off:e} of a largest gradient {scale:e}"
@@ -298,8 +315,7 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
     });
 }
 
-/// Criterion 2: the test MLP (with a neuron mask) and a small CNN with batch norm, pooling and
-/// dropout.
+/// The test MLP (with a neuron mask) and a small CNN with batch norm, pooling and dropout.
 #[test]
 fn gradients_match_the_tape() {
     let mut t = twin(mlp::<f64>, mlp::<f32>, 21);
@@ -311,7 +327,7 @@ fn gradients_match_the_tape() {
     check_gradients(t, &Data::new(2, 6, 2 * 64, 5, (-1.0, 1.0)), "small cnn");
 }
 
-/// Criterion 3: one `mnist-cnn` step and one `cifar-cnn` step.
+/// One `mnist-cnn` step and one `cifar-cnn` step.
 #[test]
 fn benchmark_networks_match_the_tape() {
     let t = twin(mnist_cnn::<f64>, mnist_cnn::<f32>, 23);
@@ -357,7 +373,7 @@ fn sgd_updates_within_its_bound() {
     });
 }
 
-/// Criterion 5: two runs of three Adam steps from the same start give the same bits, in the
+/// Two runs of three Adam steps from the same start give the same bits, in the
 /// parameters, the running statistics, the batch counts and the optimiser's state.
 #[test]
 fn two_runs_give_the_same_bits() {
@@ -448,7 +464,83 @@ fn a_non_finite_step_changes_nothing() {
             assert_eq!(bits(&before), bits(&after), "{name}");
         }
         assert_eq!(trainer.optimizer_state(), state);
+        // The next good step trains: nothing of the bad one is left in the gradients.
+        assert!(trainer.step(&t.net, good.view()).unwrap().is_finite());
+        assert_eq!(trainer.optimizer_state().steps, vec![2; state.steps.len()]);
     });
+}
+
+/// Five steps of the GPU trainer against five of the CPU's `Trainer` from the same start, on
+/// the small CNN (batch norm, max pooling, dropout) with SGD and momentum, and on the MLP with
+/// Adam: each step's loss within 2⁻¹⁰ of the CPU's, and the parameters, running statistics and
+/// batch counts after the last within 2⁻¹⁰ of each tensor's largest value plus 2⁻¹⁶. Later
+/// steps read what earlier ones left: the momentum, the moments, the running statistics, the
+/// next step's dropout masks and the gradient buffers.
+#[test]
+fn steps_track_the_cpu_trainer() {
+    let cases = [
+        (
+            twin(small_cnn::<f64>, small_cnn::<f32>, 29),
+            2 * 64,
+            5,
+            OptimizerConfig::Sgd {
+                lr: 0.05,
+                momentum: 0.9,
+                weight_decay: 1e-4,
+            },
+            "small cnn, sgd",
+        ),
+        (
+            twin(mlp::<f64>, mlp::<f32>, 30),
+            12,
+            4,
+            OptimizerConfig::Adam {
+                lr: 1e-2,
+                weight_decay: 0.0,
+            },
+            "mlp, adam",
+        ),
+    ];
+    for (t, width, classes, config, what) in cases {
+        let batches: Vec<Data> = (0..5)
+            .map(|s| Data::new(40 + s, 6, width, classes, (-1.0, 1.0)))
+            .collect();
+        let mut cpu = t.params.clone();
+        let mut trainer = crate::Trainer::new(&t.net, config.build(), Loss::CrossEntropy, 6);
+        let cpu_losses: Vec<f32> = batches
+            .iter()
+            .map(|d| trainer.step(&t.net, &mut cpu, d.view()).unwrap())
+            .collect();
+        for_each_gpu(|gpu| {
+            let mut gpu_trainer =
+                GpuTrainer::new(&t.net, &t.params, &config, Loss::CrossEntropy, 6, gpu).unwrap();
+            for (s, d) in batches.iter().enumerate() {
+                let loss = gpu_trainer.step(&t.net, d.view()).unwrap();
+                let want = cpu_losses[s];
+                assert!(
+                    (loss - want).abs() <= want.abs() / 1024.0,
+                    "{what}: step {}: loss {loss}, the CPU's {want}",
+                    s + 1
+                );
+            }
+            let mut out = t.params.clone();
+            gpu_trainer.sync_to(&mut out);
+            for (name, id) in t.net.state_names() {
+                let (g, c) = (out.value(id).data(), cpu.value(id).data());
+                let scale = c.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let off = g
+                    .iter()
+                    .zip(c)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    off <= scale / 1024.0 + 1.0 / 65536.0,
+                    "{what}: {name} off by {off:e} of {scale:e}"
+                );
+                println!("{what} {name}: off by {off:.3e} of a largest value {scale:.3e}");
+            }
+        });
+    }
 }
 
 /// The share of a `cifar-cnn` training step at batch 128 spent copying the gradients into the

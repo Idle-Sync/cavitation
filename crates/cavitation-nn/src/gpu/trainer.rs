@@ -125,8 +125,7 @@ struct TrainPass {
     pools: Vec<Pool>,
     /// The values: the input first, then each output a forward call writes.
     values: Vec<PooledBuffer>,
-    /// The gradients of the values, with their parameters' gradients.
-    #[allow(dead_code)] // Read only through the bind groups.
+    /// The gradients of the values.
     grads: Vec<PooledBuffer>,
     /// Each parameter's gradient, in the model's parameter order.
     param_grads: Vec<PooledBuffer>,
@@ -141,6 +140,9 @@ struct TrainPass {
     scratch: Vec<PooledBuffer>,
     /// The dropout masks, in the model's order.
     masks: Vec<DropoutMask>,
+    /// The gradients the pooling backward passes add to (an index into `grads` each), which
+    /// every step clears first.
+    cleared: Vec<usize>,
     /// Each max pooling's winners, an index into the scratch, in the model's order.
     #[allow(dead_code)] // The tests read the winners.
     winners: Vec<usize>,
@@ -267,8 +269,9 @@ impl GpuTrainer {
     ///
     /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for a loss other than
     /// cross-entropy and MSE, for a parameter used by two layers, and as
-    /// [`GpuModel::compile`] returns; [`Error::InvalidData`] as `compile` returns, and if the
-    /// model has no parameters.
+    /// [`GpuModel::compile`] returns; [`Error::InvalidData`] as `compile` returns, if the
+    /// model has no parameters or one that holds no values, and if a batch norm would
+    /// normalise a training batch over one value per channel.
     ///
     /// # Examples
     ///
@@ -324,6 +327,12 @@ impl GpuTrainer {
             ));
         }
         check_untied(&gpu_model, model)?;
+        if let Some(t) = gpu_model.params.iter().find(|t| t.len == 0) {
+            return Err(Error::InvalidData(format!(
+                "GpuTrainer: parameter {} holds no values",
+                t.id.position()
+            )));
+        }
         for (i, layer) in gpu_model.layers.iter().enumerate() {
             if let Kind::BatchNorm2d(norm) = layer.kind
                 && batch_size * norm.spatial < 2
@@ -525,6 +534,10 @@ impl GpuTrainer {
             at += len;
         }
         step.clear(self.pass.flag.buffer(), 0, 4);
+        for &g in &self.pass.cleared {
+            let b = &self.pass.grads[g];
+            step.clear(b.buffer(), 0, b.len());
+        }
         let kernels = &self.model.kernels;
         record(
             &self.pass.forward,
@@ -1189,6 +1202,7 @@ impl TrainPass {
             .map(|t| pool.take(4 * t.len.max(1) as u64, usage()))
             .collect();
         let mut backward = Vec::new();
+        let mut cleared = Vec::new();
         for (i, layer) in m.layers.iter().enumerate().rev() {
             let s = &saved[i];
             let n_out = batch * layer.outputs;
@@ -1325,6 +1339,8 @@ impl TrainPass {
                         (Pool::Max(_), None) => unreachable!("max pooling saves its winners"),
                     };
                     backward.push(Op::PoolBackward(kp, group));
+                    // The pooling backward passes add to their input gradient.
+                    cleared.push(dx);
                     dx
                 }
                 Kind::BatchNorm2d(norm) => {
@@ -1420,6 +1436,7 @@ impl TrainPass {
                 .iter()
                 .filter_map(|s| s.pool.and_then(|(_, w)| w))
                 .collect(),
+            cleared,
             scratch,
             masks,
         })
