@@ -325,9 +325,15 @@ fn profile(
         "", "layer", "forward ms", "backward ms"
     );
     for i in 0..model.len() {
+        // A fused batch norm carries its ReLU's times; the ReLU's row says so.
+        let name = if i > 0 && model.fuses_at(i - 1) {
+            format!("{} (in {})", model.layer(i).name(), i - 1)
+        } else {
+            model.layer(i).name().to_string()
+        };
         println!(
             "{i:>3}  {:<22} {:>12.2} {:>12.2}",
-            model.layer(i).name(),
+            name,
             ms(&|p| p.forward[i]),
             ms(&|p| p.backward[i])
         );

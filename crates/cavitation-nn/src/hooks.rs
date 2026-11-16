@@ -269,7 +269,8 @@ impl<'h, T: Real> Hooks<'h, T> {
     /// Panics, before any hook runs, if a hook (forward or backward) is registered on a layer
     /// index the model does not have; the message names the index and the valid range. Also
     /// panics if `trace` does not hold one entry per layer of `model` or was not recorded on
-    /// `tape`.
+    /// `tape`, or if a hooked layer's input or output was fused away (see
+    /// [`keep_outputs`](Self::keep_outputs)).
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -344,6 +345,40 @@ impl<'h, T: Real> Hooks<'h, T> {
         }
     }
 
+    /// Marks in `trace` every layer whose own value a hook reads: each hooked layer's output,
+    /// and its input, which is the output of the layer before. Those layers are then never
+    /// fused with the next ([`Trace::keep_output`]). Call it before
+    /// [`Sequential::forward_traced`] when the network may fuse a batch normalisation with a
+    /// ReLU ([`Sequential::fuse`]); [`fit`](crate::fit) does.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{BatchNorm2d, Hooks, Relu, Sequential, Trace};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 1, (1, 2))).push(Relu);
+    /// let mut seen = Vec::new();
+    /// let mut hooks = Hooks::new();
+    /// hooks.on_forward(0, |e| seen.extend_from_slice(e.output.data()));
+    /// let mut trace = Trace::new();
+    /// hooks.keep_outputs(&mut trace);
+    /// let mut graph = Graph::new();
+    /// // A training tape: batch norm normalises with the batch's mean (2.5) here.
+    /// let mut tape = graph.training_tape(&params.values, 0, 1);
+    /// let x = tape.input(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap().view());
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// hooks.run_forward(&tape, &trace, &net);
+    /// drop(hooks);
+    /// assert!(seen[0] < 0.0); // batch norm's own output, before the ReLU
+    /// ```
+    pub fn keep_outputs(&self, trace: &mut Trace) {
+        for entry in self.forward.iter().chain(&self.backward) {
+            trace.keep_output(entry.layer);
+            if let Some(before) = entry.layer.checked_sub(1) {
+                trace.keep_output(before);
+            }
+        }
+    }
+
     /// Panics, naming the index and the valid range, if a hook (forward or backward) watches
     /// a layer `model` does not have. Needs no tape, so a training step can call it before
     /// any kernel runs.
@@ -376,6 +411,19 @@ impl<'h, T: Real> Hooks<'h, T> {
             "hooks: the trace records {} layers, but the model has {layers}",
             trace.len()
         );
+        for entry in self.forward.iter().chain(&self.backward) {
+            let fused = [entry.layer.checked_sub(1), Some(entry.layer)]
+                .into_iter()
+                .flatten()
+                .find(|&i| trace.fused(i));
+            if let Some(i) = fused {
+                panic!(
+                    "hooks: a hook watches layer {}, but the trace fused layer {i} ({}) with                      the ReLU after it, so its own output was not kept; call                      `hooks.keep_outputs(&mut trace)` before `forward_traced`",
+                    entry.layer,
+                    model.layer(i).name()
+                );
+            }
+        }
     }
 }
 
