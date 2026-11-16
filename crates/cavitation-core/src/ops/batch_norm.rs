@@ -274,7 +274,12 @@ impl<T: Real> Tape<'_, T> {
             self.push_buffer_update(update, means, unbiased);
         }
         let stats_var = self.push(Op::Input, Shape::new(&[3 * channels]), stats);
-        let start = self.push_labels(&[channels, spatial, usize::from(use_running), usize::from(relu)]);
+        let start = self.push_labels(&[
+            channels,
+            spatial,
+            usize::from(use_running),
+            usize::from(relu),
+        ]);
         let so = Shape::new(&[batch, width]);
         self.push(Op::BatchNorm2d(x, weight, bias, stats_var, start), so, out)
     }
@@ -516,5 +521,131 @@ mod tests {
             graph.apply_buffer_updates(&mut store.values);
             assert_eq!(store.value(stats.count.unwrap()).data(), &[3.0]);
         }
+    }
+
+    /// One fused-against-separate comparison in `T`: values, the gradients of the input, γ
+    /// and β, and the running statistics after the update, all compared by bits.
+    ///
+    /// Channel 0 holds values equal to its mean, so with β = 0 those outputs are exactly 0
+    /// (ReLU's derivative there is 0); channel 2 holds a NaN, which makes its statistics and
+    /// outputs NaN (the derivative is NaN). The loss is `Σ y · r` for fixed weights `r`.
+    fn fused_matches_separate<T: crate::Real>(training: bool) {
+        let (batch, channels, spatial) = (3, 3, 4);
+        let len = batch * channels * spatial;
+        let mut xs: Vec<T> = values(len, 7).into_iter().map(T::from_f64).collect();
+        // Channel 0: image 0's values 1, 2, 3, 2 and the other images' all 2, so the
+        // channel's mean is exactly 2 and those values normalise to exactly 0.
+        for n in 0..batch {
+            for (k, v) in [1.0, 2.0, 3.0, 2.0].into_iter().enumerate() {
+                xs[n * channels * spatial + k] = T::from_f64(if n == 0 { v } else { 2.0 });
+            }
+        }
+        xs[2 * spatial + 1] = T::from_f64(f64::NAN); // channel 2 of image 0
+        let r: Vec<T> = values(len, 9).into_iter().map(T::from_f64).collect();
+        let run = |fused: bool| {
+            let mut store = ParamStore::<T>::new_generic();
+            let w = store.add(
+                Tensor::from_vec(
+                    values(channels, 1).into_iter().map(T::from_f64).collect(),
+                    &[channels],
+                )
+                .unwrap(),
+            );
+            let b = store.add(Tensor::from_vec(vec![T::ZERO; channels], &[channels]).unwrap());
+            let stats = RunningStats {
+                mean: store
+                    .add(Tensor::from_vec(vec![T::from_f64(0.25); channels], &[channels]).unwrap()),
+                var: store
+                    .add(Tensor::from_vec(vec![T::from_f64(1.5); channels], &[channels]).unwrap()),
+                count: None,
+                momentum: Some(0.1),
+            };
+            let xi = store.add(Tensor::from_vec(xs.clone(), &[batch, channels * spatial]).unwrap());
+            let mut graph = Graph::new_generic();
+            let mut tape = if training {
+                graph.training_tape(&store.values, 0, 1)
+            } else {
+                graph.tape(&store.values)
+            };
+            let (xv, wv, bv) = (tape.param(xi), tape.param(w), tape.param(b));
+            let y = if fused {
+                tape.batch_norm2d_relu(xv, Some(wv), Some(bv), Some(stats), channels, spatial, 1e-5)
+            } else {
+                let bn =
+                    tape.batch_norm2d(xv, Some(wv), Some(bv), Some(stats), channels, spatial, 1e-5);
+                tape.relu(bn)
+            };
+            let ys = tape.value(y).data().to_vec();
+            let rv = tape.input(
+                Tensor::from_vec(r.clone(), &[batch, channels * spatial])
+                    .unwrap()
+                    .view(),
+            );
+            let yr = tape.mul(y, rv);
+            let loss = tape.sum(yr);
+            tape.backward(loss, &mut store.grads);
+            drop(tape);
+            graph.apply_buffer_updates(&mut store.values);
+            let grads: Vec<Vec<T>> = [xi, w, b]
+                .iter()
+                .map(|&id| store.grad(id).data().to_vec())
+                .collect();
+            let running: Vec<Vec<T>> = [stats.mean, stats.var]
+                .iter()
+                .map(|&id| store.value(id).data().to_vec())
+                .collect();
+            (ys, grads, running)
+        };
+        let bits = |v: &[T]| v.iter().map(|x| x.to_f64().to_bits()).collect::<Vec<_>>();
+        let (fused, separate) = (run(true), run(false));
+        assert_eq!(bits(&fused.0), bits(&separate.0), "values");
+        for (k, (a, b)) in fused.1.iter().zip(&separate.1).enumerate() {
+            assert_eq!(bits(a), bits(b), "gradient {k} (input, γ, β)");
+        }
+        for (k, (a, b)) in fused.2.iter().zip(&separate.2).enumerate() {
+            assert_eq!(bits(a), bits(b), "running statistic {k} (mean, variance)");
+        }
+        // The cases the test is for are there: exact zeros, positives, and NaN.
+        assert!(fused.0.iter().any(|v| *v == T::ZERO));
+        assert!(fused.0.iter().any(|v| *v > T::ZERO));
+        assert!(fused.0.iter().any(|v| v.to_f64().is_nan()));
+    }
+
+    /// `batch_norm2d_relu` gives the bits of `batch_norm2d` then `relu`, in f32 and f64,
+    /// with batch statistics on a training tape.
+    #[test]
+    fn fused_relu_matches_separate_in_training() {
+        fused_matches_separate::<f32>(true);
+        fused_matches_separate::<f64>(true);
+    }
+
+    /// The same with the running statistics on an evaluation tape.
+    #[test]
+    fn fused_relu_matches_separate_in_evaluation() {
+        fused_matches_separate::<f32>(false);
+        fused_matches_separate::<f64>(false);
+    }
+
+    /// The gradient check passes for the fused operation with batch statistics, for the
+    /// input, γ and β, in f64.
+    #[test]
+    fn fused_relu_grad_check() {
+        let (batch, channels, spatial) = (3, 2, 4);
+        let mut store = ParamStore::<f64>::new_generic();
+        let w = store.add(Tensor::from_vec(values(channels, 1), &[channels]).unwrap());
+        let b = store.add(Tensor::from_vec(values(channels, 2), &[channels]).unwrap());
+        let x = Tensor::from_vec(
+            values(batch * channels * spatial, 4),
+            &[batch, channels * spatial],
+        )
+        .unwrap();
+        gradcheck_params(&mut store, &[x], |tape, v| {
+            let (wv, bv) = (tape.param(w), tape.param(b));
+            let y = tape.batch_norm2d_relu(v[0], Some(wv), Some(bv), None, channels, spatial, 1e-5);
+            let t = tape.tanh(y);
+            let s = tape.mul(t, t);
+            tape.sum(s)
+        })
+        .assert_passed();
     }
 }
