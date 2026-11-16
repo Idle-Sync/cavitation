@@ -627,7 +627,8 @@ mod tests {
     }
 
     /// The gradient check passes for the fused operation with batch statistics, for the
-    /// input, γ and β, in f64.
+    /// input, γ and β, in f64. The loss `Σ y · r` has a non-zero slope where ReLU's output
+    /// is 0, so a backward pass that left out ReLU's derivative would fail here.
     #[test]
     fn fused_relu_grad_check() {
         let (batch, channels, spatial) = (3, 2, 4);
@@ -639,11 +640,15 @@ mod tests {
             &[batch, channels * spatial],
         )
         .unwrap();
-        gradcheck_params(&mut store, &[x], |tape, v| {
+        let r = Tensor::from_vec(
+            values(batch * channels * spatial, 5),
+            &[batch, channels * spatial],
+        )
+        .unwrap();
+        gradcheck_params(&mut store, &[x, r], |tape, v| {
             let (wv, bv) = (tape.param(w), tape.param(b));
             let y = tape.batch_norm2d_relu(v[0], Some(wv), Some(bv), None, channels, spatial, 1e-5);
-            let t = tape.tanh(y);
-            let s = tape.mul(t, t);
+            let s = tape.mul(y, v[1]);
             tape.sum(s)
         })
         .assert_passed();
