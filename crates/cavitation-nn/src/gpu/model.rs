@@ -5,7 +5,9 @@
 use std::collections::HashMap;
 
 use cavitation_core::{Conv2dGeom, Error, GeluApprox, ParamId, ParamStore, Pool2dGeom};
-use cavitation_gpu::{BufferPool, Gpu, PooledBuffer, StepEncoder, StepSizes, wgpu};
+use cavitation_gpu::{BufferPool, Gpu, PipelineCache, PooledBuffer, StepEncoder, StepSizes, wgpu};
+
+use super::forward::{Forward, Kernels, Parts};
 
 use crate::layer::private::Token;
 use crate::{ActivationKind, InferenceLayer, Layer, Sequential};
@@ -13,6 +15,10 @@ use crate::{ActivationKind, InferenceLayer, Layer, Sequential};
 /// The most images a batch through a convolution may hold: the convolution kernels dispatch
 /// one row of workgroups per image, and a dispatch dimension holds at most 65,535.
 const MAX_CONV_BATCH: usize = 65_535;
+
+/// The most rows or columns a GEMM's output may have on the GPU: 65,535 tiles of 64, one
+/// workgroup each along a dispatch dimension.
+const MAX_GEMM_SIDE: usize = 65_535 * 64;
 
 /// An element-wise activation the GPU runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,7 +162,7 @@ pub(crate) struct GpuTensor {
 /// A neuron mask compiled for the batch: one bit per value of the layer's output, set where
 /// the value is kept.
 #[derive(Debug)]
-#[allow(dead_code)] // The forward pass reads `layer`.
+#[allow(dead_code)] // `layer` is read by the tests and the backward pass.
 pub(crate) struct GpuMask {
     /// The [`Sequential`] layer whose output it masks.
     pub(crate) layer: usize,
@@ -219,30 +225,40 @@ struct Plan {
 /// }
 /// ```
 #[derive(Debug)]
-#[allow(dead_code)] // The forward pass and the trainer read the buffers and the encoder.
 pub struct GpuModel {
     /// The GPU the model is on.
-    gpu: Gpu,
+    pub(super) gpu: Gpu,
     /// The pool every buffer of the model comes from.
-    pool: BufferPool,
+    #[allow(dead_code)] // The trainer takes its buffers from it.
+    pub(super) pool: BufferPool,
+    /// The pipelines of the model's kernels.
+    #[allow(dead_code)] // The trainer builds its kernels through it.
+    pub(super) cache: PipelineCache,
+    /// The kernels every layer shares.
+    pub(super) kernels: Kernels,
     /// The encoder every step of the model is recorded in.
-    steps: StepEncoder,
+    pub(super) steps: StepEncoder,
     /// Rows per batch.
-    batch: usize,
+    pub(super) batch: usize,
     /// The width of one input row.
-    input_width: usize,
+    pub(super) input_width: usize,
     /// The width of one output row.
-    output_width: usize,
+    pub(super) output_width: usize,
     /// The layers, one per layer of the [`Sequential`].
-    layers: Vec<CompiledLayer>,
+    pub(super) layers: Vec<CompiledLayer>,
     /// The trained parameters.
-    params: Vec<GpuTensor>,
+    pub(super) params: Vec<GpuTensor>,
     /// The batch-norm running statistics.
-    buffers: Vec<GpuTensor>,
+    pub(super) buffers: Vec<GpuTensor>,
     /// Each batch-norm batch count, with its value, kept on the host.
-    counts: Vec<(ParamId, f32)>,
+    pub(super) counts: Vec<(ParamId, f32)>,
     /// The neuron masks, by increasing layer.
-    masks: Vec<GpuMask>,
+    #[allow(dead_code)] // The trainer's backward pass binds them.
+    pub(super) masks: Vec<GpuMask>,
+    /// The forward pass in evaluation mode.
+    pub(super) eval: Forward,
+    /// The last batch's outputs, read back.
+    pub(super) host: Vec<f32>,
 }
 
 impl GpuModel {
@@ -255,12 +271,14 @@ impl GpuModel {
     ///   runs (see [`GpuModel`]) or has parameters its GPU form does not use; the message
     ///   names the layer's index and name. Also if no layer fixes the input width, or a
     ///   parameter or a batch of a layer's inputs or outputs is larger than the GPU binds,
-    ///   the model has a convolution and `batch` is above 65,535, or the parameters, running
-    ///   statistics and masks together are larger than one GPU buffer.
+    ///   the model has a convolution and `batch` is above 65,535, a `Linear`'s batch or
+    ///   outputs or a convolution's output pixels or channels are above 4,194,240, a batch
+    ///   norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the parameters, running statistics
+    ///   and masks together are larger than one GPU buffer.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
-    ///   a mask is not as wide as its layer's output, or a batch count does not hold one
-    ///   value; the message names the layer (and both widths, where two differ).
+    ///   a mask is not as wide as its layer's output, a batch count does not hold one value,
+    ///   or a batch norm that keeps no running statistics would see one value per channel; the message names the layer (and both widths, where two differ).
     ///
     /// # Panics
     ///
@@ -336,9 +354,13 @@ impl GpuModel {
                 limits.max_buffer_size
             )));
         }
+        let input_bytes = round(bytes(batch * plan.input_width));
+        let output_width = plan.layers.last().map_or(plan.input_width, |l| l.outputs);
+        let output_bytes = round(bytes(batch * output_width));
         let sizes = StepSizes {
-            upload_bytes: (state_bytes + mask_bytes).max(8),
-            readback_bytes: (state_bytes + mask_bytes).max(8),
+            // At least 4 KiB: the kernels' uniforms go up through this encoder too.
+            upload_bytes: (state_bytes + mask_bytes).max(input_bytes).max(4096),
+            readback_bytes: (state_bytes + mask_bytes).max(output_bytes),
             ..StepSizes::default()
         };
         let mut pool = BufferPool::new(gpu);
@@ -377,10 +399,24 @@ impl GpuModel {
         let counts = (plan.counts.iter())
             .map(|&id| (id, values.get(id).data()[0]))
             .collect();
-        let output_width = plan.layers.last().map_or(plan.input_width, |l| l.outputs);
+        let shader = |e| Error::Unsupported(format!("GpuModel::compile: {e}"));
+        let mut cache = PipelineCache::new(gpu);
+        let kernels = Kernels::new(gpu, &mut cache).map_err(shader)?;
+        let parts = Parts {
+            layers: &plan.layers,
+            params: &gpu_params,
+            buffers: &gpu_buffers,
+            masks: &masks,
+            batch,
+            input_width: plan.input_width,
+        };
+        let eval = Forward::evaluation(&parts, &kernels, &mut cache, &mut pool, &mut steps)
+            .map_err(shader)?;
         Ok(GpuModel {
             gpu: gpu.clone(),
             pool,
+            cache,
+            kernels,
             steps,
             batch,
             input_width: plan.input_width,
@@ -390,6 +426,8 @@ impl GpuModel {
             buffers: gpu_buffers,
             counts,
             masks,
+            eval,
+            host: Vec::with_capacity(batch * output_width),
         })
     }
 
@@ -550,6 +588,49 @@ impl Plan {
                     "GpuModel::compile: layer {i} ({name}) is a convolution, which takes at most \
                      {MAX_CONV_BATCH} images per batch on the GPU, not {batch}"
                 )));
+            }
+            let too_wide = |what: &str, n: usize| {
+                Err(Error::Unsupported(format!(
+                    "GpuModel::compile: layer {i} ({name}) has {n} {what}, more than the \
+                     {MAX_GEMM_SIDE} the GPU's GEMM takes"
+                )))
+            };
+            match kind {
+                Kind::Linear { outputs, .. } => {
+                    if batch > MAX_GEMM_SIDE {
+                        return too_wide("rows per batch", batch);
+                    }
+                    if outputs > MAX_GEMM_SIDE {
+                        return too_wide("outputs", outputs);
+                    }
+                }
+                Kind::Conv2d { geom, .. } => {
+                    let (oh, ow) = geom.out_size();
+                    if oh * ow > MAX_GEMM_SIDE {
+                        return too_wide("output pixels per channel", oh * ow);
+                    }
+                    if geom.out_channels() > MAX_GEMM_SIDE {
+                        return too_wide("output channels", geom.out_channels());
+                    }
+                }
+                Kind::BatchNorm2d(norm) => {
+                    if norm.running.is_none() && batch * norm.spatial < 2 {
+                        return Err(Error::InvalidData(format!(
+                            "GpuModel::compile: layer {i} ({name}) normalises with the batch's \
+                             statistics, which need more than one value per channel; a batch of \
+                             {batch} gives {}",
+                            batch * norm.spatial
+                        )));
+                    }
+                    if norm.eps != 0.0 && (norm.eps as f32) < f32::MIN_POSITIVE {
+                        return Err(Error::Unsupported(format!(
+                            "GpuModel::compile: layer {i} ({name}) has eps {:e}, which the GPU's \
+                             f32 arithmetic may flush to 0; use 0 or at least 2⁻¹²⁶",
+                            norm.eps
+                        )));
+                    }
+                }
+                _ => {}
             }
             let outputs = kind.output_width(width);
             if outputs == 0 {
@@ -982,6 +1063,30 @@ mod tests {
             assert_eq!(err.to_string(), message);
         }
         let net = Sequential::new().push(linear(&mut params, &mut rng));
+        // A GEMM's sides, batch norm on one value per channel, and an eps f32 flushes.
+        let err = Plan::build(&net, &params, 4_194_241).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported: GpuModel::compile: layer 0 (linear) has 4194241 rows per batch, more \
+             than the 4194240 the GPU's GEMM takes"
+        );
+        let mut store = ParamStore::new();
+        let batch_stats =
+            BatchNorm2d::with_options(&mut store, 2, (1, 1), 1e-5, Some(0.1), true, false).unwrap();
+        let err = Plan::build(&Sequential::new().push(batch_stats), &store, 1).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid data: GpuModel::compile: layer 0 (batch_norm2d) normalises with the batch's \
+             statistics, which need more than one value per channel; a batch of 1 gives 1"
+        );
+        let tiny_eps =
+            BatchNorm2d::with_options(&mut store, 2, (2, 2), 1e-40, Some(0.1), true, true).unwrap();
+        let err = Plan::build(&Sequential::new().push(tiny_eps), &store, 4).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported: GpuModel::compile: layer 0 (batch_norm2d) has eps 1e-40, which the \
+             GPU's f32 arithmetic may flush to 0; use 0 or at least 2⁻¹²⁶"
+        );
         let err = Plan::build(&net, &params, 0).unwrap_err();
         assert_eq!(
             err.to_string(),

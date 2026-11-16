@@ -1135,6 +1135,96 @@ fn check_layers(model: &Sequential) -> Result<(), Error> {
     Ok(())
 }
 
+/// Measures outputs another engine computes, as [`Evaluator::evaluate`] measures its own:
+/// `outputs` is called with each run of up to `batch` rows of `data`'s inputs and appends
+/// their outputs, `width` per row, to the (emptied) buffer it is given. The checks, the
+/// accuracy or R² and the loss (recorded on a tape from each batch's outputs, weighted by its
+/// rows) are the evaluator's.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub(crate) fn measure(
+    model: &Sequential,
+    data: &Dataset,
+    loss: Loss,
+    batch: usize,
+    width: usize,
+    mut outputs: impl FnMut(TensorView<'_, f32>, &mut Vec<f32>),
+) -> Result<Evaluation, Error> {
+    check_dataset(data)?;
+    check_model_and_loss(model, loss, data)?;
+    let (mut means, mut ss_tot, mut ss_res) = (Vec::new(), Vec::new(), Vec::new());
+    if let Targets::Values(t) = &data.targets {
+        target_spread(t.data(), t.shape().dims()[1], &mut means, &mut ss_tot);
+        ss_res.resize(means.len(), 0.0);
+    }
+    let (rows, features) = (data.len(), data.features());
+    let no_params = ParamStore::new().values;
+    let mut graph = Graph::new();
+    let mut out = Vec::new();
+    let (mut correct, mut total) = (0usize, 0.0f64);
+    for start in (0..rows).step_by(batch) {
+        let end = (start + batch).min(rows);
+        let n = end - start;
+        let x = TensorView::from_slice(
+            &data.x.data()[start * features..end * features],
+            &[n, features],
+        )
+        .expect("a run of whole rows of x has the batch's shape");
+        out.clear();
+        outputs(x, &mut out);
+        let y = TensorView::from_slice(&out, &[n, width])
+            .expect("the engine gives width outputs per row");
+        let targets = match &data.targets {
+            Targets::Classes(labels) => {
+                for (i, (row, &label)) in out
+                    .chunks_exact(width.max(1))
+                    .zip(&labels[start..end])
+                    .enumerate()
+                {
+                    check_label(start + i, label, width)?;
+                    if argmax(row) == Some(label) {
+                        correct += 1;
+                    }
+                }
+                TargetsView::Classes(&labels[start..end])
+            }
+            Targets::Values(t) => {
+                let tw = t.shape().dims()[1];
+                let values = TensorView::from_slice(&t.data()[start * tw..end * tw], &[n, tw])
+                    .expect("a run of whole rows of the targets has the batch's shape");
+                check_value_width(values, width)?;
+                for (target, row) in values
+                    .data()
+                    .chunks_exact(width.max(1))
+                    .zip(out.chunks_exact(width.max(1)))
+                {
+                    for ((s, &t), &p) in ss_res.iter_mut().zip(target).zip(row) {
+                        let e = f64::from(t) - f64::from(p);
+                        *s += e * e;
+                    }
+                }
+                TargetsView::Values(values)
+            }
+        };
+        let mut tape = graph.tape(&no_params);
+        let y = tape.input(y);
+        let l = loss.record(&mut tape, y, targets);
+        total += f64::from(tape.value(l).data()[0]) * n as f64;
+    }
+    let loss = total / rows as f64;
+    Ok(match &data.targets {
+        Targets::Classes(_) => Evaluation {
+            loss,
+            accuracy: Some(correct as f64 / rows as f64),
+            r2: None,
+        },
+        Targets::Values(_) => Evaluation {
+            loss,
+            accuracy: None,
+            r2: Some(r2(&ss_res, &ss_tot)),
+        },
+    })
+}
+
 /// Returns [`Error::InvalidData`], naming the row, the label and the width, if `label` is
 /// not below the model's output width.
 fn check_label(row: usize, label: usize, width: usize) -> Result<(), Error> {

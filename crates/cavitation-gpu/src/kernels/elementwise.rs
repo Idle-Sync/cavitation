@@ -1,5 +1,6 @@
 //! The element-wise GPU kernels: add, multiply and scale; ReLU and leaky ReLU, tanh, the
-//! sigmoid and GELU (both forms), forward and backward; and dropout with a bit-packed mask.
+//! sigmoid and GELU (both forms), forward and backward; and dropout and neuron masks with a
+//! bit-packed mask.
 //! Their CPU twins are `cavitation-core`'s: the one-rounding operations match it bit for bit
 //! on normal values, and tanh, the sigmoid and GELU are the CPU kernels' formulas ported
 //! operation for operation, within the bounds their tests state.
@@ -75,11 +76,15 @@ pub enum Elementwise {
     /// clear (so a dropped −3 is −0 and a dropped NaN stays NaN):
     /// dropout forward, and its backward pass on the gradient with the same mask.
     Dropout,
+    /// `a` where the mask in `b` has the element's bit set and `+0` where it is clear, selected
+    /// rather than multiplied (so a cleared −3 or NaN is `+0`), as `Tape::keep_where` computes
+    /// it: a neuron mask forward, and its backward pass on the gradient with the same mask.
+    KeepWhere,
 }
 
 impl Elementwise {
     /// Every operation, in declaration order.
-    pub const ALL: [Elementwise; 16] = [
+    pub const ALL: [Elementwise; 17] = [
         Elementwise::Add,
         Elementwise::Mul,
         Elementwise::Scale,
@@ -96,9 +101,11 @@ impl Elementwise {
         Elementwise::GeluErf,
         Elementwise::GeluErfBackward,
         Elementwise::Dropout,
+        Elementwise::KeepWhere,
     ];
 
-    /// Whether the operation reads `b`: binary operations, backward passes and dropout.
+    /// Whether the operation reads `b`: binary operations, backward passes, dropout and
+    /// [`KeepWhere`](Elementwise::KeepWhere) (the mask).
     ///
     /// # Examples
     ///
@@ -140,6 +147,7 @@ impl Elementwise {
             Elementwise::GeluErf => "gelu_erf_forward",
             Elementwise::GeluErfBackward => "gelu_erf_backward",
             Elementwise::Dropout => return (DROPOUT, "dropout"),
+            Elementwise::KeepWhere => return (DROPOUT, "keep_where"),
         };
         (ELEMENTWISE, e)
     }
@@ -284,7 +292,7 @@ impl ElementwiseKernels {
         );
         let b = if op.takes_b() {
             let b = b.unwrap_or_else(|| panic!("{op:?} reads b, and none was given"));
-            let need = if op == Elementwise::Dropout {
+            let need = if matches!(op, Elementwise::Dropout | Elementwise::KeepWhere) {
                 4 * u64::from(n.div_ceil(32))
             } else {
                 bytes
