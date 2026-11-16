@@ -52,11 +52,11 @@ fn source(p: u32, t: u32, stride: u32, padding: u32, dilation: u32) -> u32 {
     if (padded < reach) {
         return NONE;
     }
-    let q = padded - reach;
-    if (q % stride != 0u) {
+    let start = padded - reach;
+    if (start % stride != 0u) {
         return NONE;
     }
-    return q / stride;
+    return start / stride;
 }
 
 // dY'[kk][col] of image z.

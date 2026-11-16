@@ -6,8 +6,7 @@
 //!   `2(k + 3) · u · (Σ|w·x| + |bias|)` of the f64 convolution of the same f32 inputs,
 //!   `k` = in·kh·kw, and exact on small-integer inputs.
 //! - [`ConvInputGrad`]: the input gradient. Its CPU twin is `conv2d_backward_reference`'s
-//!   `dx`. Every value is within `2(k + 3) · u · Σ|w·dy|`, `k` = out·kh·kw, and exact on
-//!   small-integer inputs.
+//!   `dx`.
 
 use super::gemm::{DIMS_BYTES, GemmDims, TILE};
 use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder};
@@ -564,7 +563,8 @@ impl ConvForward {
 }
 
 /// One prepared convolution pass: its shape, its two uniforms and its bind group, from
-/// [`ConvForward::call`] or [`ConvInputGrad::call`].
+/// [`ConvForward::call`] or [`ConvInputGrad::call`]. It records only through the kernel that
+/// made it: the two kernels' bind group layouts differ.
 ///
 /// # Examples
 ///
@@ -575,7 +575,7 @@ pub struct ConvCall {
     dims: ConvDims,
     /// The batched GEMM it runs.
     gemm: GemmDims,
-    /// The GEMM's `Dims` uniform and the `Conv` uniform, from the pool.
+    /// The GEMM's `Dims` uniform and the `Conv` or `ConvGrad` uniform, from the pool.
     params: [PooledBuffer; 2],
     /// The bind group.
     group: wgpu::BindGroup,
@@ -613,8 +613,8 @@ impl ConvCall {
 /// then the column), the output gradient of the one window whose tap lands on it, or 0 where
 /// none does. It uses `fma` and writes every input gradient, overwriting it, with no
 /// atomics. So it is within `2(k + 3) · u · Σ|w·dy|` of the exact gradient, `k` = out·kh·kw
-/// and `u` = 2⁻²⁴, to first order in `u`, and exact on inputs whose products and partial sums
-/// are integers below 2²⁴. The same inputs give the same bits on every run on one GPU and
+/// and `u` = 2^-24, to first order in `u`, and exact on inputs whose products and partial sums
+/// are integers below 2^24. The same inputs give the same bits on every run on one GPU and
 /// backend. As in the forward pass, a NaN or infinite weight meets 0 at a tap no window
 /// covers, where the CPU reference skips the tap, so its input gradients are NaN.
 ///
@@ -679,8 +679,9 @@ impl ConvInputGrad {
     /// # Panics
     ///
     /// As [`ConvForward::call`]: if no window fits, or a count, size, stride or dilation is
-    /// 0, a buffer is shorter than its tensor, a tensor holds 2³² values or more, `batch` is
-    /// above 65,535, or `dx` is the weight or `dy`.
+    /// 0 (an input of size 0 included, which padding alone would let a window fit), a buffer
+    /// is shorter than its tensor, a tensor holds 2^32 values or more, `batch` is above
+    /// 65,535, or `dx` is the weight or `dy`.
     ///
     /// # Examples
     ///
@@ -695,6 +696,10 @@ impl ConvInputGrad {
         dx: &PooledBuffer,
     ) -> ConvCall {
         let size = dims.checked_out_size();
+        assert!(
+            dims.input.0 > 0 && dims.input.1 > 0,
+            "a convolution's input gradient needs an input of at least 1 × 1, not {dims:?}"
+        );
         dims.check_buffers(
             &[
                 ("the weight", weight, dims.weight_len()),

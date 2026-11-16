@@ -72,10 +72,12 @@ const NETWORKS: [Shape; 6] = [
     (6, 16, (14, 14), (5, 5), (1, 1), (0, 0), (1, 1)),
 ];
 
-/// Shapes past one tile in every direction: more than 64 output channels, an image of more
-/// than 64 positions whose rows do not divide 64, and a k that is not a multiple of 16.
-const SPANNING: [Shape; 3] = [
+/// Shapes past one tile in every direction: more than 64 output channels, more than 64 input
+/// channels (the input gradient's rows), an image of more than 64 positions whose rows do not
+/// divide 64, and a k that is not a multiple of 16.
+const SPANNING: [Shape; 4] = [
     (5, 130, (11, 13), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (130, 5, (11, 13), (3, 3), (1, 1), (1, 1), (1, 1)),
     (7, 65, (20, 9), (3, 2), (2, 1), (2, 0), (1, 2)),
     (3, 70, (9, 70), (1, 5), (1, 3), (0, 2), (1, 1)),
 ];
@@ -128,11 +130,17 @@ fn run(
     got
 }
 
+/// A shape whose windows leave input positions uncovered on both axes: stride 3 with
+/// dilation 2 down (rows 1, 4 and 7 are never read) and stride 2 across (columns 0, 2, 4 and
+/// 6 meet no tap), so their input gradients are 0.
+const GAPS: Shape = (2, 3, (9, 8), (2, 1), (3, 2), (0, 1), (2, 1));
+
 /// Every shape at `batch`, the network shapes at a batch of 4.
 fn all_shapes() -> Vec<ConvDims> {
     let mut out: Vec<ConvDims> = CPU_GEOMETRIES.iter().map(|&s| dims(3, s)).collect();
     out.extend(NETWORKS.iter().map(|&s| dims(4, s)));
     out.extend(SPANNING.iter().map(|&s| dims(2, s)));
+    out.push(dims(2, GAPS));
     out
 }
 
@@ -290,7 +298,7 @@ fn run_grad(kit: &mut Kit, grad: &ConvInputGrad, d: ConvDims, w: &[f32], dy: &[f
 
 /// On values from {-2, -1, 1, 2}, every input gradient is a small integer, so the GPU gives
 /// the f64 reference's value exactly, 0 included where no window covers a position (the
-/// strided shapes).
+/// `GAPS` shape).
 #[test]
 fn input_grad_exact_twins() {
     for_each_gpu(|gpu| {
@@ -377,11 +385,29 @@ fn input_grad_refusals() {
                 &dy,
                 &dx,
             ),
+            (
+                ConvDims {
+                    dilation: (1, 0),
+                    ..good
+                },
+                &w,
+                &dy,
+                &dx,
+            ),
             (ConvDims { batch: 0, ..good }, &w, &dy, &dx),
+            (
+                ConvDims {
+                    padding: (1, 1),
+                    ..ConvDims::new(1, 1, 1, (0, 0), (1, 1))
+                },
+                &w,
+                &dy,
+                &dx,
+            ),
             (good, &small, &dy, &dx),
             (good, &w, &small, &dx),
             (good, &w, &dy, &small),
-            (good, &w, &dy, &w),
+            (good, &dx, &dy, &dx),
             (good, &w, &dx, &dx),
         ];
         for (d, w, dy, dx) in cases {
