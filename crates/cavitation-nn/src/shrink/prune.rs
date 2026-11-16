@@ -9,6 +9,7 @@ use std::fmt;
 use cavitation_core::{Error, ParamStore, Rng};
 
 use super::ablate::{check_hidden, points_lost};
+use super::activity::position_means;
 use super::compact::{foreign_parameters, has_image_layers, linear_after_run, unvouched_layer};
 use super::compact_image::{foreign_image_parameters, unvouched_channel_layer};
 use super::{activity, channel_activity, channels_on, compact, neurons_on};
@@ -266,7 +267,7 @@ impl Default for RetrainConfig {
 /// (for a ReLU, those that never fire) and then the lowest out-norms, in steps of 1,000 bp up to 7,000 and of 500 bp from there to
 /// 9,500, retrains as [`RetrainConfig::default`], keeps the latest step that loses at most
 /// 1 accuracy point (class targets), and stops after 2 misses in a row. It does not fold
-/// removed neurons' mean outputs into the next bias. It has no validation set: set
+/// removed units' mean outputs into the next layer's bias. It has no validation set: set
 /// [`validation`](Self::validation).
 ///
 /// ```
@@ -294,20 +295,30 @@ pub struct ShrinkConfig<'s> {
     /// Whether units whose output is 0 on every training row (for a ReLU, units that never
     /// fire) go before the ranking's order; removing them changes nothing. On by default.
     pub dead_first: bool,
-    /// Whether each removed neuron's mean output on the training rows is folded into the
-    /// bias of the `Linear` that receives it, `b[i] += W[i, j] · mean_j`, so that the next
-    /// layer still gets the neuron's average contribution. The mean is measured at each
-    /// step, before retraining, on the network as it stands once the step has removed the
-    /// neurons of the listed layers before this one (and folded theirs), read where the
-    /// neuron's output is final ([`LayerActivity::mean`](super::LayerActivity::mean)). For
-    /// a neuron whose output is the same on every row the fold is exact: the network's
-    /// outputs do not change, within rounding. The fold changes the parameters, so it is in
-    /// the step's checkpoint and in the network the run keeps. It costs one extra pass over
-    /// the training rows per step for each listed layer after the first that loses neurons
-    /// at that step, to measure its means anew. The fold needs a bias to fold into, so with
-    /// it on, [`shrink`] refuses a listed layer whose next `Linear` has none. It folds
-    /// neurons only: with it on, [`shrink`] refuses a `Conv2d` among the layers to shrink.
-    /// Off by default.
+    /// Whether each removed unit's mean output on the training rows is folded into the
+    /// bias of the layer that receives it, so that the next layer still gets the unit's
+    /// average contribution:
+    ///
+    /// - a neuron into the next `Linear`, `b[i] += W[i, j] · mean_j`;
+    /// - a channel into the next `Conv2d`, `b[o] += mean_c · Σ_taps W[o, c, taps]`, with
+    ///   `mean_c` its mean over positions ([`ChannelActivity::mean`](super::ChannelActivity::mean));
+    ///   that conv must have no padding, where a border output would read zeros in place of
+    ///   the channel;
+    /// - a channel into the `Linear` after a `Flatten`, each position with its own mean,
+    ///   `b[i] += Σ_p W[i, c·plane + p] · mean_{c,p}`.
+    ///
+    /// The means are measured at each step, before retraining, on the network as it stands
+    /// once the step has removed the units of the listed layers before this one (and folded
+    /// theirs), read where the unit's output is final
+    /// ([`LayerActivity::mean`](super::LayerActivity::mean) for a neuron). For a unit whose
+    /// output is the same on every row (and, for a channel, at every position) the fold is
+    /// exact: the network's outputs do not change, within rounding. The fold changes the
+    /// parameters, so it is in the step's checkpoint and in the network the run keeps. It
+    /// costs one extra pass over the training rows per step for each listed layer after the
+    /// first that loses units at that step, and for each `Conv2d` whose channels reach a
+    /// `Linear`, to measure its means anew. The fold needs a bias to fold into, so with it
+    /// on, [`shrink`] refuses a listed layer whose receiving layer has none, and a listed
+    /// `Conv2d` whose channels reach a `Conv2d` with padding. Off by default.
     pub fold_means: bool,
     /// The step between levels, in basis points, up to `fine_from_bp`. Default 1,000.
     pub step_bp: u32,
@@ -559,9 +570,9 @@ pub struct ShrinkReport {
 /// 2. switches off, in each layer, the units it must lose: with
 ///    [`dead_first`](ShrinkConfig::dead_first), first those whose output is 0 on every
 ///    training row, then the lowest-ranked. With [`fold_means`](ShrinkConfig::fold_means),
-///    the layers are taken in order of index, and before a layer's neurons go their mean
+///    the layers are taken in order of index, and before a layer's units go their mean
 ///    outputs, measured on the network with the earlier layers already shrunk, are folded
-///    into the next `Linear`'s bias;
+///    into the bias of the layer that receives them;
 /// 3. retrains the network on the training rows as [`ShrinkConfig::retrain`] says, with a
 ///    fresh optimiser (masked units pass no gradient, so they stay off);
 /// 4. measures it on the validation set, records the step, and calls `on_step`
@@ -604,8 +615,9 @@ pub struct ShrinkReport {
 /// for value targets, or the criterion's number is NaN; if `step_bp` or `fine_step_bp` is
 /// 0, `max_removed_bp` is 0 or above 10,000, `patience` is `Some(0)` or the retraining
 /// batch is 0; if a listed layer's mask does not have its width; if
-/// [`fold_means`](ShrinkConfig::fold_means) is on and a listed layer is a `Conv2d`, or the
-/// `Linear` after a listed layer has no bias to fold into; and as [`evaluate`] does for the
+/// [`fold_means`](ShrinkConfig::fold_means) is on and the layer that receives a listed
+/// layer's units has no bias to fold into, or is a `Conv2d` with padding after a listed
+/// `Conv2d`; and as [`evaluate`] does for the
 /// validation set. Returns [`Error::Unsupported`] if a listed layer, or a layer between it
 /// and the layer that holds its units, carries a mask set with [`Sequential::set_mask`]
 /// (clear it and mask by `Linear` or by `Conv2d` instead), if the mask at the end of a
@@ -994,13 +1006,20 @@ impl Run<'_, '_, '_> {
     }
 
     /// Sets the step's `masks`, one listed layer at a time in order of layer index, and
-    /// before each folds the mean output of every neuron the mask newly switches off into
-    /// the bias of the next `Linear`: `b[i] += Σⱼ W[i, j] · mean_j`, summed in `f64` and
-    /// rounded once. The means of the first layer that loses neurons are `stats`, measured
-    /// before the step changed anything; those of a later layer are measured again, on the
-    /// network with the earlier layers' masks and folds in place. A mean of exactly 0 (a
-    /// dead neuron) adds nothing, even against an infinite weight. Every target is a
-    /// `Linear`: `check_fold_biases` refused a `Conv2d`.
+    /// before each folds the mean output of every unit the mask newly switches off into
+    /// the bias of the layer that receives it, summed in `f64` and rounded once:
+    ///
+    /// - a neuron into the next `Linear`, `b[i] += Σⱼ W[i, j] · mean_j`;
+    /// - a channel into the next `Conv2d` (which has no padding), `b[o] += Σ_c mean_c ·
+    ///   Σ_taps W[o, c, taps]`, with `mean_c` its mean over positions and rows;
+    /// - a channel into the `Linear` after a `Flatten`, `b[i] += Σ_c Σ_p W[i, c·plane + p] ·
+    ///   mean_{c,p}`, with `mean_{c,p}` the mean of each of its positions over the rows,
+    ///   measured for this fold.
+    ///
+    /// The means of the first layer that loses units are `stats`, measured before the step
+    /// changed anything; those of a later layer are measured again, on the network with the
+    /// earlier layers' masks and folds in place. A mean of exactly 0 (a dead unit) adds
+    /// nothing, even against an infinite weight.
     fn fold_and_mask(
         &mut self,
         masks: &[(usize, NeuronMask)],
@@ -1010,48 +1029,111 @@ impl Run<'_, '_, '_> {
         order.sort_by_key(|&k| masks[k].0);
         let mut changed = false;
         for k in order {
-            let (linear, ref mask) = masks[k];
-            let before = neurons_on(self.model, linear);
+            let target = self.targets[k];
+            let mask = &masks[k].1;
+            let before = target.on(self.model);
             let removed: Vec<usize> = (0..before.len())
                 .filter(|&j| before[j] && !mask.is_on(j))
                 .collect();
             if !removed.is_empty() {
-                let measured;
-                let mean = if changed {
-                    measured =
-                        activity(self.model, self.params, self.train, &[linear], EVAL_BATCH)?;
-                    &measured[0].mean
-                } else {
-                    &stats[k].mean
-                };
-                let next = linear_after_run(self.model, linear)
-                    .expect("check_layout found a Linear after each run");
-                let bias = next
-                    .bias()
+                let increments = self.fold_increments(target, &removed, &stats[k], changed)?;
+                let bias = receiver_bias(self.model, target)
                     .expect("check_fold_biases found a bias after each run");
-                let (inputs, weight) = (next.inputs(), next.weight());
-                let increments: Vec<f64> = self
-                    .params
-                    .value(weight)
-                    .data()
-                    .chunks_exact(inputs)
-                    .map(|row| {
-                        removed
-                            .iter()
-                            .filter(|&&j| mean[j] != 0.0)
-                            .map(|&j| f64::from(row[j]) * mean[j])
-                            .sum()
-                    })
-                    .collect();
                 let b = self.params.value_mut(bias).data_mut();
                 for (b, increment) in b.iter_mut().zip(increments) {
                     *b = (f64::from(*b) + increment) as f32;
                 }
                 changed = true;
             }
-            self.model.set_neuron_mask(linear, mask.clone());
+            target.set(self.model, mask.clone());
         }
         Ok(())
+    }
+
+    /// What [`fold_and_mask`](Self::fold_and_mask) adds to each entry of the receiving
+    /// layer's bias for the units `removed` of `target`: their means (from `stats`, or
+    /// measured again when `remeasure`) times their outgoing weights.
+    fn fold_increments(
+        &self,
+        target: Target,
+        removed: &[usize],
+        stats: &UnitStats,
+        remeasure: bool,
+    ) -> Result<Vec<f64>, Error> {
+        let next_at = target.end(self.model) + 1;
+        let train = self.train;
+        if target.unit == Unit::Channels && self.model.linear(next_at).is_some() {
+            // A channel into a `Linear`: each of its positions has its own weights, so its
+            // own mean.
+            let means = position_means(self.model, self.params, train, target.layer, EVAL_BATCH)?;
+            let plane = self.model.channel_shape(target.layer).1;
+            let next = self.model.linear(next_at).expect("just checked");
+            let w = self.params.value(next.weight()).data();
+            return Ok(w
+                .chunks_exact(next.inputs())
+                .map(|row| {
+                    removed
+                        .iter()
+                        .flat_map(|&c| c * plane..(c + 1) * plane)
+                        .filter(|&j| means[j] != 0.0)
+                        .map(|j| f64::from(row[j]) * means[j])
+                        .sum()
+                })
+                .collect());
+        }
+        let measured;
+        let mean: &[f64] = if remeasure {
+            measured = match target.unit {
+                Unit::Neurons => {
+                    activity(self.model, self.params, train, &[target.layer], EVAL_BATCH)?
+                        .remove(0)
+                        .mean
+                }
+                Unit::Channels => {
+                    channel_activity(self.model, self.params, train, &[target.layer], EVAL_BATCH)?
+                        .remove(0)
+                        .mean
+                }
+            };
+            &measured
+        } else {
+            &stats.mean
+        };
+        if let Some(conv) = self.model.layer(next_at).as_conv2d() {
+            // A channel into a `Conv2d` without padding: every output reads every tap of the
+            // channel, so the channel's mean times the sum of its taps.
+            let g = conv.geom();
+            let (kh, kw) = g.kernel();
+            let (taps, ins) = (kh * kw, g.in_channels());
+            let w = self.params.value(conv.weight()).data();
+            return Ok((0..g.out_channels())
+                .map(|o| {
+                    removed
+                        .iter()
+                        .filter(|&&c| mean[c] != 0.0)
+                        .map(|&c| {
+                            let taps_sum: f64 = w[(o * ins + c) * taps..][..taps]
+                                .iter()
+                                .map(|&v| f64::from(v))
+                                .sum();
+                            taps_sum * mean[c]
+                        })
+                        .sum()
+                })
+                .collect());
+        }
+        let next = linear_after_run(self.model, target.layer)
+            .expect("check_layout found a Linear after each run");
+        let w = self.params.value(next.weight()).data();
+        Ok(w.chunks_exact(next.inputs())
+            .map(|row| {
+                removed
+                    .iter()
+                    .filter(|&&j| mean[j] != 0.0)
+                    .map(|&j| f64::from(row[j]) * mean[j])
+                    .sum()
+            })
+            .collect())
     }
 
     /// The mask of `target` that keeps `keep` of its units (or every unit on, if no more
@@ -1494,26 +1576,50 @@ fn check_layout(
     Ok(warnings)
 }
 
-/// Refuses, with `InvalidData`, a listed `Conv2d` (the fold is for neurons), and a listed
-/// `Linear` whose next `Linear` has no bias, which [`ShrinkConfig::fold_means`] would have
-/// to fold the removed neurons' means into. Runs after `check_layout`, which found a
-/// `Linear` after each listed `Linear`'s run.
+/// The bias of the layer that receives the units of `target`: the next `Linear` after a
+/// `Linear`'s run, or the `Conv2d` or `Linear` after a `Conv2d`'s run; `None` if it has
+/// none (or the layer is neither, which `check_layout` refused).
+fn receiver_bias(model: &Sequential, target: Target) -> Option<cavitation_core::ParamId> {
+    let next = target.end(model) + 1;
+    if next >= model.len() {
+        return None;
+    }
+    match model.layer(next).as_conv2d() {
+        Some(conv) => conv.bias(),
+        None => model.linear(next).and_then(|l| l.bias()),
+    }
+}
+
+/// Refuses, with `InvalidData`, a listed layer whose receiving layer has no bias, which
+/// [`ShrinkConfig::fold_means`] would have to fold the removed units' means into, and a
+/// listed `Conv2d` whose channels reach a `Conv2d` with padding, where the border outputs
+/// read zeros for some taps and no bias can stand for the channel's mean. Runs after
+/// `check_layout`, which found the receiving layer of each listed run.
 fn check_fold_biases(model: &Sequential, targets: &[Target]) -> Result<(), Error> {
     for &target in targets {
-        let layer = target.layer;
-        if target.unit == Unit::Channels {
+        let (layer, kind) = (target.layer, target.kind());
+        let next_at = target.end(model) + 1;
+        if let Some(conv) = model.layer(next_at).as_conv2d()
+            && conv.geom().padding() != (0, 0)
+        {
             return Err(Error::InvalidData(format!(
-                "shrink: fold_means folds the means of removed neurons into the next Linear's \
-                 bias, and the conv layer {layer} loses channels; turn fold_means off, or list \
-                 only Linear layers in ShrinkConfig::layers"
+                "shrink: fold_means would fold the means of the conv layer {layer}'s removed \
+                 channels into the bias of the conv layer {next_at}, whose padding {:?} makes \
+                 its border outputs read zeros where the channel was, so no bias stands for the \
+                 channel's mean; turn fold_means off, or leave layer {layer} out of \
+                 ShrinkConfig::layers",
+                conv.geom().padding()
             )));
         }
-        let next_at = model.neuron_layer(layer) + 1;
-        let next = linear_after_run(model, layer).expect("check_layout found a Linear");
-        if next.bias().is_none() {
+        if receiver_bias(model, target).is_none() {
+            let receiver = if model.layer(next_at).as_conv2d().is_some() {
+                "conv"
+            } else {
+                "linear"
+            };
             return Err(Error::InvalidData(format!(
-                "shrink: fold_means folds the means of the linear layer {layer}'s removed \
-                 neurons into the bias of the linear layer {next_at}, which has no bias; turn \
+                "shrink: fold_means folds the means of the {kind} layer {layer}'s removed units \
+                 into the bias of the {receiver} layer {next_at}, which has no bias; turn \
                  fold_means off, or give that layer a bias"
             )));
         }
