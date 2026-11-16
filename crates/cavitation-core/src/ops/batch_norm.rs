@@ -416,24 +416,23 @@ pub(super) fn backward<T: Real>(
                         for (d, &v) in dst.iter_mut().zip(xs) {
                             *d = dx(*d, v);
                         }
-                        continue;
-                    }
-                    let mut block = [T::ZERO; BLOCK];
-                    let step = if relu { BLOCK } else { spatial.max(1) };
-                    for k0 in (0..spatial).step_by(step) {
-                        let len = step.min(spatial - k0);
-                        let dys: &[T] = if relu {
-                            relu_masked(
-                                &mut block[..len],
-                                &out_grad[at + k0..][..len],
-                                &yv[at + k0..][..len],
-                            );
-                            &block[..len]
-                        } else {
-                            &out_grad[at + k0..][..len]
-                        };
-                        for ((d, &dy), &v) in
-                            dst[k0..k0 + len].iter_mut().zip(dys).zip(&xs[k0..k0 + len])
+                    } else if relu {
+                        let mut block = [T::ZERO; BLOCK];
+                        for k0 in (0..spatial).step_by(BLOCK) {
+                            let len = BLOCK.min(spatial - k0);
+                            let (at, block) = (at + k0, &mut block[..len]);
+                            relu_masked(block, &out_grad[at..][..len], &yv[at..][..len]);
+                            for ((d, &dy), &v) in dst[k0..][..len]
+                                .iter_mut()
+                                .zip(&*block)
+                                .zip(&xs[k0..][..len])
+                            {
+                                let dx = dx(dy, v);
+                                *d = if beta == T::ZERO { dx } else { *d + dx };
+                            }
+                        }
+                    } else {
+                        for ((d, &dy), &v) in dst.iter_mut().zip(&out_grad[at..][..spatial]).zip(xs)
                         {
                             let dx = dx(dy, v);
                             *d = if beta == T::ZERO { dx } else { *d + dx };
@@ -599,134 +598,169 @@ mod tests {
         }
     }
 
-    /// One fused-against-separate comparison in `T`: values, the gradients of the input, γ
-    /// and β, and the running statistics after the update, all compared by bits.
+    /// One case of the fused-against-separate comparison.
+    #[derive(Clone, Copy)]
+    struct Case {
+        /// A training tape (batch statistics, recorded updates) or an evaluation tape.
+        training: bool,
+        /// With γ and β.
+        affine: bool,
+        /// With running statistics.
+        running: bool,
+        /// `x` a parameter (it takes a gradient) rather than an input (it takes none).
+        x_param: bool,
+        /// `x` also used after the batch norm, so the batch norm adds to its gradient.
+        reuse_x: bool,
+        /// Values per channel of each image.
+        spatial: usize,
+    }
+
+    /// One fused-against-separate comparison in `T`: values, every gradient taken (`x`, γ,
+    /// β) and the running statistics after the update, all compared by bits.
     ///
-    /// Channel 0 holds values equal to its mean and has β = 0, so those outputs are exactly
-    /// 0 (ReLU's derivative there is 0); channel 2 holds a NaN, which makes its statistics
-    /// and outputs NaN (the derivative is NaN); the other βs are not 0. With `affine` false
-    /// there is no γ or β. The loss is `Σ y · r`, plus `Σ x · q` with `reuse_x`: that term,
-    /// recorded after the batch norm, gives `x` its first gradient, so the batch norm's
-    /// backward pass adds to it (the block path) rather than writing it (the in-place path).
-    fn fused_matches_separate<T: crate::Real>(training: bool, affine: bool, reuse_x: bool) {
-        let (batch, channels, spatial) = (3, 3, 4);
-        let len = batch * channels * spatial;
+    /// Channel 0 holds values whose mean is exactly 2 with every value but two equal to it,
+    /// and has β = 0, so most of its outputs are exactly 0 (ReLU's derivative there is 0);
+    /// channel 2 holds a NaN, which makes its batch statistics and outputs NaN (the
+    /// derivative is NaN); the other βs are not 0. The loss is `Σ y · r`, plus `Σ x · q`
+    /// with `reuse_x`: that term, recorded after the batch norm, gives `x` its first
+    /// gradient, so the batch norm's backward pass adds to it rather than writing it.
+    fn fused_matches_separate<T: crate::Real>(case: Case) {
+        let (batch, channels, spatial) = (3, 3, case.spatial);
+        let width = channels * spatial;
+        let len = batch * width;
         let mut xs: Vec<T> = values(len, 7).into_iter().map(T::from_f64).collect();
-        // Channel 0: image 0's values 1, 2, 3, 2 and the other images' all 2, so the
-        // channel's mean is exactly 2 and those values normalise to exactly 0.
         for n in 0..batch {
-            for (k, v) in [1.0, 2.0, 3.0, 2.0].into_iter().enumerate() {
-                xs[n * channels * spatial + k] = T::from_f64(if n == 0 { v } else { 2.0 });
+            for k in 0..spatial {
+                xs[n * width + k] = T::from_f64(2.0);
             }
         }
+        xs[0] = T::from_f64(1.0);
+        xs[2] = T::from_f64(3.0);
         xs[2 * spatial + 1] = T::from_f64(f64::NAN); // channel 2 of image 0
         let r: Vec<T> = values(len, 9).into_iter().map(T::from_f64).collect();
         let q: Vec<T> = values(len, 11).into_iter().map(T::from_f64).collect();
         let run = |fused: bool| {
             let mut store = ParamStore::<T>::new_generic();
-            let w = store.add(
-                Tensor::from_vec(
-                    values(channels, 1).into_iter().map(T::from_f64).collect(),
-                    &[channels],
-                )
-                .unwrap(),
-            );
+            let gammas = values(channels, 1).into_iter().map(T::from_f64).collect();
+            let w = store.add(Tensor::from_vec(gammas, &[channels]).unwrap());
             let betas = [0.0, 0.3, -0.4].map(T::from_f64).to_vec();
             let b = store.add(Tensor::from_vec(betas, &[channels]).unwrap());
+            let full = |v: f64| Tensor::from_vec(vec![T::from_f64(v); channels], &[channels]);
             let stats = RunningStats {
-                mean: store
-                    .add(Tensor::from_vec(vec![T::from_f64(0.25); channels], &[channels]).unwrap()),
-                var: store
-                    .add(Tensor::from_vec(vec![T::from_f64(1.5); channels], &[channels]).unwrap()),
+                mean: store.add(full(0.25).unwrap()),
+                var: store.add(full(1.5).unwrap()),
                 count: None,
                 momentum: Some(0.1),
             };
-            let xi = store.add(Tensor::from_vec(xs.clone(), &[batch, channels * spatial]).unwrap());
+            let running = case.running.then_some(stats);
+            let xt = Tensor::from_vec(xs.clone(), &[batch, width]).unwrap();
+            let xi = store.add(xt.clone());
             let mut graph = Graph::new_generic();
-            let mut tape = if training {
+            let mut tape = if case.training {
                 graph.training_tape(&store.values, 0, 1)
             } else {
                 graph.tape(&store.values)
             };
-            let xv = tape.param(xi);
-            let (wv, bv) = if affine {
+            let xv = if case.x_param {
+                tape.param(xi)
+            } else {
+                tape.input(xt.view())
+            };
+            let (wv, bv) = if case.affine {
                 (Some(tape.param(w)), Some(tape.param(b)))
             } else {
                 (None, None)
             };
             let y = if fused {
-                tape.batch_norm2d_relu(xv, wv, bv, Some(stats), channels, spatial, 1e-5)
+                tape.batch_norm2d_relu(xv, wv, bv, running, channels, spatial, 1e-5)
             } else {
-                let bn = tape.batch_norm2d(xv, wv, bv, Some(stats), channels, spatial, 1e-5);
+                let bn = tape.batch_norm2d(xv, wv, bv, running, channels, spatial, 1e-5);
                 tape.relu(bn)
             };
             let ys = tape.value(y).data().to_vec();
-            let rv = tape.input(
-                Tensor::from_vec(r.clone(), &[batch, channels * spatial])
-                    .unwrap()
-                    .view(),
-            );
+            let rv = tape.input(Tensor::from_vec(r.clone(), &[batch, width]).unwrap().view());
             let yr = tape.mul(y, rv);
             let mut loss = tape.sum(yr);
-            if reuse_x {
-                let qv = tape.input(
-                    Tensor::from_vec(q.clone(), &[batch, channels * spatial])
-                        .unwrap()
-                        .view(),
-                );
+            if case.reuse_x {
+                let qv = tape.input(Tensor::from_vec(q.clone(), &[batch, width]).unwrap().view());
                 let xq = tape.mul(xv, qv);
-                let c = tape.sum(xq);
-                loss = tape.add(loss, c);
+                let extra = tape.sum(xq);
+                loss = tape.add(loss, extra);
             }
             tape.backward(loss, &mut store.grads);
             drop(tape);
             graph.apply_buffer_updates(&mut store.values);
-            let ids = if affine { vec![xi, w, b] } else { vec![xi] };
+            let mut ids = Vec::new();
+            if case.x_param {
+                ids.push(xi);
+            }
+            if case.affine {
+                ids.extend([w, b]);
+            }
             let grads: Vec<Vec<T>> = ids
                 .iter()
                 .map(|&id| store.grad(id).data().to_vec())
                 .collect();
-            let running: Vec<Vec<T>> = [stats.mean, stats.var]
+            let stats: Vec<Vec<T>> = [stats.mean, stats.var]
                 .iter()
                 .map(|&id| store.value(id).data().to_vec())
                 .collect();
-            (ys, grads, running)
+            (ys, grads, stats)
         };
         let bits = |v: &[T]| v.iter().map(|x| x.to_f64().to_bits()).collect::<Vec<_>>();
         let (fused, separate) = (run(true), run(false));
         assert_eq!(bits(&fused.0), bits(&separate.0), "values");
         for (k, (a, b)) in fused.1.iter().zip(&separate.1).enumerate() {
-            assert_eq!(bits(a), bits(b), "gradient {k} (input, γ, β)");
+            assert_eq!(bits(a), bits(b), "gradient {k} (x if taken, then γ and β)");
         }
         for (k, (a, b)) in fused.2.iter().zip(&separate.2).enumerate() {
             assert_eq!(bits(a), bits(b), "running statistic {k} (mean, variance)");
         }
-        // The cases the test is for are there: exact zeros, positives, and NaN.
+        // The cases the test is for are there: zeros, positives, and NaN.
         assert!(fused.0.contains(&T::ZERO));
         assert!(fused.0.iter().any(|v| *v > T::ZERO));
         assert!(fused.0.iter().any(|v| v.to_f64().is_nan()));
     }
 
-    /// `batch_norm2d_relu` gives the bits of `batch_norm2d` then `relu`, in f32 and f64,
-    /// with batch statistics on a training tape, with and without γ and β.
-    #[test]
-    fn fused_relu_matches_separate_in_training() {
+    /// Every combination of the cases, in f32 and f64, at `spatial` values per channel.
+    fn fused_matches_separate_everywhere(training: bool, spatial: usize) {
         for affine in [true, false] {
-            for reuse_x in [false, true] {
-                fused_matches_separate::<f32>(true, affine, reuse_x);
-                fused_matches_separate::<f64>(true, affine, reuse_x);
+            for running in [true, false] {
+                for x_param in [true, false] {
+                    for reuse_x in [false, true] {
+                        let case = Case {
+                            training,
+                            affine,
+                            running,
+                            x_param,
+                            reuse_x,
+                            spatial,
+                        };
+                        fused_matches_separate::<f32>(case);
+                        fused_matches_separate::<f64>(case);
+                    }
+                }
             }
         }
     }
 
-    /// The same with the running statistics on an evaluation tape.
+    /// `batch_norm2d_relu` gives the bits of `batch_norm2d` then `relu` on a training tape:
+    /// with and without γ and β, running statistics, a gradient for `x` and a second use of
+    /// `x`, in f32 and f64, at 4 values per channel and at 300 (more than one 256-value
+    /// block, and not a multiple of it).
+    #[test]
+    fn fused_relu_matches_separate_in_training() {
+        for spatial in [4, 300] {
+            fused_matches_separate_everywhere(true, spatial);
+        }
+    }
+
+    /// The same on an evaluation tape (running statistics where given, batch statistics
+    /// otherwise).
     #[test]
     fn fused_relu_matches_separate_in_evaluation() {
-        for affine in [true, false] {
-            for reuse_x in [false, true] {
-                fused_matches_separate::<f32>(false, affine, reuse_x);
-                fused_matches_separate::<f64>(false, affine, reuse_x);
-            }
+        for spatial in [4, 300] {
+            fused_matches_separate_everywhere(false, spatial);
         }
     }
 
