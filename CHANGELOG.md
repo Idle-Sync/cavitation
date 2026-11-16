@@ -9,6 +9,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `OptimizerKernel`'s docs give plain SGD's value bound, where the backend rounds its `fma` twice, as `u·|p'| + u·(1 + u)·lr·|g|`; it was stated as `u·(|p'| + lr·|g|)`, which leaves out the second-order term (#287).
 - The `cavitation-gpu` docs state the rounding its kernels assume: each f32 operation rounded to nearest, within `u = 2⁻²⁴`, with ties to even where a kernel matches the CPU bit for bit. WGSL leaves the rounding mode open, so on a backend that rounds another way each rounding's `u` becomes `2u`. A new test, `tests/rounding.rs`, checks f32 `+` and `*` on cases just above, just below and exactly at halfway points, and fails by name on a backend that does not round to nearest, ties to even (#288).
 
+### Data, examples, guide and benchmark
+
+- `scripts/bench/torch_cnn.py --device cuda` trains the PyTorch side of `mnist-cnn` and `cifar-cnn` on a CUDA GPU, from the same initial weights and batch order, with each step timed between `torch.cuda.synchronize()` calls and a median step time over every epoch but the first. `cudnn.benchmark` stays False unless `--cudnn-benchmark` is given. The CPU default's output is unchanged.
+
 ## v0.4.0 (2026-11-16)
 
 This release adds the `cavitation-gpu` crate, behind the `gpu` feature: device setup, buffer and pipeline reuse, one-submission steps, and GPU kernels for most of a training step (the GEMM, the convolution's forward pass and input gradient, pooling, element-wise layers, batch norm, the optimisers, the losses and the health values), each checked against its CPU twin. Training on the GPU through `fit` is not built yet: nothing in `cavitation-nn` runs these kernels, and the GPU model, trainer and device selection follow in 0.4.x releases. A default build has no wgpu in it. On the CPU, 3 × 3 convolutions run directly at the SIMD levels, and CNNs can now be shrunk by channel.
