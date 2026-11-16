@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- At the NEON level the direct f32 weight gradient of a 3 × 3 convolution (stride 1, padding 1, dilation 1, width a multiple of 4) takes three output channels per pass, 27 accumulators, so each padded-input load feeds three fused multiply-adds, and runs for any number of input channels; it ran only for at most 4. Each sum's order is unchanged, so it still matches `conv3x3_direct_weight_grad_twin` bit for bit. On an Apple M4 at 4 threads (`CAVITATION_KERNEL=neon`, `cifar-cnn --profile 9`, batch 128, medians of interleaved runs), the backward passes of the `cifar-cnn` network's convolutions take 0.68, 12.76, 6.53 and 12.93 ms instead of 1.06, 16.26, 7.36 and 14.60 with im2col and the GEMM on the last three, and the whole step 67.4 ms instead of 73.8 (#284).
+
 ### GPU
 
 - `OptimizerKernel`'s docs give plain SGD's value bound, where the backend rounds its `fma` twice, as `u·|p'| + u·(1 + u)·lr·|g|`; it was stated as `u·(|p'| + lr·|g|)`, which leaves out the second-order term (#287).
@@ -12,6 +16,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - A timed pass whose end timestamp reads before its beginning now has no time (`None`), and neither has its span; it counted as 0.
 - Span times on Metal are the step's own: the timestamps were resolved in the step's own command buffer, which on Metal read the counter samples of the step before, so each span had the previous step's time. They now resolve in a submission of their own after the step's has finished. `cavitation-bench gemm-gpu`, which times the same step over and over, gives the same medians as before (within 0.3% on an Apple M4).
 - `kernels::ConvWeightGrad`: the 2-D convolution's weight gradient on the GPU, NCHW, with stride, padding and dilation, for a batch of images in one call. It is an implicit GEMM through the tiled GEMM's core over the batch's `batch · oh · ow` output positions, cut into fixed blocks of `WEIGHT_GRAD_BLOCK` (1,024) consecutive positions: each block sums its positions in the CPU reference's order (image, output row, column) into a partial gradient of its own, and a second pass adds the partials in block order and overwrites the weight gradient, with no atomics. The blocks depend only on the shape, so runs give the same bits. With `L` positions per block and `B` blocks it is within `2(L + B + 2) · u · Σ|dy·x|` of `conv2d_backward_reference`'s weight gradient in f64, and exact on small integers, the `cifar-cnn` network's first two convolutions at batch 128 (131,072 positions in 128 blocks) included, checked on an Apple M4 (Metal).
+- `GpuModel::compile(&model, &params, batch, &gpu)` (in `cavitation-nn`, behind `gpu`) compiles a `Sequential` for batches of `batch` rows on the GPU: `Linear`, `Conv2d`, `MaxPool2d`, `AvgPool2d`, `BatchNorm2d`, `Dropout`, `Flatten`, `Identity`, and the activations `Relu`, `LeakyRelu`, `Tanh`, `Sigmoid` and `Gelu` (both forms). Any other layer, including a layer of your own that has parameters, is refused with `Error::Unsupported` naming its index and name; widths that do not chain, and masks that are not as wide as their layer's output, are `Error::InvalidData` naming the layer. Each parameter and batch-norm running statistic is uploaded under its `ParamId`, in one step, and comes back bit for bit (signed zeros, NaN payloads, subnormals and infinities included; checked on Vulkan and DX12); `num_batches_tracked` stays on the host. Neuron masks set on the model are compiled in as one bit per value of the batch. Running the model follows in the next changes (#297).
 
 ### Data, examples, guide and benchmark
 

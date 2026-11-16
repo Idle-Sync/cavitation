@@ -182,7 +182,9 @@ fn tree_sum_any(lanes: &[f32]) -> f32 {
 
 /// Adds one image's weight-gradient sums for `job` with a kernel `$name` of `$lanes` lanes
 /// under target feature `$feat`, with `$zero`, `$load`, `$store` and `$madd(acc, x, w)`,
-/// which returns `acc + x · w`.
+/// which returns `acc + x · w`. NEON has its own kernel, which takes three output channels
+/// at a time.
+#[cfg(target_arch = "x86_64")]
 macro_rules! weight_grad_kernel {
     ($name:ident, $feat:literal, $lanes:literal, $zero:expr, $load:path, $store:path,
      $madd:path) => {
@@ -352,13 +354,73 @@ mod arm {
         vld1q_dup_f32
     );
 
-    weight_grad_kernel!(
-        weight_grad_neon,
-        "neon",
-        4,
-        vdupq_n_f32(0.0),
-        vld1q_f32,
-        vst1q_f32,
-        madd_neon
-    );
+    /// For each output channel of `job`'s block, adds `Σ dy · x` over the image for each of
+    /// the nine taps to the block's totals, three output channels at a time (27
+    /// accumulators, so each padded-input load feeds three fused multiply-adds), then two or
+    /// one. Each sum's order is the one the module describes.
+    ///
+    /// # Safety
+    ///
+    /// `job`'s pointers must hold what [`WeightJob`] describes, `job.w` must be a multiple
+    /// of 4, and the CPU must support NEON.
+    #[target_feature(enable = "neon")]
+    pub(in crate::kernels) unsafe fn weight_grad_neon(job: &WeightJob) {
+        let mut o = job.o0;
+        while o < job.o1 {
+            // SAFETY: as this function's contract; the match keeps o + N <= job.o1.
+            unsafe {
+                match job.o1 - o {
+                    1 => weight_grad_neon_block::<1>(job, o),
+                    2 => weight_grad_neon_block::<2>(job, o),
+                    _ => weight_grad_neon_block::<3>(job, o),
+                }
+            }
+            o += (job.o1 - o).min(3);
+        }
+    }
+
+    /// [`weight_grad_neon`] for output channels `o..o + N`.
+    ///
+    /// # Safety
+    ///
+    /// As [`weight_grad_neon`], with `o + N <= job.o1`.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn weight_grad_neon_block<const N: usize>(job: &WeightJob, o: usize) {
+        let (wp, hw) = (job.w + 2, job.h * job.w);
+        let mut acc = [[vdupq_n_f32(0.0); 9]; N];
+        // SAFETY: every read is inside the padded plane (rows y..y + 3, columns x0..x0 + 6)
+        // or planes `o..o + N` of `dy`; every write is one of the block's totals for those
+        // output channels and input channel `c`.
+        unsafe {
+            let d = job.dy.add(o * hw);
+            for y in 0..job.h {
+                let mut x0 = 0;
+                while x0 + 4 <= job.w {
+                    let mut dv = [vdupq_n_f32(0.0); N];
+                    for (i, v) in dv.iter_mut().enumerate() {
+                        *v = vld1q_f32(d.add(i * hw + y * job.w + x0));
+                    }
+                    for ky in 0..3 {
+                        let row = job.pad.add((y + ky) * wp + x0);
+                        for kx in 0..3 {
+                            let (t, xv) = (ky * 3 + kx, vld1q_f32(row.add(kx)));
+                            for i in 0..N {
+                                acc[i][t] = madd_neon(acc[i][t], dv[i], xv);
+                            }
+                        }
+                    }
+                    x0 += 4;
+                }
+            }
+            let mut lanes = [0.0f32; 4];
+            for (i, sums) in acc.iter().enumerate() {
+                let out = job.out.add(((o + i - job.o0) * job.cin + job.c) * 9);
+                for (t, &a) in sums.iter().enumerate() {
+                    vst1q_f32(lanes.as_mut_ptr(), a);
+                    *out.add(t) += tree_sum(&lanes);
+                }
+            }
+        }
+    }
 }

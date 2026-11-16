@@ -1522,31 +1522,22 @@ pub fn conv3x3_direct_twin(
 /// plane once for all of them.
 const WEIGHT_GRAD_BLOCK: usize = 8;
 
-/// The most input channels for which NEON takes the direct weight gradient. On an Apple M4
-/// the direct kernel beat im2col and the GEMM on the 3-input-channel layer of the
-/// `cifar-cnn` network (backward 1.98 → 1.07 ms), but lost on its 32- and 64-channel
-/// layers (+0.5 to +2.0 ms each): there the NEON GEMM, which reuses each load across many
-/// fused multiply-adds, is the faster path. Untested between 4 and 32 channels.
-const NEON_WEIGHT_GRAD_MAX_IN: usize = 4;
-
 /// Whether the weight gradient of `geom` runs through [`conv3x3_direct_weight_grad`] at
 /// `level`: a 3 × 3 kernel with stride 1, padding 1 and dilation 1, a width that is a
 /// multiple of the level's vector width (4 at SSE4.2 and NEON, 8 at AVX2), at a level with
-/// one of those kernels on this CPU. Any channel counts at SSE4.2 and AVX2; at NEON at most
-/// 4 input channels, where it measured faster than the GEMM.
+/// one of those kernels on this CPU, for any channel counts.
 ///
 /// ```
 /// use cavitation_core::kernels::Level;
 /// use cavitation_core::kernels::conv::{Conv2dGeom, direct_weight_grad_runs};
 /// let g = Conv2dGeom::with_options(3, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
 /// assert!(!direct_weight_grad_runs(Level::Reference, &g));
-/// let wide = Conv2dGeom::with_options(32, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
-/// assert!(!direct_weight_grad_runs(Level::Neon, &wide));
+/// let odd = Conv2dGeom::with_options(32, 32, (32, 30), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+/// assert!(!direct_weight_grad_runs(Level::Neon, &odd)); // 30 is not a multiple of 4
 /// ```
 pub fn direct_weight_grad_runs(level: Level, geom: &Conv2dGeom) -> bool {
     let lanes = match level {
-        Level::Sse42 => 4,
-        Level::Neon if geom.in_channels <= NEON_WEIGHT_GRAD_MAX_IN => 4,
+        Level::Sse42 | Level::Neon => 4,
         Level::Avx2Fma => 8,
         _ => return false,
     };
