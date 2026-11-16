@@ -14,7 +14,7 @@ use cavitation_core::{ParamId, ParamStore, Tensor};
 use cavitation_gpu::kernels::{OptimizerKernel, OptimizerRule};
 use cavitation_gpu::{Gpu, PooledBuffer};
 use cavitation_nn::{Adam, AdamW, Optimizer, Sgd};
-use common::{Kit, Seeded, U, assert_within, for_each_gpu, seeded_values};
+use common::{FLOOR, Kit, Seeded, U, assert_within, for_each_gpu, seeded_values};
 
 /// The parameters' lengths. Each workgroup updates one parameter's run of 256 elements, and
 /// these end it at every kind of place: a 232-element tail (1000), 37, a single element, a
@@ -151,6 +151,23 @@ fn store_state(x: f64) -> f32 {
     }
 }
 
+/// The bound on plain SGD's value `p' = p − lr·g`, one `fma`, which WGSL lets a backend
+/// round once or twice ("inherited from x * y + z"): rounded twice, the product is within
+/// `u·lr·|g|` and the sum adds `u` of `p'` and of that error, so
+/// `u·|p'| + u·(1 + u)·lr·|g|`.
+fn plain_sgd_bound(value: f64, lr: f64, g: f64) -> f64 {
+    U * value.abs() + U * (1.0 + U) * lr * g.abs()
+}
+
+/// The largest error of `got` against `reference` as a share of one rounding, `u·|p'|`
+/// plus the floor: what a backend that fuses plain SGD's `fma` stays within.
+fn one_rounding_share(got: &[f32], reference: &[f64]) -> f64 {
+    got.iter()
+        .zip(reference)
+        .map(|(&g, &r)| (f64::from(g) - r).abs() / (U * r.abs() + FLOOR))
+        .fold(0.0, f64::max)
+}
+
 /// Picks one of an [`Exact`]'s results and its bound.
 type Pick = fn(&Exact) -> (f64, f64);
 
@@ -176,8 +193,7 @@ struct Exact {
 /// `cavitation_nn::optim`): the value `p`, its state `m` and `v`, its gradient `g`, and
 /// whether this is its first update, with constants `c`. The bounds are those
 /// `OptimizerKernel`'s docs state, which hold whether each `fma` rounds once or twice, with
-/// 5% to spare for second-order terms; plain SGD's one rounding has no margin and needs a
-/// fused `fma`.
+/// 5% to spare for second-order terms; plain SGD's is [`plain_sgd_bound`], exact.
 fn exact(
     rule: &OptimizerRule,
     c: &Constants,
@@ -205,7 +221,7 @@ fn exact(
             let plain = c.wd == 0.0 && c.momentum == 0.0;
             let buffer = U * (step.abs() + carried + s.abs() + decay);
             let value_bound = if plain {
-                U * value.abs()
+                plain_sgd_bound(value, c.lr, g)
             } else {
                 1.05 * (U * (value.abs() + c.lr * step.abs()) + c.lr * buffer)
             };
@@ -512,8 +528,10 @@ impl Twin {
 
 /// Every rule, 50 steps on the GPU, each step checked from the GPU's own starting state:
 /// every active element's value and state within its bound of the exact result with the
-/// GPU's `f32` constants (SGD without decay or momentum within one rounding), every inactive
-/// element's unchanged bit for bit, and the update counts those of the active steps.
+/// GPU's `f32` constants, every inactive element's unchanged bit for bit, and the update
+/// counts those of the active steps. For SGD without decay or momentum it also prints the
+/// worst error as a share of one rounding, which stays within 1 where the backend fuses the
+/// `fma`.
 #[test]
 fn every_step_is_within_its_bound_of_the_cpu_arithmetic() {
     for_each_gpu(|gpu| {
@@ -525,6 +543,15 @@ fn every_step_is_within_its_bound_of_the_cpu_arithmetic() {
             let mut before = twin.read(&mut kit);
             let mut counts = [0u32; LENS.len()];
             let mut worst = [0.0f64; 3];
+            let plain = matches!(
+                rule,
+                OptimizerRule::Sgd {
+                    momentum: 0.0,
+                    weight_decay: 0.0,
+                    ..
+                }
+            );
+            let mut fused = 0.0f64;
             for t in 0..STEPS {
                 let g = gradients(100 + r as u64, t);
                 twin.step(&mut kit, &g, 0, t);
@@ -576,6 +603,10 @@ fn every_step_is_within_its_bound_of_the_cpu_arithmetic() {
                             &format!("{rule:?} step {t} parameter {k} {what}"),
                         );
                         worst[s] = worst[s].max(w.ratio());
+                        if s == 0 && plain {
+                            fused =
+                                fused.max(one_rounding_share(&after[0][range.clone()], &reference));
+                        }
                     }
                     counts[k] += 1;
                 }
@@ -586,6 +617,9 @@ fn every_step_is_within_its_bound_of_the_cpu_arithmetic() {
                 "{rule:?}: worst error as a share of its bound: value {:.3}, first state {:.3}, second moment {:.3}",
                 worst[0], worst[1], worst[2]
             );
+            if plain {
+                println!("{rule:?}: worst value error as a share of one rounding: {fused:.3}");
+            }
         }
     });
 }
@@ -734,7 +768,7 @@ fn a_skip_before_the_first_update_changes_nothing() {
 
 /// 65,536 one-element parameters: 65,536 workgroups, so the grid takes two rows and all but
 /// one workgroup of the second row lie past the table. Every parameter moves by one plain
-/// SGD step, within one rounding, and counts one update.
+/// SGD step, within [`plain_sgd_bound`], and counts one update.
 #[test]
 fn many_parameters_cover_a_split_grid() {
     for_each_gpu(|gpu| {
@@ -763,11 +797,16 @@ fn many_parameters_cover_a_split_grid() {
             .zip(&g)
             .map(|(&p, &g)| f64::from(p) - lr * f64::from(g))
             .collect();
+        let got = kit.read(&values);
         assert_within(
-            &kit.read(&values),
+            &got,
             &reference,
-            |i| U * reference[i].abs(),
+            |i| plain_sgd_bound(reference[i], lr, f64::from(g[i])),
             "sgd over 65,536 parameters",
+        );
+        println!(
+            "sgd over 65,536 parameters: worst error as a share of one rounding: {:.3}",
+            one_rounding_share(&got, &reference)
         );
         assert!(kernel.steps().iter().all(|&c| c == 1));
     });
