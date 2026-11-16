@@ -35,6 +35,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 - `shrink::compact` compacts image models by channel: each output channel a channel mask switches off is removed from its `Conv2d`, from the `BatchNorm2d` and poolings of its run, and from the next `Conv2d`'s input channels or the channel's block of inputs of the `Linear` after a `Flatten`, and the compacted model matches the masked one within the rounding of the shorter sums. In the same pass it removes the off neurons of the model's `Linear` layers (a shrunk dense head after a `Flatten`), with the next `Linear`'s columns and a per-neuron `Prelu`'s slopes, as in a dense network. Before, `compact` refused any model with an image layer (#209).
 - `shrink::shrink` shrinks `Conv2d` layers by output channel beside hidden `Linear` layers by neuron: by default every hidden `Linear` and every `Conv2d` whose channels reach a `Conv2d` or a `Linear`. Each step measures the convs with `channel_activity`, ranks their channels (`Ranking::OutNorm` takes a channel's input-channel weights in the next conv, or its block of columns in the `Linear` after a `Flatten`), switches the lowest off with `set_channel_mask`, retrains and measures; `ShrinkStep::kept` counts channels for a conv, and the parameter count is the compacted network's. `fold_means` folds neurons only and is refused with a conv to shrink. `train_found_size` rebuilds a shrunk CNN with new starting values (convs as `Conv2d::new` draws them, batch norms started again). `activity`, `ablate`, `shrink` and `train_found_size` no longer refuse a model with an image layer: its `Linear` layers are measured and shrunk as in a dense network (#209).
 
+### Data, examples, guide and benchmark
+
+- The `shrink_mnist_cnn` example and the section "Shrinking a CNN" of the guide's chapter "Image models": the LeNet-5-style network shrunk by channel and by neuron on 12,000 MNIST digits, from 61,706 parameters to 11,074 within half an accuracy point, compacted, and compared with the same size trained from new random weights (#209).
+
 ## v0.3.2 (2026-11-15)
 
 ### Layers, training and inference (`cavitation-nn`)
