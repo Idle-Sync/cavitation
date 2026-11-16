@@ -30,6 +30,8 @@
 //! - [`kernels::Gemm`]: the tiled matrix product `C = A·B + β·C` with either operand
 //!   transposed, within `2(k + 3) · u · Σ|terms|` of the exact product and exact on small
 //!   integers.
+//! - [`kernels::ConvForward`]: the 2-D convolution forward pass as an implicit GEMM, with
+//!   stride, padding, dilation and a bias, within the GEMM's bound of the CPU reference.
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!

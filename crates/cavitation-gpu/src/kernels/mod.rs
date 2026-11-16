@@ -1,11 +1,13 @@
 //! The GPU kernels, one module per family, each checked against its CPU twin in
 //! `cavitation_core::kernels`.
 
+mod conv;
 mod elementwise;
 mod gemm;
 mod optimizer;
 mod pooling;
 
+pub use conv::{ConvCall, ConvDims, ConvForward};
 pub use elementwise::{Elementwise, ElementwiseCall, ElementwiseKernels};
 pub use gemm::{Gemm, GemmCall, GemmDims};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
