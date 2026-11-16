@@ -11,6 +11,8 @@
 mod forward;
 #[cfg(test)]
 mod forward_tests;
+#[cfg(test)]
+mod health_tests;
 mod model;
 mod trainer;
 #[cfg(test)]

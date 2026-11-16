@@ -9,9 +9,9 @@ use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_gpu::kernels::{
     AvgPool2d, BatchNormBackward, BatchNormForward, BatchStats, BiasAddCall, ChannelDims,
     ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
-    ConvWeightGradCall, CrossEntropyCall, Elementwise, ElementwiseCall, FiniteFlag, FiniteFlagCall,
-    GemmCall, GemmDims, MaxPool2d, MeanSquaredError, MseCall, OptimizerKernel, OptimizerRule,
-    RunningUpdate, SoftmaxCrossEntropy,
+    ConvWeightGradCall, CrossEntropyCall, DeadRelu, DeadReluCall, Elementwise, ElementwiseCall,
+    FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, MaxPool2d, MeanSquaredError, MseCall,
+    OptimizerKernel, OptimizerRule, RunningUpdate, SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepSizes, wgpu,
@@ -19,7 +19,11 @@ use cavitation_gpu::{
 
 use super::forward::Kernels;
 use super::model::{Act, GpuModel, Kind};
-use crate::{BatchView, Loss, OptimizerConfig, Sequential, TargetsView};
+use crate::health::channel_size;
+use crate::{
+    BatchView, GradStats, Health, HealthMonitor, Loss, OnNonFinite, OptimizerConfig, Sequential,
+    StepInputs, TargetsView,
+};
 
 /// The usage of every training buffer: bound as storage, written by copies and uploads, read
 /// back.
@@ -47,6 +51,11 @@ struct TrainKernels {
     mse: MeanSquaredError,
     /// The finite flag over the loss and every gradient.
     finite: FiniteFlag,
+    /// Each parameter gradient's sum of squares, for the gradient-norm checks.
+    squares: SumSquares,
+    /// Each ReLU neuron's (or channel's) bit, set when it was non-zero in the step, for the
+    /// dead-ReLU check, which ORs the steps' bits over the epoch.
+    dead_relu: DeadRelu,
 }
 
 /// A pooling layer's kernel, built for the batch.
@@ -146,6 +155,28 @@ struct TrainPass {
     /// Each max pooling's winners, an index into the scratch, in the model's order.
     #[allow(dead_code)] // The tests read the winners.
     winners: Vec<usize>,
+    /// Each parameter gradient's sum of squares, into word `k` of `square_sums`.
+    squares: Vec<SumSquaresCall>,
+    /// The sums of squares, one `f32` per parameter in the model's order.
+    square_sums: PooledBuffer,
+    /// Each ReLU layer's bits.
+    relus: Vec<ReluBits>,
+    /// The bits of every ReLU layer, overwritten each step.
+    relu_bits: PooledBuffer,
+}
+
+/// One ReLU layer's dead-neuron bits: one per channel of `spatial` values, or one per neuron
+/// (`spatial` 1), as the CPU health checks group them.
+#[derive(Debug)]
+struct ReluBits {
+    /// The layer.
+    layer: usize,
+    /// Its first word in the bits.
+    word: usize,
+    /// Its channels: its width over `spatial`.
+    channels: usize,
+    /// The bits' call.
+    call: DeadReluCall,
 }
 
 /// The optimiser's state on the GPU: the parameters and gradients laid end to end, its state
@@ -199,6 +230,18 @@ pub struct GpuOptimizerState {
 ///
 /// While a step runs on the GPU, the next step's dropout masks are drawn on the host.
 ///
+/// Every step runs the CPU trainer's [`Health`] checks (the default unless
+/// [`set_health`](GpuTrainer::set_health) changes it) on values the step reads back with its
+/// loss: the finite flag, each gradient's count of NaN and infinite values and its sum of
+/// squares, and each ReLU neuron's bit, set when it was non-zero in the step (one per channel
+/// after a convolution).
+/// It sends the CPU's warnings and returns the CPU's errors, at the same steps and naming the
+/// same parameters. One difference is deliberate: a step whose loss or gradient is NaN or
+/// infinite is never applied on the GPU, so under [`OnNonFinite::Stop`] the parameters, the
+/// optimiser's state and the running statistics stay as they were, where the CPU trainer has
+/// already applied a non-finite gradient that came with a finite loss.
+/// [`OnNonFinite::Warn`], which trains on through such a step, is refused.
+///
 /// # Examples
 ///
 /// ```
@@ -234,8 +277,7 @@ pub struct GpuOptimizerState {
 ///     trainer.sync_to(&mut params);
 /// }
 /// ```
-#[derive(Debug)]
-pub struct GpuTrainer {
+pub struct GpuTrainer<'s> {
     /// The model: its parameters and buffers, and its evaluation pass.
     model: GpuModel,
     /// The training kernels.
@@ -259,9 +301,47 @@ pub struct GpuTrainer {
     next_for: u64,
     /// The bytes of the batch's upload, reused from step to step.
     upload: Vec<u8>,
+    /// The health checks run on every step.
+    health: HealthMonitor<'s>,
+    /// The model's parameter names, for the health checks' messages.
+    names: Vec<(String, ParamId)>,
+    /// The model's parameters (an index into its parameter order) in the order of the
+    /// store, the order the CPU optimisers fill their gradient statistics in.
+    store_order: Vec<(ParamId, usize)>,
+    /// The gradient statistics of the last step, from the sums of squares and the counts.
+    stats: GradStats,
+    /// The last step's health values: each gradient's sum of squares and count of NaN and
+    /// infinite values, and the ReLU bits.
+    read: HealthRead,
+    /// The steps left out under [`OnNonFinite::Skip`].
+    skipped: u64,
 }
 
-impl GpuTrainer {
+/// One step's health values, read back with the loss and the flag.
+#[derive(Debug, Default)]
+struct HealthRead {
+    /// Each parameter gradient's sum of squares, in the model's order.
+    squares: Vec<f32>,
+    /// Each parameter gradient's count of NaN and infinite values, in the model's order.
+    counts: Vec<f32>,
+    /// The ReLU layers' bits.
+    bits: Vec<u32>,
+}
+
+impl std::fmt::Debug for GpuTrainer<'_> {
+    /// Writes the model, the steps taken and skipped and the health settings.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuTrainer")
+            .field("model", &self.model)
+            .field("loss", &self.loss)
+            .field("steps", &self.taken)
+            .field("skipped", &self.skipped)
+            .field("health", self.health.health())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'s> GpuTrainer<'s> {
     /// A trainer for `model`, with its values in `params`, that minimises `loss` with
     /// `optimizer` on batches of `batch_size` rows on `gpu`.
     ///
@@ -296,7 +376,7 @@ impl GpuTrainer {
         loss: Loss,
         batch_size: usize,
         gpu: &Gpu,
-    ) -> Result<GpuTrainer, Error> {
+    ) -> Result<GpuTrainer<'s>, Error> {
         let rule = match *optimizer {
             OptimizerConfig::Sgd {
                 lr,
@@ -355,7 +435,19 @@ impl GpuTrainer {
             cross_entropy: SoftmaxCrossEntropy::new(gpu, &mut m.cache).map_err(shader)?,
             mse: MeanSquaredError::new(gpu, &mut m.cache).map_err(shader)?,
             finite: FiniteFlag::new(gpu, &mut m.cache).map_err(shader)?,
+            squares: SumSquares::new(gpu, &mut m.cache).map_err(shader)?,
+            dead_relu: DeadRelu::new(gpu, &mut m.cache).map_err(shader)?,
         };
+        // The ReLU layers whose outputs the dead-neuron check reads, with their values per
+        // channel as the CPU check groups them.
+        let relus: Vec<(usize, usize)> = (0..m.layers.len())
+            .filter(|&i| matches!(m.layers[i].kind, Kind::Activation(Act::Relu)))
+            .map(|i| (i, channel_size(model, i, m.layers[i].outputs).unwrap_or(1)))
+            .collect();
+        let relu_words: usize = relus
+            .iter()
+            .map(|&(i, spatial)| (m.layers[i].outputs / spatial).div_ceil(32))
+            .sum();
         let lens: Vec<usize> = m.params.iter().map(|t| t.len).collect();
         let kernel =
             OptimizerKernel::new(gpu, &mut m.cache, &mut m.pool, rule, &lens).map_err(shader)?;
@@ -383,11 +475,13 @@ impl GpuTrainer {
                 + kernel.upload_bytes()
                 + 64 * norms as u64
                 + 4096,
-            readback_bytes: round(4 * elements).max(16),
+            // The loss, the flag and the health values each step, or one flat buffer.
+            readback_bytes: round(4 * elements)
+                .max(16 + 2 * round(4 * lens.len()) + round(4 * relu_words)),
             ..StepSizes::default()
         };
         let mut steps = StepEncoder::new(gpu, sizes);
-        let pass = TrainPass::build(m, &kernels, &mut steps, loss).map_err(shader)?;
+        let pass = TrainPass::build(m, &kernels, &mut steps, loss, &relus).map_err(shader)?;
 
         let flat_values = m.pool.take(4 * elements as u64, usage());
         let flat_grads = m.pool.take(4 * elements as u64, usage());
@@ -437,6 +531,14 @@ impl GpuTrainer {
             .iter()
             .map(|d| vec![0u32; d.len.div_ceil(32)])
             .collect();
+        let names = model.parameter_names();
+        let mut store_order: Vec<(ParamId, usize)> = gpu_model
+            .params
+            .iter()
+            .enumerate()
+            .map(|(k, t)| (t.id, k))
+            .collect();
+        store_order.sort_by_key(|(id, _)| id.position());
         let mut trainer = GpuTrainer {
             model: gpu_model,
             kernels,
@@ -449,6 +551,12 @@ impl GpuTrainer {
             next,
             next_for: 0,
             upload: Vec::new(),
+            health: HealthMonitor::new(Health::default()).with_loss(loss),
+            names,
+            store_order,
+            stats: GradStats::new(),
+            read: HealthRead::default(),
+            skipped: 0,
         };
         trainer.draw_next(1);
         Ok(trainer)
@@ -459,14 +567,19 @@ impl GpuTrainer {
     /// optimiser's update, then batch norm's running statistics. Returns the loss.
     ///
     /// The update and the running statistics are skipped on the GPU when the loss or a
-    /// gradient is NaN or infinite; the step is counted either way.
+    /// gradient is NaN or infinite; the step is counted either way, and under
+    /// [`OnNonFinite::Skip`] also in [`skipped_steps`](Self::skipped_steps), with its loss
+    /// returned. The health checks run on every step (see [`GpuTrainer`]).
     ///
     /// # Errors
     ///
     /// [`Error::InvalidData`] if the batch does not hold [`batch_size`](Self::batch_size) rows
-    /// of the model's input width, or its targets do not suit the loss or the model's output;
-    /// [`Error::NonFinite`], naming the step, when the loss or a gradient was not finite (the
-    /// parameters, the optimiser's state and the running statistics are then as they were).
+    /// of the model's input width, or its targets do not suit the loss or the model's output.
+    /// Under [`OnNonFinite::Stop`], [`Error::NonFinite`] as the CPU trainer returns it, naming
+    /// the step and `"loss"` (with the first NaN or infinite input or target value, or that
+    /// the inputs were finite) or the first parameter in the store whose gradient was not
+    /// finite; the parameters, the optimiser's state and the running statistics are then as
+    /// they were.
     ///
     /// # Examples
     ///
@@ -558,6 +671,15 @@ impl GpuTrainer {
             &mut step,
         );
         self.kernels.finite.record(&mut step, &self.pass.finite);
+        for call in &self.pass.squares {
+            self.kernels.squares.record(&mut step, call);
+        }
+        let dead_relu = self.health.health().dead_relu;
+        if dead_relu {
+            for relu in &self.pass.relus {
+                self.kernels.dead_relu.record(&mut step, &relu.call);
+            }
+        }
         let flat = &mut self.flat;
         for (g, &off) in self.pass.param_grads.iter().zip(&flat.offsets) {
             step.copy(g.buffer(), 0, flat.grads.buffer(), 4 * off as u64, g.len());
@@ -577,8 +699,17 @@ impl GpuTrainer {
         }
         let loss_at = step.read_back(self.pass.loss_value.buffer(), 0, 4);
         let flag_at = step.read_back(self.pass.flag.buffer(), 0, 4);
+        let n = self.pass.squares.len() as u64;
+        let squares_at = step.read_back(self.pass.square_sums.buffer(), 0, 4 * n);
+        let counts_at = step.read_back(self.pass.finite.counts().buffer(), 0, 4 * n);
+        let words = self.pass.relus.last().map_or(0, |r| {
+            r.word + cavitation_gpu::kernels::DeadRelu::words(u32_of(r.channels)) as usize
+        });
+        let bits_at = (dead_relu && words > 0)
+            .then(|| step.read_back(self.pass.relu_bits.buffer(), 0, 4 * words as u64));
         // The next step's masks are drawn while this one runs.
         let (seed, masks, next) = (self.dropout_seed, &self.pass.masks, &mut self.next);
+        let read = &mut self.read;
         let (value, flag) = thread::scope(|scope| {
             let drawing = (!masks.is_empty()).then(|| {
                 scope.spawn(move || {
@@ -592,6 +723,17 @@ impl GpuTrainer {
             let word = |at: usize| [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
             let value = f32::from_le_bytes(word(loss_at));
             let flag = u32::from_le_bytes(word(flag_at));
+            let floats = |at: usize, n: usize, out: &mut Vec<f32>| {
+                out.clear();
+                out.extend((0..n).map(|k| f32::from_le_bytes(word(at + 4 * k))));
+            };
+            floats(squares_at, n as usize, &mut read.squares);
+            floats(counts_at, n as usize, &mut read.counts);
+            read.bits.clear();
+            if let Some(at) = bits_at {
+                read.bits
+                    .extend((0..words).map(|k| u32::from_le_bytes(word(at + 4 * k))));
+            }
             if let Some(drawing) = drawing {
                 drawing
                     .join()
@@ -606,15 +748,185 @@ impl GpuTrainer {
             update.commit(ran);
         }
         self.taken = step_number;
-        if ran {
-            Ok(value)
-        } else {
-            Err(Error::NonFinite {
-                step: step_number,
-                location: "the loss or a gradient".to_string(),
-                detail: None,
-            })
+        let inputs = StepInputs {
+            x: batch.x,
+            targets: batch.targets,
+            rows: None,
+        };
+        let checked = self.check(model, step_number, value, inputs);
+        // The GPU applied the update exactly when the flag was clear; the checks must agree:
+        // a set flag is a stopped step (an error) or a skipped one (no update).
+        assert!(
+            match &checked {
+                Ok(applied) => *applied == ran,
+                Err(_) => !ran,
+            },
+            "GpuTrainer::step: the health checks disagree with the GPU's finite flag ({flag}) at \
+             step {step_number}"
+        );
+        match checked {
+            Ok(applied) => {
+                self.skipped += u64::from(!applied);
+                Ok(value)
+            }
+            Err(e) => Err(e),
         }
+    }
+
+    /// The health checks of step `step` with loss `value`, on the values read back: the
+    /// loss, the dead-ReLU bits, the gradients' finiteness (under [`OnNonFinite::Skip`]) and
+    /// their norms, in the CPU trainer's order. `Ok(true)` when the step trained, `Ok(false)`
+    /// when it was left out.
+    fn check(
+        &mut self,
+        model: &Sequential,
+        step: u64,
+        value: f32,
+        inputs: StepInputs<'_>,
+    ) -> Result<bool, Error> {
+        self.health.check_loss(step, value, inputs)?;
+        if self.health.health().dead_relu && !self.health.left_out(value) {
+            let (layers, relus, bits) = (&self.model.layers, &self.pass.relus, &self.read.bits);
+            self.health.track_relus(
+                model,
+                layers.len(),
+                |i| layers[i].outputs,
+                |i, spatial, alive| {
+                    let relu = relus
+                        .iter()
+                        .find(|r| r.layer == i)
+                        .expect("every ReLU layer has its bits");
+                    for (c, values) in alive.chunks_mut(spatial).enumerate() {
+                        let w = bits[relu.word + c / 32];
+                        if w >> (c % 32) & 1 == 1 {
+                            values.fill(true);
+                        }
+                    }
+                },
+            );
+        }
+        let (counts, order) = (&self.read.counts, &self.store_order);
+        let index = |id: ParamId| {
+            order
+                .iter()
+                .find(|(i, _)| *i == id)
+                .map(|&(_, k)| k)
+                .expect("every named parameter is the model's")
+        };
+        if !self
+            .health
+            .before_update_with(step, value, &self.names, |id| counts[index(id)] == 0.0)
+        {
+            return Ok(false);
+        }
+        self.stats.reset(order.len());
+        for &(id, k) in order {
+            let finite = self.read.counts[k] == 0.0;
+            let squares = self.read.squares[k];
+            // The GPU sums in `f32`, the CPU in `f64`: a finite gradient whose sum overflows
+            // `f32` is reported with its norm at least √f32::MAX, as exploding.
+            let sum = if finite && !squares.is_finite() {
+                f64::from(f32::MAX)
+            } else {
+                f64::from(squares)
+            };
+            self.stats.push(id, sum, finite);
+        }
+        self.health.after_update(step, &self.stats, &self.names)?;
+        Ok(true)
+    }
+
+    /// Replaces the health checks run on every step with `health`, starting afresh, as
+    /// [`Trainer::set_health`](crate::Trainer::set_health) does.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Unsupported`] for [`OnNonFinite::Warn`]: the GPU never applies a step whose
+    /// loss or gradient is NaN or infinite, so it cannot train on as `Warn` does;
+    /// [`OnNonFinite::Skip`] leaves such a step out, and [`OnNonFinite::Stop`] stops at it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_gpu::Gpu;
+    /// use cavitation_nn::{GpuTrainer, Health, Linear, Loss, OnNonFinite, OptimizerConfig, Sequential};
+    ///
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 3, 2, &mut Rng::seed(0)));
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let sgd = OptimizerConfig::Sgd { lr: 0.1, momentum: 0.0, weight_decay: 0.0 };
+    ///     let mut trainer = GpuTrainer::new(&net, &params, &sgd, Loss::Mse, 4, &gpu).unwrap();
+    ///     let skip = Health { on_non_finite: OnNonFinite::Skip, ..Health::quiet() };
+    ///     assert!(trainer.set_health(skip).is_ok());
+    ///     let warn = Health { on_non_finite: OnNonFinite::Warn, ..Health::quiet() };
+    ///     assert!(trainer.set_health(warn).is_err());
+    /// }
+    /// ```
+    pub fn set_health(&mut self, health: Health<'s>) -> Result<(), Error> {
+        if health.on_non_finite == OnNonFinite::Warn {
+            return Err(Error::Unsupported(
+                "GpuTrainer: OnNonFinite::Warn is not run on the GPU, which never applies a step \
+                 whose loss or gradient is NaN or infinite; use OnNonFinite::Skip to train past \
+                 such a step"
+                    .to_string(),
+            ));
+        }
+        self.health = HealthMonitor::new(health).with_loss(self.loss);
+        Ok(())
+    }
+
+    /// Ends epoch `epoch` of the health checks, as [`Trainer::end_epoch`](crate::Trainer::end_epoch)
+    /// does: the dead-neuron report, and the check that not every step of the epoch was left
+    /// out under [`OnNonFinite::Skip`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NonFinite`] if every step of the epoch was left out under `Skip`.
+    ///
+    /// # Examples
+    ///
+    /// See [`skipped_steps`](Self::skipped_steps).
+    pub fn end_epoch(&mut self, epoch: usize) -> Result<(), Error> {
+        self.health.end_epoch(epoch)
+    }
+
+    /// The steps left out under [`OnNonFinite::Skip`], as
+    /// [`Trainer::skipped_steps`](crate::Trainer::skipped_steps) counts them; each is counted
+    /// in [`steps`](Self::steps) too.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, TensorView};
+    /// use cavitation_gpu::Gpu;
+    /// use cavitation_nn::{
+    ///     BatchView, GpuTrainer, Health, Linear, Loss, OnNonFinite, OptimizerConfig, Sequential,
+    ///     TargetsView,
+    /// };
+    ///
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(Linear::new(&mut params, 2, 1, &mut Rng::seed(0)));
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let sgd = OptimizerConfig::Sgd { lr: 0.1, momentum: 0.0, weight_decay: 0.0 };
+    ///     let mut trainer = GpuTrainer::new(&net, &params, &sgd, Loss::Mse, 2, &gpu).unwrap();
+    ///     let skip = Health { on_non_finite: OnNonFinite::Skip, ..Health::quiet() };
+    ///     trainer.set_health(skip).unwrap();
+    ///     static GOOD: [f32; 4] = [1.0, 2.0, 3.0, 4.0];
+    ///     static BAD: [f32; 4] = [1.0, f32::NAN, 3.0, 4.0];
+    ///     static T: [f32; 2] = [1.0, 2.0];
+    ///     let batch = |x: &'static [f32]| BatchView {
+    ///         x: TensorView::from_slice(x, &[2, 2]).unwrap(),
+    ///         targets: TargetsView::Values(TensorView::from_slice(&T, &[2, 1]).unwrap()),
+    ///     };
+    ///     assert!(trainer.step(&net, batch(&GOOD)).unwrap().is_finite());
+    ///     assert!(trainer.step(&net, batch(&BAD)).unwrap().is_nan()); // left out
+    ///     assert_eq!((trainer.steps(), trainer.skipped_steps()), (2, 1));
+    ///     assert!(trainer.end_epoch(1).is_ok()); // one step of the epoch trained
+    /// }
+    /// ```
+    pub fn skipped_steps(&self) -> u64 {
+        self.skipped
     }
 
     /// Copies the parameters, batch norm's running statistics and batch counts into `params`
@@ -964,12 +1276,14 @@ struct Saved {
 
 impl TrainPass {
     /// Prepares the training step of `m`: the forward pass in training mode, the loss, the
-    /// backward pass, the finite flag and the running-statistics updates.
+    /// backward pass, the finite flag, the health values and the running-statistics updates.
+    /// `relus` lists each ReLU layer with its values per channel.
     fn build(
         m: &mut GpuModel,
         train: &TrainKernels,
         steps: &mut StepEncoder,
         loss: Loss,
+        relus: &[(usize, usize)],
     ) -> Result<TrainPass, GpuError> {
         let batch = m.batch;
         let k = &m.kernels;
@@ -1397,6 +1711,39 @@ impl TrainPass {
         let finite = train
             .finite
             .call(steps, pool, (&loss_value, 0), &grads_list, &flag);
+        // The health values: each gradient's sum of squares, and each ReLU layer's bits.
+        let square_sums = pool.take(4 * grads_list.len().max(1) as u64, usage());
+        let squares = grads_list
+            .iter()
+            .enumerate()
+            .map(|(k, &g)| train.squares.call(steps, pool, g, &square_sums, u32_of(k)))
+            .collect();
+        let words: usize = relus
+            .iter()
+            .map(|&(i, spatial)| DeadRelu::words(u32_of(m.layers[i].outputs / spatial)) as usize)
+            .sum();
+        let relu_bits = pool.take(4 * words.max(1) as u64, usage());
+        let mut word = 0;
+        let relus = relus
+            .iter()
+            .map(|&(i, spatial)| {
+                let channels = m.layers[i].outputs / spatial;
+                let dims = ChannelDims::new(u32_of(batch), u32_of(channels), u32_of(spatial));
+                let y = &values[saved[i].pre];
+                let call =
+                    train
+                        .dead_relu
+                        .call(steps, pool, dims, y, &relu_bits, u32_of(word), false);
+                let bits = ReluBits {
+                    layer: i,
+                    word,
+                    channels,
+                    call,
+                };
+                word += DeadRelu::words(u32_of(channels)) as usize;
+                bits
+            })
+            .collect();
         let mut running = Vec::new();
         for (i, layer) in m.layers.iter().enumerate() {
             if let (Kind::BatchNorm2d(norm), Some((f, st))) = (layer.kind, saved[i].norm)
@@ -1439,6 +1786,10 @@ impl TrainPass {
             cleared,
             scratch,
             masks,
+            squares,
+            square_sums,
+            relus,
+            relu_bits,
         })
     }
 }
