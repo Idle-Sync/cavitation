@@ -1755,9 +1755,12 @@ fn model_without_hidden_linear_refused() {
         assert!(msg.contains("no hidden layer to shrink"), "{msg}");
     }
     let mut net = hidden_network(&mut params, 4, 8);
-    for (bad, words) in [(1, "layer 1 is not a Linear"), (2, "last Linear")] {
+    for (bad, words) in [
+        (1, "layer 1 is neither a Linear nor a Conv2d"),
+        (2, "last Linear"),
+    ] {
         let config = ShrinkConfig {
-            linears: vec![0, bad],
+            layers: vec![0, bad],
             ..quick(clusters(30, 4, 6))
         };
         let err = shrink(&mut net, &mut params, &clusters(48, 4, 7), config).unwrap_err();
@@ -1926,7 +1929,12 @@ fn carve_retrains_on_the_rest() {
     let config = ShrinkConfig {
         validation: Some(Validation::Carve { share: 0.26 }),
         ranking: Ranking::Custom(Box::new(|ctx| {
-            seen.push(ctx.activity.clone());
+            seen.push([
+                ctx.mean.to_vec(),
+                ctx.mean_abs.to_vec(),
+                ctx.firing.to_vec(),
+                ctx.max.to_vec(),
+            ]);
             ctx.on.iter().map(|&j| j as f64).collect()
         })),
         step_bp: 2000,
@@ -1936,6 +1944,10 @@ fn carve_retrains_on_the_rest() {
     let report = shrink(&mut net, &mut params, &train, config).unwrap();
     let rest = train.subset(0..74);
     let want = activity(&start_net, &start, &rest, &[0], 256).unwrap();
+    let want: Vec<[Vec<f64>; 4]> = want
+        .into_iter()
+        .map(|a| [a.mean, a.mean_abs, a.firing, a.max])
+        .collect();
     assert_eq!(seen, want);
     let (masks, store) = report.steps[0].checkpoint.as_ref().unwrap();
     let (mut by_hand, mut values) = (start_net.clone(), start.clone());
@@ -2308,7 +2320,7 @@ fn remove_exactly(
         fold_means,
         criterion: Some(ALWAYS),
         ranking: Ranking::Custom(Box::new(move |ctx: &RankContext<'_>| {
-            let target = if ctx.linear == 0 {
+            let target = if ctx.layer == 0 {
                 neurons[0]
             } else {
                 neurons[1]
@@ -2408,7 +2420,7 @@ fn check_later_means(linears: Vec<usize>, kept: [usize; 2]) {
     config.ranking = Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
         ctx.on.iter().map(|&j| j as f64).collect()
     }));
-    config.linears = linears;
+    config.layers = linears;
     let report = shrink(&mut net, &mut params, &train, config).unwrap();
     assert_eq!(report.steps[0].kept, kept);
     let removed: Vec<usize> = off_in(&report.steps[0], 2);
@@ -2910,11 +2922,14 @@ fn train_found_size_keeps_layers_without_a_bias() {
     }
 }
 
-/// Every shrink tool refuses a model with an image layer, before doing anything, with
-/// `Error::Unsupported` naming the layer: each of the five built-in image layers, at layer
-/// 1 behind a `Linear`, in a small network on 1 × 4 × 4 images.
+/// The neuron tools work on the `Linear` layers of a model with an image layer: each of
+/// the five built-in image layers, at layer 1 behind a `Linear`, in a small network on
+/// 1 × 4 × 4 images. `activity` and `ablate` measure the hidden `Linear`, `compact` copies
+/// the model with no mask and removes a hidden `Linear`'s off neurons as in a dense
+/// network, `train_found_size` trains the compacted size, and `shrink` shrinks the hidden
+/// `Linear` by neuron.
 #[test]
-fn image_layers_are_refused() {
+fn neuron_tools_on_image_models() {
     use cavitation_core::{Conv2dGeom, Pool2dGeom};
     use cavitation_nn::{AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv2d, MaxPool2d};
     type Make = fn(&mut ParamStore, Sequential) -> (Sequential, usize, &'static str);
@@ -2947,41 +2962,462 @@ fn image_layers_are_refused() {
         let mut params = ParamStore::new();
         let first = Sequential::new().push(Linear::new(&mut params, 16, 16, &mut rng));
         let (net, out, name) = make(&mut params, first);
-        let mut net = net
+        let net = net
             .push(Linear::new(&mut params, out, 6, &mut rng))
             .push(Relu)
             .push(Linear::new(&mut params, 6, 2, &mut rng));
-        let refused = |tool: &str, r: Result<(), Error>| match r {
-            Err(Error::Unsupported(m)) => {
-                assert!(m.starts_with(&format!("{tool}: layer 1 ")), "{m}");
-                assert!(m.contains(name), "{m}");
-            }
-            other => panic!("{tool} on {name}: {other:?}"),
-        };
-        refused(
-            "activity",
-            activity(&net, &params, &data, &[2], 4).map(drop),
-        );
-        refused(
-            "ablate",
-            ablate(&net, &params, &data, &[2], Loss::CrossEntropy, 4).map(drop),
-        );
-        refused("compact", compact(&net, &params).map(drop));
-        refused(
-            "train_found_size",
-            train_found_size(&net, &params, &data, &data, FromScratch::default()).map(drop),
+        let stats = activity(&net, &params, &data, &[2], 4).unwrap();
+        assert_eq!(stats[0].mean.len(), 6, "{name}");
+        let ranked = ablate(&net, &params, &data, &[2], Loss::CrossEntropy, 4).unwrap();
+        assert_eq!(ranked.len(), 6, "{name}");
+        let (copy, _) = compact(&net, &params).unwrap();
+        assert_eq!(copy.len(), net.len(), "{name}");
+        let mut masked = net.clone();
+        masked.set_neuron_mask(2, NeuronMask::from_off(6, &[1]));
+        // The neurons of a Linear in an image model are removed as in a dense network.
+        let (small, _) = compact(&masked, &params).unwrap();
+        assert_eq!(small.linear(2).unwrap().outputs(), 5, "{name}");
+        assert_eq!(small.linear(4).unwrap().inputs(), 5, "{name}");
+        let found = train_found_size(&masked, &params, &data, &data, FromScratch::default());
+        assert_eq!(
+            found.unwrap().model.linear(2).unwrap().outputs(),
+            5,
+            "{name}"
         );
         let config = ShrinkConfig {
+            layers: vec![2],
             validation: Some(Validation::Given(data.clone())),
+            max_removed_bp: 2000,
+            criterion: Some(Criterion::LossIncrease {
+                relative: f64::INFINITY,
+            }),
             ..ShrinkConfig::default()
         };
-        let before = params.clone();
-        refused(
-            "shrink",
-            shrink(&mut net, &mut params, &data, config).map(drop),
-        );
+        let (mut net, mut params) = (net, params);
+        let report = shrink(&mut net, &mut params, &data, config).unwrap();
+        assert_eq!(report.steps.len(), 2, "{name}");
+        // At 2,000 bp the 6 neurons keep ceil(6 · 0.8) = 5.
+        assert_eq!(report.steps[1].kept, [5], "{name}");
+        assert_eq!(net.neuron_mask(2).unwrap().count_on(), 5, "{name}");
+    }
+}
+
+/// A small CNN on 6 × 6 images in 3 classes: conv(1 → 4, 3 × 3, padding 1) → batch norm →
+/// ReLU → max pool 2 × 2 → conv(4 → 4, 3 × 3, padding 1) → ReLU → flatten →
+/// linear(36 → 3). Its two convs are the layers `shrink` shrinks by default (the linear's
+/// neurons are the outputs).
+fn cnn(params: &mut ParamStore) -> Sequential {
+    use cavitation_core::{Conv2dGeom, Pool2dGeom};
+    use cavitation_nn::{BatchNorm2d, Conv2d, Flatten, MaxPool2d};
+    let mut rng = Rng::seed(11);
+    let same = |ins, outs, size| {
+        Conv2dGeom::with_options(ins, outs, size, (3, 3), (1, 1), (1, 1), (1, 1)).unwrap()
+    };
+    Sequential::new()
+        .push(Conv2d::new(params, same(1, 4, (6, 6)), &mut rng))
+        .push(BatchNorm2d::new(params, 4, (6, 6)))
+        .push(Relu)
+        .push(MaxPool2d::new(Pool2dGeom::new(4, (6, 6), (2, 2)).unwrap()))
+        .push(Conv2d::new(params, same(4, 4, (3, 3)), &mut rng))
+        .push(Relu)
+        .push(Flatten)
+        .push(Linear::new(params, 36, 3, &mut rng))
+}
+
+/// The number of values in the parameters of `model`.
+fn parameters_of(model: &Sequential, params: &ParamStore) -> usize {
+    (0..model.len())
+        .flat_map(|i| model.layer(i).parameters())
+        .map(|(_, id)| params.value(id).data().len())
+        .sum()
+}
+
+/// `shrink` with the default layers shrinks both convs of the CNN by channel: 3, 2 and 1
+/// of 4 channels kept at 2,500, 5,000 and 7,500 bp. The kept step's channel masks are on
+/// the model, `compact` removes them, the compacted model gives the masked one's outputs
+/// within the rounding of the shorter sums, and each step's parameter count is the
+/// compacted network's.
+#[test]
+fn shrink_cnn_by_channel() {
+    let mut params = ParamStore::new();
+    let mut net = cnn(&mut params);
+    let train = clusters(120, 36, 31);
+    let config = ShrinkConfig {
+        step_bp: 2500,
+        fine_from_bp: 7500,
+        max_removed_bp: 7500,
+        criterion: Some(ALWAYS),
+        patience: None,
+        ..quick(clusters(60, 36, 32))
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    let kept: Vec<Vec<usize>> = report.steps.iter().map(|s| s.kept.clone()).collect();
+    assert_eq!(kept, [vec![3, 3], vec![2, 2], vec![1, 1]]);
+    assert_eq!(report.chosen, Some(2));
+    let (masks, store) = report.steps[2].checkpoint.as_ref().unwrap();
+    assert_eq!((masks[0].0, masks[1].0), (0, 4));
+    assert_eq!(net.channel_mask(0).as_ref(), Some(&masks[0].1));
+    assert_eq!(net.channel_mask(4).as_ref(), Some(&masks[1].1));
+    let w = net.layer(4).as_conv2d().unwrap().weight();
+    assert_eq!(params.value(w).data(), store.value(w).data());
+
+    let (small, small_params) = compact(&net, &params).unwrap();
+    assert_eq!(small.layer(0).as_conv2d().unwrap().geom().out_channels(), 1);
+    assert_eq!(small.layer(4).as_conv2d().unwrap().geom().in_channels(), 1);
+    assert_eq!(small.linear(7).unwrap().inputs(), 9);
+    assert_eq!(
+        report.steps[2].parameters,
+        parameters_of(&small, &small_params)
+    );
+    let x = clusters(8, 36, 33).x;
+    let mut masked = InferenceModel::compile(&net, &params).unwrap();
+    let mut compacted = InferenceModel::compile(&small, &small_params).unwrap();
+    let want = masked.infer_batch(x.view()).data().to_vec();
+    let got = compacted.infer_batch(x.view()).data().to_vec();
+    let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    for (g, w) in got.iter().zip(&want) {
+        assert!((g - w).abs() <= 1e-4 * scale, "{g} against {w}");
+    }
+}
+
+/// `Ranking::OutNorm` removes the channel with the smallest outgoing weights: for the first
+/// conv, its input channel's weights in the second conv (every output channel and tap);
+/// for the second, its block of 9 columns in the linear after the flatten. With no
+/// retraining, one 2,500 bp step removes exactly that channel of each.
+#[test]
+fn channel_out_norms() {
+    let mut params = ParamStore::new();
+    let mut net = cnn(&mut params);
+    let start = params.clone();
+    let argmin = |norms: Vec<f64>| {
+        (0..norms.len())
+            .min_by(|&a, &b| norms[a].total_cmp(&norms[b]))
+            .unwrap()
+    };
+    let w4 = start
+        .value(net.layer(4).as_conv2d().unwrap().weight())
+        .data()
+        .to_vec();
+    let first = argmin(
+        (0..4)
+            .map(|c| {
+                (0..4)
+                    .flat_map(|o| &w4[(o * 4 + c) * 9..][..9])
+                    .map(|&v| f64::from(v) * f64::from(v))
+                    .sum()
+            })
+            .collect(),
+    );
+    let w7 = start.value(net.linear(7).unwrap().weight()).data().to_vec();
+    let second = argmin(
+        (0..4)
+            .map(|c| {
+                w7.as_chunks::<36>()
+                    .0
+                    .iter()
+                    .flat_map(|row| &row[c * 9..(c + 1) * 9])
+                    .map(|&v| f64::from(v) * f64::from(v))
+                    .sum()
+            })
+            .collect(),
+    );
+    let config = ShrinkConfig {
+        layers: vec![4, 0],
+        step_bp: 2500,
+        max_removed_bp: 2500,
+        dead_first: false,
+        criterion: Some(ALWAYS),
+        retrain: RetrainConfig {
+            epochs: 0,
+            ..RetrainConfig::default()
+        },
+        ..quick(clusters(30, 36, 34))
+    };
+    let report = shrink(&mut net, &mut params, &clusters(60, 36, 35), config).unwrap();
+    assert_eq!(off_in(&report.steps[0], 0), [first]);
+    assert_eq!(off_in(&report.steps[0], 4), [second]);
+    // The listed order: layer 4 first.
+    let (masks, _) = report.steps[0].checkpoint.as_ref().unwrap();
+    assert_eq!((masks[0].0, masks[1].0), (4, 0));
+}
+
+/// A custom ranking of a conv sees the conv's index, its channels that are on, and the
+/// channel activity `channel_activity` measures on the training rows.
+#[test]
+fn custom_ranking_sees_channels() {
+    use cavitation_nn::shrink::channel_activity;
+    let mut params = ParamStore::new();
+    let mut net = cnn(&mut params);
+    net.set_channel_mask(4, NeuronMask::from_off(4, &[2]));
+    let (start_net, start) = (net.clone(), params.clone());
+    let train = clusters(60, 36, 36);
+    let mut seen = Vec::new();
+    let config = ShrinkConfig {
+        layers: vec![4],
+        ranking: Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
+            seen.push((
+                ctx.layer,
+                ctx.on.to_vec(),
+                ctx.mean.to_vec(),
+                ctx.firing.to_vec(),
+            ));
+            ctx.on.iter().map(|&c| c as f64).collect()
+        })),
+        step_bp: 5000,
+        max_removed_bp: 5000,
+        dead_first: false,
+        criterion: Some(ALWAYS),
+        ..quick(clusters(30, 36, 37))
+    };
+    let report = shrink(&mut net, &mut params, &train, config).unwrap();
+    let want = channel_activity(&start_net, &start, &train, &[4], 256).unwrap();
+    assert_eq!(
+        seen,
+        [(
+            4,
+            vec![0, 1, 3],
+            want[0].mean.clone(),
+            want[0].firing.clone()
+        )]
+    );
+    // Channel 2 was off already and counts as removed: one more goes, the lowest score.
+    assert_eq!(off_in(&report.steps[0], 4), [0, 2]);
+}
+
+/// The conv refusals, each before anything changes: `fold_means` into a conv with padding;
+/// a listed layer that is neither a `Linear` nor a `Conv2d`; a mask set with `set_mask`
+/// inside a conv's run; a mask at the run's end that switches off part of a channel; a
+/// listed conv whose channels reach the model's output; and a model with nothing to
+/// shrink.
+#[test]
+fn conv_refusals() {
+    use cavitation_core::Conv2dGeom;
+    use cavitation_nn::Conv2d;
+    let mut params = ParamStore::new();
+    let train = clusters(30, 36, 38);
+    let base = cnn(&mut params);
+    let start = params.clone();
+    let config = |layers: Vec<usize>, fold_means| ShrinkConfig {
+        layers,
+        fold_means,
+        ..quick(clusters(20, 36, 39))
+    };
+    let attempt = |net: &Sequential, c: ShrinkConfig<'static>| {
+        let (mut net, mut params) = (net.clone(), start.clone());
+        let err = shrink(&mut net, &mut params, &train, c).unwrap_err();
         for (_, id) in net.state_names() {
-            assert_eq!(params.value(id).data(), before.value(id).data());
+            assert_eq!(params.value(id).data(), start.value(id).data());
+        }
+        err
+    };
+    // The second conv has padding 1, so the first conv's channels cannot fold into it.
+    let err = attempt(&base, config(Vec::new(), true));
+    assert!(
+        matches!(&err, Error::InvalidData(m) if m.contains("padding (1, 1)")),
+        "{err}"
+    );
+    let err = attempt(&base, config(vec![2], false));
+    assert!(
+        err.to_string()
+            .contains("layer 2 is neither a Linear nor a Conv2d"),
+        "{err}"
+    );
+    let mut inside = base.clone();
+    inside.set_mask(1, NeuronMask::from_off(144, &[0]));
+    let err = attempt(&inside, config(Vec::new(), false));
+    assert!(
+        matches!(&err, Error::Unsupported(m) if m.contains("inside the run of the conv layer 0")),
+        "{err}"
+    );
+    let mut part = base.clone();
+    part.set_mask(3, NeuronMask::from_off(36, &[0]));
+    let err = attempt(&part, config(Vec::new(), false));
+    assert!(
+        matches!(&err, Error::Unsupported(m) if m.contains("part of a channel")),
+        "{err}"
+    );
+
+    let mut params = ParamStore::new();
+    let geom = Conv2dGeom::new(1, 2, (6, 6), (3, 3)).unwrap();
+    let last = Sequential::new()
+        .push(Conv2d::new(&mut params, geom, &mut Rng::seed(0)))
+        .push(Relu);
+    let run = |layers: Vec<usize>| {
+        let (mut net, mut values) = (last.clone(), params.clone());
+        shrink(&mut net, &mut values, &train, config(layers, false)).unwrap_err()
+    };
+    let err = run(vec![0]);
+    assert!(
+        matches!(&err, Error::Unsupported(m) if m.contains("the model's output")),
+        "{err}"
+    );
+    let err = run(Vec::new());
+    assert!(
+        err.to_string().contains("no hidden layer to shrink"),
+        "{err}"
+    );
+}
+
+/// `train_found_size` on a shrunk CNN builds the compacted widths from new starting
+/// values, drawn in layer order from `Rng::seed(scratch.seed)`: each conv as `Conv2d::new`
+/// draws it, then the linear as `FromScratch::weights` says, and the batch norm started
+/// again (γ = 1, β = 0). With 0 epochs the fresh network is those starting values.
+#[test]
+fn train_found_size_on_a_cnn() {
+    use cavitation_nn::Conv2d;
+    let mut params = ParamStore::new();
+    let mut net = cnn(&mut params);
+    net.set_channel_mask(0, NeuronMask::from_off(4, &[1, 3]));
+    net.set_channel_mask(4, NeuronMask::from_off(4, &[0]));
+    let train = clusters(60, 36, 40);
+    let scratch = FromScratch {
+        seed: 5,
+        fit: cavitation_nn::FitConfig {
+            epochs: 0,
+            ..cavitation_nn::FitConfig::default()
+        },
+        ..FromScratch::default()
+    };
+    let found = train_found_size(&net, &params, &train, &clusters(30, 36, 41), scratch).unwrap();
+    let (model, values) = (&found.model, &found.params);
+    let c0 = model.layer(0).as_conv2d().unwrap();
+    let c4 = model.layer(4).as_conv2d().unwrap();
+    let (g0, g4) = (c0.geom(), c4.geom());
+    assert_eq!(
+        (g0.out_channels(), g4.in_channels(), g4.out_channels()),
+        (2, 2, 3)
+    );
+    let head = model.linear(7).unwrap();
+    assert_eq!(head.inputs(), 27);
+    let mut want = ParamStore::new();
+    let mut rng = Rng::seed(5);
+    let w0 = Conv2d::new(&mut want, g0, &mut rng);
+    let w4 = Conv2d::new(&mut want, g4, &mut rng);
+    let w7 = Linear::with_init(&mut want, 27, 3, Init::XavierUniform, Init::Zeros, &mut rng);
+    for (got, wanted) in [
+        (c0.weight(), w0.weight()),
+        (c0.bias().unwrap(), w0.bias().unwrap()),
+        (c4.weight(), w4.weight()),
+        (c4.bias().unwrap(), w4.bias().unwrap()),
+        (head.weight(), w7.weight()),
+    ] {
+        assert_eq!(values.value(got).data(), want.value(wanted).data());
+    }
+    let bn = model.layer(1).as_batch_norm2d().unwrap();
+    assert_eq!(bn.channels(), 2);
+    assert_eq!(values.value(bn.weight().unwrap()).data(), &[1.0; 2]);
+    assert_eq!(values.value(bn.bias().unwrap()).data(), &[0.0; 2]);
+}
+
+/// conv(1 → 3, 3 × 3, no padding) on 5 × 5 images → ReLU, then `next`, with channel 1 of
+/// the conv made constant: weights 0 and bias 0.7, so 0.7 at every position of every row.
+fn constant_channel_cnn(params: &mut ParamStore, next: &str) -> Sequential {
+    use cavitation_core::Conv2dGeom;
+    use cavitation_nn::{Conv2d, Flatten};
+    let mut rng = Rng::seed(21);
+    let conv = Conv2d::new(
+        params,
+        Conv2dGeom::new(1, 3, (5, 5), (3, 3)).unwrap(),
+        &mut rng,
+    );
+    let w = params.value_mut(conv.weight()).data_mut();
+    w[9..18].fill(0.0);
+    params.value_mut(conv.bias().unwrap()).data_mut()[1] = 0.7;
+    let net = Sequential::new().push(conv).push(Relu);
+    match next {
+        "linear" => net.push(Flatten).push(Linear::new(params, 27, 3, &mut rng)),
+        _ => net
+            .push(Conv2d::new(
+                params,
+                Conv2dGeom::new(3, 2, (3, 3), (2, 2)).unwrap(),
+                &mut rng,
+            ))
+            .push(Flatten)
+            .push(Linear::new(params, 8, 3, &mut rng)),
+    }
+}
+
+/// With `fold_means`, removing a channel that is the same at every position of every row
+/// leaves the network's outputs as they were, within rounding, when the channel reaches a
+/// conv without padding (its mean times the sum of its taps goes into the conv's bias) and
+/// when it reaches the `Linear` after a `Flatten` (each position's mean times its column
+/// goes into the bias). Without the fold the outputs change.
+#[test]
+fn fold_means_for_channels() {
+    for next in ["linear", "conv"] {
+        for fold_means in [true, false] {
+            let mut params = ParamStore::new();
+            let mut net = constant_channel_cnn(&mut params, next);
+            let x = clusters(40, 25, 42).x;
+            let mut before = InferenceModel::compile(&net, &params).unwrap();
+            let want = before.infer_batch(x.view()).data().to_vec();
+            let config = ShrinkConfig {
+                layers: vec![0],
+                fold_means,
+                step_bp: 4000,
+                max_removed_bp: 4000,
+                dead_first: false,
+                criterion: Some(ALWAYS),
+                ranking: Ranking::Custom(Box::new(|ctx: &RankContext<'_>| {
+                    ctx.on
+                        .iter()
+                        .map(|&c| if c == 1 { 0.0 } else { 1.0 })
+                        .collect()
+                })),
+                retrain: RetrainConfig {
+                    epochs: 0,
+                    ..RetrainConfig::default()
+                },
+                ..quick(clusters(20, 25, 43))
+            };
+            let report = shrink(&mut net, &mut params, &clusters(40, 25, 44), config).unwrap();
+            assert_eq!(off_in(&report.steps[0], 0), [1], "{next}");
+            let mut after = InferenceModel::compile(&net, &params).unwrap();
+            let got = after.infer_batch(x.view()).data().to_vec();
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0f32, f32::max);
+            if fold_means {
+                assert!(worst <= 1e-5, "{next}: off by {worst}");
+            } else {
+                assert!(worst > 1e-3, "{next}: the channel mattered by only {worst}");
+            }
         }
     }
+}
+
+/// `fold_means` refuses a conv whose channels reach a layer with no bias.
+#[test]
+fn fold_means_needs_a_bias_after_a_conv() {
+    use cavitation_core::Conv2dGeom;
+    use cavitation_nn::{Conv2d, Flatten};
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(22);
+    let mut net = Sequential::new()
+        .push(Conv2d::new(
+            &mut params,
+            Conv2dGeom::new(1, 3, (5, 5), (3, 3)).unwrap(),
+            &mut rng,
+        ))
+        .push(Relu)
+        .push(Flatten)
+        .push(Linear::without_bias(
+            &mut params,
+            27,
+            3,
+            Init::XavierUniform,
+            &mut rng,
+        ));
+    let config = ShrinkConfig {
+        fold_means: true,
+        ..quick(clusters(20, 25, 45))
+    };
+    let err = shrink(&mut net, &mut params, &clusters(20, 25, 46), config).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidData(m) if m.contains("which has no bias")),
+        "{err}"
+    );
 }

@@ -1,6 +1,8 @@
-//! Classification metrics, as scikit-learn computes them: the confusion matrix; precision,
-//! recall and F-beta per class and averaged (macro, weighted, micro); and, for a binary
-//! classifier's scores, ROC AUC and average precision.
+//! Evaluation metrics, as scikit-learn computes them: for classifiers, the confusion matrix,
+//! precision, recall and F-beta per class and averaged (macro, weighted, micro), log loss
+//! and top-k accuracy, and, for a binary classifier's scores, ROC AUC and average
+//! precision; for regression, the mean absolute and squared errors, RMSE and R² per output
+//! and averaged ([`RegressionMetrics`]).
 //!
 //! Accuracy alone hides a model that ignores a rare class: on a set with 95% of one class,
 //! always answering that class scores 95%. The per-class rates show it at once, as a recall
@@ -676,6 +678,360 @@ pub fn average_precision(scores: &[f32], positive: &[bool]) -> Result<f64, Error
     Ok(ap)
 }
 
+/// Regression errors per output of `[rows, outputs]` targets and predictions, as
+/// scikit-learn's `mean_absolute_error`, `mean_squared_error`, `root_mean_squared_error`
+/// and `r2_score` with `multioutput='raw_values'`; the `*_mean` methods are their
+/// `uniform_average`, the mean over the outputs. Sums run in f64.
+///
+/// R² of an output whose targets are all equal is 1 if every prediction is exact and 0
+/// otherwise, as scikit-learn's `force_finite=True`. One row is such a case here too, where
+/// scikit-learn warns that R² is not defined and returns NaN.
+///
+/// ```
+/// use cavitation_nn::metrics::RegressionMetrics;
+/// // Two rows, two outputs, row-major.
+/// let targets = [1.0, 10.0, 3.0, 20.0];
+/// let predicted = [2.0, 10.0, 3.0, 16.0];
+/// let m = RegressionMetrics::new(&targets, &predicted, 2).unwrap();
+/// assert_eq!((m.mae(0), m.mae(1)), (0.5, 2.0));
+/// assert_eq!((m.mse(0), m.mse(1)), (0.5, 8.0));
+/// assert_eq!(m.rmse(1), 8f64.sqrt());
+/// assert_eq!(m.r2(0), 0.5); // 1 − 1 / 2
+/// assert_eq!(m.mae_mean(), 1.25);
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegressionMetrics {
+    /// The rows.
+    rows: usize,
+    /// Mean absolute error per output.
+    mae: Vec<f64>,
+    /// Mean squared error per output.
+    mse: Vec<f64>,
+    /// R² per output.
+    r2: Vec<f64>,
+}
+
+impl RegressionMetrics {
+    /// The errors of `predicted` against `targets`, both `[rows, outputs]` row-major.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidData`] if `outputs` is 0, the lengths differ or are not a whole
+    /// number of rows, there are no rows, or a value is not finite.
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert!(RegressionMetrics::new(&[1.0, 2.0], &[1.0], 1).is_err());
+    /// assert!(RegressionMetrics::new(&[f32::NAN], &[1.0], 1).is_err());
+    /// ```
+    pub fn new(
+        targets: &[f32],
+        predicted: &[f32],
+        outputs: usize,
+    ) -> Result<RegressionMetrics, Error> {
+        check_pair(
+            targets.len(),
+            "target values",
+            predicted.len(),
+            "predicted values",
+        )?;
+        if outputs == 0 || targets.is_empty() || !targets.len().is_multiple_of(outputs) {
+            return Err(Error::InvalidData(format!(
+                "regression metrics: {} values are not a whole, non-empty number of rows of {outputs} outputs",
+                targets.len()
+            )));
+        }
+        if let Some(i) = targets.iter().chain(predicted).position(|v| !v.is_finite()) {
+            let (what, at) = if i < targets.len() {
+                ("target", i)
+            } else {
+                ("prediction", i - targets.len())
+            };
+            return Err(Error::InvalidData(format!(
+                "regression metrics: the {what} of row {}, output {}, is not finite",
+                at / outputs,
+                at % outputs
+            )));
+        }
+        let rows = targets.len() / outputs;
+        let (mut abs, mut sq, mut mean) =
+            (vec![0.0; outputs], vec![0.0; outputs], vec![0.0; outputs]);
+        for (t, p) in targets
+            .chunks_exact(outputs)
+            .zip(predicted.chunks_exact(outputs))
+        {
+            for o in 0..outputs {
+                let e = f64::from(t[o]) - f64::from(p[o]);
+                abs[o] += e.abs();
+                sq[o] += e * e;
+                mean[o] += f64::from(t[o]);
+            }
+        }
+        let n = rows as f64;
+        for m in &mut mean {
+            *m /= n;
+        }
+        let mut tot = vec![0.0; outputs];
+        for t in targets.chunks_exact(outputs) {
+            for o in 0..outputs {
+                let d = f64::from(t[o]) - mean[o];
+                tot[o] += d * d;
+            }
+        }
+        let r2 = (0..outputs)
+            .map(|o| match (tot[o] == 0.0, sq[o] == 0.0) {
+                (true, true) => 1.0,
+                (true, false) => 0.0,
+                _ => 1.0 - sq[o] / tot[o],
+            })
+            .collect();
+        Ok(RegressionMetrics {
+            rows,
+            mae: abs.into_iter().map(|a| a / n).collect(),
+            mse: sq.into_iter().map(|q| q / n).collect(),
+            r2,
+        })
+    }
+
+    /// The number of outputs.
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[1.0, 2.0], &[1.0, 2.0], 2).unwrap().outputs(), 2);
+    /// ```
+    pub fn outputs(&self) -> usize {
+        self.mae.len()
+    }
+
+    /// The number of rows.
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[1.0, 2.0], &[1.0, 2.0], 1).unwrap().rows(), 2);
+    /// ```
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The mean absolute error of output `o`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `o` is not below [`outputs`](Self::outputs).
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[1.0, 4.0], &[2.0, 2.0], 1).unwrap().mae(0), 1.5);
+    /// ```
+    pub fn mae(&self, o: usize) -> f64 {
+        self.mae[o]
+    }
+
+    /// The mean squared error of output `o`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `o` is not below [`outputs`](Self::outputs).
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[1.0, 4.0], &[2.0, 2.0], 1).unwrap().mse(0), 2.5);
+    /// ```
+    pub fn mse(&self, o: usize) -> f64 {
+        self.mse[o]
+    }
+
+    /// The root mean squared error of output `o`, in the targets' units.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `o` is not below [`outputs`](Self::outputs).
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[0.0, 0.0], &[3.0, 4.0], 2).unwrap().rmse(1), 4.0);
+    /// ```
+    pub fn rmse(&self, o: usize) -> f64 {
+        self.mse[o].sqrt()
+    }
+
+    /// The coefficient of determination R² of output `o`: 1 minus the squared error over
+    /// the targets' spread about their mean.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `o` is not below [`outputs`](Self::outputs).
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// // Predicting the targets' mean scores 0.
+    /// assert_eq!(RegressionMetrics::new(&[1.0, 3.0], &[2.0, 2.0], 1).unwrap().r2(0), 0.0);
+    /// ```
+    pub fn r2(&self, o: usize) -> f64 {
+        self.r2[o]
+    }
+
+    /// The mean absolute error averaged over the outputs.
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[0.0, 0.0], &[1.0, 3.0], 2).unwrap().mae_mean(), 2.0);
+    /// ```
+    pub fn mae_mean(&self) -> f64 {
+        mean_of(&self.mae)
+    }
+
+    /// The mean squared error averaged over the outputs.
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[0.0, 0.0], &[1.0, 3.0], 2).unwrap().mse_mean(), 5.0);
+    /// ```
+    pub fn mse_mean(&self) -> f64 {
+        mean_of(&self.mse)
+    }
+
+    /// The root mean squared error averaged over the outputs: each output's RMSE, then
+    /// their mean, as scikit-learn's `root_mean_squared_error` (not the root of
+    /// [`mse_mean`](Self::mse_mean)).
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// assert_eq!(RegressionMetrics::new(&[0.0, 0.0], &[1.0, 3.0], 2).unwrap().rmse_mean(), 2.0);
+    /// ```
+    pub fn rmse_mean(&self) -> f64 {
+        self.mse.iter().map(|m| m.sqrt()).sum::<f64>() / self.mse.len() as f64
+    }
+
+    /// R² averaged over the outputs.
+    ///
+    /// ```
+    /// use cavitation_nn::metrics::RegressionMetrics;
+    /// let m = RegressionMetrics::new(&[1.0, 1.0, 3.0, 3.0], &[1.0, 2.0, 3.0, 2.0], 2).unwrap();
+    /// assert_eq!((m.r2(0), m.r2(1), m.r2_mean()), (1.0, 0.0, 0.5));
+    /// ```
+    pub fn r2_mean(&self) -> f64 {
+        mean_of(&self.r2)
+    }
+}
+
+/// The mean of `values`.
+fn mean_of(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+/// The mean cross-entropy of predicted class probabilities against labels, as
+/// scikit-learn's `log_loss` with `labels = 0..classes`: `−mean ln p[label]` over the rows,
+/// each probability first clipped to `[ε, 1 − ε]` with ε = `f32::EPSILON` (scikit-learn
+/// clips at the epsilon of the input's type). `probabilities` is `[rows, classes]`
+/// row-major.
+///
+/// # Errors
+///
+/// [`Error::InvalidData`] if the lengths do not fit, a label is not below `classes`, a
+/// probability is outside `[0, 1]` or NaN, or a row does not sum to 1 within
+/// `√f32::EPSILON` relative. scikit-learn only warns at that last check; a row that does
+/// not sum to 1 is not a probability, so this refuses it.
+///
+/// ```
+/// use cavitation_nn::metrics::log_loss;
+/// let p = [0.5, 0.5, 0.25, 0.75];
+/// let loss = log_loss(&p, 2, &[0, 1]).unwrap();
+/// assert!((loss - (2f64.ln() + (4.0f64 / 3.0).ln()) / 2.0).abs() < 1e-12);
+/// assert!(log_loss(&[0.5, 0.6], 2, &[0]).is_err());
+/// ```
+pub fn log_loss(probabilities: &[f32], classes: usize, labels: &[usize]) -> Result<f64, Error> {
+    let rows = check_rows("log_loss", probabilities.len(), classes, labels)?;
+    let eps = f64::from(f32::EPSILON);
+    let tol = f64::from(f32::EPSILON).sqrt();
+    let mut total = 0.0;
+    for (r, (row, &label)) in probabilities.chunks_exact(classes).zip(labels).enumerate() {
+        if let Some(v) = row.iter().find(|v| !(0.0..=1.0).contains(*v)) {
+            return Err(Error::InvalidData(format!(
+                "log_loss: row {r} has {v}, which is not a probability"
+            )));
+        }
+        let sum: f64 = row.iter().map(|&v| f64::from(v)).sum();
+        if (sum - 1.0).abs() > tol {
+            return Err(Error::InvalidData(format!(
+                "log_loss: row {r} sums to {sum}, not 1"
+            )));
+        }
+        total -= f64::from(row[label]).clamp(eps, 1.0 - eps).ln();
+    }
+    Ok(total / rows as f64)
+}
+
+/// The share of rows whose label is among the `k` highest of their `scores` (`[rows,
+/// classes]` row-major), as scikit-learn's `top_k_accuracy_score` with `labels =
+/// 0..classes`: among equal scores, the higher class index ranks first. `k = 1` is plain
+/// accuracy of the largest score, with that tie rule, and a `k` of `classes` or more scores
+/// 1 (scikit-learn warns there). With 2 classes this ranks the two columns; scikit-learn's
+/// two-class path instead thresholds one score column, so the two agree from 3 classes on.
+///
+/// # Errors
+///
+/// [`Error::InvalidData`] if `k` is 0, the lengths do not fit, a label is not below
+/// `classes`, or a score is NaN.
+///
+/// ```
+/// use cavitation_nn::metrics::top_k_accuracy;
+/// let scores = [0.1, 0.6, 0.3, 0.5, 0.2, 0.3];
+/// // Row 0 ranks 1, 2, 0; row 1 ranks 0, 2, 1.
+/// assert_eq!(top_k_accuracy(&scores, 3, &[2, 2], 1).unwrap(), 0.0);
+/// assert_eq!(top_k_accuracy(&scores, 3, &[2, 2], 2).unwrap(), 1.0);
+/// ```
+pub fn top_k_accuracy(
+    scores: &[f32],
+    classes: usize,
+    labels: &[usize],
+    k: usize,
+) -> Result<f64, Error> {
+    if k == 0 {
+        return Err(Error::InvalidData(
+            "top_k_accuracy: k must be at least 1".into(),
+        ));
+    }
+    let rows = check_rows("top_k_accuracy", scores.len(), classes, labels)?;
+    let mut hits = 0usize;
+    for (r, (row, &label)) in scores.chunks_exact(classes).zip(labels).enumerate() {
+        if row.iter().any(|v| v.is_nan()) {
+            return Err(Error::InvalidData(format!(
+                "top_k_accuracy: row {r} has a NaN score"
+            )));
+        }
+        let s = row[label];
+        // The classes ranked above the label: higher scores, and equal scores at a higher
+        // index.
+        let above = row
+            .iter()
+            .enumerate()
+            .filter(|&(c, &v)| v > s || (v == s && c > label))
+            .count();
+        if above < k {
+            hits += 1;
+        }
+    }
+    Ok(hits as f64 / rows as f64)
+}
+
+/// The number of rows of a `[rows, classes]` buffer of `len` values with one label each,
+/// checked: `what` names the caller in the error.
+fn check_rows(what: &str, len: usize, classes: usize, labels: &[usize]) -> Result<usize, Error> {
+    if classes == 0 || labels.is_empty() || len != labels.len() * classes {
+        return Err(Error::InvalidData(format!(
+            "{what}: {len} values do not make {} rows of {classes} classes",
+            labels.len()
+        )));
+    }
+    if let Some((r, &l)) = labels.iter().enumerate().find(|&(_, &l)| l >= classes) {
+        return Err(Error::InvalidData(format!(
+            "{what}: row {r}'s label is {l}, but there are {classes} classes"
+        )));
+    }
+    Ok(labels.len())
+}
+
 /// Tests for the metrics by hand; the scikit-learn fixtures are in
 /// `tests/metrics.rs`.
 #[cfg(test)]
@@ -761,6 +1117,42 @@ mod tests {
         let inf = [f32::INFINITY, 0.0, f32::NEG_INFINITY];
         assert_eq!(roc_auc(&inf, &[true, false, false]).unwrap(), 1.0);
         assert_eq!(average_precision(&inf, &[false, true, false]).unwrap(), 0.5);
+    }
+
+    /// Log loss clips a probability of 0 to ε, refuses rows that are not probabilities, and
+    /// top-k ranks a tie by the higher index first.
+    #[test]
+    fn log_loss_and_top_k_edges() {
+        let eps = f64::from(f32::EPSILON);
+        let loss = log_loss(&[1.0, 0.0], 2, &[1]).unwrap();
+        assert!((loss + eps.ln()).abs() < 1e-12, "{loss}");
+        assert!(log_loss(&[1.5, -0.5], 2, &[0]).is_err());
+        assert!(log_loss(&[0.5, 0.5], 2, &[2]).is_err());
+        assert!(log_loss(&[0.5, f32::NAN], 2, &[0]).is_err());
+        // Equal scores: class 1 ranks above class 0.
+        assert_eq!(top_k_accuracy(&[0.5, 0.5], 2, &[1], 1).unwrap(), 1.0);
+        assert_eq!(top_k_accuracy(&[0.5, 0.5], 2, &[0], 1).unwrap(), 0.0);
+        assert!(top_k_accuracy(&[0.5, 0.5], 2, &[0], 0).is_err());
+    }
+
+    /// R² of constant targets is 1 when predicted exactly and 0 otherwise; bad shapes and
+    /// non-finite values are refused.
+    #[test]
+    fn regression_edges() {
+        let exact = RegressionMetrics::new(&[2.0, 2.0], &[2.0, 2.0], 1).unwrap();
+        let missed = RegressionMetrics::new(&[2.0, 2.0], &[2.0, 3.0], 1).unwrap();
+        assert_eq!((exact.r2(0), missed.r2(0)), (1.0, 0.0));
+        assert!(RegressionMetrics::new(&[1.0, 2.0, 3.0], &[1.0, 2.0, 3.0], 2).is_err());
+        assert!(RegressionMetrics::new(&[], &[], 1).is_err());
+        let e = RegressionMetrics::new(&[1.0, 2.0], &[1.0, f32::INFINITY], 1).unwrap_err();
+        assert!(
+            e.to_string().contains("prediction of row 1, output 0"),
+            "{e}"
+        );
+        // One row: the constant-column rule (scikit-learn returns NaN).
+        let one = RegressionMetrics::new(&[2.0], &[3.0], 1).unwrap();
+        assert_eq!(one.r2(0), 0.0);
+        assert_eq!(top_k_accuracy(&[0.1, 0.9, 0.5], 3, &[0], 3).unwrap(), 1.0);
     }
 
     /// A negative or non-finite beta is refused.

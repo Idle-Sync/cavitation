@@ -39,6 +39,22 @@ fn reduce_into<T: Real>(
     out: &mut [T],
 ) {
     debug_assert!(x.len() == outer * n * inner && out.len() == outer * inner);
+    if inner == 1 {
+        // Each output sums one contiguous run: one running sum over a plain slice, the same
+        // additions in the same order as the general loop.
+        for (o, d) in out.iter_mut().enumerate() {
+            let mut acc = T::ZERO;
+            for &v in &x[o * n..][..n] {
+                acc += v;
+            }
+            *d = if divisor != T::ONE {
+                acc / divisor
+            } else {
+                acc
+            };
+        }
+        return;
+    }
     for (o, row) in out.chunks_exact_mut(inner.max(1)).enumerate() {
         row.fill(T::ZERO);
         for k in 0..n {
@@ -204,14 +220,30 @@ pub(super) fn backward<T: Real>(
     let Some(slot) = ctx.slot(x) else { return };
     slot.update_with(|buf, beta| {
         let overwrite = beta == T::ZERO;
+        if inner == 1 {
+            // One gradient per contiguous run of `n` inputs, divided once.
+            for (o, run) in buf.chunks_exact_mut(n.max(1)).take(outer).enumerate() {
+                let g = out_grad[o] / divisor;
+                if overwrite {
+                    run.fill(g);
+                } else {
+                    for d in run {
+                        *d += g;
+                    }
+                }
+            }
+            return;
+        }
         for o in 0..outer {
+            let src = &out_grad[o * inner..][..inner];
             for k in 0..n {
                 let dst = &mut buf[(o * n + k) * inner..][..inner];
-                let src = &out_grad[o * inner..][..inner];
-                for (d, &g) in dst.iter_mut().zip(src) {
-                    if overwrite {
+                if overwrite {
+                    for (d, &g) in dst.iter_mut().zip(src) {
                         *d = g / divisor;
-                    } else {
+                    }
+                } else {
+                    for (d, &g) in dst.iter_mut().zip(src) {
                         *d += g / divisor;
                     }
                 }
@@ -250,6 +282,59 @@ pub(super) fn axis_backward<T: Real>(
 #[cfg(test)]
 mod tests {
     use crate::{Graph, ParamStore, Tensor};
+
+    /// The whole-tensor and last-axis paths give the bits of one running sum per output in
+    /// element order, and their gradients the bits of `g / divisor` in every element, written
+    /// and added: over values whose sums round differently in another order.
+    #[test]
+    fn contiguous_reductions_keep_the_running_sum() {
+        let (rows, n) = (3, 1001);
+        let v: Vec<f32> = (0..rows * n)
+            .map(|i| ((i * 7919) % 1013) as f32 / 97.0 - 5.0)
+            .collect();
+        let running = |xs: &[f32]| xs.iter().fold(0.0f32, |a, &b| a + b);
+        let mut params = ParamStore::new();
+        let p = params.add(Tensor::from_vec(v.clone(), &[rows, n]).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let x = tape.param(p);
+        let whole = tape.mean(x);
+        let per_row = tape.sum_axis(x, 1, false);
+        let row_mean = tape.mean_axis(x, 1, false);
+        assert_eq!(
+            tape.value(whole).data()[0].to_bits(),
+            (running(&v) / (rows * n) as f32).to_bits()
+        );
+        for r in 0..rows {
+            let want = running(&v[r * n..][..n]);
+            assert_eq!(tape.value(per_row).data()[r].to_bits(), want.to_bits());
+            assert_eq!(
+                tape.value(row_mean).data()[r].to_bits(),
+                (want / n as f32).to_bits()
+            );
+        }
+        // The gradient of mean(x) is 1 / count in every element; that of the sum of the row
+        // means adds 1 / n to it.
+        tape.backward(whole, &mut params.grads);
+        let first = 1.0 / (rows * n) as f32;
+        assert!(
+            params
+                .grad(p)
+                .data()
+                .iter()
+                .all(|g| g.to_bits() == first.to_bits())
+        );
+        let m = tape.sum(row_mean);
+        tape.backward(m, &mut params.grads);
+        let both = first + 1.0 / n as f32;
+        assert!(
+            params
+                .grad(p)
+                .data()
+                .iter()
+                .all(|g| g.to_bits() == both.to_bits())
+        );
+    }
 
     /// A 2 x 2 input holding [[1, 2], [3, 4]].
     fn square() -> Tensor<f32> {

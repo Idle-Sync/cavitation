@@ -1,0 +1,250 @@
+//! The GPU convolution forward pass against its CPU twin, `conv2d_reference` in f64 on the
+//! same f32 inputs: bit for bit on small integers, and within the GEMM's bound
+//! `2(k + 3) · u · (Σ|w·x| + |bias|)` on seeded values, over the CPU tests' geometries, the
+//! CIFAR and MNIST networks' convolutions, and shapes that span several tiles.
+
+mod common;
+
+use cavitation_core::kernels::conv::{Conv2dGeom, conv2d_reference};
+use cavitation_gpu::kernels::{ConvDims, ConvForward};
+use common::{Kit, U, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values};
+
+/// The CPU geometry with the same shape as `dims`.
+fn geom(d: &ConvDims) -> Conv2dGeom {
+    let u = |p: (u32, u32)| (p.0 as usize, p.1 as usize);
+    Conv2dGeom::with_options(
+        d.in_channels as usize,
+        d.out_channels as usize,
+        u(d.input),
+        u(d.kernel),
+        u(d.stride),
+        u(d.padding),
+        u(d.dilation),
+    )
+    .expect("a valid convolution")
+}
+
+/// A shape from the CPU tests' tuple order: (in, out, input, kernel, stride, padding,
+/// dilation), at `batch` images.
+type Shape = (
+    u32,
+    u32,
+    (u32, u32),
+    (u32, u32),
+    (u32, u32),
+    (u32, u32),
+    (u32, u32),
+);
+
+fn dims(batch: u32, s: Shape) -> ConvDims {
+    let (cin, cout, input, kernel, stride, padding, dilation) = s;
+    ConvDims {
+        stride,
+        padding,
+        dilation,
+        ..ConvDims::new(batch, cin, cout, input, kernel)
+    }
+}
+
+/// The geometries of `cavitation-core`'s convolution tests: strides, padding and dilation,
+/// rectangular images and kernels, and a 1 × 1 kernel.
+const CPU_GEOMETRIES: [Shape; 6] = [
+    (2, 3, (5, 5), (3, 3), (1, 1), (0, 0), (1, 1)),
+    (1, 2, (6, 7), (3, 2), (2, 1), (1, 0), (1, 1)),
+    (3, 2, (7, 7), (3, 3), (1, 1), (2, 2), (2, 2)),
+    (2, 2, (4, 6), (1, 1), (1, 1), (0, 0), (1, 1)),
+    (2, 1, (5, 4), (2, 3), (2, 2), (1, 1), (1, 1)),
+    (1, 1, (3, 3), (3, 3), (1, 1), (1, 1), (1, 1)),
+];
+
+/// The CIFAR network's four convolutions (3 × 3, padding 1) and the MNIST network's two
+/// (5 × 5, the first with padding 2), as `cavitation-bench` builds them.
+const NETWORKS: [Shape; 6] = [
+    (3, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (32, 32, (32, 32), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (32, 64, (16, 16), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (64, 64, (16, 16), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (1, 6, (28, 28), (5, 5), (1, 1), (2, 2), (1, 1)),
+    (6, 16, (14, 14), (5, 5), (1, 1), (0, 0), (1, 1)),
+];
+
+/// Shapes past one tile in every direction: more than 64 output channels, an image of more
+/// than 64 positions whose rows do not divide 64, and a k that is not a multiple of 16.
+const SPANNING: [Shape; 3] = [
+    (5, 130, (11, 13), (3, 3), (1, 1), (1, 1), (1, 1)),
+    (7, 65, (20, 9), (3, 2), (2, 1), (2, 0), (1, 2)),
+    (3, 70, (9, 70), (1, 5), (1, 3), (0, 2), (1, 1)),
+];
+
+/// The f64 reference for `x`, `w` and `bias`, and the same convolution of their absolute
+/// values (Σ|w·x| + |bias| for each output).
+fn reference(d: &ConvDims, x: &[f32], w: &[f32], bias: Option<&[f32]>) -> (Vec<f64>, Vec<f64>) {
+    let g = geom(d);
+    let wide = |v: &[f32]| v.iter().map(|&a| f64::from(a)).collect::<Vec<f64>>();
+    let abs = |v: &[f32]| v.iter().map(|&a| f64::from(a).abs()).collect::<Vec<f64>>();
+    let batch = d.batch as usize;
+    let mut want = vec![0.0; d.out_len() as usize];
+    let mut size = vec![0.0; d.out_len() as usize];
+    let (bw, ba) = (bias.map(wide), bias.map(abs));
+    conv2d_reference(&g, batch, &wide(x), &wide(w), bw.as_deref(), &mut want);
+    conv2d_reference(&g, batch, &abs(x), &abs(w), ba.as_deref(), &mut size);
+    (want, size)
+}
+
+/// The GPU's output for `x`, `w` and `bias`, written over a buffer of NaNs (so every output
+/// is shown to be written).
+fn run(
+    kit: &mut Kit,
+    conv: &ConvForward,
+    d: ConvDims,
+    x: &[f32],
+    w: &[f32],
+    bias: Option<&[f32]>,
+) -> Vec<f32> {
+    let (xb, wb) = (kit.upload(x), kit.upload(w));
+    let bb = bias.map(|b| kit.upload(b));
+    let out = kit.upload(&vec![f32::NAN; d.out_len() as usize]);
+    let call = conv.call(
+        &mut kit.steps,
+        &mut kit.pool,
+        d,
+        &xb,
+        &wb,
+        bb.as_ref(),
+        &out,
+    );
+    let mut step = kit.steps.begin();
+    conv.record(&mut step, &call);
+    let _ = step.finish();
+    let got = kit.read(&out);
+    call.release(&mut kit.pool);
+    for buffer in [xb, wb, out].into_iter().chain(bb) {
+        kit.pool.give(buffer);
+    }
+    got
+}
+
+/// Every shape at `batch`, the network shapes at a batch of 4.
+fn all_shapes() -> Vec<ConvDims> {
+    let mut out: Vec<ConvDims> = CPU_GEOMETRIES.iter().map(|&s| dims(3, s)).collect();
+    out.extend(NETWORKS.iter().map(|&s| dims(4, s)));
+    out.extend(SPANNING.iter().map(|&s| dims(2, s)));
+    out
+}
+
+/// On values from {-2, -1, 1, 2}, every sum is a small integer, so the GPU gives the f64
+/// reference's value exactly, with and without a bias.
+#[test]
+fn exact_twins() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 24);
+        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        for (s, d) in all_shapes().into_iter().enumerate() {
+            let seed = 10 * s as u64;
+            let x = exact_values(seed, d.x_len() as usize);
+            let w = exact_values(seed + 1, d.weight_len() as usize);
+            let b = exact_values(seed + 2, d.out_channels as usize);
+            for bias in [None, Some(&b[..])] {
+                let (want, _) = reference(&d, &x, &w, bias);
+                let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+                let got = run(&mut kit, &conv, d, &x, &w, bias);
+                assert_exact(
+                    &got,
+                    &want,
+                    &format!("conv exact {d:?}, bias {}", bias.is_some()),
+                );
+            }
+        }
+    });
+}
+
+/// On seeded values in [-1, 1), each output is within the GEMM bound of the f64 reference.
+#[test]
+fn rounding_twins() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 24);
+        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        for (s, d) in all_shapes().into_iter().enumerate() {
+            let seed = 500 + 10 * s as u64;
+            let x = seeded_values(seed, d.x_len() as usize, -1.0, 1.0);
+            let w = seeded_values(seed + 1, d.weight_len() as usize, -1.0, 1.0);
+            let b = seeded_values(seed + 2, d.out_channels as usize, -1.0, 1.0);
+            let (want, size) = reference(&d, &x, &w, Some(&b));
+            let got = run(&mut kit, &conv, d, &x, &w, Some(&b));
+            let k = f64::from(d.in_channels * d.kernel.0 * d.kernel.1);
+            let worst = assert_within(
+                &got,
+                &want,
+                |i| 2.0 * (k + 3.0) * U * size[i],
+                &format!("conv rounding {d:?}"),
+            );
+            println!("{d:?}: worst error {:.4} of its bound", worst.ratio());
+        }
+    });
+}
+
+/// The same inputs give the same bits on a second run.
+#[test]
+fn runs_are_identical() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 24);
+        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        let d = dims(4, NETWORKS[1]);
+        let x = seeded_values(7, d.x_len() as usize, -1.0, 1.0);
+        let w = seeded_values(8, d.weight_len() as usize, -1.0, 1.0);
+        let first = run(&mut kit, &conv, d, &x, &w, None);
+        let second = run(&mut kit, &conv, d, &x, &w, None);
+        let bits = |v: &[f32]| v.iter().map(|a| a.to_bits()).collect::<Vec<u32>>();
+        assert_eq!(bits(&first), bits(&second));
+    });
+}
+
+/// Misuse is refused when the convolution is prepared: a window that does not fit, a zero
+/// stride, a short buffer, and an output that is also an input.
+#[test]
+fn refusals() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 1 << 16);
+        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        let good = ConvDims::new(2, 2, 3, (5, 5), (3, 3));
+        let (x, w, out) = (kit.zeros(100), kit.zeros(54), kit.zeros(54));
+        let (small, b, tiny) = (kit.zeros(53), kit.zeros(3), kit.zeros(2));
+        conv.call(&mut kit.steps, &mut kit.pool, good, &x, &w, Some(&b), &out)
+            .release(&mut kit.pool);
+        let cases: Vec<(ConvDims, &_, &_, Option<&_>, &_)> = vec![
+            (ConvDims::new(2, 2, 3, (2, 2), (3, 3)), &x, &w, None, &out),
+            (
+                ConvDims {
+                    stride: (0, 1),
+                    ..good
+                },
+                &x,
+                &w,
+                None,
+                &out,
+            ),
+            (
+                ConvDims {
+                    dilation: (1, 0),
+                    ..good
+                },
+                &x,
+                &w,
+                None,
+                &out,
+            ),
+            (ConvDims { batch: 0, ..good }, &x, &w, None, &out),
+            (good, &x, &small, None, &out),
+            (good, &x, &w, None, &small),
+            (good, &x, &w, Some(&tiny), &out),
+            (good, &x, &w, None, &x),
+            (good, &x, &w, Some(&out), &out),
+        ];
+        for (d, x, w, bias, out) in cases {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                conv.call(&mut kit.steps, &mut kit.pool, d, x, w, bias, out)
+            }));
+            assert!(result.is_err(), "{d:?} was accepted");
+        }
+    });
+}

@@ -1,6 +1,7 @@
 //! The ablation sweep: [`ablate`], [`ablate_with`] and [`ablate_controlled`] switch each
 //! neuron of chosen hidden `Linear` layers off, one at a time, measure the network, and rank
-//! the neurons by how much each one's absence costs.
+//! the neurons by how much each one's absence costs; [`ablate_channels`] does the same for
+//! the output channels of `Conv2d` layers.
 
 use cavitation_core::{Error, ParamStore};
 
@@ -111,10 +112,6 @@ pub fn ablate(
 ///
 /// # Errors
 ///
-/// Returns [`Error::Unsupported`], naming the layer, if the model has an image layer
-/// (`Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AvgPool2d` or `AdaptiveAvgPool2d`): the shrink
-/// tools work on the neurons of dense networks.
-///
 /// Returns [`Error::InvalidData`] if an entry of `linears` is not the index of a hidden
 /// `Linear` layer: a layer that is not a `Linear`, or the last `Linear`, whose neurons are
 /// the model's outputs (the message names the layer); if `batch` is 0; and as
@@ -196,7 +193,6 @@ pub fn ablate_controlled(
     batch: usize,
     on_neuron: &mut dyn FnMut(&Ablation) -> Flow,
 ) -> Result<Vec<Ablation>, Error> {
-    super::refuse_image_layers(model, "ablate")?;
     let mut chosen: Vec<usize> = Vec::with_capacity(linears.len());
     for &linear in linears {
         check_hidden(model, linear, "ablate")?;
@@ -244,6 +240,151 @@ pub fn ablate_controlled(
         b.drop
             .total_cmp(&a.drop)
             .then((a.linear, a.neuron).cmp(&(b.linear, b.neuron)))
+    });
+    Ok(all)
+}
+
+/// What switching one output channel of a `Conv2d` off costs, from [`ablate_channels`]: the
+/// channel, the network's [`Evaluation`] without it (every other channel and neuron as the
+/// model had it), and the drop, measured as [`Ablation::drop`] is.
+///
+/// It is `#[non_exhaustive]`, so a later release can add a field without breaking your
+/// code: read its fields, and get one from [`ablate_channels`].
+///
+/// ```
+/// use cavitation_core::{Conv2dGeom, ParamStore, Rng, Tensor};
+/// use cavitation_nn::shrink::{ChannelAblation, ablate_channels};
+/// use cavitation_nn::{Conv2d, Dataset, Flatten, Linear, Loss, Relu, Sequential, Targets};
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let geom = Conv2dGeom::new(1, 3, (3, 3), (2, 2)).unwrap();
+/// let net = Sequential::new()
+///     .push(Conv2d::new(&mut params, geom, &mut rng))
+///     .push(Relu)
+///     .push(Flatten)
+///     .push(Linear::new(&mut params, 12, 2, &mut rng));
+/// let data = Dataset { x: Tensor::zeros(&[4, 9]), targets: Targets::Classes(vec![0; 4]) };
+/// let all: Vec<ChannelAblation> =
+///     ablate_channels(&net, &params, &data, &[0], Loss::CrossEntropy, 4).unwrap();
+/// assert_eq!(all.len(), 3);
+/// assert!(all.iter().all(|a| a.conv == 0 && a.channel < 3));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct ChannelAblation {
+    /// The index of the `Conv2d` layer the channel belongs to.
+    pub conv: usize,
+    /// The channel's index among the conv's output channels.
+    pub channel: usize,
+    /// The network's measures on the data set with this channel off.
+    pub evaluation: Evaluation,
+    /// The cost of switching the channel off, as [`Ablation::drop`].
+    pub drop: f64,
+}
+
+/// Switches each output channel of the `Conv2d` layers `convs` off in turn, through a channel
+/// mask (see [`Sequential::set_channel_mask`]), measures the network on `data` with `loss`
+/// in batches of `batch` rows, and returns one [`ChannelAblation`] per channel that was on,
+/// largest drop first (ties by conv, then channel), as [`ablate`] does for the neurons of
+/// `Linear` layers. Channels a mask has off already stay off and get no entry; `model` is
+/// not changed.
+///
+/// # Errors
+///
+/// [`Error::InvalidData`] when a layer of `convs` is not a `Conv2d`, when the layer that
+/// holds a listed conv's channels has a mask that does not switch whole channels, or as
+/// [`Evaluator::evaluate`] fails on `data`.
+///
+/// # Panics
+///
+/// Panics as [`Sequential::set_channel_mask`] does when a mask set with `set_mask` sits
+/// inside a listed conv's run.
+///
+/// ```
+/// use cavitation_core::{Conv2dGeom, ParamStore, Rng, Tensor};
+/// use cavitation_nn::shrink::ablate_channels;
+/// use cavitation_nn::{Conv2d, Dataset, Flatten, Linear, Loss, NeuronMask, Relu, Sequential, Targets};
+/// let mut params = ParamStore::new();
+/// let mut rng = Rng::seed(0);
+/// let geom = Conv2dGeom::new(1, 3, (3, 3), (2, 2)).unwrap();
+/// let mut net = Sequential::new()
+///     .push(Conv2d::new(&mut params, geom, &mut rng))
+///     .push(Relu)
+///     .push(Flatten)
+///     .push(Linear::new(&mut params, 12, 2, &mut rng));
+/// net.set_channel_mask(0, NeuronMask::from_off(3, &[1]));
+/// let data = Dataset { x: Tensor::full(&[4, 9], 0.5f32), targets: Targets::Classes(vec![1; 4]) };
+/// let all = ablate_channels(&net, &params, &data, &[0], Loss::CrossEntropy, 4).unwrap();
+/// let mut channels: Vec<usize> = all.iter().map(|a| a.channel).collect();
+/// channels.sort();
+/// assert_eq!(channels, [0, 2]);
+/// ```
+pub fn ablate_channels(
+    model: &Sequential,
+    params: &ParamStore,
+    data: &Dataset,
+    convs: &[usize],
+    loss: Loss,
+    batch: usize,
+) -> Result<Vec<ChannelAblation>, Error> {
+    let mut chosen: Vec<usize> = Vec::with_capacity(convs.len());
+    for &conv in convs {
+        if conv >= model.len() || model.layer(conv).as_conv2d().is_none() {
+            return Err(Error::InvalidData(format!(
+                "ablate_channels: layer {conv} is not a Conv2d layer"
+            )));
+        }
+        if !chosen.contains(&conv) {
+            chosen.push(conv);
+        }
+    }
+    // A copy with a channel mask on every chosen conv, so the evaluator has a mask step to
+    // change for each.
+    let mut copy = model.clone();
+    for &conv in &chosen {
+        // A mask at the channel layer that is not whole channels (set with `set_mask`)
+        // would be replaced by the first channel mask the sweep puts there.
+        let layer = copy.channel_layer(conv);
+        if let (Some(values), Some(channels)) = (copy.mask(layer), copy.channel_mask(conv))
+            && *values != copy.channel_values(conv, &channels)
+        {
+            return Err(Error::InvalidData(format!(
+                "ablate_channels: layer {layer}, which holds the channels of the conv layer \
+                 {conv}, has a mask that does not switch whole channels; clear it or put a \
+                 channel mask there with set_channel_mask"
+            )));
+        }
+        if copy.channel_mask(conv).is_none() {
+            let channels = model.channel_shape(conv).0;
+            copy.set_channel_mask(conv, NeuronMask::all_on(channels));
+        }
+    }
+    let mut evaluator = Evaluator::new(&copy, params, loss, batch)?;
+    let base = evaluator.evaluate(data)?;
+    let rows = data.len();
+    let mut all = Vec::new();
+    for &conv in &chosen {
+        let start = copy.channel_mask(conv).expect("put on above");
+        let layer = copy.channel_layer(conv);
+        let mut work = start.clone();
+        for channel in start.on().collect::<Vec<_>>() {
+            work.set(channel, false);
+            evaluator.set_mask(layer, &copy.channel_values(conv, &work))?;
+            let evaluation = evaluator.evaluate(data)?;
+            work.set(channel, true);
+            all.push(ChannelAblation {
+                conv,
+                channel,
+                evaluation,
+                drop: drop_of(&base, &evaluation, &data.targets, rows),
+            });
+        }
+        evaluator.set_mask(layer, &copy.channel_values(conv, &start))?;
+    }
+    all.sort_by(|a, b| {
+        b.drop
+            .total_cmp(&a.drop)
+            .then((a.conv, a.channel).cmp(&(b.conv, b.channel)))
     });
     Ok(all)
 }
@@ -344,5 +485,104 @@ mod tests {
         assert_eq!(drop(0.97, 0.96, 100), 1.0);
         assert_eq!(drop(0.96, 0.97, 100), -1.0);
         assert_eq!(drop(1.0, 0.0, 100), 100.0);
+    }
+
+    /// Each entry of `ablate_channels` equals a fresh evaluation of the model with that
+    /// channel off through `set_channel_mask`, on conv → BatchNorm2d → ReLU → avg pool →
+    /// flatten → linear; a channel off already gets no entry, and the order is by drop.
+    #[test]
+    fn ablate_channels_matches_masking_each_channel() {
+        use crate::{AvgPool2d, BatchNorm2d, Conv2d, Flatten, Linear, Relu};
+        use cavitation_core::kernels::pooling::Pool2dGeom;
+        use cavitation_core::{Conv2dGeom, Rng, Tensor};
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(11);
+        let mut net = Sequential::new()
+            .push(Conv2d::new(
+                &mut params,
+                Conv2dGeom::new(1, 4, (6, 6), (3, 3)).unwrap(),
+                &mut rng,
+            ))
+            .push(BatchNorm2d::new(&mut params, 4, (4, 4)))
+            .push(Relu)
+            .push(AvgPool2d::new(Pool2dGeom::new(4, (4, 4), (2, 2)).unwrap()))
+            .push(Flatten)
+            .push(Linear::new(&mut params, 16, 3, &mut rng));
+        net.set_channel_mask(0, NeuronMask::from_off(4, &[3]));
+        let rows = 12;
+        let x: Vec<f32> = (0..rows * 36).map(|_| rng.uniform_f32()).collect();
+        let data = Dataset {
+            x: Tensor::from_vec(x, &[rows, 36]).unwrap(),
+            targets: Targets::Classes((0..rows).map(|r| r % 3).collect()),
+        };
+        let all = ablate_channels(&net, &params, &data, &[0], Loss::CrossEntropy, 5).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.windows(2).all(|w| w[0].drop >= w[1].drop));
+        let base = Evaluator::new(&net, &params, Loss::CrossEntropy, 5)
+            .unwrap()
+            .evaluate(&data)
+            .unwrap();
+        for a in &all {
+            assert_ne!(a.channel, 3);
+            let mut off = net.clone();
+            off.set_channel_mask(0, NeuronMask::from_off(4, &[3, a.channel]));
+            let want = Evaluator::new(&off, &params, Loss::CrossEntropy, 5)
+                .unwrap()
+                .evaluate(&data)
+                .unwrap();
+            assert_eq!(a.evaluation, want, "channel {}", a.channel);
+            assert_eq!(a.drop, drop_of(&base, &want, &data.targets, rows));
+        }
+        // The model keeps its own mask.
+        assert_eq!(net.channel_mask(0).unwrap().off().collect::<Vec<_>>(), [3]);
+    }
+
+    /// A mask at the channel layer that switches single positions, not whole channels, is
+    /// refused rather than overwritten by the sweep.
+    #[test]
+    fn ablate_channels_refuses_a_partial_channel_mask() {
+        use crate::{Conv2d, Flatten, Linear, Relu};
+        use cavitation_core::{Conv2dGeom, Rng, Tensor};
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let mut net = Sequential::new()
+            .push(Conv2d::new(
+                &mut params,
+                Conv2dGeom::new(1, 2, (3, 3), (2, 2)).unwrap(),
+                &mut rng,
+            ))
+            .push(Relu)
+            .push(Flatten)
+            .push(Linear::new(&mut params, 8, 2, &mut rng));
+        net.set_mask(2, NeuronMask::from_off(8, &[0]));
+        let data = Dataset {
+            x: Tensor::zeros(&[2, 9]),
+            targets: Targets::Classes(vec![0; 2]),
+        };
+        let err = ablate_channels(&net, &params, &data, &[0], Loss::CrossEntropy, 2).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidData(m) if m.contains("does not switch whole channels"))
+        );
+    }
+
+    /// A layer that is not a conv is refused, naming it.
+    #[test]
+    fn ablate_channels_refuses_a_non_conv() {
+        use crate::{Linear, Relu};
+        use cavitation_core::{Rng, Tensor};
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(0);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 2, 3, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 3, 2, &mut rng));
+        let data = Dataset {
+            x: Tensor::zeros(&[2, 2]),
+            targets: Targets::Classes(vec![0; 2]),
+        };
+        let err = ablate_channels(&net, &params, &data, &[0], Loss::CrossEntropy, 2).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(m) if m.contains("layer 0 is not a Conv2d")));
+        let err = ablate_channels(&net, &params, &data, &[9], Loss::CrossEntropy, 2).unwrap_err();
+        assert!(matches!(err, Error::InvalidData(m) if m.contains("layer 9 is not a Conv2d")));
     }
 }

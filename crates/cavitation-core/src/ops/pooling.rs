@@ -4,7 +4,7 @@
 use crate::graph::{BackwardCtx, Var};
 use crate::kernels::pooling::{
     Pool2dGeom, WORDS, adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d,
-    avg_pool2d_backward, max_pool2d, max_pool2d_backward,
+    avg_pool2d_backward, max_pool2d, max_pool2d_backward_into,
 };
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
@@ -174,10 +174,7 @@ pub(super) fn max_backward<T: Real>(
     let winners = &labels[start + WORDS..][..batch * geom.out_width()];
     if let Some(slot) = ctx.slot(x) {
         slot.update_with(|buf, beta| {
-            if beta == T::ZERO {
-                buf.fill(T::ZERO);
-            }
-            max_pool2d_backward(&geom, batch, out_grad, winners, buf);
+            max_pool2d_backward_into(&geom, batch, out_grad, winners, buf, beta == T::ZERO);
         });
     }
 }

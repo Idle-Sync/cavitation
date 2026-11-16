@@ -8,7 +8,10 @@ use cavitation_core::{Error, ParamStore, Rng};
 
 use super::compact;
 use crate::train::check_dataset;
-use crate::{Dataset, Evaluation, FitConfig, History, Init, Linear, Prelu, Sequential, evaluate};
+use crate::{
+    BatchNorm2d, Conv2d, Dataset, Evaluation, FitConfig, History, Init, Linear, Prelu, Sequential,
+    evaluate,
+};
 
 /// The rows run at a time when measuring the two networks.
 const EVAL_BATCH: usize = 256;
@@ -127,9 +130,11 @@ impl fmt::Debug for FoundSize {
 /// network is `compact`'s rebuild of `model` with every parameter started again: each
 /// `Linear` gets new weights and biases as [`FromScratch::weights`] and
 /// [`FromScratch::biases`] say (a `Linear` without a bias gets none), drawn in layer order
-/// from `Rng::seed(scratch.seed)`, each
-/// `Prelu` gets new slopes of 0.25 ([`Prelu::new`]), and the layers without parameters are
-/// shared with `model`. The fresh network is then trained on `train` with
+/// from `Rng::seed(scratch.seed)`, each `Conv2d` gets new weights and biases as
+/// [`Conv2d::new`] draws them (PyTorch's default, [`Init::TorchDefault`]) from the same
+/// generator in the same order, each `BatchNorm2d` starts again with γ = 1, β = 0 and
+/// fresh running statistics (its other settings kept), each `Prelu` gets new slopes of 0.25
+/// ([`Prelu::new`]), and the layers without parameters are shared with `model`. The fresh network is then trained on `train` with
 /// [`fit`](crate::fit) and `scratch.fit`, and both networks are measured on `eval` with
 /// `scratch.fit.loss`, 256 rows at a time.
 ///
@@ -197,7 +202,6 @@ pub fn train_found_size(
     eval: &Dataset,
     scratch: FromScratch,
 ) -> Result<FoundSize, Error> {
-    super::refuse_image_layers(model, "train_found_size")?;
     check_dataset(eval).map_err(|e| match e {
         Error::InvalidData(msg) => {
             Error::InvalidData(format!("train_found_size: the evaluation rows: {msg}"))
@@ -220,10 +224,11 @@ pub fn train_found_size(
 }
 
 /// `layout` (with its values in `values`) rebuilt in a new store with new starting values:
-/// each `Linear` as `scratch` says (without a bias if it had none), drawn in layer order
-/// from one generator, each `Prelu`
-/// with as many slopes as before, all 0.25, and every other layer shared. `layout` comes
-/// from `compact`, so it has no other layer with parameters.
+/// each `Linear` as `scratch` says (without a bias if it had none) and each `Conv2d` as
+/// `Conv2d::new` starts one (without a bias if it had none), drawn in layer order from one
+/// generator; each `BatchNorm2d` new with its settings kept; each `Prelu` with as many
+/// slopes as before, all 0.25; and every other layer shared. `layout` comes from `compact`,
+/// so it has no other layer with parameters.
 fn reinitialised(
     layout: &Sequential,
     values: &ParamStore,
@@ -249,6 +254,28 @@ fn reinitialised(
                     Linear::without_bias(&mut store, inputs, outputs, scratch.weights, &mut rng)
                 }
             });
+        } else if let Some(conv) = layer.as_conv2d() {
+            let bias = conv.bias().map(|_| Init::TorchDefault);
+            out = out.push(Conv2d::with_init(
+                &mut store,
+                conv.geom(),
+                Init::TorchDefault,
+                bias,
+                &mut rng,
+            ));
+        } else if let Some(bn) = layer.as_batch_norm2d() {
+            let running = bn.running();
+            let fresh = BatchNorm2d::with_options(
+                &mut store,
+                bn.channels(),
+                (1, bn.spatial()),
+                bn.eps(),
+                running.and_then(|r| r.momentum),
+                bn.weight().is_some(),
+                running.is_some(),
+            )
+            .expect("the settings of a built batch norm are valid");
+            out = out.push(fresh);
         } else if let Some(prelu) = layer.as_prelu() {
             let slopes = values.value(prelu.weight()).data().len();
             out = out.push(Prelu::new(&mut store, slopes));
