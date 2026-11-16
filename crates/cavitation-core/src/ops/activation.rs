@@ -49,7 +49,7 @@ pub(crate) fn sigmoid_value<T: Real>(x: T) -> T {
 }
 
 /// The derivative of ReLU: 1 above 0, 0 at and below it, NaN for NaN.
-pub(super) fn relu_derivative<T: Real>(x: T) -> T {
+pub(crate) fn relu_derivative<T: Real>(x: T) -> T {
     if x > T::ZERO {
         T::ONE
     } else if x <= T::ZERO {

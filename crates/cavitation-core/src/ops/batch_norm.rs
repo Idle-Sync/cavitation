@@ -1,5 +1,6 @@
-//! Batch normalisation on the tape: `batch_norm2d`, with its backward pass, on images stored
-//! as flat NCHW rows.
+//! Batch normalisation on the tape: `batch_norm2d`, and `batch_norm2d_relu` with a ReLU
+//! after it in the same passes, with their backward pass, on images stored as flat NCHW
+//! rows.
 //!
 //! Both passes run one task per channel on the thread pool. Each channel's sums run in a
 //! fixed order on the thread that takes it, so every result is the same for any thread
@@ -9,6 +10,7 @@ use crate::graph::{BackwardCtx, BufferUpdate, ParamId, Var};
 use crate::kernels::conv::Parts;
 use crate::kernels::{self, pool};
 use crate::ops::Op;
+use crate::ops::activation::relu_derivative;
 use crate::{Real, Shape, Tape};
 
 /// The running statistics of a batch normalisation: the buffers it reads in evaluation and
@@ -90,6 +92,63 @@ impl<T: Real> Tape<'_, T> {
         channels: usize,
         spatial: usize,
         eps: f64,
+    ) -> Var {
+        self.batch_norm2d_with(x, weight, bias, running, channels, spatial, eps, false)
+    }
+
+    /// Records [`batch_norm2d`](Self::batch_norm2d) followed by ReLU as one node: the same
+    /// value, gradients and running statistics, bit for bit, as `batch_norm2d` then
+    /// [`relu`](Self::relu), in one pass over the output instead of two forward and two
+    /// backward. The node's value is ReLU's output; batch norm's own output is not kept.
+    ///
+    /// The backward pass multiplies the incoming gradient by ReLU's derivative at the node's
+    /// value, which is positive exactly where ReLU's input was and NaN exactly where it was
+    /// NaN, so the product is the one ReLU's own backward pass would pass on.
+    ///
+    /// # Panics
+    ///
+    /// As [`batch_norm2d`](Self::batch_norm2d).
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let x = Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap();
+    /// let x = tape.input(x.view());
+    /// let fused = tape.batch_norm2d_relu(x, None, None, None, 1, 2, 0.0);
+    /// let bn = tape.batch_norm2d(x, None, None, None, 1, 2, 0.0);
+    /// let separate = tape.relu(bn);
+    /// assert_eq!(tape.value(fused).data(), tape.value(separate).data());
+    /// assert_eq!(tape.value(fused).data()[..2], [0.0, 0.0]);
+    /// ```
+    #[allow(clippy::too_many_arguments)]
+    pub fn batch_norm2d_relu(
+        &mut self,
+        x: Var,
+        weight: Option<Var>,
+        bias: Option<Var>,
+        running: Option<RunningStats>,
+        channels: usize,
+        spatial: usize,
+        eps: f64,
+    ) -> Var {
+        self.batch_norm2d_with(x, weight, bias, running, channels, spatial, eps, true)
+    }
+
+    /// [`batch_norm2d`](Self::batch_norm2d), with ReLU applied to each output value as it is
+    /// written when `relu` is true.
+    #[allow(clippy::too_many_arguments)]
+    fn batch_norm2d_with(
+        &mut self,
+        x: Var,
+        weight: Option<Var>,
+        bias: Option<Var>,
+        running: Option<RunningStats>,
+        channels: usize,
+        spatial: usize,
+        eps: f64,
+        relu: bool,
     ) -> Var {
         let sx = self.shape(x);
         let width = channels * spatial;
@@ -186,8 +245,14 @@ impl<T: Real> Tape<'_, T> {
                     let at = n * width + c * spatial;
                     // SAFETY: task `c` alone writes channel `c`'s values of each image.
                     let o = unsafe { outs.slice(at, spatial) };
-                    for (o, &v) in o.iter_mut().zip(&xv[at..][..spatial]) {
-                        *o = (v - mean) * inv * g + s;
+                    if relu {
+                        for (o, &v) in o.iter_mut().zip(&xv[at..][..spatial]) {
+                            *o = ((v - mean) * inv * g + s).relu();
+                        }
+                    } else {
+                        for (o, &v) in o.iter_mut().zip(&xv[at..][..spatial]) {
+                            *o = (v - mean) * inv * g + s;
+                        }
                     }
                 }
             });
@@ -209,13 +274,14 @@ impl<T: Real> Tape<'_, T> {
             self.push_buffer_update(update, means, unbiased);
         }
         let stats_var = self.push(Op::Input, Shape::new(&[3 * channels]), stats);
-        let start = self.push_labels(&[channels, spatial, usize::from(use_running)]);
+        let start = self.push_labels(&[channels, spatial, usize::from(use_running), usize::from(relu)]);
         let so = Shape::new(&[batch, width]);
         self.push(Op::BatchNorm2d(x, weight, bias, stats_var, start), so, out)
     }
 }
 
-/// Backward of `batch_norm2d`. With `x̂ = (x − mean) · inv` and `g = dy · γ` per channel over
+/// Backward of `batch_norm2d` and `batch_norm2d_relu` (`out` is the node, whose value, ReLU's
+/// output, gives the fused ReLU's derivative). With `x̂ = (x − mean) · inv` and `g = dy · γ` per channel over
 /// its `m` values: `dβ = Σ dy`, `dγ = Σ dy · x̂`, and `dx = inv · g` with the running
 /// statistics, else `dx = inv / m · (m · g − Σ g − x̂ · Σ g · x̂)` through the batch's.
 pub(super) fn backward<T: Real>(
@@ -224,16 +290,21 @@ pub(super) fn backward<T: Real>(
     bias: Option<Var>,
     stats: Var,
     start: usize,
+    out: Var,
     out_grad: &[T],
     ctx: &mut BackwardCtx<'_, T>,
 ) {
-    let l = &ctx.labels()[start..start + 3];
-    let (channels, spatial, use_running) = (l[0], l[1], l[2] == 1);
+    let l = &ctx.labels()[start..start + 4];
+    let (channels, spatial, use_running, relu) = (l[0], l[1], l[2] == 1, l[3] == 1);
     let batch = ctx.shape(x).dims()[0];
     let width = channels * spatial;
     let m = batch * spatial;
     let (xv, sv) = (ctx.value(x), ctx.value(stats));
     let w = weight.map(|v| ctx.value(v));
+    let yv = ctx.value(out);
+    // The gradient reaching batch norm's own output: `dy`, or with the fused ReLU `dy` times
+    // ReLU's derivative at the node's value, the product ReLU's backward pass would write.
+    let grad = |dy: T, y: T| if relu { dy * relu_derivative(y) } else { dy };
     // Per channel: Σ dy and Σ dy · x̂.
     let mut sums = ctx.scratch(2 * channels);
     let threads = kernels::threads();
@@ -244,7 +315,12 @@ pub(super) fn backward<T: Real>(
         let (mut s, mut sx) = (T::ZERO, T::ZERO);
         for n in 0..batch {
             let at = n * width + c * spatial;
-            for (&g, &v) in out_grad[at..][..spatial].iter().zip(&xv[at..][..spatial]) {
+            for ((&g, &v), &y) in out_grad[at..][..spatial]
+                .iter()
+                .zip(&xv[at..][..spatial])
+                .zip(&yv[at..][..spatial])
+            {
+                let g = grad(g, y);
                 s += g;
                 sx += g * ((v - mean) * inv);
             }
@@ -277,12 +353,13 @@ pub(super) fn backward<T: Real>(
                     let at = n * width + c * spatial;
                     // SAFETY: task `c` alone writes channel `c`'s values of each image.
                     let dst = unsafe { bufs.slice(at, spatial) };
-                    for ((d, &dy), &v) in dst
+                    for (((d, &dy), &v), &y) in dst
                         .iter_mut()
                         .zip(&out_grad[at..][..spatial])
                         .zip(&xv[at..][..spatial])
+                        .zip(&yv[at..][..spatial])
                     {
-                        let gy = dy * g;
+                        let gy = grad(dy, y) * g;
                         let dx = if use_running {
                             gy * inv
                         } else {
