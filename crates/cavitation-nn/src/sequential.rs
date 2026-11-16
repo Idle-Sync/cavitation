@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use cavitation_core::{ParamId, Real, Tape, Var};
 
 use crate::activation::last_dim;
-use crate::mask::LayerMask;
 use crate::layer::private::Token;
+use crate::mask::LayerMask;
 use crate::{ActivationKind, BatchNorm2d, Layer, Linear, NeuronMask};
 
 /// Each layer's input and output [`Var`] from one forward pass. A masked layer's output is

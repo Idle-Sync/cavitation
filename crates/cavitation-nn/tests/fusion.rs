@@ -11,7 +11,10 @@ fn net(params: &mut ParamStore) -> Sequential {
     let mut rng = Rng::seed(4);
     let bn = BatchNorm2d::new(params, 3, (3, 3));
     let beta = bn.bias().unwrap();
-    params.value_mut(beta).data_mut().copy_from_slice(&[0.5, -0.25, 0.0]);
+    params
+        .value_mut(beta)
+        .data_mut()
+        .copy_from_slice(&[0.5, -0.25, 0.0]);
     Sequential::new()
         .push(Conv2d::new(
             params,
@@ -43,7 +46,11 @@ fn train(model: &Sequential, mut params: ParamStore) -> (Vec<Vec<u32>>, Vec<Vec<
     let mut graph = Graph::new();
     let mut trace = Trace::new();
     let ids: Vec<_> = model.state_names().into_iter().map(|(_, id)| id).collect();
-    let params_ids: Vec<_> = model.parameter_names().into_iter().map(|(_, id)| id).collect();
+    let params_ids: Vec<_> = model
+        .parameter_names()
+        .into_iter()
+        .map(|(_, id)| id)
+        .collect();
     let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     let mut grads = Vec::new();
     for step in 1..=2 {
@@ -57,7 +64,10 @@ fn train(model: &Sequential, mut params: ParamStore) -> (Vec<Vec<u32>>, Vec<Vec<
         tape.backward(loss, &mut params.grads);
         drop(tape);
         graph.apply_buffer_updates(&mut params.values);
-        grads = params_ids.iter().map(|&id| bits(params.grad(id).data())).collect();
+        grads = params_ids
+            .iter()
+            .map(|&id| bits(params.grad(id).data()))
+            .collect();
         for &id in &params_ids {
             let g = params.grad(id).data().to_vec();
             for (p, g) in params.value_mut(id).data_mut().iter_mut().zip(g) {
@@ -65,7 +75,10 @@ fn train(model: &Sequential, mut params: ParamStore) -> (Vec<Vec<u32>>, Vec<Vec<
             }
         }
     }
-    let state = ids.iter().map(|&id| bits(params.value(id).data())).collect();
+    let state = ids
+        .iter()
+        .map(|&id| bits(params.value(id).data()))
+        .collect();
     let mut tape = graph.tape(&params.values);
     let xv = tape.input(x.view());
     let y = model.forward(&mut tape, xv);
@@ -90,7 +103,11 @@ fn fused_training_matches_unfused() {
 fn fused_layers(model: &Sequential, params: &ParamStore, trace: &mut Trace) -> Vec<bool> {
     let mut graph = Graph::new();
     let mut tape = graph.training_tape(&params.values, 0, 1);
-    let x = tape.input(Tensor::from_vec(values(2 * 25, 3), &[2, 25]).unwrap().view());
+    let x = tape.input(
+        Tensor::from_vec(values(2 * 25, 3), &[2, 25])
+            .unwrap()
+            .view(),
+    );
     model.forward_traced(&mut tape, x, trace);
     (0..trace.len()).map(|i| trace.fused(i)).collect()
 }
@@ -152,7 +169,11 @@ fn hooks_need_their_layers_kept() {
         hooks.on_forward(layer, |_| {});
         let mut graph = Graph::new();
         let mut tape = graph.training_tape(&params.values, 0, 1);
-        let x = tape.input(Tensor::from_vec(values(2 * 25, 3), &[2, 25]).unwrap().view());
+        let x = tape.input(
+            Tensor::from_vec(values(2 * 25, 3), &[2, 25])
+                .unwrap()
+                .view(),
+        );
         let mut trace = Trace::new();
         model.forward_traced(&mut tape, x, &mut trace);
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
