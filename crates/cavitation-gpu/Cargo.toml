@@ -22,7 +22,8 @@ wgpu = { version = "30.0.2", default-features = false, features = ["std", "parki
 # on native backends.
 pollster = "1.0.1"
 # Pool2dGeom, the geometry the pooling kernels take; the tests also use its f64 tape as the
-# reference for the activation twins (tanh, the sigmoid and GELU) and their gradients.
+# reference for the activation twins (tanh, the sigmoid and GELU) and their gradients, and
+# for the bias add (tests/reduce.rs).
 cavitation-core = { path = "../cavitation-core", version = "0.3.2" }
 
 [dev-dependencies]

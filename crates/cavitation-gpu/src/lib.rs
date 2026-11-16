@@ -32,6 +32,9 @@
 //!   integers.
 //! - [`kernels::ConvForward`]: the 2-D convolution forward pass as an implicit GEMM, with
 //!   stride, padding, dilation and a bias, within the GEMM's bound of the CPU reference.
+//! - [`kernels::BiasAdd`] and [`kernels::ChannelSums`]: a bias added per channel, with the
+//!   CPU's bits, and each channel's sum in a fixed tree, over `[outer][channels][inner]` tensors (an
+//!   `M × N` matrix or an NCHW batch).
 //! - [`Backend`] and [`GpuError`].
 //! - [`wgpu`] itself, re-exported, so its types match the version this crate uses.
 //!
