@@ -66,8 +66,9 @@ pub(crate) enum Op<T: Real> {
     /// output size start in the label buffer.
     AdaptiveAvgPool2d(Var, usize),
     /// 2-D batch normalisation: the images, γ and β if given, the node holding each
-    /// channel's mean and 1 / √(var + eps), and where the channels, the spatial size and
-    /// whether the running statistics were used start in the label buffer.
+    /// channel's mean and 1 / √(var + eps), and where the channels, the spatial size,
+    /// whether the running statistics were used and whether a ReLU is fused after it start
+    /// in the label buffer.
     BatchNorm2d(Var, Option<Var>, Option<Var>, Var, usize),
     /// Matrix product `a · bᵀ` of `[m, k]` and `[n, k]`.
     MatMulNt(Var, Var),
@@ -178,7 +179,7 @@ impl<T: Real> Op<T> {
             Op::AvgPool2d(x, start) => pooling::avg_backward(x, start, out_grad, ctx),
             Op::AdaptiveAvgPool2d(x, start) => pooling::adaptive_backward(x, start, out_grad, ctx),
             Op::BatchNorm2d(x, w, b, stats, start) => {
-                batch_norm::backward(x, w, b, stats, start, out_grad, ctx)
+                batch_norm::backward(x, w, b, stats, start, out, out_grad, ctx)
             }
             Op::MatMulNt(a, b) => matmul::backward(true, a, b, out_grad, ctx),
             Op::Scale(a, s) => elementwise::scale_backward(a, s, out_grad, ctx),
