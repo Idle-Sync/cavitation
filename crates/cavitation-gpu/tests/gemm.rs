@@ -53,10 +53,20 @@ fn reference(a: &[f32], b: &[f32], c: &[f32], d: &GemmDims) -> (Vec<f64>, Vec<f6
     (value, abs)
 }
 
-/// Runs the GEMM `dims` on `a`, `b` and the old `c` and returns the new `C`.
-fn run(kit: &mut Kit, gemm: &Gemm, dims: GemmDims, a: &[f32], b: &[f32], c: &[f32]) -> Vec<f32> {
+/// Runs the GEMM `dims` on `a`, `b` and the old `c`, on the wide tile when the product is one
+/// it computes, and returns the new `C`.
+fn run(
+    kit: &mut Kit,
+    gemm: &mut Gemm,
+    dims: GemmDims,
+    a: &[f32],
+    b: &[f32],
+    c: &[f32],
+) -> Vec<f32> {
     let (ba, bb, bc) = (kit.upload(a), kit.upload(b), kit.upload(c));
     let call = gemm.call(&mut kit.steps, &mut kit.pool, dims, &ba, &bb, &bc);
+    gemm.ensure_wide(&mut kit.cache, &call)
+        .expect("the wide tile builds");
     let mut step = kit.steps.begin();
     gemm.record(&mut step, &call);
     let _ = step.finish();
@@ -86,7 +96,7 @@ fn transposes(dims: GemmDims) -> [GemmDims; 4] {
 fn exact_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 4 * 64 * 131_072);
-        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
         let shapes = [
             GemmDims::new(64, 64, 16),
             GemmDims::new(67, 33, 129),
@@ -116,7 +126,7 @@ fn exact_twins() {
                 let c = exact_values(seed + 200, dims.c_len() as usize);
                 let (want, _) = reference(&a, &b, &c, &dims);
                 let want: Vec<f32> = want.iter().map(|&w| w as f32).collect();
-                let got = run(&mut kit, &gemm, dims, &a, &b, &c);
+                let got = run(&mut kit, &mut gemm, dims, &a, &b, &c);
                 assert_exact(&got, &want, &format!("gemm exact {dims:?}"));
             }
         }
@@ -131,7 +141,7 @@ fn exact_twins() {
 fn rounding_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 4 * 8192 * 576);
-        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
         let mut shapes: Vec<GemmDims> = Vec::new();
         for base in [
             GemmDims::new(256, 256, 256),
@@ -175,7 +185,7 @@ fn rounding_twins() {
             let b = seeded_values(seed + 1, dims.b_len() as usize, -1.0, 1.0);
             let c = seeded_values(seed + 2, dims.c_len() as usize, -1.0, 1.0);
             let (want, abs) = reference(&a, &b, &c, &dims);
-            let got = run(&mut kit, &gemm, dims, &a, &b, &c);
+            let got = run(&mut kit, &mut gemm, dims, &a, &b, &c);
             let k = dims.k as f64;
             let worst = assert_within(
                 &got,
@@ -202,7 +212,7 @@ fn rounding_twins() {
 fn beta_zero_ignores_old_c() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 16);
-        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
         let dims = GemmDims::new(20, 30, 40);
         let a = exact_values(1, dims.a_len() as usize);
         let b = exact_values(2, dims.b_len() as usize);
@@ -210,7 +220,7 @@ fn beta_zero_ignores_old_c() {
         let (want, _) = reference(&a, &b, &nans, &dims);
         let want: Vec<f32> = want.iter().map(|&w| w as f32).collect();
         assert_exact(
-            &run(&mut kit, &gemm, dims, &a, &b, &nans),
+            &run(&mut kit, &mut gemm, dims, &a, &b, &nans),
             &want,
             "beta 0 with NaN in C",
         );
@@ -222,14 +232,168 @@ fn beta_zero_ignores_old_c() {
 fn runs_are_identical() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 4 * 512 * 512);
-        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
         let dims = GemmDims::new(300, 200, 500);
         let a = seeded_values(5, dims.a_len() as usize, -1.0, 1.0);
         let b = seeded_values(6, dims.b_len() as usize, -1.0, 1.0);
         let c = vec![0.0; dims.c_len() as usize];
-        let first = run(&mut kit, &gemm, dims, &a, &b, &c);
-        let second = run(&mut kit, &gemm, dims, &a, &b, &c);
+        let first = run(&mut kit, &mut gemm, dims, &a, &b, &c);
+        let second = run(&mut kit, &mut gemm, dims, &a, &b, &c);
         assert_exact(&second, &first, "two runs");
+    });
+}
+
+/// The wide tile and the square tile give the same bits. A batch of products of at most 32
+/// rows and more than 64 columns, with at least 64 wide tiles between them, runs on the wide
+/// tile (32 × 128 per workgroup); the same rows as the first rows of one taller `A` run on
+/// the square tile (64 × 64). Each output is its products added in increasing k on either,
+/// so every product of the batch agrees with the shared rows bit for bit, in every transpose
+/// combination, for k of 1, 16, 17 and 77 and for widths on both sides of a tile's edge.
+#[test]
+fn the_wide_tile_gives_the_square_tiles_bits() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 4 * 512 * 512);
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let tall = 70usize;
+        for (seed, (m, n, k, batch)) in [
+            (32usize, 300usize, 77usize, 22usize),
+            (32, 128, 16, 64),
+            (27, 129, 17, 32),
+            (10, 256, 1, 32),
+            (1, 65, 77, 64),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let base = GemmDims::new(m as u32, n as u32, k as u32);
+            let plain_a = seeded_values(40 + seed as u64, tall * k, -1.0, 1.0);
+            for dims in transposes(base) {
+                // A's first m rows in this layout, and the same rows atop 70 − m more.
+                let stored = |rows: usize| -> Vec<f32> {
+                    let mut out = vec![0.0f32; rows * k];
+                    for r in 0..rows {
+                        for j in 0..k {
+                            let at = if dims.trans_a {
+                                j * rows + r
+                            } else {
+                                r * k + j
+                            };
+                            out[at] = plain_a[r * k + j];
+                        }
+                    }
+                    out
+                };
+                let b = seeded_values(60 + seed as u64, dims.b_len() as usize, -1.0, 1.0);
+                // The batch shares A and B; each product writes a C of its own.
+                let batched = GemmDims {
+                    batch: batch as u32,
+                    c_batch: (m * n) as u32,
+                    ..dims
+                };
+                let zeros = vec![0.0; m * n * batch];
+                let wide = run(&mut kit, &mut gemm, batched, &stored(m), &b, &zeros);
+                let square_dims = GemmDims {
+                    trans_a: dims.trans_a,
+                    trans_b: dims.trans_b,
+                    ..GemmDims::new(tall as u32, n as u32, k as u32)
+                };
+                let square = run(
+                    &mut kit,
+                    &mut gemm,
+                    square_dims,
+                    &stored(tall),
+                    &b,
+                    &vec![0.0; tall * n],
+                );
+                assert!(wide.iter().any(|v| *v != 0.0), "{m} × {n} × {k}: all zero");
+                for (z, product) in wide.chunks(m * n).enumerate() {
+                    assert_exact(
+                        product,
+                        &square[..m * n],
+                        &format!(
+                            "{m} × {n} × {k}, product {z} of {batch}, transposes {} {}",
+                            dims.trans_a, dims.trans_b
+                        ),
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// The wide tile reads each product's own `A` and `B` and adds `β` times its own old `C`:
+/// 32 products of 27 × 129 × 17 with `A`s, `B`s and old `C`s of their own (the batch strides)
+/// and `β = 1` run on the wide tile, and each agrees bit for bit with the same product run
+/// alone as the first 27 rows of a 70-row product on the square tile, in every transpose
+/// combination.
+#[test]
+fn the_wide_tile_reads_each_products_operands() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 4 * 512 * 512);
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let (m, n, k, batch, tall) = (27usize, 129usize, 17usize, 32usize, 70usize);
+        // Product z's A (70 rows, the first 27 of them the batch's), B and old C.
+        let plain_a: Vec<Vec<f32>> = (0..batch)
+            .map(|z| seeded_values(700 + z as u64, tall * k, -1.0, 1.0))
+            .collect();
+        let old_c: Vec<Vec<f32>> = (0..batch)
+            .map(|z| seeded_values(900 + z as u64, tall * n, -1.0, 1.0))
+            .collect();
+        for base in transposes(GemmDims::new(m as u32, n as u32, k as u32)) {
+            let stored = |z: usize, rows: usize| -> Vec<f32> {
+                let mut out = vec![0.0f32; rows * k];
+                for r in 0..rows {
+                    for j in 0..k {
+                        let at = if base.trans_a {
+                            j * rows + r
+                        } else {
+                            r * k + j
+                        };
+                        out[at] = plain_a[z][r * k + j];
+                    }
+                }
+                out
+            };
+            let b: Vec<Vec<f32>> = (0..batch)
+                .map(|z| seeded_values(800 + z as u64, k * n, -1.0, 1.0))
+                .collect();
+            let dims = GemmDims {
+                beta: 1.0,
+                batch: batch as u32,
+                a_batch: (m * k) as u32,
+                b_batch: (k * n) as u32,
+                c_batch: (m * n) as u32,
+                ..base
+            };
+            let all_a: Vec<f32> = (0..batch).flat_map(|z| stored(z, m)).collect();
+            let all_b: Vec<f32> = b.iter().flatten().copied().collect();
+            let all_c: Vec<f32> = old_c.iter().flat_map(|c| c[..m * n].to_vec()).collect();
+            let wide = run(&mut kit, &mut gemm, dims, &all_a, &all_b, &all_c);
+            for z in 0..batch {
+                let square_dims = GemmDims {
+                    trans_a: base.trans_a,
+                    trans_b: base.trans_b,
+                    beta: 1.0,
+                    ..GemmDims::new(tall as u32, n as u32, k as u32)
+                };
+                let square = run(
+                    &mut kit,
+                    &mut gemm,
+                    square_dims,
+                    &stored(z, tall),
+                    &b[z],
+                    &old_c[z],
+                );
+                assert_exact(
+                    &wide[z * m * n..(z + 1) * m * n],
+                    &square[..m * n],
+                    &format!(
+                        "product {z} of {batch}, transposes {} {}",
+                        base.trans_a, base.trans_b
+                    ),
+                );
+            }
+        }
     });
 }
 
@@ -347,7 +511,7 @@ fn packed(d: &GemmDims) -> GemmDims {
 fn strided_batched_products_are_exact() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 22);
-        let gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
+        let mut gemm = Gemm::new(gpu, &mut kit.cache).expect("build");
         let (m, n, k) = (37u32, 29u32, 45u32);
         for (t, (trans_a, trans_b)) in [(false, false), (false, true), (true, false), (true, true)]
             .into_iter()
@@ -397,7 +561,7 @@ fn strided_batched_products_are_exact() {
                     }
                 }
             }
-            let got = run(&mut kit, &gemm, dims, &a, &b, &c);
+            let got = run(&mut kit, &mut gemm, dims, &a, &b, &c);
             assert_exact(&got, &want, &format!("strided batch {dims:?}"));
         }
     });

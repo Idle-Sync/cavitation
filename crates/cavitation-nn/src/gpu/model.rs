@@ -401,7 +401,7 @@ impl GpuModel {
             .collect();
         let shader = |e| Error::Unsupported(format!("GpuModel::compile: {e}"));
         let mut cache = PipelineCache::new(gpu);
-        let kernels = Kernels::new(gpu, &mut cache).map_err(shader)?;
+        let mut kernels = Kernels::new(gpu, &mut cache).map_err(shader)?;
         let parts = Parts {
             layers: &plan.layers,
             params: &gpu_params,
@@ -410,7 +410,7 @@ impl GpuModel {
             batch,
             input_width: plan.input_width,
         };
-        let eval = Forward::evaluation(&parts, &kernels, &mut cache, &mut pool, &mut steps)
+        let eval = Forward::evaluation(&parts, &mut kernels, &mut cache, &mut pool, &mut steps)
             .map_err(shader)?;
         Ok(GpuModel {
             gpu: gpu.clone(),

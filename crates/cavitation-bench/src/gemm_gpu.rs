@@ -1,4 +1,5 @@
-//! `cavitation-bench gemm-gpu`: the tiled GPU GEMM's speed on square products, timed on the
+//! `cavitation-bench gemm-gpu`: the tiled GPU GEMM's speed on square products, and on
+//! products of any `m x n x k` given with `--shapes`, timed on the
 //! GPU with timestamps, after a warm-up by time, with the GPU clock read from `nvidia-smi`
 //! before and after when it is there.
 
@@ -18,15 +19,20 @@ struct Options {
     backend: Option<Backend>,
     /// The square sizes to time.
     sizes: Vec<u32>,
+    /// More products to time after the squares, each `[m, n, k, batch]`: `C` is `m × n`, and
+    /// `batch` products (1 unless given) run in one dispatch on the same `A` and `B`.
+    shapes: Vec<[u32; 4]>,
     /// The warm-up before each size's timed steps.
     warm_up: Duration,
 }
 
-/// Reads `[--backend vulkan|dx12|metal] [--sizes 1024,4096] [--warm-up SECONDS]`.
+/// Reads `[--backend vulkan|dx12|metal] [--sizes 1024,4096] [--shapes 32x1024x288,10x256x128x64]
+/// [--warm-up SECONDS]`. `--sizes none` times no squares.
 fn parse(args: &[String]) -> Result<Options, String> {
     let mut o = Options {
         backend: None,
         sizes: vec![1024, 2048, 4096],
+        shapes: Vec::new(),
         warm_up: Duration::from_secs(1),
     };
     let mut it = args.iter();
@@ -35,11 +41,38 @@ fn parse(args: &[String]) -> Result<Options, String> {
         match arg.as_str() {
             "--backend" => o.backend = Some(value()?.parse().map_err(|e| format!("{e}"))?),
             "--sizes" => {
-                o.sizes = value()?
+                let list = value()?;
+                o.sizes = if list.trim() == "none" {
+                    Vec::new()
+                } else {
+                    list.split(',')
+                        .map(|s| s.trim().parse::<u32>().ok().filter(|&n| n > 0))
+                        .collect::<Option<Vec<u32>>>()
+                        .ok_or(
+                            "--sizes takes positive whole numbers separated by commas, or none",
+                        )?
+                };
+            }
+            "--shapes" => {
+                o.shapes = value()?
                     .split(',')
-                    .map(|s| s.trim().parse::<u32>().ok().filter(|&n| n > 0))
-                    .collect::<Option<Vec<u32>>>()
-                    .ok_or("--sizes takes positive whole numbers separated by commas")?;
+                    .map(|shape| {
+                        let parts = shape
+                            .trim()
+                            .split('x')
+                            .map(|s| s.parse::<u32>().ok().filter(|&n| n > 0))
+                            .collect::<Option<Vec<u32>>>()?;
+                        match parts[..] {
+                            [m, n, k] => Some([m, n, k, 1]),
+                            [m, n, k, batch] => Some([m, n, k, batch]),
+                            _ => None,
+                        }
+                    })
+                    .collect::<Option<Vec<[u32; 4]>>>()
+                    .ok_or(
+                        "--shapes takes products as MxNxK or MxNxKxBATCH (C is M by N), separated by \
+                         commas",
+                    )?;
             }
             "--warm-up" => {
                 let seconds: f64 = value()?
@@ -49,6 +82,9 @@ fn parse(args: &[String]) -> Result<Options, String> {
             }
             other => return Err(format!("unknown argument `{other}`")),
         }
+    }
+    if o.sizes.is_empty() && o.shapes.is_empty() {
+        return Err("nothing to time: --sizes none needs --shapes".to_string());
     }
     Ok(o)
 }
@@ -79,45 +115,63 @@ fn seeded_bytes(seed: u64, n: u64) -> Vec<u8> {
         .collect()
 }
 
-/// Times the GEMM on each size in `o`, plain and with `B` transposed (as a convolution's
-/// forward product is), and prints the median GPU time and GFLOPS of each.
+/// Times the GEMM on each size and shape in `o`, plain and with `B` transposed (as a
+/// convolution's forward product is), and prints the median GPU time and GFLOPS of each.
 fn time(gpu: &Gpu, o: &Options) -> Result<(), String> {
-    let largest = u64::from(*o.sizes.iter().max().expect("at least one size"));
+    let products: Vec<[u32; 4]> = (o.sizes.iter().map(|&n| [n, n, n, 1]))
+        .chain(o.shapes.iter().copied())
+        .collect();
+    // The values of the largest operand, which is uploaded in one step.
+    let largest = products
+        .iter()
+        .map(|&[m, n, k, _]| u64::from(k) * u64::from(m.max(n)))
+        .max()
+        .expect("at least one product");
     let mut cache = PipelineCache::new(gpu);
     let mut pool = BufferPool::new(gpu);
     let mut steps = StepEncoder::new(
         gpu,
         StepSizes {
-            upload_bytes: 4 * largest * largest,
+            // Room for the largest operand, and for a small product's `Dims` uniform.
+            upload_bytes: (4 * largest).max(4096),
             ..StepSizes::default()
         },
     );
     steps.set_profiling(true);
-    let gemm = Gemm::new(gpu, &mut cache).map_err(|e| e.to_string())?;
+    let mut gemm = Gemm::new(gpu, &mut cache).map_err(|e| e.to_string())?;
     let usage =
         wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
-    for &n in &o.sizes {
-        let len = 4 * u64::from(n) * u64::from(n);
-        let (a, b, c) = (
-            pool.take(len, usage),
-            pool.take(len, usage),
-            pool.take(len, usage),
+    for &[m, n, k, batch] in &products {
+        let c_batch = m
+            .checked_mul(n)
+            .ok_or_else(|| format!("{m} x {n}: C holds 2^32 values or more"))?;
+        let (a_len, b_len, c_len) = (
+            u64::from(m) * u64::from(k),
+            u64::from(k) * u64::from(n),
+            u64::from(m) * u64::from(n) * u64::from(batch),
         );
-        for (buffer, seed) in [(&a, 1), (&b, 2)] {
+        let (a, b, c) = (
+            pool.take(4 * a_len, usage),
+            pool.take(4 * b_len, usage),
+            pool.take(4 * c_len, usage),
+        );
+        for (buffer, seed, len) in [(&a, 1, a_len), (&b, 2, b_len)] {
             let mut step = steps.begin();
-            step.upload(
-                buffer.buffer(),
-                0,
-                &seeded_bytes(seed, u64::from(n) * u64::from(n)),
-            );
+            step.upload(buffer.buffer(), 0, &seeded_bytes(seed, len));
             let _ = step.finish();
         }
         for trans_b in [false, true] {
             let dims = GemmDims {
                 trans_b,
-                ..GemmDims::new(n, n, n)
+                batch,
+                // Every product reads the same A and B and writes a C of its own.
+                c_batch,
+                ..GemmDims::new(m, n, k)
             };
             let call = gemm.call(&mut steps, &mut pool, dims, &a, &b, &c);
+            // The wide tile, for the products it computes.
+            gemm.ensure_wide(&mut cache, &call)
+                .map_err(|e| e.to_string())?;
             let run = |steps: &mut StepEncoder| {
                 let mut step = steps.begin();
                 step.span("gemm");
@@ -138,7 +192,12 @@ fn time(gpu: &Gpu, o: &Options) -> Result<(), String> {
             times.sort_by(f64::total_cmp);
             let median = (times[TIMED / 2 - 1] + times[TIMED / 2]) / 2.0;
             println!(
-                "gemm {n} x {n} x {n} {}: median of {TIMED} {:.3} ms (min {:.3}, max {:.3}) = {:.0} GFLOPS",
+                "gemm {m} x {n} x {k}{} {}: median of {TIMED} {:.4} ms (min {:.4}, max {:.4}) = {:.0} GFLOPS",
+                if batch > 1 {
+                    format!(" x {batch} products")
+                } else {
+                    String::new()
+                },
                 if trans_b {
                     "B transposed"
                 } else {
@@ -200,6 +259,18 @@ mod tests {
             (d.backend, d.sizes.clone(), d.warm_up),
             (None, vec![1024, 2048, 4096], Duration::from_secs(1))
         );
+        assert!(d.shapes.is_empty());
+        let s = parse(&args(&[
+            "--sizes",
+            "none",
+            "--shapes",
+            "32x1024x288, 10x256x128",
+        ]))
+        .unwrap();
+        assert!(s.sizes.is_empty());
+        assert_eq!(s.shapes, vec![[32, 1024, 288, 1], [10, 256, 128, 1]]);
+        let b = parse(&args(&["--shapes", "32x1024x288x128"])).unwrap();
+        assert_eq!(b.shapes, vec![[32, 1024, 288, 128]]);
         let o = parse(&args(&[
             "--backend",
             "dx12",
@@ -215,6 +286,11 @@ mod tests {
         for bad in [
             &["--sizes", "0"][..],
             &["--sizes", "x"],
+            &["--sizes", "none"],
+            &["--shapes", "32x1024"],
+            &["--shapes", "32x0x8"],
+            &["--shapes", "1x2x3x4x5"],
+            &["--shapes", "1x2x3x0"],
             &["--backend", "gl"],
             &["--warm-up"],
             &["--what"],
