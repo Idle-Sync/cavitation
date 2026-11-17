@@ -25,8 +25,8 @@
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--ours-only] [--profile N] [--device cpu|gpu] [--backend B] [--torch-device D]
-//!   [--deterministic]` train the v0.3 benchmark CNNs (LeNet-5's layout on
+//!   [--ours-only] [--profile N] [--no-fuse] [--device cpu|gpu] [--backend B]
+//!   [--torch-device D] [--deterministic]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
 //!   epochs) here and then
 //!   with `scripts/bench/torch_cnn.py` at the same thread count, from the same initial
@@ -125,8 +125,8 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096] [--warm-up SECONDS] (with the gpu feature)\n\
     \x20 conv    [--batch N]\n\
-    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
-    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
+    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
+    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
     \x20     (both CNNs) [--device cpu|gpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
     \x20     [--deterministic]; --device gpu needs the gpu feature\n\
     \x20 subnormal [--steps N]\n\

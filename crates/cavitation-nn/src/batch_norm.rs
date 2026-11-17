@@ -277,6 +277,20 @@ impl BatchNorm2d {
     }
 }
 
+impl BatchNorm2d {
+    /// Records this layer followed by ReLU as one node ([`Tape::batch_norm2d_relu`]), for
+    /// [`Sequential`](crate::Sequential)'s fused pairs.
+    ///
+    /// # Panics
+    ///
+    /// As [`Layer::forward`].
+    pub(crate) fn forward_relu<T: Real>(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+        let w = self.weight.map(|id| tape.param(id));
+        let b = self.bias.map(|id| tape.param(id));
+        tape.batch_norm2d_relu(x, w, b, self.running, self.channels, self.spatial, self.eps)
+    }
+}
+
 impl<T: Real> Layer<T> for BatchNorm2d {
     /// Returns `"batch_norm2d"`.
     fn name(&self) -> &str {

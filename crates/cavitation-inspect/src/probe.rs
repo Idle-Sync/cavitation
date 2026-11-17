@@ -402,6 +402,8 @@ impl Probe {
         grads.zero_grad();
         let mut tape = self.graph.tape(&params.values);
         let input = tape.input(x);
+        // The probe shows each layer's own input and output, so nothing is fused.
+        self.trace.keep_all_outputs();
         let out = model.forward_traced(&mut tape, input, &mut self.trace);
         let width = tape.shape(out).dims().last().copied().unwrap_or(0);
         let targets = match &data.targets {

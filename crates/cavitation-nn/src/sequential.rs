@@ -7,11 +7,13 @@ use std::time::{Duration, Instant};
 use cavitation_core::{ParamId, Real, Tape, Var};
 
 use crate::activation::last_dim;
+use crate::layer::private::Token;
 use crate::mask::LayerMask;
-use crate::{Layer, Linear, NeuronMask};
+use crate::{ActivationKind, BatchNorm2d, Layer, Linear, NeuronMask};
 
 /// Each layer's input and output [`Var`] from one forward pass. A masked layer's output is
-/// the masked value.
+/// the masked value. A batch normalisation fused with the ReLU after it shares that ReLU's
+/// output ([`fused`](Trace::fused)); [`keep_output`](Trace::keep_output) asks for its own.
 ///
 /// Fill it with [`Sequential::forward_traced`]. Reuse one trace for every step: it keeps its
 /// capacity, so tracing allocates nothing after the first step.
@@ -47,6 +49,12 @@ pub struct Trace {
     /// Each layer's forward time from the last traced pass made with timing on; empty after
     /// a pass made with timing off.
     times: Vec<Duration>,
+    /// Whether each layer was fused with the next in the last traced pass.
+    fused: Vec<bool>,
+    /// The layers whose own outputs the next passes must keep (never fused into the next).
+    keep: Vec<bool>,
+    /// Every layer's own output is kept (no fusion at all).
+    keep_all: bool,
 }
 
 impl Trace {
@@ -77,6 +85,9 @@ impl Trace {
             outputs: Vec::with_capacity(layers),
             timing: false,
             times: Vec::new(),
+            fused: Vec::with_capacity(layers),
+            keep: Vec::new(),
+            keep_all: false,
         }
     }
 
@@ -220,6 +231,119 @@ impl Trace {
         );
         self.outputs[i]
     }
+
+    /// Whether layer `i` was fused with layer `i + 1` in the last traced pass: a
+    /// [`BatchNorm2d`](crate::BatchNorm2d) followed by a [`Relu`](crate::Relu), recorded as
+    /// one node (see [`Sequential::fuse`]). Then [`output(i)`](Self::output),
+    /// [`input(i + 1)`](Self::input) and [`output(i + 1)`](Self::output) are all that node,
+    /// whose value is the ReLU's output, and the pair's forward time is layer `i`'s.
+    /// Ask for layer `i`'s own output with [`keep_output`](Self::keep_output).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `i` is not a recorded layer.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{BatchNorm2d, Relu, Sequential, Trace};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 1, (1, 2))).push(Relu);
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&params.values);
+    /// let x = tape.input(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap().view());
+    /// let mut trace = Trace::new();
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// assert!(trace.fused(0));
+    /// assert_eq!(trace.output(0), trace.output(1));
+    /// trace.keep_output(0);
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// assert!(!trace.fused(0));
+    /// assert_ne!(trace.output(0), trace.output(1));
+    /// ```
+    pub fn fused(&self, i: usize) -> bool {
+        assert!(
+            i < self.len(),
+            "trace: layer {i} out of range for {} layers",
+            self.len()
+        );
+        self.fused[i]
+    }
+
+    /// Keeps layer `i`'s own output in every pass that follows, until
+    /// [`clear_kept`](Self::clear_kept): layer `i` is never fused with the next, so
+    /// [`output(i)`](Self::output) is that layer's value. For a hook or a probe that reads a
+    /// batch normalisation's output before its ReLU. The first call for a layer past the ones
+    /// kept so far allocates.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{BatchNorm2d, Relu, Sequential, Trace};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 1, (1, 2))).push(Relu);
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.training_tape(&params.values, 0, 1);
+    /// let x = tape.input(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap().view());
+    /// let mut trace = Trace::new();
+    /// trace.keep_output(0);
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// // Batch norm's own output, before the ReLU: the first value is below the mean.
+    /// assert!(tape.value(trace.output(0)).data()[0] < 0.0);
+    /// assert_eq!(tape.value(trace.output(1)).data()[0], 0.0);
+    /// ```
+    pub fn keep_output(&mut self, i: usize) {
+        if self.keep.len() <= i {
+            self.keep.resize(i + 1, false);
+        }
+        self.keep[i] = true;
+    }
+
+    /// Keeps every layer's own output in every pass that follows (no fusion), until
+    /// [`clear_kept`](Self::clear_kept), as [`keep_output`](Self::keep_output) for every layer.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{BatchNorm2d, Relu, Sequential, Trace};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 1, (1, 2))).push(Relu);
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.training_tape(&params.values, 0, 1);
+    /// let x = tape.input(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap().view());
+    /// let mut trace = Trace::new();
+    /// trace.keep_all_outputs();
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// assert!((0..trace.len()).all(|i| !trace.fused(i)));
+    /// ```
+    pub fn keep_all_outputs(&mut self) {
+        self.keep_all = true;
+    }
+
+    /// Forgets every [`keep_output`](Self::keep_output) and
+    /// [`keep_all_outputs`](Self::keep_all_outputs), so the passes that follow fuse again
+    /// where the network does. Keeps the allocation.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// use cavitation_nn::{BatchNorm2d, Relu, Sequential, Trace};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 1, (1, 2))).push(Relu);
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.training_tape(&params.values, 0, 1);
+    /// let x = tape.input(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap().view());
+    /// let mut trace = Trace::new();
+    /// trace.keep_output(0);
+    /// trace.clear_kept();
+    /// net.forward_traced(&mut tape, x, &mut trace);
+    /// assert!(trace.fused(0));
+    /// ```
+    pub fn clear_kept(&mut self) {
+        self.keep.fill(false);
+        self.keep_all = false;
+    }
+
+    /// Whether layer `i`'s own output is to be kept.
+    pub(crate) fn keeps(&self, i: usize) -> bool {
+        self.keep_all || self.keep.get(i).copied().unwrap_or(false)
+    }
 }
 
 /// Layers run one after another, each taking the previous layer's output.
@@ -276,6 +400,8 @@ pub struct Sequential<T: Real = f32> {
     layers: Vec<Arc<dyn Layer<T>>>,
     /// The neuron mask on each layer's output, if any; one entry per layer.
     masks: Vec<Option<LayerMask<T>>>,
+    /// Whether a batch normalisation followed by a ReLU is recorded as one node.
+    fuse: bool,
 }
 
 impl Sequential<f32> {
@@ -308,6 +434,7 @@ impl<T: Real> Sequential<T> {
         Sequential {
             layers: Vec::new(),
             masks: Vec::new(),
+            fuse: true,
         }
     }
 
@@ -322,6 +449,59 @@ impl<T: Real> Sequential<T> {
         self.layers.push(Arc::new(layer));
         self.masks.push(None);
         self
+    }
+
+    /// Whether to record a [`BatchNorm2d`](crate::BatchNorm2d) directly followed by a plain
+    /// [`Relu`](crate::Relu) as one tape node (on by default), and returns the network.
+    ///
+    /// The fused node gives the same values, gradients and running statistics, bit for bit,
+    /// as the two layers apart, with one pass over memory fewer each way
+    /// ([`Tape::batch_norm2d_relu`]). The pair is not fused when either layer has a mask, or
+    /// when a trace asks for the batch normalisation's own output
+    /// ([`Trace::keep_output`]); [`Trace::fused`] says which pairs were.
+    ///
+    /// [`Tape::batch_norm2d_relu`]: cavitation_core::Tape::batch_norm2d_relu
+    ///
+    /// ```
+    /// use cavitation_core::ParamStore;
+    /// use cavitation_nn::{BatchNorm2d, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 2, (3, 3))).push(Relu);
+    /// assert!(net.fuses());
+    /// assert!(!net.fuse(false).fuses());
+    /// ```
+    pub fn fuse(mut self, on: bool) -> Sequential<T> {
+        self.fuse = on;
+        self
+    }
+
+    /// Whether this network fuses a batch normalisation with the ReLU after it (see
+    /// [`fuse`](Self::fuse)).
+    ///
+    /// ```
+    /// use cavitation_nn::Sequential;
+    /// assert!(Sequential::new().fuses());
+    /// assert!(!Sequential::new().fuse(false).fuses());
+    /// ```
+    pub fn fuses(&self) -> bool {
+        self.fuse
+    }
+
+    /// Whether a forward pass fuses layer `i` with layer `i + 1` when no trace keeps layer
+    /// `i`'s output: layer `i` is a batch normalisation, layer `i + 1` a plain ReLU, neither
+    /// has a mask, and the network fuses. A profile then has the pair's times on layer `i`
+    /// and zero on layer `i + 1`.
+    ///
+    /// ```
+    /// use cavitation_core::ParamStore;
+    /// use cavitation_nn::{BatchNorm2d, Relu, Sequential};
+    /// let mut params = ParamStore::new();
+    /// let net = Sequential::new().push(BatchNorm2d::new(&mut params, 2, (3, 3))).push(Relu);
+    /// assert!(net.fuses_at(0));
+    /// assert!(!net.fuses_at(1));
+    /// ```
+    pub fn fuses_at(&self, i: usize) -> bool {
+        self.fused_batch_norm(i, None).is_some()
     }
 
     /// Adds a layer already shared with another network at the end, so that both hold the
@@ -960,7 +1140,8 @@ impl<T: Real> Sequential<T> {
     /// Records every layer's forward pass on `tape`, each taking the previous output, and
     /// returns the last output (`x` itself for an empty network). A masked layer's output is
     /// recorded through [`Tape::keep_where`] with the mask as the condition; an unmasked
-    /// layer records nothing extra.
+    /// layer records nothing extra. A batch normalisation followed by a plain ReLU is
+    /// recorded as one node for both, when the network fuses ([`fuse`](Self::fuse)).
     ///
     /// # Panics
     ///
@@ -988,7 +1169,8 @@ impl<T: Real> Sequential<T> {
     }
 
     /// Like [`forward`](Self::forward), and records each layer's input and output in `trace`
-    /// (cleared first; its capacity is kept).
+    /// (cleared first; its capacity is kept). A fused pair's two layers share one node
+    /// ([`Trace::fused`]); layers the trace keeps ([`Trace::keep_output`]) are not fused.
     ///
     /// # Panics
     ///
@@ -1018,6 +1200,8 @@ impl<T: Real> Sequential<T> {
             trace.inputs.clear();
             trace.outputs.clear();
             trace.times.clear();
+            trace.fused.clear();
+            trace.fused.reserve(self.layers.len());
             trace.inputs.reserve(self.layers.len());
             trace.outputs.reserve(self.layers.len());
             if trace.timing {
@@ -1026,7 +1210,20 @@ impl<T: Real> Sequential<T> {
             }
         }
         let mut x = x;
+        // Set when layer `i - 1` was fused into this one, which then records nothing.
+        let mut fused_into = false;
         for (i, layer) in self.layers.iter().enumerate() {
+            if std::mem::take(&mut fused_into) {
+                if let Some(trace) = trace.as_deref_mut() {
+                    if clock.is_some() {
+                        trace.times.push(Duration::ZERO);
+                    }
+                    trace.inputs.push(x);
+                    trace.outputs.push(x);
+                    trace.fused.push(false);
+                }
+                continue;
+            }
             let width = last_dim(tape.shape(x));
             if let Some(expected) = layer.input_width()
                 && expected != width
@@ -1044,7 +1241,12 @@ impl<T: Real> Sequential<T> {
                     self.layers[i - 1].name()
                 );
             }
-            let mut y = layer.forward(tape, x);
+            let fused = self.fused_batch_norm(i, trace.as_deref());
+            let mut y = match fused {
+                Some(bn) => bn.forward_relu(tape, x),
+                None => layer.forward(tape, x),
+            };
+            fused_into = fused.is_some();
             let produced = last_dim(tape.shape(y));
             let reported = layer.output_width(width);
             assert!(
@@ -1070,10 +1272,34 @@ impl<T: Real> Sequential<T> {
                 }
                 trace.inputs.push(x);
                 trace.outputs.push(y);
+                trace.fused.push(fused_into);
             }
             x = y;
         }
         x
+    }
+
+    /// Layer `i` as a batch normalisation to fuse with the plain ReLU at `i + 1`: when this
+    /// network fuses, neither layer has a mask, and `trace` (if any) does not keep layer
+    /// `i`'s own output.
+    fn fused_batch_norm(&self, i: usize, trace: Option<&Trace>) -> Option<&BatchNorm2d> {
+        if !self.fuse || i + 1 >= self.layers.len() {
+            return None;
+        }
+        if self.masks[i].is_some() || self.masks[i + 1].is_some() {
+            return None;
+        }
+        if trace.is_some_and(|t| t.keeps(i)) {
+            return None;
+        }
+        let relu = self.layers[i + 1]
+            .activation()
+            .and_then(|a| a.builtin())
+            .is_some_and(|kind| kind == ActivationKind::Relu);
+        if !relu {
+            return None;
+        }
+        self.layers[i].batch_norm2d_form(Token(()))
     }
 
     /// Every parameter with its PyTorch-style name `"{layer index}.{local name}"` (for
