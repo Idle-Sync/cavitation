@@ -1027,6 +1027,42 @@ impl RunningUpdate {
         self.count
     }
 
+    /// Sets the batches counted so far to `count`, for a layer that keeps a count: a second
+    /// update of the same layer (a training step compiled for another batch size) takes up the
+    /// count where the first left it. A layer without a count is left as it is.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::{BatchNorm2d, BatchStats, ChannelDims};
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let bn = BatchNorm2d::new(&gpu, &mut PipelineCache::new(&gpu)).unwrap();
+    ///     let mut pool = BufferPool::new(&gpu);
+    ///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+    ///         | wgpu::BufferUsages::COPY_SRC;
+    ///     let dims = ChannelDims::new(2, 1, 2);
+    ///     let (x, y, stats) = (pool.take(16, usage), pool.take(16, usage), pool.take(12, usage));
+    ///     let [mean, var, finite] = [(); 3].map(|_| pool.take(4, usage));
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let forward = bn.forward_call(&mut steps, &mut pool, dims, 0.0, BatchStats::Batch, &x, None, &y, &stats);
+    ///     // A cumulative average (no momentum), 3 batches counted so far.
+    ///     let mut update = bn.running_call(&mut steps, &mut pool, &forward, &stats, (&mean, &var), &finite, None, Some(3.0));
+    ///     update.set_count(7.0);
+    ///     assert_eq!(update.count(), Some(7.0));
+    ///     // The next batch is the 8th: it gets an eighth of the weight.
+    ///     assert_eq!(update.rates(), (0.125, 0.875));
+    ///     forward.release(&mut pool);
+    ///     update.release(&mut pool);
+    /// }
+    /// ```
+    pub fn set_count(&mut self, count: f32) {
+        if let Some(n) = &mut self.count {
+            *n = count;
+        }
+    }
+
     /// Gives this call's uniform back to `pool`, once it is no longer recorded.
     ///
     /// # Examples

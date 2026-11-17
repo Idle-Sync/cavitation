@@ -228,7 +228,8 @@ pub struct GpuOptimizerState {
 /// losses are [`Loss::CrossEntropy`] and [`Loss::Mse`], and the optimisers SGD (with or
 /// without momentum), Adam and AdamW. A parameter used by two layers is refused.
 ///
-/// While a step runs on the GPU, the next step's dropout masks are drawn on the host.
+/// While a full step runs on the GPU, the next full step's dropout masks are drawn on the host;
+/// a batch of fewer rows draws its own before it runs.
 ///
 /// Every step runs the CPU trainer's [`Health`] checks (the default unless
 /// [`set_health`](GpuTrainer::set_health) changes it) on values the step reads back with its
@@ -315,6 +316,24 @@ pub struct GpuTrainer<'s> {
     read: HealthRead,
     /// The steps left out under [`OnNonFinite::Skip`].
     skipped: u64,
+    /// The ReLU layers and their values per channel, for building a pass.
+    relus: Vec<(usize, usize)>,
+    /// The steps for batches of fewer rows than [`batch_size`](GpuTrainer::batch_size) (an
+    /// epoch's last), one per row count, each built the first time a batch of its rows comes.
+    short: Vec<ShortPass>,
+}
+
+/// The training step for a batch of fewer rows than the trainer's batch size.
+#[derive(Debug)]
+struct ShortPass {
+    /// Its rows.
+    rows: usize,
+    /// Its calls and buffers.
+    pass: TrainPass,
+    /// The optimiser's bind group with this pass's finite flag.
+    group: wgpu::BindGroup,
+    /// Its dropout masks' bits, one list per dropout layer.
+    next: Vec<Vec<u32>>,
 }
 
 /// One step's health values, read back with the loss and the flag.
@@ -481,7 +500,8 @@ impl<'s> GpuTrainer<'s> {
             ..StepSizes::default()
         };
         let mut steps = StepEncoder::new(gpu, sizes);
-        let pass = TrainPass::build(m, &kernels, &mut steps, loss, &relus).map_err(shader)?;
+        let pass =
+            TrainPass::build(m, &kernels, &mut steps, loss, &relus, batch_size).map_err(shader)?;
 
         let flat_values = m.pool.take(4 * elements as u64, usage());
         let flat_grads = m.pool.take(4 * elements as u64, usage());
@@ -557,6 +577,8 @@ impl<'s> GpuTrainer<'s> {
             stats: GradStats::new(),
             read: HealthRead::default(),
             skipped: 0,
+            relus,
+            short: Vec::new(),
         };
         trainer.draw_next(1);
         Ok(trainer)
@@ -566,6 +588,13 @@ impl<'s> GpuTrainer<'s> {
     /// pass in training mode, the loss (its mean over the batch), the backward pass and the
     /// optimiser's update, then batch norm's running statistics. Returns the loss.
     ///
+    /// The batch holds [`batch_size`](Self::batch_size) rows, or fewer, as an epoch's last
+    /// batch does: a batch of fewer rows runs a training step compiled for that many rows the
+    /// first time one comes and kept, one per row count (one for a run whose every epoch ends
+    /// with the same rows). It shares the parameters, the optimiser's state and batch norm's
+    /// running statistics and batch counts with the full step, and has buffers of its own for
+    /// every value, gradient and mask, sized for its rows.
+    ///
     /// The update and the running statistics are skipped on the GPU when the loss or a
     /// gradient is NaN or infinite; the step is counted either way, and under
     /// [`OnNonFinite::Skip`] also in [`skipped_steps`](Self::skipped_steps), with its loss
@@ -573,8 +602,10 @@ impl<'s> GpuTrainer<'s> {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidData`] if the batch does not hold [`batch_size`](Self::batch_size) rows
-    /// of the model's input width, or its targets do not suit the loss or the model's output.
+    /// [`Error::InvalidData`] if the batch does not hold 1 to [`batch_size`](Self::batch_size)
+    /// rows of the model's input width, if its targets do not suit the loss or the model's
+    /// output, or if a batch norm would normalise its rows over one value per channel;
+    /// [`Error::Unsupported`] if a step for a batch of fewer rows does not build on this GPU.
     /// Under [`OnNonFinite::Stop`], [`Error::NonFinite`] as the CPU trainer returns it, naming
     /// the step and `"loss"` (with the first NaN or infinite input or target value, or that
     /// the inputs were finite) or the first parameter in the store whose gradient was not
@@ -586,17 +617,24 @@ impl<'s> GpuTrainer<'s> {
     /// See [`GpuTrainer`].
     pub fn step(&mut self, model: &Sequential, batch: BatchView<'_, f32>) -> Result<f32, Error> {
         debug_assert_eq!(model.len(), self.model.layers.len());
-        let (b, input, output) = (
+        let (full, input, output) = (
             self.model.batch,
             self.model.input_width,
             self.model.output_width,
         );
-        if batch.x.shape().dims() != [b, input] {
+        let b = batch.x.shape().dims().first().copied().unwrap_or(0);
+        if batch.x.shape().dims() != [b, input] || b == 0 || b > full {
             return Err(Error::InvalidData(format!(
-                "GpuTrainer::step: the batch is {:?}, but the trainer takes [{b}, {input}]",
+                "GpuTrainer::step: the batch is {:?}, but the trainer takes [rows, {input}] \
+                 with 1 to {full} rows",
                 batch.x.shape().dims()
             )));
         }
+        let short = if b < full {
+            Some(self.prepare_short(model, b)?)
+        } else {
+            None
+        };
         self.upload.clear();
         self.upload
             .extend(batch.x.data().iter().flat_map(|v| v.to_le_bytes()));
@@ -625,66 +663,79 @@ impl<'s> GpuTrainer<'s> {
             }
         }
         let step_number = self.taken + 1;
-        if self.next_for != step_number {
-            self.draw_next(step_number);
-        }
         let target_end = self.upload.len();
-        for words in &self.next {
-            self.upload
-                .extend(words.iter().flat_map(|w| w.to_le_bytes()));
+        if let Some(s) = short.map(|k| &mut self.short[k]) {
+            // The short step's masks are drawn now, for its rows; the next full step's are
+            // drawn when it comes.
+            for (mask, words) in s.pass.masks.iter().zip(s.next.iter_mut()) {
+                draw(self.dropout_seed, step_number, mask, words);
+            }
+            for words in &s.next {
+                self.upload
+                    .extend(words.iter().flat_map(|w| w.to_le_bytes()));
+            }
+        } else {
+            if self.next_for != step_number {
+                self.draw_next(step_number);
+            }
+            for words in &self.next {
+                self.upload
+                    .extend(words.iter().flat_map(|w| w.to_le_bytes()));
+            }
         }
+        let (pass, short_group) = match short.map(|k| &mut self.short[k]) {
+            Some(s) => (&mut s.pass, Some(&s.group)),
+            None => (&mut self.pass, None),
+        };
         let mut step = self.steps.begin();
-        step.upload(self.pass.values[0].buffer(), 0, &self.upload[..x_bytes]);
-        step.upload(
-            self.pass.targets.buffer(),
-            0,
-            &self.upload[x_bytes..target_end],
-        );
+        step.upload(pass.values[0].buffer(), 0, &self.upload[..x_bytes]);
+        step.upload(pass.targets.buffer(), 0, &self.upload[x_bytes..target_end]);
         let mut at = target_end;
-        for mask in &self.pass.masks {
+        for mask in &pass.masks {
             let len = 4 * mask.len.div_ceil(32);
             step.upload(mask.bits.buffer(), 0, &self.upload[at..at + len]);
             at += len;
         }
-        step.clear(self.pass.flag.buffer(), 0, 4);
-        for &g in &self.pass.cleared {
-            let b = &self.pass.grads[g];
+        step.clear(pass.flag.buffer(), 0, 4);
+        for &g in &pass.cleared {
+            let b = &pass.grads[g];
             step.clear(b.buffer(), 0, b.len());
         }
         let kernels = &self.model.kernels;
         record(
-            &self.pass.forward,
+            &pass.forward,
             kernels,
             &self.kernels,
-            &self.pass.pools,
+            &pass.pools,
             &mut step,
         );
-        match &self.pass.loss {
+        match &pass.loss {
             LossCall::CrossEntropy(call) => self.kernels.cross_entropy.record(&mut step, call),
             LossCall::Mse(call) => self.kernels.mse.record(&mut step, call),
         }
         record(
-            &self.pass.backward,
+            &pass.backward,
             kernels,
             &self.kernels,
-            &self.pass.pools,
+            &pass.pools,
             &mut step,
         );
-        self.kernels.finite.record(&mut step, &self.pass.finite);
-        for call in &self.pass.squares {
+        self.kernels.finite.record(&mut step, &pass.finite);
+        for call in &pass.squares {
             self.kernels.squares.record(&mut step, call);
         }
         let dead_relu = self.health.health().dead_relu;
         if dead_relu {
-            for relu in &self.pass.relus {
+            for relu in &pass.relus {
                 self.kernels.dead_relu.record(&mut step, &relu.call);
             }
         }
         let flat = &mut self.flat;
-        for (g, &off) in self.pass.param_grads.iter().zip(&flat.offsets) {
+        for (g, &off) in pass.param_grads.iter().zip(&flat.offsets) {
             step.copy(g.buffer(), 0, flat.grads.buffer(), 4 * off as u64, g.len());
         }
-        flat.kernel.record(&mut step, &flat.group, &flat.active);
+        let group = short_group.unwrap_or(&flat.group);
+        flat.kernel.record(&mut step, group, &flat.active);
         for (t, &off) in self.model.params.iter().zip(&flat.offsets) {
             step.copy(
                 flat.values.buffer(),
@@ -694,24 +745,24 @@ impl<'s> GpuTrainer<'s> {
                 4 * t.len as u64,
             );
         }
-        for (_, update) in &self.pass.running {
+        for (_, update) in &pass.running {
             kernels.batch_norm.record_running(&mut step, update);
         }
-        let loss_at = step.read_back(self.pass.loss_value.buffer(), 0, 4);
-        let flag_at = step.read_back(self.pass.flag.buffer(), 0, 4);
-        let n = self.pass.squares.len() as u64;
-        let squares_at = step.read_back(self.pass.square_sums.buffer(), 0, 4 * n);
-        let counts_at = step.read_back(self.pass.finite.counts().buffer(), 0, 4 * n);
-        let words = self.pass.relus.last().map_or(0, |r| {
+        let loss_at = step.read_back(pass.loss_value.buffer(), 0, 4);
+        let flag_at = step.read_back(pass.flag.buffer(), 0, 4);
+        let n = pass.squares.len() as u64;
+        let squares_at = step.read_back(pass.square_sums.buffer(), 0, 4 * n);
+        let counts_at = step.read_back(pass.finite.counts().buffer(), 0, 4 * n);
+        let words = pass.relus.last().map_or(0, |r| {
             r.word + cavitation_gpu::kernels::DeadRelu::words(u32_of(r.channels)) as usize
         });
         let bits_at = (dead_relu && words > 0)
-            .then(|| step.read_back(self.pass.relu_bits.buffer(), 0, 4 * words as u64));
-        // The next step's masks are drawn while this one runs.
-        let (seed, masks, next) = (self.dropout_seed, &self.pass.masks, &mut self.next);
+            .then(|| step.read_back(pass.relu_bits.buffer(), 0, 4 * words as u64));
+        // The next full step's masks are drawn while this one runs.
+        let (seed, masks, next) = (self.dropout_seed, &pass.masks, &mut self.next);
         let read = &mut self.read;
         let (value, flag) = thread::scope(|scope| {
-            let drawing = (!masks.is_empty()).then(|| {
+            let drawing = (short.is_none() && !masks.is_empty()).then(|| {
                 scope.spawn(move || {
                     for (mask, words) in masks.iter().zip(next.iter_mut()) {
                         draw(seed, step_number + 1, mask, words);
@@ -741,11 +792,20 @@ impl<'s> GpuTrainer<'s> {
             }
             (value, flag)
         });
-        self.next_for = step_number + 1;
+        if short.is_none() {
+            self.next_for = step_number + 1;
+        }
         let ran = flag == 0;
         self.flat.kernel.commit(ran);
-        for (_, update) in &mut self.pass.running {
+        for (_, update) in &mut pass.running {
             update.commit(ran);
+        }
+        // The other passes' updates of the same layers take up the batch counts.
+        if let Some(k) = short {
+            take_counts(&self.short[k].pass.running, &mut self.pass.running);
+        }
+        for s in &mut self.short {
+            take_counts(&self.pass.running, &mut s.pass.running);
         }
         self.taken = step_number;
         let inputs = StepInputs {
@@ -1022,7 +1082,7 @@ impl<'s> GpuTrainer<'s> {
         &mut self.model
     }
 
-    /// The rows each step takes.
+    /// The rows a full step takes; a step takes up to this many.
     ///
     /// # Examples
     ///
@@ -1127,6 +1187,64 @@ impl<'s> GpuTrainer<'s> {
         self.next_for = step;
     }
 
+    /// The index in `short` of the step for a batch of `rows` rows, fewer than the trainer's
+    /// batch size: built the first time a batch of that many rows comes, and kept.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidData`] if a batch norm would normalise `rows` rows over one value per
+    /// channel; [`Error::Unsupported`] if a kernel does not build.
+    fn prepare_short(&mut self, model: &Sequential, rows: usize) -> Result<usize, Error> {
+        if let Some(k) = self.short.iter().position(|s| s.rows == rows) {
+            return Ok(k);
+        }
+        for (i, layer) in self.model.layers.iter().enumerate() {
+            if let Kind::BatchNorm2d(norm) = layer.kind
+                && rows * norm.spatial < 2
+            {
+                return Err(Error::InvalidData(format!(
+                    "GpuTrainer::step: layer {i} ({}) normalises a training batch with its own \
+                     statistics, which need more than one value per channel; a batch of \
+                     {rows} gives {}",
+                    model.layer(i).name(),
+                    rows * norm.spatial
+                )));
+            }
+        }
+        let shader = |e: GpuError| Error::Unsupported(format!("GpuTrainer: {e}"));
+        let mut pass = TrainPass::build(
+            &mut self.model,
+            &self.kernels,
+            &mut self.steps,
+            self.loss,
+            &self.relus,
+            rows,
+        )
+        .map_err(shader)?;
+        take_counts(&self.pass.running, &mut pass.running);
+        let flat = &self.flat;
+        let state: Vec<&PooledBuffer> = flat.state.iter().collect();
+        let group = flat.kernel.bind_group(
+            &mut self.steps,
+            &flat.values,
+            &flat.grads,
+            &state,
+            &pass.flag,
+        );
+        let next = pass
+            .masks
+            .iter()
+            .map(|d| vec![0u32; d.len.div_ceil(32)])
+            .collect();
+        self.short.push(ShortPass {
+            rows,
+            pass,
+            group,
+            next,
+        });
+        Ok(self.short.len() - 1)
+    }
+
     /// The wall-clock seconds of `n` steps that only copy the gradients into the flat buffer
     /// and the values back out, as a training step does, and of `n` empty steps: for
     /// measuring the copies' share of a step.
@@ -1205,6 +1323,16 @@ fn draw(seed: u64, step: u64, mask: &DropoutMask, words: &mut [u32]) {
     });
 }
 
+/// Sets each running update in `to` to the batch count of the one for the same layer in
+/// `from`: the two training passes update the same statistics.
+fn take_counts(from: &[(usize, RunningUpdate)], to: &mut [(usize, RunningUpdate)]) {
+    for ((_, a), (_, b)) in from.iter().zip(to.iter_mut()) {
+        if let Some(count) = a.count() {
+            b.set_count(count);
+        }
+    }
+}
+
 /// Refuses a model whose layers share a parameter: the kernels overwrite each gradient, so a
 /// second use would replace the first's contribution.
 fn check_untied(gpu: &GpuModel, model: &Sequential) -> Result<(), Error> {
@@ -1276,16 +1404,18 @@ struct Saved {
 
 impl TrainPass {
     /// Prepares the training step of `m`: the forward pass in training mode, the loss, the
-    /// backward pass, the finite flag, the health values and the running-statistics updates.
-    /// `relus` lists each ReLU layer with its values per channel.
+    /// backward pass, the finite flag, the health values and the running-statistics updates,
+    /// for batches of `rows` rows (at most the model's batch). `relus` lists each ReLU layer
+    /// with its values per channel.
     fn build(
         m: &mut GpuModel,
         train: &TrainKernels,
         steps: &mut StepEncoder,
         loss: Loss,
         relus: &[(usize, usize)],
+        rows: usize,
     ) -> Result<TrainPass, GpuError> {
-        let batch = m.batch;
+        let batch = rows;
         let k = &m.kernels;
         let cache: &mut PipelineCache = &mut m.cache;
         let pool: &mut BufferPool = &mut m.pool;

@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// Runs `body` on each GPU this platform has, one per backend, and returns how many ran.
-fn for_each_gpu(mut body: impl FnMut(&Gpu)) -> usize {
+pub(super) fn for_each_gpu(mut body: impl FnMut(&Gpu)) -> usize {
     let mut ran = 0;
     for &backend in Backend::on_this_platform() {
         if let Some(gpu) = Gpu::with_backend(backend) {
@@ -59,20 +59,20 @@ fn collecting(health: Health<'static>) -> (Health<'static>, Seen) {
 }
 
 /// One batch: rows of inputs, and class labels or target values.
-struct Data {
+pub(super) struct Data {
     /// The inputs, row after row.
-    x: Vec<f32>,
+    pub(super) x: Vec<f32>,
     /// The rows.
-    rows: usize,
+    pub(super) rows: usize,
     /// Class labels, for cross-entropy.
-    labels: Vec<usize>,
+    pub(super) labels: Vec<usize>,
     /// Target values, for MSE.
-    values: Option<Vec<f32>>,
+    pub(super) values: Option<Vec<f32>>,
 }
 
 impl Data {
     /// `rows` rows of `width` inputs in `[-1, 1)` and labels below `classes`, from `seed`.
-    fn new(seed: u64, rows: usize, width: usize, classes: usize) -> Data {
+    pub(super) fn new(seed: u64, rows: usize, width: usize, classes: usize) -> Data {
         let mut rng = Rng::seed(seed);
         Data {
             x: (0..rows * width)
@@ -87,7 +87,7 @@ impl Data {
     }
 
     /// The batch as a trainer takes it.
-    fn view(&self) -> BatchView<'_, f32> {
+    pub(super) fn view(&self) -> BatchView<'_, f32> {
         let x = TensorView::from_slice(&self.x, &[self.rows, self.x.len() / self.rows]).unwrap();
         let targets = match &self.values {
             Some(v) => TargetsView::Values(
