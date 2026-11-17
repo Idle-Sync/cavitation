@@ -13,11 +13,11 @@
 
 use crate::graph::{BackwardCtx, Var};
 use crate::kernels::conv::{
-    Conv2dGeom, conv2d_backward, conv2d_forward, conv2d_scratch, conv3x3_direct,
+    Conv2dGeom, Parts, conv2d_backward, conv2d_forward, conv2d_scratch, conv3x3_direct,
     conv3x3_direct_input_grad, conv3x3_direct_weight_grad, direct_input_grad_runs, direct_runs,
     direct_scratch, direct_weight_grad_runs, direct_weight_grad_scratch, groups,
 };
-use crate::kernels::{self, MatMut, MatRef};
+use crate::kernels::{self, MatMut, MatRef, pool};
 use crate::ops::Op;
 use crate::{Real, Shape, Tape};
 use std::any::TypeId;
@@ -179,15 +179,23 @@ pub(super) fn backward<T: Real>(
         && let Some(slot) = ctx.slot(b)
     {
         slot.update_with(|buf, beta| {
-            for (o, d) in buf.iter_mut().enumerate() {
+            // One task per output channel: each channel's sum runs in the same order on the
+            // thread that takes it, so the gradient is the same for any thread count. A sum
+            // is one chain of dependent additions, so a channel per thread is the speed-up.
+            let parts = Parts(buf.as_mut_ptr());
+            pool::run(kernels::threads(), cout, &|t| {
+                let o = t.index;
                 let mut acc = T::ZERO;
                 for n in 0..batch {
                     for &g in &out_grad[n * out_w + o * windows..][..windows] {
                         acc += g;
                     }
                 }
+                // SAFETY: task `o` alone writes element `o` of the bias gradient, which has
+                // `cout` elements.
+                let d = unsafe { &mut parts.slice(o, 1)[0] };
                 *d = if beta == T::ZERO { acc } else { *d + acc };
-            }
+            });
         });
     }
     let threads = kernels::threads();
