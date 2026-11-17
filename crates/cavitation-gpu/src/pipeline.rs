@@ -284,6 +284,11 @@ impl PipelineCache {
         Ok(pipeline)
     }
 
+    /// The GPU this cache builds its pipelines on.
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
     /// The number of pipelines this cache has built.
     ///
     /// # Examples

@@ -6,6 +6,16 @@
 // named vec4s, never an indexed private array. Each output's products are added in
 // increasing k with fma; loads past an edge read 0, so any m, n and k work.
 
+const TILE: u32 = 64u;
+const STEP: u32 = 16u;
+// The row stride of the shared tiles: 64 plus 2 floats of padding, so that writes with k
+// varying fastest across threads (A row-major, B transposed) fall in distinct banks.
+const PAD: u32 = 66u;
+
+// As[kk * PAD + r] holds A[row0 + r][t + kk]; Bs[kk * PAD + col] holds B[t + kk][col0 + col].
+var<workgroup> As: array<f32, 1056>;
+var<workgroup> Bs: array<f32, 1056>;
+
 @compute @workgroup_size(16, 16)
 fn main(
     @builtin(workgroup_id) wg: vec3<u32>,

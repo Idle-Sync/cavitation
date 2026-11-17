@@ -107,7 +107,7 @@ fn reference(d: &ConvDims, x: &[f32], w: &[f32], bias: Option<&[f32]>) -> (Vec<f
 /// is shown to be written).
 fn run(
     kit: &mut Kit,
-    conv: &ConvForward,
+    conv: &mut ConvForward,
     d: ConvDims,
     x: &[f32],
     w: &[f32],
@@ -125,6 +125,8 @@ fn run(
         bb.as_ref(),
         &out,
     );
+    conv.ensure_wide(&mut kit.cache, &call)
+        .expect("the wide tile builds");
     let mut step = kit.steps.begin();
     conv.record(&mut step, &call);
     let _ = step.finish();
@@ -141,12 +143,26 @@ fn run(
 /// 6 meet no tap), so their input gradients are 0.
 const GAPS: Shape = (2, 3, (9, 8), (2, 1), (3, 2), (0, 1), (2, 1));
 
-/// Every shape at `batch`, the network shapes at a batch of 4.
+/// Shapes, each with its batch, that the GEMM's wide tile computes (at most 32 rows, more
+/// than 64 columns and at least 64 wide tiles in the dispatch), where every other shape here
+/// runs on the square tile. The rows are the output channels forward and the input channels
+/// in the input gradient; the columns the output positions and the input positions.
+/// - 8 → 8 channels on 12 × 12 with padding 1, 32 images: 144 positions, 2 wide tiles an
+///   image, 64 in all, both ways.
+/// - 3 → 20 channels on 11 × 9 with a 3 × 2 kernel and padding (1, 0), 64 images: 88 output
+///   positions and 99 input positions, 1 wide tile an image with columns left over.
+const WIDE: [(u32, Shape); 2] = [
+    (32, (8, 8, (12, 12), (3, 3), (1, 1), (1, 1), (1, 1))),
+    (64, (3, 20, (11, 9), (3, 2), (1, 1), (1, 0), (1, 1))),
+];
+
+/// Every shape at `batch`, the network shapes at a batch of 4, and the wide-tile shapes.
 fn all_shapes() -> Vec<ConvDims> {
     let mut out: Vec<ConvDims> = CPU_GEOMETRIES.iter().map(|&s| dims(3, s)).collect();
     out.extend(NETWORKS.iter().map(|&s| dims(4, s)));
     out.extend(SPANNING.iter().map(|&s| dims(2, s)));
     out.push(dims(2, GAPS));
+    out.extend(WIDE.iter().map(|&(batch, s)| dims(batch, s)));
     out
 }
 
@@ -156,7 +172,7 @@ fn all_shapes() -> Vec<ConvDims> {
 fn exact_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        let mut conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
         for (s, d) in all_shapes().into_iter().enumerate() {
             let seed = 10 * s as u64;
             let x = exact_values(seed, d.x_len() as usize);
@@ -165,7 +181,7 @@ fn exact_twins() {
             for bias in [None, Some(&b[..])] {
                 let (want, _) = reference(&d, &x, &w, bias);
                 let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
-                let got = run(&mut kit, &conv, d, &x, &w, bias);
+                let got = run(&mut kit, &mut conv, d, &x, &w, bias);
                 assert_exact(
                     &got,
                     &want,
@@ -181,14 +197,14 @@ fn exact_twins() {
 fn rounding_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        let mut conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
         for (s, d) in all_shapes().into_iter().enumerate() {
             let seed = 500 + 10 * s as u64;
             let x = seeded_values(seed, d.x_len() as usize, -1.0, 1.0);
             let w = seeded_values(seed + 1, d.weight_len() as usize, -1.0, 1.0);
             let b = seeded_values(seed + 2, d.out_channels as usize, -1.0, 1.0);
             let (want, size) = reference(&d, &x, &w, Some(&b));
-            let got = run(&mut kit, &conv, d, &x, &w, Some(&b));
+            let got = run(&mut kit, &mut conv, d, &x, &w, Some(&b));
             let k = f64::from(d.in_channels * d.kernel.0 * d.kernel.1);
             let worst = assert_within(
                 &got,
@@ -206,12 +222,12 @@ fn rounding_twins() {
 fn runs_are_identical() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
+        let mut conv = ConvForward::new(gpu, &mut kit.cache).expect("build");
         let d = dims(4, NETWORKS[1]);
         let x = seeded_values(7, d.x_len() as usize, -1.0, 1.0);
         let w = seeded_values(8, d.weight_len() as usize, -1.0, 1.0);
-        let first = run(&mut kit, &conv, d, &x, &w, None);
-        let second = run(&mut kit, &conv, d, &x, &w, None);
+        let first = run(&mut kit, &mut conv, d, &x, &w, None);
+        let second = run(&mut kit, &mut conv, d, &x, &w, None);
         let bits = |v: &[f32]| v.iter().map(|a| a.to_bits()).collect::<Vec<u32>>();
         assert_eq!(bits(&first), bits(&second));
     });
@@ -287,10 +303,18 @@ fn grad_reference(d: &ConvDims, w: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<f64>) {
 
 /// The GPU's input gradient for `w` and `dy`, written over a buffer of NaNs (so every value
 /// is shown to be written).
-fn run_grad(kit: &mut Kit, grad: &ConvInputGrad, d: ConvDims, w: &[f32], dy: &[f32]) -> Vec<f32> {
+fn run_grad(
+    kit: &mut Kit,
+    grad: &mut ConvInputGrad,
+    d: ConvDims,
+    w: &[f32],
+    dy: &[f32],
+) -> Vec<f32> {
     let (wb, dyb) = (kit.upload(w), kit.upload(dy));
     let dx = kit.upload(&vec![f32::NAN; d.x_len() as usize]);
     let call = grad.call(&mut kit.steps, &mut kit.pool, d, &wb, &dyb, &dx);
+    grad.ensure_wide(&mut kit.cache, &call)
+        .expect("the wide tile builds");
     let mut step = kit.steps.begin();
     grad.record(&mut step, &call);
     let _ = step.finish();
@@ -309,7 +333,7 @@ fn run_grad(kit: &mut Kit, grad: &ConvInputGrad, d: ConvDims, w: &[f32], dy: &[f
 fn input_grad_exact_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
         for (s, d) in all_shapes().into_iter().enumerate() {
             let seed = 1000 + 10 * s as u64;
             let w = exact_values(seed, d.weight_len() as usize);
@@ -317,7 +341,7 @@ fn input_grad_exact_twins() {
             let (want, _) = grad_reference(&d, &w, &dy);
             let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
             assert_exact(
-                &run_grad(&mut kit, &grad, d, &w, &dy),
+                &run_grad(&mut kit, &mut grad, d, &w, &dy),
                 &want,
                 &format!("conv input gradient exact {d:?}"),
             );
@@ -331,13 +355,13 @@ fn input_grad_exact_twins() {
 fn input_grad_rounding_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
         for (s, d) in all_shapes().into_iter().enumerate() {
             let seed = 1500 + 10 * s as u64;
             let w = seeded_values(seed, d.weight_len() as usize, -1.0, 1.0);
             let dy = seeded_values(seed + 1, d.out_len() as usize, -1.0, 1.0);
             let (want, size) = grad_reference(&d, &w, &dy);
-            let got = run_grad(&mut kit, &grad, d, &w, &dy);
+            let got = run_grad(&mut kit, &mut grad, d, &w, &dy);
             let k = f64::from(d.out_channels * d.kernel.0 * d.kernel.1);
             let worst = assert_within(
                 &got,
@@ -358,12 +382,12 @@ fn input_grad_rounding_twins() {
 fn input_grad_runs_are_identical() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvInputGrad::new(gpu, &mut kit.cache).expect("build");
         let d = dims(4, NETWORKS[1]);
         let w = seeded_values(9, d.weight_len() as usize, -1.0, 1.0);
         let dy = seeded_values(10, d.out_len() as usize, -1.0, 1.0);
-        let first = run_grad(&mut kit, &grad, d, &w, &dy);
-        let second = run_grad(&mut kit, &grad, d, &w, &dy);
+        let first = run_grad(&mut kit, &mut grad, d, &w, &dy);
+        let second = run_grad(&mut kit, &mut grad, d, &w, &dy);
         assert_exact(&second, &first, "the input gradient on a second run");
     });
 }
@@ -457,7 +481,7 @@ fn weight_grad_reference(d: &ConvDims, x: &[f32], dy: &[f32]) -> (Vec<f64>, Vec<
 /// is shown to be written), and the call's blocks and block length.
 fn run_weight_grad(
     kit: &mut Kit,
-    grad: &ConvWeightGrad,
+    grad: &mut ConvWeightGrad,
     d: ConvDims,
     x: &[f32],
     dy: &[f32],
@@ -465,6 +489,8 @@ fn run_weight_grad(
     let (xb, dyb) = (kit.upload(x), kit.upload(dy));
     let dw = kit.upload(&vec![f32::NAN; d.weight_len() as usize]);
     let call = grad.call(&mut kit.steps, &mut kit.pool, d, &xb, &dyb, &dw);
+    grad.ensure_wide(&mut kit.cache, &call)
+        .expect("the wide tile builds");
     let (blocks, len) = (call.blocks(), call.block_len());
     let mut step = kit.steps.begin();
     grad.record(&mut step, &call);
@@ -483,14 +509,14 @@ fn run_weight_grad(
 fn weight_grad_exact_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
         for (s, d) in all_shapes().into_iter().chain(block_edges()).enumerate() {
             let seed = 2000 + 10 * s as u64;
             let x = exact_values(seed, d.x_len() as usize);
             let dy = exact_values(seed + 1, d.out_len() as usize);
             let (want, _) = weight_grad_reference(&d, &x, &dy);
             let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
-            let (got, _, _) = run_weight_grad(&mut kit, &grad, d, &x, &dy);
+            let (got, _, _) = run_weight_grad(&mut kit, &mut grad, d, &x, &dy);
             assert_exact(&got, &want, &format!("conv weight gradient exact {d:?}"));
         }
     });
@@ -498,12 +524,14 @@ fn weight_grad_exact_twins() {
 
 /// At the CIFAR network's batch of 128, the first two convolutions sum 128 · 32 · 32 =
 /// 131,072 positions in 128 blocks; on values from {-2, -1, 1, 2} every sum stays below
-/// 4 · 131,072 = 2^19, so the GPU still gives the f64 reference's value exactly.
+/// 4 · 131,072 = 2^19, so the GPU still gives the f64 reference's value exactly. The second
+/// (32 → 32 channels: 32 rows, 288 columns, 128 blocks of 3 wide tiles) runs on the GEMM's
+/// wide tile, the first (27 columns) on the square one.
 #[test]
 fn weight_grad_exact_at_full_cifar_batch() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 25);
-        let grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
         for (s, &shape) in NETWORKS[..2].iter().enumerate() {
             let d = dims(128, shape);
             let seed = 2500 + 10 * s as u64;
@@ -511,7 +539,7 @@ fn weight_grad_exact_at_full_cifar_batch() {
             let dy = exact_values(seed + 1, d.out_len() as usize);
             let (want, _) = weight_grad_reference(&d, &x, &dy);
             let want: Vec<f32> = want.iter().map(|&v| v as f32).collect();
-            let (got, blocks, _) = run_weight_grad(&mut kit, &grad, d, &x, &dy);
+            let (got, blocks, _) = run_weight_grad(&mut kit, &mut grad, d, &x, &dy);
             assert_eq!(blocks, 131_072 / WEIGHT_GRAD_BLOCK);
             assert_exact(&got, &want, &format!("conv weight gradient exact {d:?}"));
         }
@@ -520,22 +548,24 @@ fn weight_grad_exact_at_full_cifar_batch() {
 
 /// On seeded values in [-1, 1), each weight gradient is within `2(L + B + 2) · u · Σ|dy·x|`
 /// of the f64 reference: a block's `L` fused multiply-adds, then `B` blocks added in order.
-/// The CIFAR network's first convolution at its full batch of 128 is among the shapes.
+/// The CIFAR network's first two convolutions at its full batch of 128 are among the shapes.
 #[test]
 fn weight_grad_rounding_twins() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 25);
-        let grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
         let shapes = all_shapes()
             .into_iter()
             .chain(block_edges())
-            .chain([dims(128, NETWORKS[0])]);
+            // At the full batch: the first convolution on the square tile, the second on
+            // the wide one.
+            .chain([dims(128, NETWORKS[0]), dims(128, NETWORKS[1])]);
         for (s, d) in shapes.enumerate() {
             let seed = 3000 + 10 * s as u64;
             let x = seeded_values(seed, d.x_len() as usize, -1.0, 1.0);
             let dy = seeded_values(seed + 1, d.out_len() as usize, -1.0, 1.0);
             let (want, size) = weight_grad_reference(&d, &x, &dy);
-            let (got, blocks, len) = run_weight_grad(&mut kit, &grad, d, &x, &dy);
+            let (got, blocks, len) = run_weight_grad(&mut kit, &mut grad, d, &x, &dy);
             let n = f64::from(len) + f64::from(blocks);
             let worst = assert_within(
                 &got,
@@ -556,12 +586,12 @@ fn weight_grad_rounding_twins() {
 fn weight_grad_runs_are_identical() {
     for_each_gpu(|gpu| {
         let mut kit = Kit::new(gpu, 1 << 24);
-        let grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
+        let mut grad = ConvWeightGrad::new(gpu, &mut kit.cache).expect("build");
         let d = dims(4, NETWORKS[1]);
         let x = seeded_values(11, d.x_len() as usize, -1.0, 1.0);
         let dy = seeded_values(12, d.out_len() as usize, -1.0, 1.0);
-        let (first, _, _) = run_weight_grad(&mut kit, &grad, d, &x, &dy);
-        let (second, _, _) = run_weight_grad(&mut kit, &grad, d, &x, &dy);
+        let (first, _, _) = run_weight_grad(&mut kit, &mut grad, d, &x, &dy);
+        let (second, _, _) = run_weight_grad(&mut kit, &mut grad, d, &x, &dy);
         assert_exact(&second, &first, "the weight gradient on a second run");
     });
 }

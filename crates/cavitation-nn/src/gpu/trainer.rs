@@ -568,7 +568,7 @@ impl<'s> GpuTrainer<'s> {
         }
         let shader = |e: GpuError| Error::Unsupported(format!("GpuTrainer: {e}"));
         let m = &mut gpu_model;
-        let kernels = TrainKernels {
+        let mut kernels = TrainKernels {
             conv_input: ConvInputGrad::new(gpu, &mut m.cache).map_err(shader)?,
             conv_weight: ConvWeightGrad::new(gpu, &mut m.cache).map_err(shader)?,
             sums: ChannelSums::new(gpu, &mut m.cache).map_err(shader)?,
@@ -626,8 +626,8 @@ impl<'s> GpuTrainer<'s> {
                 .max(16 + 2 * round(4 * lens.len()) + round(4 * relu_words)),
         };
         let mut steps = StepEncoder::new(gpu, sizes);
-        let pass =
-            TrainPass::build(m, &kernels, &mut steps, loss, &relus, batch_size).map_err(shader)?;
+        let pass = TrainPass::build(m, &mut kernels, &mut steps, loss, &relus, batch_size)
+            .map_err(shader)?;
 
         let flat_values = m.pool.take(4 * elements as u64, usage());
         let flat_grads = m.pool.take(4 * elements as u64, usage());
@@ -1469,7 +1469,7 @@ impl<'s> GpuTrainer<'s> {
         let shader = |e: GpuError| Error::Unsupported(format!("GpuTrainer: {e}"));
         let mut pass = TrainPass::build(
             &mut self.model,
-            &self.kernels,
+            &mut self.kernels,
             &mut self.steps,
             self.loss,
             &self.relus,
@@ -1664,7 +1664,7 @@ impl TrainPass {
     /// with its values per channel.
     fn build(
         m: &mut GpuModel,
-        train: &TrainKernels,
+        train: &mut TrainKernels,
         steps: &mut StepEncoder,
         loss: Loss,
         relus: &[(usize, usize)],
@@ -2153,6 +2153,25 @@ impl TrainPass {
                     count,
                 );
                 running.push((i, update));
+            }
+        }
+        // The GEMM's wide tile, for the calls of this pass that use it: its pipelines are
+        // built only for a model, and a batch, that has such a call.
+        for op in forward.iter().chain(&backward) {
+            match op {
+                Op::Gemm(call) => {
+                    m.kernels.gemm.ensure_wide(&mut m.cache, call)?;
+                }
+                Op::Conv(call) => {
+                    m.kernels.conv.ensure_wide(&mut m.cache, call)?;
+                }
+                Op::ConvInput(call) => {
+                    train.conv_input.ensure_wide(&mut m.cache, call)?;
+                }
+                Op::ConvWeight(call) => {
+                    train.conv_weight.ensure_wide(&mut m.cache, call)?;
+                }
+                _ => {}
             }
         }
         Ok(TrainPass {
