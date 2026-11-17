@@ -311,12 +311,16 @@ impl OptimizerRule {
     }
 
     /// Panics, naming the rule, unless every setting is finite once rounded to the `f32` the
-    /// kernel receives, and the betas are in `[0, 1)`, as the CPU's Adam requires.
+    /// kernel receives, and the betas are in `[0, 1)`, as the CPU's Adam requires, both as
+    /// given and as the kernel holds them: a beta from `1 − 2⁻²⁵` up rounds to 1 in `f32`,
+    /// which would make its bias correction infinite.
     fn check(&self) {
         let [.., beta1, beta2, _] = self.settings();
+        let in_range = |b: f64| (0.0..1.0).contains(&b) && (0.0..1.0).contains(&as_stored(b));
         assert!(
-            (0.0..1.0).contains(&beta1) && (0.0..1.0).contains(&beta2),
-            "optimizer: Adam betas must be in [0, 1), got ({beta1}, {beta2})"
+            in_range(beta1) && in_range(beta2),
+            "optimizer: Adam betas must be in [0, 1), also once rounded to f32, got ({beta1}, \
+             {beta2})"
         );
         assert!(
             self.settings().iter().all(|&v| (v as f32).is_finite()),
@@ -843,6 +847,20 @@ mod tests {
     //! The shared constants' moment weights.
 
     use super::{OptimizerRule, shared_constants};
+
+    /// A beta below 1 that rounds to 1 in `f32` is refused, as 1 itself is.
+    #[test]
+    #[should_panic(expected = "also once rounded to f32")]
+    fn a_beta_that_rounds_to_one_is_refused() {
+        OptimizerRule::Adam {
+            lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999_999_99,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        }
+        .check();
+    }
 
     /// For each beta, the weight on the new term over one minus the weight on the old, both
     /// as the kernels hold them, is 1, so a moment of a constant input settles on that
