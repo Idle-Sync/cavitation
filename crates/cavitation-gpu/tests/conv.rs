@@ -45,6 +45,7 @@ type Shape = (
     (u32, u32),
 );
 
+/// The convolution of `s` over `batch` images.
 fn dims(batch: u32, s: Shape) -> ConvDims {
     let (cin, cout, input, kernel, stride, padding, dilation) = s;
     ConvDims {

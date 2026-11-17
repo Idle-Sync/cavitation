@@ -2547,7 +2547,7 @@ pub fn accuracy(model: &Sequential, params: &ParamStore, data: &Dataset, batch: 
 
 /// The index of the first largest value of `row`, ignoring NaN; `None` if every value is
 /// NaN.
-pub(super) fn argmax(row: &[f32]) -> Option<usize> {
+pub(crate) fn argmax(row: &[f32]) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (i, &v) in row.iter().enumerate() {
         if !v.is_nan() && best.is_none_or(|(_, b)| v > b) {

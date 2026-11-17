@@ -64,6 +64,12 @@ fn default_gpu() {
             .contains(wgpu::Features::TIMESTAMP_QUERY),
         info.timestamps
     );
+    assert_eq!(
+        gpu.device()
+            .features()
+            .contains(wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS),
+        info.encoder_timestamps
+    );
     round_trip(&gpu);
 }
 

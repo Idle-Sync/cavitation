@@ -184,6 +184,51 @@ fn dropout_follows_its_mask() {
     });
 }
 
+/// A neuron mask selects each element where its bit is set and gives +0 where it is clear,
+/// as `Tape::keep_where` does: a cleared −3, −0, NaN or infinity is +0, a kept one keeps its
+/// bits.
+#[test]
+fn keep_where_follows_its_mask() {
+    for_each_gpu(|gpu| {
+        let n = 100_003;
+        let mut kit = Kit::new(gpu, 4 * n as u64);
+        let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
+        let mut x = seeded_values(5, n, -4.0, 4.0);
+        x[..SPECIAL.len()].copy_from_slice(&SPECIAL);
+        x[SPECIAL.len()] = -3.0;
+        let mut rng = common::Seeded::new(6);
+        let mut words: Vec<u32> = (0..n.div_ceil(32)).map(|_| rng.next_u64() as u32).collect();
+        // The specials and the −3 each meet a cleared bit and, in the next word, a set one.
+        let specials = SPECIAL.len() + 1;
+        assert!(specials <= 32);
+        words[0] = 0;
+        words[1] = u32::MAX;
+        x.copy_within(..specials, 32);
+        let mask_as_f32: Vec<f32> = words.iter().map(|w| f32::from_bits(*w)).collect();
+        let got = run(
+            &mut kit,
+            &kernels,
+            Elementwise::KeepWhere,
+            &x,
+            Some(&mask_as_f32),
+            0.0,
+            0.0,
+        );
+        let want: Vec<f32> = (0..n)
+            .map(|i| {
+                if (words[i / 32] >> (i % 32)) & 1 == 1 {
+                    x[i]
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        assert!(want[..specials].iter().all(|v| v.to_bits() == 0));
+        assert!(want[32..32 + specials].iter().any(|v| v.is_nan()));
+        assert_exact(&got, &want, "keep_where");
+    });
+}
+
 /// The f64 tape's values of `f` at `x` and, with `g` flowing back, its gradient.
 fn tape_reference(
     x: &[f32],

@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use cavitation_gpu::{
     Backend, BufferPool, Gpu, MAX_WORKGROUPS_PER_DIMENSION, PipelineCache, PooledBuffer, Shader,
-    StepEncoder, StepSizes, wgpu,
+    StepEncoder, StepSizes, TimedKind, Timing, wgpu,
 };
 
 /// Adds 1 to `count[i]` for each thread's linear index `i`, with workgroups numbered over
@@ -325,4 +325,117 @@ fn unprofiled_spans_have_no_times() {
     step.span("b");
     let output = step.finish();
     assert_eq!(output.spans(), &[("a", None), ("b", None)]);
+}
+
+/// A profiled step's timed entries, in the order recorded: a span begins a pass, an upload
+/// ends it, a dispatch begins another and a readback ends that. With encoder timestamps
+/// the two runs of copies are entries too. Every entry has a time, the span's time is the
+/// sum of its entries', and what is not timed is said by name.
+#[test]
+fn profiled_steps_time_passes_and_copies() {
+    let Some(gpu) = gpu() else { return };
+    let mut cache = PipelineCache::new(&gpu);
+    let pipeline = cache.get(ADD_ONE, "main", &[]).expect("build");
+    let mut pool = BufferPool::new(&gpu);
+    let (x, y) = (pool.take(4096, TENSOR), pool.take(4096, TENSOR));
+    let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    steps.set_profiling(true);
+    let group = bind(&mut steps, &pipeline, &[&x, &y]);
+    let timing = steps.timing();
+    let info = gpu.info();
+    let want: &[TimedKind] = match timing {
+        Timing::Untimed { why } => {
+            assert!(!info.timestamps && why.contains("TIMESTAMP_QUERY"), "{why}");
+            &[]
+        }
+        Timing::Passes { copies_untimed } => {
+            assert!(info.timestamps && !info.encoder_timestamps);
+            assert!(copies_untimed.contains("TIMESTAMP_QUERY_INSIDE_ENCODERS"));
+            &[TimedKind::Pass, TimedKind::Pass]
+        }
+        Timing::PassesAndCopies => {
+            assert!(info.timestamps && info.encoder_timestamps);
+            &[
+                TimedKind::Pass,
+                TimedKind::Copies,
+                TimedKind::Pass,
+                TimedKind::Copies,
+            ]
+        }
+    };
+    let mut step = steps.begin();
+    step.span("add one");
+    step.upload(x.buffer(), 0, &bytes(&[2.0; 1024]));
+    step.dispatch(&pipeline, &group, 4);
+    step.read_back(y.buffer(), 0, 4096);
+    let output = step.finish();
+    assert_eq!(floats(output.bytes()), vec![3.0; 1024]);
+    let timed = output.timed();
+    let kinds: Vec<TimedKind> = timed.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, want, "{timing:?}");
+    assert!(timed.iter().all(|t| t.span == 0));
+    let times: Vec<f64> = timed
+        .iter()
+        .map(|t| {
+            t.nanoseconds
+                .expect("each entry's end follows its beginning")
+        })
+        .collect();
+    let span = output.spans()[0].1;
+    if want.is_empty() {
+        assert_eq!(span, None);
+    } else {
+        assert_eq!(span, Some(times.iter().sum::<f64>()));
+    }
+    println!(
+        "{timing:?}: {} of {} entries timed, {kinds:?}, {times:?} ns",
+        times.len(),
+        want.len()
+    );
+    pool.give(x);
+    pool.give(y);
+}
+
+/// Each step's times are its own, not the step before's: steps alternate between a small
+/// and a large dispatch, 1,024 times the work, and the large steps' median time is above the
+/// small steps'. Read from a resolve in the step's own submission, Metal gave each step the
+/// previous step's times, which turns the medians around (small 348 µs, large 3.75 µs).
+/// Medians, and no wider margin, because the other tests in this file share the GPU and can
+/// stretch the small steps well past a few microseconds.
+#[test]
+fn span_times_belong_to_their_step() {
+    let Some(gpu) = gpu() else { return };
+    if matches!(
+        StepEncoder::new(&gpu, StepSizes::default()).timing(),
+        Timing::Untimed { .. }
+    ) {
+        println!("no timestamps: not checked");
+        return;
+    }
+    let mut cache = PipelineCache::new(&gpu);
+    let pipeline = cache.get(COUNT, "main", &[]).expect("build");
+    let mut pool = BufferPool::new(&gpu);
+    let count = pool.take(4 << 22, TENSOR);
+    let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    steps.set_profiling(true);
+    let group = bind(&mut steps, &pipeline, &[&count]);
+    let mut time = |workgroups: u32| {
+        let mut step = steps.begin();
+        step.span("count");
+        step.dispatch_split(&pipeline, &group, workgroups);
+        step.finish().spans()[0].1.expect("timed")
+    };
+    let (mut small, mut large) = (Vec::new(), Vec::new());
+    for _ in 0..9 {
+        small.push(time(16));
+        large.push(time(1 << 14));
+    }
+    println!("small {small:?} ns; large {large:?} ns");
+    let median = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let (small, large) = (median(&mut small), median(&mut large));
+    assert!(large > small, "median small {small} ns, large {large} ns");
+    pool.give(count);
 }

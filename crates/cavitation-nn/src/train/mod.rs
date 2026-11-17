@@ -15,7 +15,11 @@ mod step_log;
 mod stopping;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
+#[cfg(feature = "gpu")]
+pub(crate) use evaluate::measure;
 pub use evaluate::{Evaluation, Evaluator, confusion_matrix, evaluate};
+#[cfg(feature = "gpu")]
+pub(crate) use fit::argmax;
 pub use fit::{
     EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig, StepControl,
     StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled, fit_with_hooks,
