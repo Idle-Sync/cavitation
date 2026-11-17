@@ -4,6 +4,11 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Breaking changes
+
+- `Sequential` fuses a `BatchNorm2d` followed directly by a plain `Relu` by default, so for such a pair at layers `i` and `i + 1`, `Trace::output(i)` and `Trace::input(i + 1)` are now the ReLU's output, not the batch norm's. Code that read the batch norm's own output from a trace, or took a gradient at it, now gets the ReLU's. To get the old behaviour, call `trace.keep_output(i)` (or `trace.keep_all_outputs()`) before `forward_traced`, or build the network with `.fuse(false)`.
+- `Hooks::run_forward` and `Hooks::run_backward` now panic, naming the layer, when a hook watches a fused batch norm or the ReLU after it. To get the old behaviour, call `hooks.keep_outputs(&mut trace)` before `forward_traced` (`fit` already does), or build the network with `.fuse(false)`.
+
 ### Tensors and autograd (`cavitation-core`)
 
 - `Tape::batch_norm2d_relu` records batch normalisation followed by ReLU as one node. Its values, gradients and running statistics are the same bits as `batch_norm2d` then `relu`, with one pass over memory fewer in each direction: the forward pass applies ReLU as it writes, and the backward pass multiplies the gradient by ReLU's derivative inside batch norm's own two passes.
