@@ -396,6 +396,54 @@ fn profiled_steps_time_passes_and_copies() {
     pool.give(y);
 }
 
+/// A copy between two GPU buffers is timed as an upload is: with encoder timestamps, a
+/// profiled step of a copy, a dispatch and a readback gives a run of copies, a pass and
+/// another run of copies, as in [`profiled_steps_time_passes_and_copies`].
+#[test]
+fn profiled_copies_between_buffers_are_timed() {
+    let Some(gpu) = gpu() else { return };
+    let mut cache = PipelineCache::new(&gpu);
+    let pipeline = cache.get(ADD_ONE, "main", &[]).expect("build");
+    let mut pool = BufferPool::new(&gpu);
+    let (w, x, y) = (
+        pool.take(4096, TENSOR),
+        pool.take(4096, TENSOR),
+        pool.take(4096, TENSOR),
+    );
+    let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    let group = bind(&mut steps, &pipeline, &[&x, &y]);
+    let mut step = steps.begin();
+    step.upload(w.buffer(), 0, &bytes(&[2.0; 1024]));
+    let _ = step.finish();
+    steps.set_profiling(true);
+    let timing = steps.timing();
+    let mut step = steps.begin();
+    step.span("add one");
+    step.copy(w.buffer(), 0, x.buffer(), 0, 4096);
+    step.dispatch(&pipeline, &group, 4);
+    step.read_back(y.buffer(), 0, 4096);
+    let output = step.finish();
+    assert_eq!(floats(output.bytes()), vec![3.0; 1024]);
+    let kinds: Vec<TimedKind> = output.timed().iter().map(|t| t.kind).collect();
+    match timing {
+        Timing::PassesAndCopies => assert_eq!(
+            kinds,
+            [
+                TimedKind::Pass,
+                TimedKind::Copies,
+                TimedKind::Pass,
+                TimedKind::Copies
+            ]
+        ),
+        Timing::Passes { .. } => assert_eq!(kinds, [TimedKind::Pass, TimedKind::Pass]),
+        Timing::Untimed { .. } => assert!(kinds.is_empty()),
+    }
+    println!("{timing:?}: {kinds:?}");
+    for b in [w, x, y] {
+        pool.give(b);
+    }
+}
+
 /// Each step's times are its own, not the step before's: steps alternate between a small
 /// and a large dispatch, 1,024 times the work, and the large steps' median time is above the
 /// small steps'. Read from a resolve in the step's own submission, Metal gave each step the

@@ -726,6 +726,66 @@ impl<'a> Step<'a> {
             .clear_buffer(buffer, offset, Some(len));
     }
 
+    /// Copies `len` bytes of `src` from `src_offset` into `dst` at `dst_offset` when the
+    /// step runs, in order with the step's other commands: for moving values between
+    /// buffers on the GPU without a round trip through the host. When profiling with
+    /// encoder timestamps, it is timed with the step's other copies, as an upload is.
+    ///
+    /// # Panics
+    ///
+    /// If `len` or an offset is not a multiple of 4, either range is outside its buffer, or
+    /// `src` is `dst` (wgpu does not copy within one buffer).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_gpu::{Gpu, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let make = || gpu.device().create_buffer(&wgpu::BufferDescriptor {
+    ///         label: None,
+    ///         size: 8,
+    ///         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+    ///         mapped_at_creation: false,
+    ///     });
+    ///     let (a, b) = (make(), make());
+    ///     let mut step = steps.begin();
+    ///     step.upload(&a, 0, &[1, 2, 3, 4, 5, 6, 7, 8]);
+    ///     step.clear(&b, 0, 8);
+    ///     step.copy(&a, 4, &b, 0, 4);
+    ///     step.read_back(&b, 0, 8);
+    ///     assert_eq!(step.finish().bytes(), &[5, 6, 7, 8, 0, 0, 0, 0]);
+    /// }
+    /// ```
+    pub fn copy(
+        &mut self,
+        src: &wgpu::Buffer,
+        src_offset: u64,
+        dst: &wgpu::Buffer,
+        dst_offset: u64,
+        len: u64,
+    ) {
+        assert!(
+            len.is_multiple_of(4) && src_offset.is_multiple_of(4) && dst_offset.is_multiple_of(4),
+            "a copy needs a whole number of 4-byte words at 4-byte offsets, not {len} bytes from \
+             {src_offset} to {dst_offset}"
+        );
+        assert!(
+            src_offset + len <= src.size() && dst_offset + len <= dst.size(),
+            "a copy of {len} bytes from {src_offset} to {dst_offset} runs past a buffer of {} or \
+             {} bytes",
+            src.size(),
+            dst.size()
+        );
+        assert!(src != dst, "a copy needs two different buffers");
+        self.begin_copies();
+        self.encoder
+            .as_mut()
+            .expect("the step is being recorded")
+            .copy_buffer_to_buffer(src, src_offset, dst, dst_offset, len);
+    }
+
     /// Starts a span named `name`: when profiling, the dispatches that follow run in timed
     /// compute passes of their own until the next span; otherwise the name only labels
     /// them, and they share the current pass.

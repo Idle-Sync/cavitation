@@ -271,8 +271,8 @@ impl GpuModel {
     ///   runs (see [`GpuModel`]) or has parameters its GPU form does not use; the message
     ///   names the layer's index and name. Also if no layer fixes the input width, or a
     ///   parameter or a batch of a layer's inputs or outputs is larger than the GPU binds,
-    ///   the model has a convolution and `batch` is above 65,535, a `Linear`'s batch or
-    ///   outputs or a convolution's output pixels or channels are above 4,194,240, a batch
+    ///   the model has a convolution and `batch` is above 65,535, a `Linear`'s batch,
+    ///   inputs or outputs or a convolution's output pixels or channels are above 4,194,240, a batch
     ///   norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the parameters, running statistics
     ///   and masks together are larger than one GPU buffer.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
@@ -596,12 +596,18 @@ impl Plan {
                 )))
             };
             match kind {
-                Kind::Linear { outputs, .. } => {
+                Kind::Linear {
+                    inputs, outputs, ..
+                } => {
                     if batch > MAX_GEMM_SIDE {
                         return too_wide("rows per batch", batch);
                     }
                     if outputs > MAX_GEMM_SIDE {
                         return too_wide("outputs", outputs);
+                    }
+                    // The backward pass's input gradient is a GEMM with `inputs` columns.
+                    if inputs > MAX_GEMM_SIDE {
+                        return too_wide("inputs", inputs);
                     }
                 }
                 Kind::Conv2d { geom, .. } => {
