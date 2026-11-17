@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.4.1 (2026-11-17)
+
+Training on the GPU now runs end to end: `fit` takes `FitConfig::device`, and `Device::Gpu(&gpu)` (with the `gpu` feature) trains through the new `GpuTrainer`, with the CPU run's batches, learning rates, dropout masks and health checks, a short last batch included. `GpuModel` runs a compiled model in evaluation mode (`infer_batch`, `evaluate`, `accuracy`), and `GpuTrainer::profile_next_step` times each layer on the GPU. The kernels gain the convolution's weight gradient and a neuron mask. On the CPU, `Sequential` fuses a batch norm with the ReLU after it by default, and convolution backward passes are faster. Two changes are breaking: the new `FitConfig::device` field, and the fused pair's trace and hooks behaviour; both entries below say how to keep the old behaviour.
+
 ### Breaking changes
 
 - `Sequential` fuses a `BatchNorm2d` followed directly by a plain `Relu` by default, so for such a pair at layers `i` and `i + 1`, `Trace::output(i)` and `Trace::input(i + 1)` are now the ReLU's output, not the batch norm's. Code that read the batch norm's own output from a trace, or took a gradient at it, now gets the ReLU's. To get the old behaviour, call `trace.keep_output(i)` (or `trace.keep_all_outputs()`) before `forward_traced`, or build the network with `.fuse(false)`.
