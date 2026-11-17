@@ -120,7 +120,12 @@ fn ce_bounds(batch: usize, classes: usize, logits: &[f32], labels: &[u32]) -> (f
         let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let x: Vec<f64> = z.iter().map(|v| v - m).collect();
         let k = x.iter().position(|&v| v == 0.0).unwrap();
-        let rest = || x.iter().enumerate().filter(move |&(j, _)| j != k).map(|(_, &v)| v);
+        let rest = || {
+            x.iter()
+                .enumerate()
+                .filter(move |&(j, _)| j != k)
+                .map(|(_, &v)| v)
+        };
         let e: f64 = rest().map(f64::exp).sum();
         let d_e: f64 = rest()
             .map(|v| (6.0 + 5.0 * v.abs()) * U * v.exp() + FLOOR)
