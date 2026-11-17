@@ -75,13 +75,14 @@ fn a_profile_has_every_layer() {
         parts.extend([p.copies, p.readback]);
         let sum: Duration = parts.iter().flatten().sum();
         assert!(sum <= p.total, "{sum:?} of parts against {:?}", p.total);
-        // Each time is its own layer's: the convolution's backward pass (its weight and input
-        // gradients over every position) is the longest, and `Flatten` (no work) the shortest,
-        // which a profile with the layers in the wrong order would not show.
+        // Each time is its own layer's: `Flatten` (no work) is the shortest both ways, which a
+        // profile with the layers in the wrong order would not show. No ordering between layers
+        // that do work is asserted: one step's times are single samples, and on some backends
+        // (Vulkan and DX12 on an NVIDIA GTX 1660 Super) batch norm's or a `Linear`'s backward
+        // pass has come out longer than the convolution's (#315).
         if timed {
             let times = |v: &[Option<Duration>]| v.iter().map(|t| t.unwrap()).collect::<Vec<_>>();
             let (fwd, bwd) = (times(&p.forward), times(&p.backward));
-            assert_eq!(bwd.iter().max(), Some(&bwd[0]), "{bwd:?}");
             assert_eq!(bwd.iter().min(), Some(&bwd[5]), "{bwd:?}");
             assert_eq!(fwd.iter().min(), Some(&fwd[5]), "{fwd:?}");
         }
