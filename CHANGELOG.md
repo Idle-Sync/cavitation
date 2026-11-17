@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### GPU
+
+- The GPU's Adam and AdamW take one minus each beta, and the bias corrections, from the beta rounded to `f32` as the kernel holds it, not from its `f64` setting. Before, the second moment's two weights added up to more than 1 (with β₂ = 0.999), so it settled 1.29e-5 above a constant `g²`, and each step was about 6.5e-6 shorter than the CPU's. On the digits (64 → 64 → 32 → 10, Adam at 0.002, batch 32, 5 epochs, seeds 0 to 4) the GPU's final training loss was 4.7e-7 to 6.0e-7 above the CPU's, relative, on every seed. It is now 5.3e-8 to 1.4e-7 above, measured on an Intel UHD Graphics (JSL) through Vulkan (#316).
+
 ## v0.4.1 (2026-11-17)
 
 Training on the GPU now runs end to end: `fit` takes `FitConfig::device`, and `Device::Gpu(&gpu)` (with the `gpu` feature) trains through the new `GpuTrainer`, with the CPU run's batches, learning rates, dropout masks and health checks, a short last batch included. `GpuModel` runs a compiled model in evaluation mode (`infer_batch`, `evaluate`, `accuracy`), and `GpuTrainer::profile_next_step` times each layer on the GPU. The kernels gain the convolution's weight gradient and a neuron mask. On the CPU, `Sequential` fuses a batch norm with the ReLU after it by default, and convolution backward passes are faster. Two changes are breaking: the new `FitConfig::device` field, and the fused pair's trace and hooks behaviour; both entries below say how to keep the old behaviour.
