@@ -3,7 +3,7 @@
 //! - **Softmax cross-entropy:** the loss and the logits' gradient within their stated bounds
 //!   of `Tape::softmax_cross_entropy` on an `f64` store, from one row to 70,000 rows and from
 //!   one class to 1,000. A NaN or infinite logit, or a bad label, gives a NaN row that the
-//!   finite flag catches.
+//!   finite flag catches. On confident rows the loss carries no bias.
 //! - **Mean squared error:** the gradient bit for bit against `Tape::mse` on an `f32` store,
 //!   and the loss within its bound of the `f64` tape. Both are checked up to more values than
 //!   one grid row of workgroups holds, and an overflowed square and a NaN reach the loss.
@@ -119,14 +119,20 @@ fn ce_bounds(batch: usize, classes: usize, logits: &[f32], labels: &[u32]) -> (f
         let z: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
         let m = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let x: Vec<f64> = z.iter().map(|v| v - m).collect();
-        let s: f64 = x.iter().map(|v| v.exp()).sum();
-        let d_s: f64 = x
-            .iter()
+        let k = x.iter().position(|&v| v == 0.0).unwrap();
+        let rest = || x.iter().enumerate().filter(move |&(j, _)| j != k).map(|(_, &v)| v);
+        let e: f64 = rest().map(f64::exp).sum();
+        let d_e: f64 = rest()
             .map(|v| (6.0 + 5.0 * v.abs()) * U * v.exp() + FLOOR)
             .sum::<f64>()
-            + sum_bound(classes, s);
-        let lse = s.ln();
-        let d = second(d_s / s) + 2f64.powi(-21) + 6.0 * U * lse.abs();
+            + sum_bound(classes - 1, e);
+        let s = 1.0 + e;
+        let lse = e.ln_1p();
+        let d = if e <= 1.0 {
+            second(d_e + 10.0 * U * lse)
+        } else {
+            second((d_e + U * s) / s + 6.0 * U * lse)
+        };
         let label = labels[i] as usize;
         let loss = lse - x[label];
         losses += loss;
@@ -470,5 +476,43 @@ fn refusals() {
             squared(16, &z, &l, &g, (&z, 0))
                 .contains("the loss output and the prediction must be different")
         );
+    });
+}
+
+/// Confident rows, as late in training: 4,096 rows of 10 logits in `[−4, 4)` with the label's
+/// raised by 7 or by 12 (mean losses near 0.24 and 0.0026), 20 batches each. Each batch's
+/// loss is within its bound of the `f64` tape's, and the mean of their relative errors is
+/// within 8u: rounding, not a bias. Computing `ln S` with WGSL's `log` gave a mean of −26.5u
+/// at a raise of 12 on an Intel UHD Graphics (JSL) through Vulkan, from its 2⁻²¹ absolute
+/// error near 1.
+#[test]
+fn cross_entropy_confident_rows_have_no_bias() {
+    for_each_gpu(|gpu| {
+        let (batch, classes) = (4096u32, 10u32);
+        let n = (batch * classes) as usize;
+        let mut kit = kit(gpu, n);
+        let ce = SoftmaxCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+        let flag = FiniteFlag::new(gpu, &mut kit.cache).unwrap();
+        for raise in [7.0f32, 12.0] {
+            let mut sum = 0.0;
+            for seed in 0..20u64 {
+                let mut z = seeded_values(100 + seed, n, -4.0, 4.0);
+                let y = labels(200 + seed, batch as usize, classes);
+                for (i, &l) in y.iter().enumerate() {
+                    z[i * classes as usize + l as usize] += raise;
+                }
+                let (loss, _, _) = gpu_ce(&mut kit, (&ce, &flag), (batch, classes), &z, &y);
+                let (want, _) = tape_ce(batch as usize, classes as usize, &z, &y);
+                let (bound, _) = ce_bounds(batch as usize, classes as usize, &z, &y);
+                assert_within(&[loss], &[want], |_| bound, &format!("loss, raise {raise}"));
+                sum += (f64::from(loss) - want) / want;
+            }
+            let mean = sum / 20.0 / U;
+            println!("confident rows, raise {raise}: mean relative error {mean:.2}u");
+            assert!(
+                mean.abs() <= 8.0,
+                "confident rows, raise {raise}: the loss's mean relative error is {mean:.2}u"
+            );
+        }
     });
 }

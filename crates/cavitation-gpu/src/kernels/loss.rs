@@ -28,7 +28,11 @@ const UNIFORM_BYTES: u64 = 16;
 const MAX_VALUES: u64 = 65_535 * 4_096;
 
 /// Softmax cross-entropy, one thread per row: the row's loss `ln Σ e^(z − max) − (z_label −
-/// max)` and its gradient `w · (softmax − onehot)`, as the CPU computes them. A row with a
+/// max)` and its gradient `w · (softmax − onehot)`. The sum leaves out the first maximum's
+/// term, `e = Σ_{j≠k} e^(z_j − max)`, and the logarithm is `ln(1 + e)`: for `e ≤ 1` it is
+/// `2·atanh(e / (2 + e))` from its series to `y¹⁵`, which keeps `e`'s low bits that `1 + e`
+/// rounded to `f32` would drop and avoids WGSL's `log`, whose error near 1 is 2⁻²¹ absolute
+/// rather than relative. A row with a
 /// logit whose exponent bits are all set (NaN or ±∞), or with a label past the classes, gets
 /// NaN for its loss and its gradient. NaN is written as bits through `u32` views of both
 /// outputs, since WGSL may fold NaN arithmetic away.
@@ -65,9 +69,30 @@ const ROWS: Shader = Shader {
                 for (var j = 0u; j < r.classes; j = j + 1u) { grad[base + j] = NAN_BITS; }
                 return;
             }
-            var s = 0.0;
-            for (var j = 0u; j < r.classes; j = j + 1u) { s = s + exp(logits[base + j] - m); }
-            let lse = log(s);
+            var k = 0u;
+            for (var j = 0u; j < r.classes; j = j + 1u) {
+                if (logits[base + j] == m) { k = j; break; }
+            }
+            var e = 0.0;
+            for (var j = 0u; j < r.classes; j = j + 1u) {
+                if (j != k) { e = e + exp(logits[base + j] - m); }
+            }
+            var lse: f32;
+            if (e <= 1.0) {
+                let y = e / (2.0 + e);
+                let q = y * y;
+                var t = 1.0 / 15.0;
+                t = 1.0 / 13.0 + q * t;
+                t = 1.0 / 11.0 + q * t;
+                t = 1.0 / 9.0 + q * t;
+                t = 1.0 / 7.0 + q * t;
+                t = 1.0 / 5.0 + q * t;
+                t = 1.0 / 3.0 + q * t;
+                t = 1.0 + q * t;
+                lse = 2.0 * y * t;
+            } else {
+                lse = log(1.0 + e);
+            }
             row_loss[i] = bitcast<u32>(-(logits[base + label] - m - lse));
             for (var j = 0u; j < r.classes; j = j + 1u) {
                 let p = exp(logits[base + j] - m - lse);
@@ -131,19 +156,24 @@ fn reciprocal(n: u64) -> f32 {
 /// GPU, as `Tape::softmax_cross_entropy` with `Reduction::Mean` computes it: the loss (one
 /// word) and the logits' gradient `(softmax − onehot) / batch`.
 ///
-/// Each row runs in one thread. It takes the row's maximum, then `ln Σ e^(z − max)`, then its
-/// loss and gradient. The row losses' mean is a per-channel sum in a fixed tree, divided by
+/// Each row runs in one thread. It takes the row's maximum, then `ln Σ e^(z − max)` as
+/// `ln(1 + e)` with `e` the sum without the first maximum's term, then its loss and gradient.
+/// For `e ≤ 1` the logarithm comes from the series of `2·atanh(e / (2 + e))`, so a confident
+/// row's small loss keeps its relative accuracy; the CPU rounds `1 + e` to `f32` first, so
+/// on such rows it can sit below the exact loss where this kernel does not. The row losses' mean is a per-channel sum in a fixed tree, divided by
 /// the batch rounded to `f32`. A row with a NaN or infinite logit, or a label not below the
 /// classes, gives a NaN loss and a NaN gradient row, so the step's finite flag is set. The
 /// CPU would give a finite loss for a −∞ logit off the label, and panics on a bad label;
 /// `fit` refuses bad labels before training, so only a hand-written loop meets that case.
 ///
 /// The bounds are against the exact result of the same `f32` logits. WGSL gives `exp` within
-/// `3 + 2|x|` ulp and `log` within 2⁻²¹ on `[0.5, 2]`, else 3 ulp, and every multiply-add may
-/// round twice. With `x_j = z_j − max`, `S = Σ e^(x_j)` and `ℓ = ln S − x_label`:
+/// `3 + 2|x|` ulp, `log` within 3 ulp off `[0.5, 2]` and division within 2.5 ulp, and every
+/// multiply-add may round twice. With `x_j = z_j − max`, `e = Σ_{j≠k} e^(x_j)`, `S = 1 + e`
+/// and `ℓ = ln S − x_label`:
 ///
-/// - **`S`:** within `ΔS = Σ (6 + 5|x_j|)·u·e^(x_j) + 2(K + 2)·u·S` for `K` classes.
-/// - **`ln S`:** within `Δ = ΔS/S + (2⁻²¹ if S ≤ 2, else 6u·ln S)`.
+/// - **`e`:** within `Δe = Σ_{j≠k} (6 + 5|x_j|)·u·e^(x_j) + 2(K + 1)·u·e` for `K` classes.
+/// - **`ln S`:** within `Δ = Δe + 10u·ln S` if `e ≤ 1` (the quotient's 6u, the series' 2u
+///   with its truncation, the last product's u), else `Δ = (Δe + u·S)/S + 6u·ln S`.
 /// - **A row's loss:** within `2u·(|z_label| + |max| + ln S) + Δ`: its two subtractions in
 ///   either order, as a compiler may reassociate them.
 /// - **The loss:** the row losses' bounds summed and divided by the batch, plus
