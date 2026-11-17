@@ -129,6 +129,9 @@ pub struct Options {
     /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
     /// steps) and print each layer's median forward and backward time.
     pub profile: Option<usize>,
+    /// `--no-fuse`: record each batch normalisation and the ReLU after it as two nodes
+    /// (`Sequential::fuse(false)`), to compare against the fused default.
+    pub no_fuse: bool,
 }
 
 impl Options {
@@ -146,6 +149,7 @@ impl Options {
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
             ours_only: false,
             profile: None,
+            no_fuse: false,
         };
         let mut rest = args.iter();
         let number = |flag: &str, v: Option<&String>, zero_ok: bool| -> Result<usize, String> {
@@ -163,6 +167,7 @@ impl Options {
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
                 "--ours-only" => o.ours_only = true,
                 "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
+                "--no-fuse" => o.no_fuse = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
         }
@@ -325,9 +330,15 @@ fn profile(
         "", "layer", "forward ms", "backward ms"
     );
     for i in 0..model.len() {
+        // A fused batch norm carries its ReLU's times; the ReLU's row says so.
+        let name = if i > 0 && model.fuses_at(i - 1) {
+            format!("{} (in {})", model.layer(i).name(), i - 1)
+        } else {
+            model.layer(i).name().to_string()
+        };
         println!(
             "{i:>3}  {:<22} {:>12.2} {:>12.2}",
-            model.layer(i).name(),
+            name,
             ms(&|p| p.forward[i]),
             ms(&|p| p.backward[i])
         );
@@ -525,7 +536,8 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
         let model = match net.data {
             "cifar" => cifar_network(&mut params, o.seed),
             _ => mnist_network(&mut params, o.seed),
-        };
+        }
+        .fuse(!o.no_fuse);
         return profile(&model, &mut params, &train, net, o.seed, steps);
     }
     let dir = dir_root
@@ -538,7 +550,8 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     let model = match net.data {
         "cifar" => cifar_network(&mut params, o.seed),
         _ => mnist_network(&mut params, o.seed),
-    };
+    }
+    .fuse(!o.no_fuse);
     save(dir.join("init.safetensors"), &model, &params).map_err(|e| e.to_string())?;
     write_order(
         &dir.join("order.bin"),
@@ -684,6 +697,12 @@ mod tests {
         assert_eq!(Options::parse(MNIST, &[]).unwrap().profile, None);
         let p = Options::parse(CIFAR, &args(&["--profile", "7"])).unwrap();
         assert_eq!(p.profile, Some(7));
+        assert!(!p.no_fuse);
+        assert!(
+            Options::parse(CIFAR, &args(&["--no-fuse"]))
+                .unwrap()
+                .no_fuse
+        );
         assert!(Options::parse(CIFAR, &args(&["--profile", "0"])).is_err());
     }
 
