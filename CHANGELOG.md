@@ -4,10 +4,19 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Breaking changes
+
+- `Sequential` fuses a `BatchNorm2d` followed directly by a plain `Relu` by default, so for such a pair at layers `i` and `i + 1`, `Trace::output(i)` and `Trace::input(i + 1)` are now the ReLU's output, not the batch norm's. Code that read the batch norm's own output from a trace, or took a gradient at it, now gets the ReLU's. To get the old behaviour, call `trace.keep_output(i)` (or `trace.keep_all_outputs()`) before `forward_traced`, or build the network with `.fuse(false)`.
+- `Hooks::run_forward` and `Hooks::run_backward` now panic, naming the layer, when a hook watches a fused batch norm or the ReLU after it. To get the old behaviour, call `hooks.keep_outputs(&mut trace)` before `forward_traced` (`fit` already does), or build the network with `.fuse(false)`.
+
 ### Tensors and autograd (`cavitation-core`)
 
 - `Tape::batch_norm2d_relu` records batch normalisation followed by ReLU as one node. Its values, gradients and running statistics are the same bits as `batch_norm2d` then `relu`, with one pass over memory fewer in each direction: the forward pass applies ReLU as it writes, and the backward pass multiplies the gradient by ReLU's derivative inside batch norm's own two passes.
 - At the NEON level the direct f32 weight gradient of a 3 × 3 convolution (stride 1, padding 1, dilation 1, width a multiple of 4) takes three output channels per pass, 27 accumulators, so each padded-input load feeds three fused multiply-adds, and runs for any number of input channels; it ran only for at most 4. Each sum's order is unchanged, so it still matches `conv3x3_direct_weight_grad_twin` bit for bit. On an Apple M4 at 4 threads (`CAVITATION_KERNEL=neon`, `cifar-cnn --profile 9`, batch 128, medians of interleaved runs), the backward passes of the `cifar-cnn` network's convolutions take 0.68, 12.76, 6.53 and 12.93 ms instead of 1.06, 16.26, 7.36 and 14.60 with im2col and the GEMM on the last three, and the whole step 67.4 ms instead of 73.8 (#284).
+
+### Layers, training and inference (`cavitation-nn`)
+
+- `Sequential` records a `BatchNorm2d` followed directly by a plain `Relu` as one node (`Tape::batch_norm2d_relu`), on by default and turned off with `Sequential::fuse(false)`. Values, gradients and running statistics are unchanged, bit for bit. A pair is not fused when either layer has a mask or a trace asks for the batch norm's own output: `Trace::keep_output` and `Trace::keep_all_outputs` ask, `Trace::fused` says which pairs were fused, and `Sequential::fuses_at` says which would be. `fit` keeps the layers its hooks watch, the inspector's probe and shrink's activity statistics keep every layer, and `Hooks::keep_outputs` does the same for a hand-written loop; `Hooks::run_forward` and `run_backward` now panic, naming the layer, on a trace whose hooked layer (or the layer before it) was fused: a hand-written loop that hooks a batch norm or the ReLU after it calls `hooks.keep_outputs(&mut trace)` before `forward_traced`, or turns fusion off. `Trace::clear_kept` forgets the kept layers. Compacting or retraining a shrunk model keeps the model's fusion setting. A fused batch norm's profile entries carry the pair's times, and `cavitation-bench --profile` marks the ReLU's row.
 
 ### GPU
 

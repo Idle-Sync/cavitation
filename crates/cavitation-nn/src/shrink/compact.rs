@@ -144,7 +144,8 @@ pub fn compact<T: Real>(
     }
     let keep = kept_neurons(model, params, &masks)?;
     let mut store = ParamStore::<T>::new_generic();
-    let mut out = Sequential::<T>::new_generic();
+    // The copy fuses (or not) as the model does.
+    let mut out = Sequential::<T>::new_generic().fuse(model.fuses());
     for i in 0..model.len() {
         let layer = model.layer(i);
         if let Some(linear) = layer.as_linear() {
