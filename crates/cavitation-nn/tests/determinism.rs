@@ -73,6 +73,7 @@ fn train() -> Vec<u32> {
         on_epoch: None,
         validation: None,
         early_stopping: None,
+        device: Default::default(),
     };
     fit(&net, &mut params, &data, config).unwrap();
     net.parameter_names()

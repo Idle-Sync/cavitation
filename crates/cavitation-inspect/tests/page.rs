@@ -120,6 +120,7 @@ fn fit_config() -> FitConfig<'static> {
         on_epoch: None,
         validation: None,
         early_stopping: None,
+        device: Default::default(),
     }
 }
 

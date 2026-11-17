@@ -744,6 +744,18 @@ impl<'s> GpuTrainer<'s> {
     ///
     /// See [`GpuTrainer`].
     pub fn step(&mut self, model: &Sequential, batch: BatchView<'_, f32>) -> Result<f32, Error> {
+        self.step_rows(model, batch, None).map(|(loss, _)| loss)
+    }
+
+    /// [`step`](Self::step) for a batch whose rows are rows `rows` of a data set, which a
+    /// non-finite loss's error then names; also returns whether the step trained (`false`
+    /// when [`OnNonFinite::Skip`] left it out). [`fit`](crate::fit) steps through this.
+    pub(crate) fn step_rows(
+        &mut self,
+        model: &Sequential,
+        batch: BatchView<'_, f32>,
+        rows: Option<&[usize]>,
+    ) -> Result<(f32, bool), Error> {
         let started = Instant::now();
         debug_assert_eq!(model.len(), self.model.layers.len());
         let (full, input, output) = (
@@ -987,7 +999,7 @@ impl<'s> GpuTrainer<'s> {
         let inputs = StepInputs {
             x: batch.x,
             targets: batch.targets,
-            rows: None,
+            rows,
         };
         let checked = self.check(model, step_number, value, inputs);
         // The GPU applied the update exactly when the flag was clear; the checks must agree:
@@ -1012,7 +1024,7 @@ impl<'s> GpuTrainer<'s> {
         match checked {
             Ok(applied) => {
                 self.skipped += u64::from(!applied);
-                Ok(value)
+                Ok((value, applied))
             }
             Err(e) => Err(e),
         }

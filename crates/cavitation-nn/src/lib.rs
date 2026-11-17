@@ -107,7 +107,7 @@ pub use optim::{Adagrad, Adam, AdamW, GradStats, Optimizer, RmsProp, Sgd};
 pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 pub use sequential::{Sequential, Trace};
 pub use train::{
-    Batch, BatchView, Batcher, Dataset, EarlyStopping, EpochReport, Evaluation, Evaluator,
+    Batch, BatchView, Batcher, Dataset, Device, EarlyStopping, EpochReport, Evaluation, Evaluator,
     FitConfig, Flow, History, Loss, LrSchedule, ModelHandle, Monitor, OptimizerConfig,
     Standardizer, StepControl, StepInfo, StepLog, StepProfile, StepRecord, Targets, TargetsView,
     Threshold, Trainer, TrainerHandle, accuracy, confusion_matrix, evaluate, fit, fit_controlled,

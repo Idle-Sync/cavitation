@@ -547,7 +547,7 @@ impl GpuModel {
     /// Returns [`Error::InvalidData`] if the rows of `data` are not as wide as the model's
     /// input, or the last batch would be short while a batch-norm layer uses the batch's
     /// statistics.
-    fn check_rows(&self, data: &Dataset) -> Result<(), Error> {
+    pub(crate) fn check_rows(&self, data: &Dataset) -> Result<(), Error> {
         let dims = data.x.shape().dims();
         if dims.len() != 2 || dims[1] != self.input_width {
             return Err(Error::InvalidData(format!(

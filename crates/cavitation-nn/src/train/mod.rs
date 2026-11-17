@@ -21,9 +21,12 @@ pub use evaluate::{Evaluation, Evaluator, confusion_matrix, evaluate};
 #[cfg(feature = "gpu")]
 pub(crate) use fit::argmax;
 pub use fit::{
-    EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig, StepControl,
-    StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled, fit_with_hooks,
+    Device, EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig,
+    StepControl, StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled,
+    fit_with_hooks,
 };
+#[cfg(feature = "gpu")]
+pub(crate) use fit::{StepRates, Watching};
 pub(crate) use fit::{check_dataset, check_widths};
 pub use standardize::Standardizer;
 pub use step_log::{StepLog, StepRecord};

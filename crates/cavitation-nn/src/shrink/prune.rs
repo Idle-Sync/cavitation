@@ -1225,6 +1225,7 @@ impl Run<'_, '_, '_> {
             on_epoch: None,
             validation: None,
             early_stopping: None,
+            device: crate::Device::Cpu,
         };
         fit(self.model, self.params, self.train, config).map(|_| ())
     }
