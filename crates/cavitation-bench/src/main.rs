@@ -20,8 +20,9 @@
 //!   training step of the named network at the current kernel level and thread count
 //!   (`CAVITATION_KERNEL`, `CAVITATION_THREADS`), and prints each product's median time,
 //!   GFLOPS (`2·m·n·k` / time) and threads used, then the rate over all eight.
-//! - `gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096] [--warm-up SECONDS]`,
-//!   with the `gpu` feature, times the tiled GPU GEMM on square products, plain and with
+//! - `gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096|none] [--shapes MxNxK[xBATCH],...]
+//!   [--warm-up SECONDS]`, with the `gpu` feature, times the tiled GPU GEMM on square products
+//!   and on the products given as `--shapes` (`C` is `M` by `N`), plain and with
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
@@ -125,7 +126,7 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 latency [--python PATH] [--numpy-best]\n\
     \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
-    \x20 gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096] [--warm-up SECONDS] (with the gpu feature)\n\
+    \x20 gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096|none] [--shapes MxNxK[xBATCH],...] [--warm-up SECONDS] (with the gpu feature)\n\
     \x20 conv    [--batch N] [--parts]\n\
     \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
     \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
