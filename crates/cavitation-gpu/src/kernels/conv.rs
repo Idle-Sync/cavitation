@@ -11,7 +11,7 @@
 //!   `dw`.
 
 use super::bindings::{Kind, layout};
-use super::gemm::{DIMS_BYTES, GemmDims, TILE};
+use super::gemm::{DIMS_BYTES, GemmDims, grid, square_grid, wide_allowed};
 use crate::{
     BufferPool, Gpu, GpuError, MAX_WORKGROUPS_PER_DIMENSION, PipelineCache, PooledBuffer, Shader,
     Step, StepEncoder,
@@ -28,6 +28,16 @@ const CONV_FORWARD: Shader = Shader {
     ),
 };
 
+/// [`CONV_FORWARD`] on the GEMM's wide tile, for at most 32 output channels.
+const CONV_FORWARD_WIDE: Shader = Shader {
+    name: "conv_forward_wide",
+    source: concat!(
+        include_str!("gemm_head.wgsl"),
+        include_str!("conv_forward.wgsl"),
+        include_str!("gemm_core_wide.wgsl")
+    ),
+};
+
 /// The input-gradient shader: the GEMM's head, the gradient's loaders, which gather each input
 /// position's output gradients as the tiles are filled, the GEMM's own store and its core.
 const CONV_INPUT_GRAD: Shader = Shader {
@@ -37,6 +47,17 @@ const CONV_INPUT_GRAD: Shader = Shader {
         include_str!("conv_input_grad.wgsl"),
         include_str!("gemm_store.wgsl"),
         include_str!("gemm_core.wgsl")
+    ),
+};
+
+/// [`CONV_INPUT_GRAD`] on the GEMM's wide tile, for at most 32 input channels.
+const CONV_INPUT_GRAD_WIDE: Shader = Shader {
+    name: "conv_input_grad_wide",
+    source: concat!(
+        include_str!("gemm_head.wgsl"),
+        include_str!("conv_input_grad.wgsl"),
+        include_str!("gemm_store.wgsl"),
+        include_str!("gemm_core_wide.wgsl")
     ),
 };
 
@@ -50,6 +71,17 @@ const CONV_WEIGHT_GRAD: Shader = Shader {
         include_str!("conv_weight_grad.wgsl"),
         include_str!("gemm_store.wgsl"),
         include_str!("gemm_core.wgsl")
+    ),
+};
+
+/// [`CONV_WEIGHT_GRAD`] on the GEMM's wide tile, for at most 32 output channels.
+const CONV_WEIGHT_GRAD_WIDE: Shader = Shader {
+    name: "conv_weight_grad_wide",
+    source: concat!(
+        include_str!("gemm_head.wgsl"),
+        include_str!("conv_weight_grad.wgsl"),
+        include_str!("gemm_store.wgsl"),
+        include_str!("gemm_core_wide.wgsl")
     ),
 };
 
@@ -560,8 +592,13 @@ pub struct ConvForward {
     /// (read-write storage), the GEMM's `Dims` and the `Conv` uniform, and the bias
     /// (read-only storage).
     group: wgpu::BindGroupLayout,
-    /// The pipeline.
+    /// The pipeline on the GEMM's square tile.
     pipeline: wgpu::ComputePipeline,
+    /// The pipeline on the GEMM's wide tile, built by `ensure_wide` for the first call that
+    /// needs it.
+    wide: Option<wgpu::ComputePipeline>,
+    /// The pipeline layout both are built with.
+    layout: wgpu::PipelineLayout,
 }
 
 impl ConvForward {
@@ -582,7 +619,41 @@ impl ConvForward {
     pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<ConvForward, GpuError> {
         let (group, layout) = conv_layout(gpu, "conv_forward", 1);
         let pipeline = cache.get_with_layout(CONV_FORWARD, "main", &[], &layout)?;
-        Ok(ConvForward { group, pipeline })
+        Ok(ConvForward {
+            group,
+            pipeline,
+            wide: None,
+            layout,
+        })
+    }
+
+    /// Builds this kernel's pipeline on the GEMM's wide tile for `call`, through `cache`, if
+    /// `call`'s product is one the wide tile computes ([`Gemm::ensure_wide`](super::Gemm::ensure_wide)
+    /// gives the rule) and it is not built yet. Returns whether `call` runs on the wide tile
+    /// from now on. `record` uses the wide tile only for a call this has been called for;
+    /// without it the call runs on the square tile, with the same bits.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if the wide kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`Gemm::ensure_wide`](super::Gemm::ensure_wide).
+    pub fn ensure_wide(
+        &mut self,
+        cache: &mut PipelineCache,
+        call: &ConvCall,
+    ) -> Result<bool, GpuError> {
+        let d = call.gemm;
+        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
+            return Ok(false);
+        }
+        if self.wide.is_none() {
+            self.wide =
+                Some(cache.get_with_layout(CONV_FORWARD_WIDE, "main", &[], &self.layout)?);
+        }
+        Ok(true)
     }
 
     /// Prepares one convolution of shape `dims`: the input images `x`, the weight
@@ -655,7 +726,9 @@ impl ConvForward {
     ///
     /// # Panics
     ///
-    /// If `oh · ow` or `out` needs more than 65,535 tiles of 64: split such a convolution
+    /// If `oh · ow` or `out` needs more than 65,535 of the GEMM's tiles (64 a side, or 128
+    /// positions across on the wide tile, which [`Gemm::record`](super::Gemm::record)
+    /// describes and which at most 32 output channels may use): split such a convolution
     /// into several calls.
     ///
     /// # Examples
@@ -663,11 +736,10 @@ impl ConvForward {
     /// See [`ConvForward`].
     pub fn record(&self, step: &mut Step<'_>, call: &ConvCall) {
         let d = call.gemm;
-        step.dispatch_grid(
-            &self.pipeline,
-            &call.group,
-            [d.n.div_ceil(TILE), d.m.div_ceil(TILE), d.batch],
-        );
+        match (grid(d.m, d.n, d.batch), &self.wide) {
+            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
+            _ => step.dispatch_grid(&self.pipeline, &call.group, square_grid(d.m, d.n, d.batch)),
+        }
     }
 }
 
@@ -759,8 +831,13 @@ pub struct ConvInputGrad {
     /// The layout of group 0: the weight and the output gradients (read-only storage), the
     /// input gradients (read-write storage), the GEMM's `Dims` and the `ConvGrad` uniform.
     group: wgpu::BindGroupLayout,
-    /// The pipeline.
+    /// The pipeline on the GEMM's square tile.
     pipeline: wgpu::ComputePipeline,
+    /// The pipeline on the GEMM's wide tile, built by `ensure_wide` for the first call that
+    /// needs it.
+    wide: Option<wgpu::ComputePipeline>,
+    /// The pipeline layout both are built with.
+    layout: wgpu::PipelineLayout,
 }
 
 impl ConvInputGrad {
@@ -776,7 +853,41 @@ impl ConvInputGrad {
     pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<ConvInputGrad, GpuError> {
         let (group, layout) = conv_layout(gpu, "conv_input_grad", 0);
         let pipeline = cache.get_with_layout(CONV_INPUT_GRAD, "main", &[], &layout)?;
-        Ok(ConvInputGrad { group, pipeline })
+        Ok(ConvInputGrad {
+            group,
+            pipeline,
+            wide: None,
+            layout,
+        })
+    }
+
+    /// Builds this kernel's pipeline on the GEMM's wide tile for `call`, through `cache`, if
+    /// `call`'s product is one the wide tile computes ([`Gemm::ensure_wide`](super::Gemm::ensure_wide)
+    /// gives the rule) and it is not built yet. Returns whether `call` runs on the wide tile
+    /// from now on. `record` uses the wide tile only for a call this has been called for;
+    /// without it the call runs on the square tile, with the same bits.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if the wide kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`Gemm::ensure_wide`](super::Gemm::ensure_wide).
+    pub fn ensure_wide(
+        &mut self,
+        cache: &mut PipelineCache,
+        call: &ConvCall,
+    ) -> Result<bool, GpuError> {
+        let d = call.gemm;
+        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
+            return Ok(false);
+        }
+        if self.wide.is_none() {
+            self.wide =
+                Some(cache.get_with_layout(CONV_INPUT_GRAD_WIDE, "main", &[], &self.layout)?);
+        }
+        Ok(true)
     }
 
     /// Prepares the input gradient of one convolution of shape `dims`: the weight
@@ -839,7 +950,9 @@ impl ConvInputGrad {
     ///
     /// # Panics
     ///
-    /// If `h · w` or `in` needs more than 65,535 tiles of 64: split such a convolution into
+    /// If `h · w` or `in` needs more than 65,535 of the GEMM's tiles (64 a side, or 128
+    /// positions across on the wide tile, which at most 32 input channels may use): split
+    /// such a convolution into
     /// several calls.
     ///
     /// # Examples
@@ -847,11 +960,10 @@ impl ConvInputGrad {
     /// See [`ConvInputGrad`].
     pub fn record(&self, step: &mut Step<'_>, call: &ConvCall) {
         let d = call.gemm;
-        step.dispatch_grid(
-            &self.pipeline,
-            &call.group,
-            [d.n.div_ceil(TILE), d.m.div_ceil(TILE), d.batch],
-        );
+        match (grid(d.m, d.n, d.batch), &self.wide) {
+            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
+            _ => step.dispatch_grid(&self.pipeline, &call.group, square_grid(d.m, d.n, d.batch)),
+        }
     }
 }
 
@@ -907,6 +1019,11 @@ pub struct ConvWeightGrad {
     group: wgpu::BindGroupLayout,
     /// The first pass: each block's partial gradient.
     pipeline: wgpu::ComputePipeline,
+    /// The first pass on the GEMM's wide tile, built by `ensure_wide` for the first call
+    /// that needs it.
+    wide: Option<wgpu::ComputePipeline>,
+    /// The pipeline layout both first passes are built with.
+    layout: wgpu::PipelineLayout,
     /// The layout of the merge's group 0: the partial gradients (read-only storage), the
     /// weight gradient (read-write storage) and the GEMM's `Dims`.
     merge_group: wgpu::BindGroupLayout,
@@ -944,6 +1061,7 @@ impl ConvWeightGrad {
             &[("TRANS_B", 1.0)],
             &pipeline_layout,
         )?;
+
         let (merge_group, merge_layout) = layout(
             gpu,
             "conv_weight_merge",
@@ -958,9 +1076,44 @@ impl ConvWeightGrad {
         Ok(ConvWeightGrad {
             group,
             pipeline,
+            wide: None,
+            layout: pipeline_layout,
             merge_group,
             merge,
         })
+    }
+
+    /// Builds the first pass's pipeline on the GEMM's wide tile for `call`, through `cache`,
+    /// if `call`'s product is one the wide tile computes ([`Gemm::ensure_wide`](super::Gemm::ensure_wide)
+    /// gives the rule) and it is not built yet. Returns whether `call` runs on the wide tile
+    /// from now on. `record` uses the wide tile only for a call this has been called for;
+    /// without it the call runs on the square tile, with the same bits.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if the wide kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`Gemm::ensure_wide`](super::Gemm::ensure_wide).
+    pub fn ensure_wide(
+        &mut self,
+        cache: &mut PipelineCache,
+        call: &ConvWeightGradCall,
+    ) -> Result<bool, GpuError> {
+        let d = call.gemm;
+        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
+            return Ok(false);
+        }
+        if self.wide.is_none() {
+            self.wide = Some(cache.get_with_layout(
+                CONV_WEIGHT_GRAD_WIDE,
+                "main",
+                &[("TRANS_B", 1.0)],
+                &self.layout,
+            )?);
+        }
+        Ok(true)
     }
 
     /// Prepares the weight gradient of one convolution of shape `dims`: the input images `x`
@@ -1046,18 +1199,18 @@ impl ConvWeightGrad {
     ///
     /// # Panics
     ///
-    /// If `in · kh · kw` or `out` needs more than 65,535 tiles of 64.
+    /// If `in · kh · kw` or `out` needs more than 65,535 of the GEMM's tiles (64 a side, or
+    /// 128 weights across on the wide tile, which at most 32 output channels may use).
     ///
     /// # Examples
     ///
     /// See [`ConvWeightGrad`].
     pub fn record(&self, step: &mut Step<'_>, call: &ConvWeightGradCall) {
         let d = call.gemm;
-        step.dispatch_grid(
-            &self.pipeline,
-            &call.group,
-            [d.n.div_ceil(TILE), d.m.div_ceil(TILE), d.batch],
-        );
+        match (grid(d.m, d.n, d.batch), &self.wide) {
+            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
+            _ => step.dispatch_grid(&self.pipeline, &call.group, square_grid(d.m, d.n, d.batch)),
+        }
         step.dispatch_split(
             &self.merge,
             &call.merge_group,

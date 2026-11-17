@@ -118,7 +118,7 @@ impl Forward {
     /// each mask is applied to its layer's output.
     pub(crate) fn evaluation(
         parts: &Parts<'_>,
-        kernels: &Kernels,
+        kernels: &mut Kernels,
         cache: &mut PipelineCache,
         pool: &mut BufferPool,
         steps: &mut StepEncoder,
@@ -301,6 +301,19 @@ impl Forward {
                 None => out,
             };
             layer_outputs.push(x);
+        }
+        // The GEMM's wide tile, for the calls of this pass that use it: its pipelines are
+        // built only for a model that has such a call.
+        for op in &ops {
+            match op {
+                Op::Gemm(call) => {
+                    kernels.gemm.ensure_wide(cache, call)?;
+                }
+                Op::Conv(call) => {
+                    kernels.conv.ensure_wide(cache, call)?;
+                }
+                _ => {}
+            }
         }
         Ok(Forward {
             ops,
