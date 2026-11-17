@@ -534,6 +534,7 @@ impl<'s> Trainer<'s> {
     ) -> (f32, Result<bool, Error>) {
         self.loss.check_targets(batch.targets);
         hooks.check_layers(model);
+        hooks.keep_outputs(&mut self.trace);
         let step = self.steps + 1;
         let profiling = std::mem::take(&mut self.profiler.asked);
         self.profiler.valid = false;
@@ -942,6 +943,8 @@ struct Profiler {
 ///   network's output.
 /// - `optimizer`: the optimiser's update (0 when the health checks stopped the step before
 ///   it).
+/// - A batch normalisation fused with the ReLU after it ([`Sequential::fuses_at`]) has the
+///   pair's forward and backward times; the ReLU's entries are zero.
 /// - `total`: the whole step, from before the batch's input is recorded to after the
 ///   gradients are marked stale, including the hooks and the health checks, which no other
 ///   entry counts.
