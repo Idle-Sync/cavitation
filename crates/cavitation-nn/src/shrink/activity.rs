@@ -359,6 +359,8 @@ fn per_value(
             })?;
             let mut graph = Graph::new();
             let mut trace = Trace::with_capacity(model.len());
+            // Statistics read layers' own outputs, so nothing is fused.
+            trace.keep_all_outputs();
             for start in (0..rows).step_by(batch) {
                 let mut tape = graph.tape(&params.values);
                 let input = tape.input(rows_of(start));
