@@ -236,7 +236,7 @@ fn reinitialised(
 ) -> (Sequential, ParamStore) {
     let mut rng = Rng::seed(scratch.seed);
     let mut store = ParamStore::new();
-    let mut out = Sequential::new();
+    let mut out = Sequential::new().fuse(layout.fuses());
     for i in 0..layout.len() {
         let layer = layout.layer(i);
         if let Some(linear) = layer.as_linear() {

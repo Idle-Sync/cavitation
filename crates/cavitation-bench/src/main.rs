@@ -25,7 +25,7 @@
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--ours-only] [--profile N]` train the v0.3 benchmark CNNs (LeNet-5's layout on
+//!   [--ours-only] [--profile N] [--no-fuse]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
 //!   epochs) here and then
 //!   with `scripts/bench/torch_cnn.py` at the same thread count, from the same initial
@@ -50,13 +50,15 @@
 //!   ended on the same loss. CPU time is read from `/proc/self/stat`, so it runs on Linux
 //!   only; its ticks are taken as 1/100 s (`USER_HZ` = 100, as on x86 and Arm Linux).
 //!   `small --child` is the child's side: one run at the current thread count.
-//! - `conv [--batch N]` (default 128) times the four convolutions of the CIFAR-10 CNN
+//! - `conv [--batch N] [--parts]` (default 128) times the four convolutions of the CIFAR-10 CNN
 //!   benchmark network (3 × 3 kernels with padding 1: 3 → 32 and 32 → 32 channels on
 //!   32 × 32 images, 32 → 64 and 64 → 64 on 16 × 16) through `Tape::conv2d` at the current
 //!   kernel level and thread count: the median of 11 forward passes and of 11 forward and
 //!   backward passes (the first layer without the input gradient, as for data), with
 //!   GFLOPS counting `2 · out · in · kh · kw` per output value, three times that for a whole
-//!   step (two for the first layer).
+//!   step (two for the first layer). With `--parts` it also times 11 steps without the input
+//!   gradient and prints the backward pass's two halves: the weight gradient (that step less
+//!   the forward pass) and the input gradient (the whole step less that step).
 //! - `activation` times `tanh` and the sigmoid over 64 and 4,096 values: the plain scalar
 //!   loop on std's `f32::tanh` and `f32::exp`, then the kernels at every level this CPU
 //!   runs, in 301 interleaved rounds, and prints the median nanoseconds per value and each
@@ -123,9 +125,9 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 all     [--python PATH] [--numpy-best]\n\
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096] [--warm-up SECONDS] (with the gpu feature)\n\
-    \x20 conv    [--batch N]\n\
-    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
-    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N]\n\
+    \x20 conv    [--batch N] [--parts]\n\
+    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
+    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
@@ -590,6 +592,7 @@ fn gemm(args: &[String]) -> Result<(), String> {
 /// Returns a message for an unknown argument or a `--batch` that is not a positive number.
 fn conv(args: &[String]) -> Result<(), String> {
     let mut batch = 128usize;
+    let mut parts = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
@@ -601,6 +604,7 @@ fn conv(args: &[String]) -> Result<(), String> {
                     .filter(|&n| n > 0)
                     .ok_or_else(|| format!("--batch must be a positive number, got `{v}`"))?;
             }
+            "--parts" => parts = true,
             other => return Err(format!("unknown argument `{other}`")),
         }
     }
@@ -617,18 +621,29 @@ fn conv(args: &[String]) -> Result<(), String> {
     let (mut fwd, mut step) = (0.0, 0.0);
     for (i, (name, geom)) in runs::cifar_convs().into_iter().enumerate() {
         let first = i == 0;
-        let t = runs::time_conv(geom, batch, first, 11);
+        let t = runs::time_conv(geom, batch, first, 11, parts);
         let flops = 2.0 * (batch * geom.out_width() * geom.kernel_len()) as f64;
         let passes = if first { 2.0 } else { 3.0 };
         fwd += t.forward;
         step += t.step;
-        println!(
+        print!(
             "{name:<20} {:>12.2} {:>9.2} {:>12.2} {:>9.2}",
             t.forward * 1e3,
             flops / t.forward / 1e9,
             t.step * 1e3,
             passes * flops / t.step / 1e9
         );
+        match t.weights_step {
+            // The weight gradient is the step without the input's gradient less the forward
+            // pass; the input gradient is the full step less that step.
+            Some(w) if !first => println!(
+                "   weight grad {:.2} ms, input grad {:.2} ms",
+                (w - t.forward) * 1e3,
+                (t.step - w) * 1e3
+            ),
+            Some(w) => println!("   weight grad {:.2} ms", (w - t.forward) * 1e3),
+            None => println!(),
+        }
     }
     println!(
         "all four: forward {:.2} ms, forward and backward {:.2} ms",

@@ -46,7 +46,8 @@ pub(super) fn compact_image<T: Real>(
     // The neurons kept of the `Linear` whose run holds layer `i`, if it loses any.
     let kept_of = |i: usize| owners[i].and_then(|owner| keep[owner].as_deref());
     let mut store = ParamStore::<T>::new_generic();
-    let mut out = Sequential::<T>::new_generic();
+    // The copy fuses (or not) as the model does.
+    let mut out = Sequential::<T>::new_generic().fuse(model.fuses());
     // For each layer, the `Narrowed` whose run it is in, if any.
     let in_run = |i: usize| narrowed.iter().find(|n| (n.conv + 1..=n.end).contains(&i));
     // The `Narrowed` whose run ends right before layer `i`: its kept channels are the
