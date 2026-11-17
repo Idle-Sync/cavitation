@@ -21,7 +21,7 @@ use crate::{
 
 /// A CNN on 2 × 8 × 8 images: a convolution, batch norm with a cumulative average, ReLU, max
 /// pooling, dropout, flatten and a `Linear`.
-fn cnn(params: &mut ParamStore, seed: u64) -> Sequential {
+pub(super) fn cnn(params: &mut ParamStore, seed: u64) -> Sequential {
     let mut rng = Rng::seed(seed);
     let g = Conv2dGeom::with_options(2, 4, (8, 8), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
     Sequential::new()
