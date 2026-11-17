@@ -1239,13 +1239,11 @@ mod tests {
     /// summed.
     #[test]
     fn cross_entropy_infinite_logit_gives_nan_loss() {
-        for bad in [f64::INFINITY] {
-            for label in [0, 1] {
-                let (y, _) = run(&[bad, 0.0], &[1, 2], |t, x| {
-                    t.softmax_cross_entropy(x, &[label], Reduction::Mean)
-                });
-                assert!(y[0].is_nan(), "logit {bad}, label {label}: {y:?}");
-            }
+        for label in [0, 1] {
+            let (y, _) = run(&[f64::INFINITY, 0.0], &[1, 2], |t, x| {
+                t.softmax_cross_entropy(x, &[label], Reduction::Mean)
+            });
+            assert!(y[0].is_nan(), "label {label}: {y:?}");
         }
     }
 
