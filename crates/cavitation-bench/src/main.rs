@@ -25,7 +25,8 @@
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--ours-only] [--profile N] [--no-fuse]` train the v0.3 benchmark CNNs (LeNet-5's layout on
+//!   [--ours-only] [--profile N] [--no-fuse] [--device cpu|gpu] [--backend B]
+//!   [--torch-device D] [--deterministic]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
 //!   epochs) here and then
 //!   with `scripts/bench/torch_cnn.py` at the same thread count, from the same initial
@@ -128,6 +129,8 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 conv    [--batch N] [--parts]\n\
     \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
     \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
+    \x20     (both CNNs) [--device cpu|gpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
+    \x20     [--deterministic]; --device gpu needs the gpu feature\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
@@ -235,6 +238,11 @@ fn info() {
     println!("current kernel level: {}", level());
     println!("threads: {}", threads());
     println!("rustc: {}", machine::rustc_version());
+    #[cfg(feature = "gpu")]
+    match cavitation_gpu::Gpu::new() {
+        Some(gpu) => println!("{}", gpu.info()),
+        None => println!("gpu: none found"),
+    }
 }
 
 /// The options of the training and latency commands.

@@ -22,5 +22,5 @@ cavitation-nn = { path = "../cavitation-nn" }
 cavitation-gpu = { path = "../cavitation-gpu", optional = true }
 
 [features]
-# The GPU benchmarks (`gemm-gpu`); they add wgpu to the build.
-gpu = ["dep:cavitation-gpu"]
+# The GPU benchmarks (`gemm-gpu`, and `--device gpu` for the CNNs); they add wgpu to the build.
+gpu = ["dep:cavitation-gpu", "cavitation-nn/gpu"]

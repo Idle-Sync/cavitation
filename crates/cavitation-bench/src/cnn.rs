@@ -129,6 +129,15 @@ pub struct Options {
     /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
     /// steps) and print each layer's median forward and backward time.
     pub profile: Option<usize>,
+    /// `--device gpu`: train our side on the GPU (`GpuTrainer`), which needs the `gpu`
+    /// feature; `cpu`, the default, trains with `Trainer`.
+    pub gpu: bool,
+    /// `--backend vulkan|dx12|metal`: the GPU backend, or the platform's default.
+    pub backend: Option<String>,
+    /// `--torch-device cpu|cuda|mps`: where the PyTorch side trains (default `cpu`).
+    pub torch_device: String,
+    /// `--deterministic`: PyTorch's deterministic algorithms on a GPU device.
+    pub deterministic: bool,
     /// `--no-fuse`: record each batch normalisation and the ReLU after it as two nodes
     /// (`Sequential::fuse(false)`), to compare against the fused default.
     pub no_fuse: bool,
@@ -149,6 +158,10 @@ impl Options {
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
             ours_only: false,
             profile: None,
+            gpu: false,
+            backend: None,
+            torch_device: "cpu".into(),
+            deterministic: false,
             no_fuse: false,
         };
         let mut rest = args.iter();
@@ -167,9 +180,38 @@ impl Options {
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
                 "--ours-only" => o.ours_only = true,
                 "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
+                "--device" => match rest.next().map(String::as_str) {
+                    Some("cpu") => o.gpu = false,
+                    Some("gpu") => o.gpu = true,
+                    other => return Err(format!("--device takes cpu or gpu, got {other:?}")),
+                },
+                "--backend" => {
+                    let b = rest.next().ok_or("--backend needs a value")?;
+                    if !["vulkan", "dx12", "metal"].contains(&b.as_str()) {
+                        return Err(format!("--backend takes vulkan, dx12 or metal, got `{b}`"));
+                    }
+                    o.backend = Some(b.clone());
+                }
+                "--torch-device" => {
+                    let d = rest.next().ok_or("--torch-device needs a value")?;
+                    if !["cpu", "cuda", "mps"].contains(&d.as_str()) {
+                        return Err(format!("--torch-device takes cpu, cuda or mps, got `{d}`"));
+                    }
+                    o.torch_device = d.clone();
+                }
+                "--deterministic" => o.deterministic = true,
                 "--no-fuse" => o.no_fuse = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
+        }
+        if o.backend.is_some() && !o.gpu {
+            return Err("--backend needs --device gpu".into());
+        }
+        if o.gpu && o.profile.is_some() {
+            return Err("--profile times the CPU trainer only; leave out --device gpu".into());
+        }
+        if o.deterministic && o.torch_device == "cpu" {
+            return Err("--deterministic needs --torch-device cuda or mps".into());
         }
         Ok(o)
     }
@@ -262,6 +304,77 @@ fn train_ours(
         epochs.push(epoch);
     }
     Ok(epochs)
+}
+
+/// Trains `model` on the GPU with `GpuTrainer`, as [`train_ours`] does on the CPU: the same
+/// batch order (a short last batch included), Adam at 1e-3, cross-entropy and dropout seed
+/// 0, and the test accuracy from the GPU model after each epoch. Each step reads its loss back, so the epoch's time is the
+/// GPU's. The parameters are copied back to `params` at the end.
+#[cfg(feature = "gpu")]
+fn train_ours_gpu(
+    model: &Sequential,
+    params: &mut ParamStore,
+    train: &Dataset,
+    test: &Dataset,
+    net: Net,
+    o: &Options,
+) -> Result<Vec<Epoch>, String> {
+    use cavitation_gpu::{Backend, Gpu};
+    use cavitation_nn::{GpuTrainer, OptimizerConfig};
+    let gpu = match &o.backend {
+        Some(b) => Gpu::with_backend(b.parse::<Backend>().map_err(|e| e.to_string())?),
+        None => Gpu::new(),
+    }
+    .ok_or("no GPU found; --device gpu needs one")?;
+    println!("{}", gpu.info());
+    let adam = OptimizerConfig::Adam {
+        lr: 1e-3,
+        weight_decay: 0.0,
+    };
+    let mut trainer = GpuTrainer::new(model, params, &adam, Loss::CrossEntropy, net.batch, &gpu)
+        .map_err(|e| e.to_string())?;
+    trainer.set_dropout_seed(0);
+    let mut batcher = Batcher::new(train.len(), net.batch, Some(o.seed));
+    let mut batch = Batch::new(train, net.batch);
+    let mut epochs = Vec::with_capacity(o.epochs);
+    for e in 1..=o.epochs {
+        batcher.epoch();
+        let (mut sum, mut steps) = (0.0f64, 0usize);
+        let start = Instant::now();
+        for range in batcher.batches() {
+            let view = batcher.gather(train, range, &mut batch);
+            sum += f64::from(trainer.step(model, view).map_err(|e| e.to_string())?);
+            steps += 1;
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let epoch = Epoch {
+            loss: sum / steps as f64,
+            accuracy: trainer.model().accuracy(test),
+            seconds,
+        };
+        println!(
+            "  ours  epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s (gpu)",
+            epoch.loss,
+            epoch.accuracy * 100.0,
+            epoch.seconds
+        );
+        epochs.push(epoch);
+    }
+    trainer.sync_to(params);
+    Ok(epochs)
+}
+
+/// Without the `gpu` feature, `--device gpu` says how to get it.
+#[cfg(not(feature = "gpu"))]
+fn train_ours_gpu(
+    _: &Sequential,
+    _: &mut ParamStore,
+    _: &Dataset,
+    _: &Dataset,
+    _: Net,
+    _: &Options,
+) -> Result<Vec<Epoch>, String> {
+    Err("--device gpu needs the gpu feature: build with --features gpu".into())
 }
 
 /// The `--profile` run: trains `steps` + 3 batches of `train` in the seeded batch order, the
@@ -383,6 +496,8 @@ fn train_torch(
         .args(["--rows", &rows.to_string()])
         .args(["--threads", &threads().to_string()])
         .args(["--seed", &o.seed.to_string()])
+        .args(["--device", &o.torch_device])
+        .args(o.deterministic.then_some("--deterministic"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -571,7 +686,11 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
         threads(),
         dir.display()
     );
-    let ours = train_ours(&model, &mut params, &train, &test, net, o)?;
+    let ours = if o.gpu {
+        train_ours_gpu(&model, &mut params, &train, &test, net, o)?
+    } else {
+        train_ours(&model, &mut params, &train, &test, net, o)?
+    };
     let rows = train.len();
     drop(train);
     let (theirs, about) = if o.ours_only {
@@ -697,6 +816,35 @@ mod tests {
         assert_eq!(Options::parse(MNIST, &[]).unwrap().profile, None);
         let p = Options::parse(CIFAR, &args(&["--profile", "7"])).unwrap();
         assert_eq!(p.profile, Some(7));
+        assert!(!p.gpu && p.backend.is_none() && p.torch_device == "cpu" && !p.deterministic);
+        let g = Options::parse(
+            CIFAR,
+            &args(&[
+                "--device",
+                "gpu",
+                "--backend",
+                "metal",
+                "--torch-device",
+                "mps",
+                "--deterministic",
+            ]),
+        )
+        .unwrap();
+        assert!(g.gpu && g.deterministic);
+        assert_eq!(
+            (g.backend.as_deref(), g.torch_device.as_str()),
+            (Some("metal"), "mps")
+        );
+        for bad in [
+            &["--device", "tpu"][..],
+            &["--backend", "vulkan"],
+            &["--device", "gpu", "--backend", "opengl"],
+            &["--torch-device", "xla"],
+            &["--deterministic"],
+            &["--device", "gpu", "--profile", "3"],
+        ] {
+            assert!(Options::parse(CIFAR, &args(bad)).is_err(), "{bad:?}");
+        }
         assert!(!p.no_fuse);
         assert!(
             Options::parse(CIFAR, &args(&["--no-fuse"]))
