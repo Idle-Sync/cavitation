@@ -14,6 +14,8 @@ mod forward_tests;
 #[cfg(test)]
 mod health_tests;
 mod model;
+#[cfg(test)]
+mod short_batch_tests;
 mod trainer;
 #[cfg(test)]
 mod trainer_tests;
