@@ -17,6 +17,8 @@ mod forward;
 mod forward_tests;
 #[cfg(test)]
 mod health_tests;
+#[cfg(test)]
+mod memory_tests;
 mod model;
 #[cfg(test)]
 mod profile_tests;

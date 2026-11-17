@@ -1566,6 +1566,18 @@ impl<'s> GpuTrainer<'s> {
         }
         out
     }
+
+    /// The GPU objects made so far, for the tests: the pool's buffers, the pipelines, and the
+    /// bind groups of the model's step encoder and of the trainer's.
+    #[cfg(test)]
+    pub(crate) fn made(&self) -> [usize; 4] {
+        [
+            self.model.pool.created(),
+            self.model.cache.pipelines_built(),
+            self.model.steps.bind_groups_made(),
+            self.steps.bind_groups_made(),
+        ]
+    }
 }
 
 /// The mask `mask` of step `step` under `seed`, packed into `words` (low bit first).
