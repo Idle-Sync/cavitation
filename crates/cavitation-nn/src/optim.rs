@@ -348,7 +348,7 @@ impl GradStats {
     }
 
     /// Forgets the last step and makes room for `n` parameters.
-    fn reset(&mut self, n: usize) {
+    pub(crate) fn reset(&mut self, n: usize) {
         self.ids.clear();
         self.sum_squares.clear();
         self.finite.clear();
@@ -358,7 +358,7 @@ impl GradStats {
     }
 
     /// Records one parameter.
-    fn push(&mut self, id: ParamId, sum_squares: f64, finite: bool) {
+    pub(crate) fn push(&mut self, id: ParamId, sum_squares: f64, finite: bool) {
         self.ids.push(id);
         self.sum_squares.push(sum_squares);
         self.finite.push(finite);
