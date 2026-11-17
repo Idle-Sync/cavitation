@@ -94,7 +94,7 @@ pub use batch_norm::BatchNorm2d;
 pub use conv::Conv2d;
 pub use dropout::{Dropout, Flatten, Identity};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuModel, GpuOptimizerState, GpuTrainer};
+pub use gpu::{GpuModel, GpuOptimizerState, GpuStepProfile, GpuTrainer};
 pub use health::{BadInput, Health, HealthMonitor, OnNonFinite, StepInputs, Warning, WarningKind};
 pub use hooks::{HookId, Hooks, LayerEvent};
 pub use inference::{InferenceLayer, InferenceModel};

@@ -4,6 +4,7 @@
 //! batch norm's running statistics run, and the loss and the flag come back.
 
 use std::thread;
+use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_gpu::kernels::{
@@ -14,7 +15,8 @@ use cavitation_gpu::kernels::{
     OptimizerKernel, OptimizerRule, RunningUpdate, SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
-    BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepSizes, wgpu,
+    BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepOutput,
+    StepSizes, TimedKind, Timing, wgpu,
 };
 
 use super::forward::Kernels;
@@ -122,8 +124,12 @@ struct DropoutMask {
 struct TrainPass {
     /// The forward calls, in order.
     forward: Vec<Op>,
+    /// Where each layer's forward calls end in `forward`, in layer order.
+    forward_ends: Vec<usize>,
     /// The backward calls, in order.
     backward: Vec<Op>,
+    /// Where each layer's backward calls end in `backward`, last layer first.
+    backward_ends: Vec<usize>,
     /// The loss.
     loss: LossCall,
     /// The finite flag over the loss and the parameter gradients.
@@ -318,6 +324,10 @@ pub struct GpuTrainer<'s> {
     skipped: u64,
     /// The ReLU layers and their values per channel, for building a pass.
     relus: Vec<(usize, usize)>,
+    /// Whether the next step is profiled.
+    profile_asked: bool,
+    /// The last profiled step's profile, when it is the last step.
+    profile: Option<GpuStepProfile>,
     /// The steps for batches of fewer rows than [`batch_size`](GpuTrainer::batch_size) (an
     /// epoch's last), one per row count, each built the first time a batch of its rows comes.
     short: Vec<ShortPass>,
@@ -345,6 +355,117 @@ struct HealthRead {
     counts: Vec<f32>,
     /// The ReLU layers' bits.
     bits: Vec<u32>,
+}
+
+/// One training step's GPU time by part, from [`GpuTrainer::last_profile`]: what
+/// [`Trainer::last_profile`](crate::Trainer::last_profile) gives on the CPU, timed on the GPU.
+/// A part the device could not time is `None`; [`timing`](GpuStepProfile::timing) says which
+/// are timed and names what is missing. A profiled step runs each part in compute passes of
+/// its own, so its parts describe a step structured for profiling.
+///
+/// # Examples
+///
+/// See [`GpuTrainer::profile_next_step`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuStepProfile {
+    /// Each layer's forward passes, in layer order.
+    pub forward: Vec<Option<Duration>>,
+    /// The loss and its gradient.
+    pub loss: Option<Duration>,
+    /// Each layer's backward passes, in layer order.
+    pub backward: Vec<Option<Duration>>,
+    /// The health values: the finite flag, the sums of squares and the ReLU bits.
+    pub health: Option<Duration>,
+    /// The optimiser's update.
+    pub optimizer: Option<Duration>,
+    /// The copies of the gradients into the optimiser's flat buffer and of the values back
+    /// out, with the update's uniform uploads, when the device times copies
+    /// ([`Timing::PassesAndCopies`]).
+    pub copies: Option<Duration>,
+    /// Batch norm's running statistics, with their uniform uploads where the device times
+    /// copies.
+    pub running: Option<Duration>,
+    /// The readback of the loss, the flag and the health values, when the device times
+    /// copies.
+    pub readback: Option<Duration>,
+    /// The whole step on the host's clock, from the call to its return: the batch's checks
+    /// and packing, a first short batch's compile, the uploads and the health checks
+    /// included.
+    pub total: Duration,
+    /// What the device times, and by name what it cannot.
+    pub timing: Timing,
+}
+
+/// The labels of a profiled step's spans, in the order recorded: each layer's forward pass,
+/// the loss, each layer's backward pass (last layer first), the health values, the update,
+/// the running statistics and the readback.
+const FORWARD: &str = "forward";
+/// See [`FORWARD`].
+const LOSS: &str = "loss";
+/// See [`FORWARD`].
+const BACKWARD: &str = "backward";
+/// See [`FORWARD`].
+const HEALTH: &str = "health";
+/// See [`FORWARD`].
+const OPTIMIZER: &str = "optimizer";
+/// See [`FORWARD`].
+const RUNNING: &str = "running statistics";
+/// See [`FORWARD`].
+const READBACK: &str = "readback";
+
+/// The timed passes a profiled step of `layers` layers, `norms` of them batch norms, needs
+/// (see `GpuTrainer::new`), or 0 if that many passes' timestamps do not fit wgpu's queries
+/// on `gpu`: two per pass, and with encoder timestamps as many again for the copy runs.
+fn profiled_passes(layers: usize, norms: usize, gpu: &Gpu) -> u32 {
+    let passes = (2 * layers + 6 + norms).max(64);
+    let per_pass = if gpu.info().encoder_timestamps { 4 } else { 2 };
+    if passes * per_pass <= wgpu::QUERY_SET_MAX_QUERIES as usize {
+        passes as u32
+    } else {
+        0
+    }
+}
+
+/// The profile of a step of `layers` layers from its `output`, as [`FORWARD`] orders the spans.
+fn profile_of(output: &StepOutput<'_>, layers: usize, timing: Timing) -> GpuStepProfile {
+    let time = |ns: Option<f64>| ns.map(|ns| Duration::from_secs_f64(ns * 1e-9));
+    let spans = output.spans();
+    let after = 2 * layers + 1;
+    let labels: Vec<&str> = spans.iter().map(|s| s.0).collect();
+    let mut want = vec![FORWARD; layers];
+    want.push(LOSS);
+    want.extend(std::iter::repeat_n(BACKWARD, layers));
+    want.extend([HEALTH, OPTIMIZER, RUNNING, READBACK]);
+    assert_eq!(
+        labels, want,
+        "a profiled step records its spans in this order"
+    );
+    let span = |k: usize| time(spans.get(k).and_then(|s| s.1));
+    let kind = |k: usize, kind: TimedKind| {
+        let mut entries = output
+            .timed()
+            .iter()
+            .filter(|t| t.span == k && t.kind == kind);
+        let first = entries.next()?;
+        let rest: Option<f64> = entries.map(|t| t.nanoseconds).sum();
+        time(first.nanoseconds.zip(rest).map(|(a, b)| a + b))
+    };
+    let copies = |k: usize| match timing {
+        Timing::PassesAndCopies => kind(k, TimedKind::Copies),
+        _ => None,
+    };
+    GpuStepProfile {
+        forward: (0..layers).map(span).collect(),
+        loss: span(layers),
+        backward: (0..layers).map(|i| span(2 * layers - i)).collect(),
+        health: span(after),
+        optimizer: kind(after + 1, TimedKind::Pass),
+        copies: copies(after + 1),
+        running: span(after + 2),
+        readback: copies(after + 3),
+        total: Duration::ZERO,
+        timing,
+    }
 }
 
 impl std::fmt::Debug for GpuTrainer<'_> {
@@ -494,10 +615,15 @@ impl<'s> GpuTrainer<'s> {
                 + kernel.upload_bytes()
                 + 64 * norms as u64
                 + 4096,
+            // A profiled step's spans: two per layer and five more. Each opens a pass, the update
+            // two (its copies end the first), and each batch norm's running update one more
+            // (its upload ends the pass before it). A model too deep for wgpu's timestamp
+            // queries is not timed.
+            spans: (2 * m.layers.len() as u32 + 5).max(16),
+            timed_passes: profiled_passes(m.layers.len(), norms, gpu),
             // The loss, the flag and the health values each step, or one flat buffer.
             readback_bytes: round(4 * elements)
                 .max(16 + 2 * round(4 * lens.len()) + round(4 * relu_words)),
-            ..StepSizes::default()
         };
         let mut steps = StepEncoder::new(gpu, sizes);
         let pass =
@@ -579,6 +705,8 @@ impl<'s> GpuTrainer<'s> {
             skipped: 0,
             relus,
             short: Vec::new(),
+            profile_asked: false,
+            profile: None,
         };
         trainer.draw_next(1);
         Ok(trainer)
@@ -616,6 +744,7 @@ impl<'s> GpuTrainer<'s> {
     ///
     /// See [`GpuTrainer`].
     pub fn step(&mut self, model: &Sequential, batch: BatchView<'_, f32>) -> Result<f32, Error> {
+        let started = Instant::now();
         debug_assert_eq!(model.len(), self.model.layers.len());
         let (full, input, output) = (
             self.model.batch,
@@ -663,6 +792,9 @@ impl<'s> GpuTrainer<'s> {
             }
         }
         let step_number = self.taken + 1;
+        let profiling = std::mem::take(&mut self.profile_asked);
+        self.steps.set_profiling(profiling);
+        let timing = self.steps.timing();
         let target_end = self.upload.len();
         if let Some(s) = short.map(|k| &mut self.short[k]) {
             // The short step's masks are drawn now, for its rows; the next full step's are
@@ -702,24 +834,57 @@ impl<'s> GpuTrainer<'s> {
             step.clear(b.buffer(), 0, b.len());
         }
         let kernels = &self.model.kernels;
-        record(
-            &pass.forward,
-            kernels,
-            &self.kernels,
-            &pass.pools,
-            &mut step,
-        );
+        let layers = pass.forward_ends.len();
+        if profiling {
+            let mut start = 0;
+            for &end in &pass.forward_ends {
+                step.span(FORWARD);
+                record(
+                    &pass.forward[start..end],
+                    kernels,
+                    &self.kernels,
+                    &pass.pools,
+                    &mut step,
+                );
+                start = end;
+            }
+            step.span(LOSS);
+        } else {
+            record(
+                &pass.forward,
+                kernels,
+                &self.kernels,
+                &pass.pools,
+                &mut step,
+            );
+        }
         match &pass.loss {
             LossCall::CrossEntropy(call) => self.kernels.cross_entropy.record(&mut step, call),
             LossCall::Mse(call) => self.kernels.mse.record(&mut step, call),
         }
-        record(
-            &pass.backward,
-            kernels,
-            &self.kernels,
-            &pass.pools,
-            &mut step,
-        );
+        if profiling {
+            let mut start = 0;
+            for &end in &pass.backward_ends {
+                step.span(BACKWARD);
+                record(
+                    &pass.backward[start..end],
+                    kernels,
+                    &self.kernels,
+                    &pass.pools,
+                    &mut step,
+                );
+                start = end;
+            }
+            step.span(HEALTH);
+        } else {
+            record(
+                &pass.backward,
+                kernels,
+                &self.kernels,
+                &pass.pools,
+                &mut step,
+            );
+        }
         self.kernels.finite.record(&mut step, &pass.finite);
         for call in &pass.squares {
             self.kernels.squares.record(&mut step, call);
@@ -729,6 +894,9 @@ impl<'s> GpuTrainer<'s> {
             for relu in &pass.relus {
                 self.kernels.dead_relu.record(&mut step, &relu.call);
             }
+        }
+        if profiling {
+            step.span(OPTIMIZER);
         }
         let flat = &mut self.flat;
         for (g, &off) in pass.param_grads.iter().zip(&flat.offsets) {
@@ -745,8 +913,14 @@ impl<'s> GpuTrainer<'s> {
                 4 * t.len as u64,
             );
         }
+        if profiling {
+            step.span(RUNNING);
+        }
         for (_, update) in &pass.running {
             kernels.batch_norm.record_running(&mut step, update);
+        }
+        if profiling {
+            step.span(READBACK);
         }
         let loss_at = step.read_back(pass.loss_value.buffer(), 0, 4);
         let flag_at = step.read_back(pass.flag.buffer(), 0, 4);
@@ -761,6 +935,7 @@ impl<'s> GpuTrainer<'s> {
         // The next full step's masks are drawn while this one runs.
         let (seed, masks, next) = (self.dropout_seed, &pass.masks, &mut self.next);
         let read = &mut self.read;
+        let profile = &mut self.profile;
         let (value, flag) = thread::scope(|scope| {
             let drawing = (short.is_none() && !masks.is_empty()).then(|| {
                 scope.spawn(move || {
@@ -770,6 +945,7 @@ impl<'s> GpuTrainer<'s> {
                 })
             });
             let output = step.finish();
+            *profile = profiling.then(|| profile_of(&output, layers, timing));
             let bytes = output.bytes();
             let word = |at: usize| [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
             let value = f32::from_le_bytes(word(loss_at));
@@ -824,6 +1000,15 @@ impl<'s> GpuTrainer<'s> {
             "GpuTrainer::step: the health checks disagree with the GPU's finite flag ({flag}) at \
              step {step_number}"
         );
+        // As on the CPU: a step left out has no profile, and the next step is asked for one.
+        let left_out = matches!(checked, Ok(false));
+        if let Some(p) = self.profile.as_mut() {
+            p.total = started.elapsed();
+        }
+        if left_out && profiling {
+            self.profile = None;
+            self.profile_asked = true;
+        }
         match checked {
             Ok(applied) => {
                 self.skipped += u64::from(!applied);
@@ -831,6 +1016,64 @@ impl<'s> GpuTrainer<'s> {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Asks the next step for a [`GpuStepProfile`], read afterwards with
+    /// [`last_profile`](Self::last_profile), as [`Trainer::profile_next_step`](crate::Trainer::profile_next_step)
+    /// does on the CPU. Only that step is profiled; it runs each layer's forward and backward
+    /// passes, the loss, the health values, the update, the running statistics and the
+    /// readback in compute passes of their own, timed on the GPU. A step left out under
+    /// [`OnNonFinite::Skip`] has no profile, and the next step is asked instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_core::{ParamStore, Rng, TensorView};
+    /// use cavitation_gpu::{Gpu, Timing};
+    /// use cavitation_nn::{
+    ///     BatchView, GpuTrainer, Health, Linear, Loss, OptimizerConfig, Relu, Sequential,
+    ///     TargetsView,
+    /// };
+    ///
+    /// let mut params = ParamStore::new();
+    /// let mut rng = Rng::seed(0);
+    /// let net = Sequential::new()
+    ///     .push(Linear::new(&mut params, 2, 4, &mut rng))
+    ///     .push(Relu)
+    ///     .push(Linear::new(&mut params, 4, 1, &mut rng));
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let sgd = OptimizerConfig::Sgd { lr: 0.1, momentum: 0.0, weight_decay: 0.0 };
+    ///     let mut trainer = GpuTrainer::new(&net, &params, &sgd, Loss::Mse, 2, &gpu).unwrap();
+    ///     trainer.set_health(Health::quiet()).unwrap();
+    ///     let (x, t) = ([1.0f32, 2.0, 3.0, 4.0], [1.0f32, 2.0]);
+    ///     let batch = BatchView {
+    ///         x: TensorView::from_slice(&x, &[2, 2]).unwrap(),
+    ///         targets: TargetsView::Values(TensorView::from_slice(&t, &[2, 1]).unwrap()),
+    ///     };
+    ///     trainer.profile_next_step();
+    ///     trainer.step(&net, batch).unwrap();
+    ///     let profile = trainer.last_profile().unwrap();
+    ///     assert_eq!((profile.forward.len(), profile.backward.len()), (3, 3));
+    ///     if !matches!(profile.timing, Timing::Untimed { .. }) {
+    ///         assert!(profile.forward.iter().all(|t| t.is_some()));
+    ///     }
+    ///     trainer.step(&net, batch).unwrap();
+    ///     assert!(trainer.last_profile().is_none()); // not asked
+    /// }
+    /// ```
+    pub fn profile_next_step(&mut self) {
+        self.profile_asked = true;
+    }
+
+    /// The profile of the last step, if that step was asked for one with
+    /// [`profile_next_step`](Self::profile_next_step); `None` after any step that was not, and
+    /// before the first step.
+    ///
+    /// # Examples
+    ///
+    /// See [`profile_next_step`](Self::profile_next_step).
+    pub fn last_profile(&self) -> Option<&GpuStepProfile> {
+        self.profile.as_ref()
     }
 
     /// The health checks of step `step` with loss `value`, on the values read back: the
@@ -1421,6 +1664,7 @@ impl TrainPass {
         let pool: &mut BufferPool = &mut m.pool;
         let mut values = vec![pool.take(4 * (batch * m.input_width) as u64, usage())];
         let mut forward = Vec::new();
+        let mut forward_ends = Vec::with_capacity(m.layers.len());
         let mut scratch: Vec<PooledBuffer> = Vec::new();
         let mut pools = Vec::new();
         let mut masks = Vec::new();
@@ -1606,6 +1850,7 @@ impl TrainPass {
                 None => out,
             };
             saved.push(s);
+            forward_ends.push(forward.len());
         }
 
         // The loss and the gradient of the output.
@@ -1646,6 +1891,7 @@ impl TrainPass {
             .map(|t| pool.take(4 * t.len.max(1) as u64, usage()))
             .collect();
         let mut backward = Vec::new();
+        let mut backward_ends = Vec::with_capacity(m.layers.len());
         let mut cleared = Vec::new();
         for (i, layer) in m.layers.iter().enumerate().rev() {
             let s = &saved[i];
@@ -1831,6 +2077,7 @@ impl TrainPass {
                 }
                 Kind::Identity => g,
             };
+            backward_ends.push(backward.len());
         }
 
         // The finite flag over the loss and every parameter's gradient, then the running
@@ -1898,7 +2145,9 @@ impl TrainPass {
         }
         Ok(TrainPass {
             forward,
+            forward_ends,
             backward,
+            backward_ends,
             loss,
             finite,
             running,
