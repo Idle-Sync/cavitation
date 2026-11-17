@@ -846,26 +846,26 @@ impl<'s> Trainer<'s> {
 
 /// The run's learning-rate schedule as [`Trainer::run_epoch`] applies it before each step.
 #[derive(Clone, Copy, Debug)]
-struct StepRates {
+pub(crate) struct StepRates {
     /// The schedule.
-    schedule: LrSchedule,
+    pub(crate) schedule: LrSchedule,
     /// The optimiser's configured rate, the schedule's peak.
-    initial: f64,
+    pub(crate) initial: f64,
     /// The step positions of one epoch: the batches of the data, the last one smaller.
-    steps_per_epoch: usize,
+    pub(crate) steps_per_epoch: usize,
     /// The run's epochs.
-    epochs: usize,
+    pub(crate) epochs: usize,
 }
 
 impl StepRates {
     /// The rate of step position `step` of the run, counting from 0.
-    fn at(&self, step: usize) -> f64 {
+    pub(crate) fn at(&self, step: usize) -> f64 {
         self.schedule
             .learning_rate(self.initial, step, self.steps_per_epoch, self.epochs)
     }
 
     /// Whether the schedule changes the rate within an epoch.
-    fn per_step(&self) -> bool {
+    pub(crate) fn per_step(&self) -> bool {
         matches!(
             self.schedule,
             LrSchedule::Warmup { .. } | LrSchedule::WarmupCosine { .. }
@@ -1806,11 +1806,72 @@ pub struct History {
     pub stopped_early: bool,
 }
 
+/// Where [`fit`] trains: [`FitConfig::device`]. The CPU is the default; the `gpu` feature
+/// adds `Device::Gpu(&gpu)`, a GPU opened with `cavitation_gpu::Gpu`.
+///
+/// The type and the field are there with or without the feature, so a `FitConfig` written
+/// with every field named builds the same either way. The enum is `#[non_exhaustive]`: a
+/// `match` on it needs a `_` arm, and so compiles with and without the `Gpu` variant.
+/// Without the feature a hidden variant that can never be built holds the lifetime `'g`,
+/// which only `Gpu` uses.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_nn::{Device, FitConfig};
+/// assert!(matches!(FitConfig::default().device, Device::Cpu));
+/// ```
+///
+/// On a GPU (with the `gpu` feature):
+///
+#[cfg_attr(feature = "gpu", doc = "```")]
+#[cfg_attr(not(feature = "gpu"), doc = "```ignore")]
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_gpu::Gpu;
+/// use cavitation_nn::{
+///     Dataset, Device, FitConfig, Linear, Loss, OptimizerConfig, Sequential, Targets, fit,
+/// };
+///
+/// let data = Dataset {
+///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
+///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
+/// };
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+/// if let Some(gpu) = Gpu::new() {
+///     let config = FitConfig {
+///         epochs: 100,
+///         batch: 2,
+///         optimizer: OptimizerConfig::Sgd { lr: 0.05, momentum: 0.0, weight_decay: 0.0 },
+///         loss: Loss::Mse,
+///         device: Device::Gpu(&gpu),
+///         ..FitConfig::default()
+///     };
+///     let history = fit(&net, &mut params, &data, config).unwrap();
+///     assert!(history.epochs[99].mean_loss < history.epochs[0].mean_loss);
+/// }
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub enum Device<'g> {
+    /// The CPU, through [`Trainer`]: the default.
+    #[default]
+    Cpu,
+    /// This GPU, through `GpuTrainer`, as [`fit`] describes under "On the GPU".
+    #[cfg(feature = "gpu")]
+    Gpu(&'g cavitation_gpu::Gpu),
+    /// Never built: it holds the lifetime a build without the `gpu` feature has no other
+    /// use for.
+    #[cfg(not(feature = "gpu"))]
+    #[doc(hidden)]
+    NoGpu(std::convert::Infallible, std::marker::PhantomData<&'g ()>),
+}
+
 /// How [`fit`] trains. Taken by value, because it holds the `on_epoch` callback.
 ///
 /// The default is 10 epochs in batches of 32, Adam at a constant learning rate of 1e-3
 /// without weight decay, cross-entropy, shuffled with seed 0, the default [`Health`] checks,
-/// no validation set and no callback.
+/// no validation set and no callback, on the CPU.
 ///
 /// # Examples
 ///
@@ -1863,12 +1924,20 @@ pub struct FitConfig<'s> {
     /// sees the epoch the rule stops on. Copying the best parameters allocates once, at
     /// the first best epoch; later copies reuse that memory.
     pub early_stopping: Option<EarlyStopping>,
+    /// Where the run trains: on the CPU (the default), or on a GPU, as [`fit`] describes
+    /// under "On the GPU". On a GPU the parameters stay there and are copied back into the
+    /// `ParamStore` only when the host reads them: before each `on_epoch` call, before an
+    /// error met during training is returned, at the end, and for `early_stopping` only
+    /// when [`EarlyStopping::restore_best`] keeps an epoch as the best so far. The
+    /// early-stopping check itself reads the epoch's report (the validation measured on the
+    /// GPU), not the parameters, so it copies nothing.
+    pub device: Device<'s>,
 }
 
 impl Default for FitConfig<'_> {
     /// 10 epochs, batch 32, Adam at a constant 1e-3, cross-entropy, shuffle seed 0, dropout
     /// seed 0, the default health checks, no callback, no validation set, no early
-    /// stopping.
+    /// stopping, on the CPU.
     fn default() -> Self {
         FitConfig {
             epochs: 10,
@@ -1885,6 +1954,7 @@ impl Default for FitConfig<'_> {
             on_epoch: None,
             validation: None,
             early_stopping: None,
+            device: Device::Cpu,
         }
     }
 }
@@ -1908,6 +1978,7 @@ impl fmt::Debug for FitConfig<'_> {
                 &self.validation.as_ref().map(|v| (v.len(), v.features())),
             )
             .field("early_stopping", &self.early_stopping)
+            .field("device", &self.device)
             .finish()
     }
 }
@@ -2091,6 +2162,42 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// continues (see [`EpochReport::rows`]), but an epoch in which every step was left out ends
 /// the run with [`Error::NonFinite`] naming the epoch, since the parameters did not change.
 ///
+/// # On the GPU
+///
+/// With the `gpu` feature, `config.device` set to `Device::Gpu` trains the same run on that
+/// GPU: the same batches in the same order, the same learning rates, dropout masks and
+/// health checks, through a `GpuTrainer` made for `config.batch` rows (an epoch's shorter
+/// last batch included), with `config.validation` measured by the trainer's `GpuModel` in
+/// evaluation mode. The values agree with the CPU's within the GPU kernels' error bounds,
+/// not bit for bit.
+///
+/// The parameters live on the GPU during the run. They are copied back into `params`:
+/// - before each `config.on_epoch` call;
+/// - when `config.early_stopping` keeps an epoch as the best so far (with
+///   [`EarlyStopping::restore_best`]);
+/// - at the end of the run, and before an error met during training is returned.
+///
+/// A run with neither a callback nor a best epoch to keep copies them back once.
+///
+/// The GPU run returns, before any training:
+/// - [`Error::Unsupported`] for what `GpuTrainer` does not run: a layer, loss or optimiser
+///   it has no kernel for, and [`OnNonFinite::Warn`](crate::OnNonFinite). [`fit_with_hooks`]
+///   with a hook registered and [`fit_controlled`] are refused the same way.
+/// - [`Error::InvalidData`] as `GpuTrainer::new` returns it (a model with no parameters, a
+///   batch norm that would normalise a batch over one value per channel), and, starting
+///   `validation: `, for a validation set that is not whole batches of `config.batch` rows
+///   when a batch-norm layer keeps no running statistics (it normalises with the batch's
+///   own, so it needs full batches).
+///
+/// An epoch's shorter last batch has a training step of its own, compiled the first time it
+/// comes, in the first epoch: an error from that (a batch norm left with one value per
+/// channel, or a shader this GPU does not build) is returned then, after the epoch's earlier
+/// batches have trained.
+///
+/// One difference from the CPU is kept: a step whose loss or gradient is NaN or infinite is
+/// never applied, so under [`OnNonFinite::Stop`](crate::OnNonFinite) the returned parameters
+/// are those before that step.
+///
 /// # Panics
 ///
 /// Panics if `config.batch` is 0, and as [`Trainer::step`] does when the layers' shapes do
@@ -2133,7 +2240,9 @@ pub fn fit(
 ///
 /// # Errors
 ///
-/// Returns the same errors as [`fit`].
+/// Returns the same errors as [`fit`], and [`Error::Unsupported`] if a hook is registered
+/// and `config.device` is a GPU: a GPU step keeps its values on the GPU, where no hook can
+/// read them.
 ///
 /// # Panics
 ///
@@ -2197,7 +2306,8 @@ pub fn fit_with_hooks(
 /// # Errors
 ///
 /// Returns the same errors as [`fit`]. A step that meets a health-check error ends the run
-/// with that error before the control sees it.
+/// with that error before the control sees it. Returns [`Error::Unsupported`] if
+/// `config.device` is a GPU: a control runs on the CPU only.
 ///
 /// # Panics
 ///
@@ -2268,6 +2378,23 @@ fn run_fit(
     mut config: FitConfig,
     hooks: &mut Hooks<'_>,
 ) -> Result<History, Error> {
+    #[cfg(feature = "gpu")]
+    if let Device::Gpu(_) = config.device {
+        if matches!(run, Run::Controlled(..)) {
+            return Err(Error::Unsupported(
+                "fit_controlled: a control between steps runs on the CPU only; use fit with \
+                 Device::Gpu, or fit_controlled with Device::Cpu"
+                    .to_string(),
+            ));
+        }
+        if !hooks.is_empty() {
+            return Err(Error::Unsupported(
+                "fit_with_hooks: hooks run on the CPU only (a GPU step keeps its values on the \
+                 GPU); use fit with Device::Gpu, or fit_with_hooks with Device::Cpu"
+                    .to_string(),
+            ));
+        }
+    }
     check_dataset(train)?;
     check_model_and_loss(run.model(), config.loss, train)?;
     check_finite(train)?;
@@ -2282,6 +2409,19 @@ fn run_fit(
         check_finite(held_out).map_err(named)?;
     }
     let watched = check_watching(&config, validation_set.is_some())?;
+    let mut watching = Watching::new(watched, config.early_stopping.take());
+    #[cfg(feature = "gpu")]
+    if let Device::Gpu(gpu) = config.device {
+        return crate::gpu::fit_on_gpu(
+            run.model(),
+            params,
+            train,
+            config,
+            validation_set,
+            watching,
+            gpu,
+        );
+    }
     let mut trainer = Trainer::with_boxed(
         run.model(),
         config.optimizer.build(),
@@ -2300,14 +2440,6 @@ fn run_fit(
         epochs: Vec::with_capacity(config.epochs.min(1024)),
         ..History::default()
     };
-    let mut plateau = watched
-        .plateau
-        .map(|(monitor, rule)| (monitor, Plateau::new(rule.higher_is_better), rule));
-    let mut watch = config.early_stopping.map(|rule| (Watch::new(&rule), rule));
-    // The best epoch's parameter values, made at the first best epoch and refreshed in
-    // place; and whether training has changed the parameters since that copy.
-    let mut best: Option<ParamValues> = None;
-    let mut trained_since_best = false;
     params.zero_grad();
     trainer.rates = Some(StepRates {
         schedule: config.schedule,
@@ -2318,7 +2450,7 @@ fn run_fit(
     for epoch in 1..=config.epochs {
         let start = Instant::now();
         let end = trainer.run_epoch(&mut run, params, train, &mut batcher, hooks, epoch)?;
-        trained_since_best = true;
+        watching.trained();
         let whole = end.whole;
         if whole {
             trainer.end_epoch(epoch)?;
@@ -2345,29 +2477,12 @@ fn run_fit(
         if end.stopped {
             break;
         }
-        if let Some((monitor, state, rule)) = &mut plateau
-            && !trainer.schedule_stopped
+        if !trainer.schedule_stopped
             && let Some(rates) = trainer.rates.as_mut()
         {
-            let value = monitor.value(&report).expect("checked before the run");
-            rates.initial = state.step(rule, value, rates.initial);
+            rates.initial = watching.peak_rate(&report, rates.initial);
         }
-        let mut stop_early = false;
-        if let Some((state, rule)) = &mut watch {
-            let value = rule.monitor.value(&report).expect("checked before the run");
-            match state.step(rule, epoch, value) {
-                Verdict::Improved if rule.restore_best => {
-                    match &mut best {
-                        Some(copy) => copy.clone_from(&params.values),
-                        None => best = Some(params.values.clone()),
-                    }
-                    trained_since_best = false;
-                }
-                Verdict::Improved | Verdict::Waiting => {}
-                Verdict::Stop => stop_early = epoch < config.epochs,
-            }
-            history.best_epoch = state.best_epoch;
-        }
+        let stop_early = watching.after_epoch(&report, config.epochs, &mut history, params, |_| {});
         if let Run::Controlled(model, control) = &mut run {
             let mut handle = ModelHandle::new(model);
             let mut trainer = TrainerHandle::new(&mut trainer);
@@ -2380,12 +2495,101 @@ fn run_fit(
             break;
         }
     }
-    if let Some(copy) = &best
-        && trained_since_best
-    {
-        params.values.clone_from(copy);
-    }
+    watching.restore_best(params);
     Ok(history)
+}
+
+/// The rules of a run that watch a measure, as the run steps them after each epoch: the
+/// plateau schedule and early stopping, with the best epoch's parameter values.
+pub(crate) struct Watching {
+    /// The plateau schedule's measure, state and rule.
+    plateau: Option<(Monitor, Plateau, PlateauRule)>,
+    /// Early stopping's state and rule.
+    watch: Option<(Watch, EarlyStopping)>,
+    /// The best epoch's parameter values, made at the first best epoch and refreshed in
+    /// place.
+    best: Option<ParamValues>,
+    /// Whether training has changed the parameters since that copy.
+    trained_since_best: bool,
+}
+
+impl Watching {
+    /// The checked rules, having seen no epoch.
+    fn new(watched: Watched, early_stopping: Option<EarlyStopping>) -> Watching {
+        Watching {
+            plateau: watched
+                .plateau
+                .map(|(monitor, rule)| (monitor, Plateau::new(rule.higher_is_better), rule)),
+            watch: early_stopping.map(|rule| (Watch::new(&rule), rule)),
+            best: None,
+            trained_since_best: false,
+        }
+    }
+
+    /// Notes that an epoch has trained since the best epoch's values were copied.
+    pub(crate) fn trained(&mut self) {
+        self.trained_since_best = true;
+    }
+
+    /// The schedule's peak rate after the epoch of `report`, given the peak `rate` before
+    /// it: lowered by the plateau schedule when its measure has stopped improving, else
+    /// `rate`.
+    pub(crate) fn peak_rate(&mut self, report: &EpochReport, rate: f64) -> f64 {
+        match &mut self.plateau {
+            Some((monitor, state, rule)) => {
+                let value = monitor.value(report).expect("checked before the run");
+                state.step(rule, value, rate)
+            }
+            None => rate,
+        }
+    }
+
+    /// Steps early stopping with the epoch of `report`, of a run of `epochs` epochs, and
+    /// returns whether the run stops before its last epoch. An epoch that is the best so far
+    /// under [`EarlyStopping::restore_best`] has its parameter values copied from `params`,
+    /// after `sync` has brought them up to date (the GPU run copies them back from the GPU
+    /// there). Records the best epoch in `history`.
+    pub(crate) fn after_epoch(
+        &mut self,
+        report: &EpochReport,
+        epochs: usize,
+        history: &mut History,
+        params: &mut ParamStore,
+        sync: impl FnOnce(&mut ParamStore),
+    ) -> bool {
+        let Some((state, rule)) = &mut self.watch else {
+            return false;
+        };
+        let value = rule.monitor.value(report).expect("checked before the run");
+        let mut stop_early = false;
+        match state.step(rule, report.epoch, value) {
+            Verdict::Improved if rule.restore_best => {
+                sync(params);
+                match &mut self.best {
+                    Some(copy) => copy.clone_from(&params.values),
+                    None => self.best = Some(params.values.clone()),
+                }
+                self.trained_since_best = false;
+            }
+            Verdict::Improved | Verdict::Waiting => {}
+            Verdict::Stop => stop_early = report.epoch < epochs,
+        }
+        history.best_epoch = state.best_epoch;
+        stop_early
+    }
+
+    /// Ends the run with the best epoch's parameter values, if a best epoch was kept and a
+    /// later epoch trained; returns whether it did, in which case every value of `params`
+    /// was replaced.
+    pub(crate) fn restore_best(&self, params: &mut ParamStore) -> bool {
+        match &self.best {
+            Some(copy) if self.trained_since_best => {
+                params.values.clone_from(copy);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The rules of a run that watch a measure, once [`check_watching`] has checked them.
@@ -2666,6 +2870,7 @@ mod tests {
             on_epoch: None,
             validation: None,
             early_stopping: None,
+            device: Device::Cpu,
         };
         let history = fit(&net, &mut params, &data, config).unwrap();
         assert_eq!(history.epochs.len(), 2000);

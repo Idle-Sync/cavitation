@@ -166,6 +166,7 @@ fn fit_config(epochs: usize) -> FitConfig<'static> {
         on_epoch: None,
         validation: None,
         early_stopping: None,
+        device: Default::default(),
     }
 }
 
