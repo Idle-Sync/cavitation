@@ -146,14 +146,24 @@ fn row_max<T: Real>(row: &[T]) -> T {
     m
 }
 
-/// `ln Σ e^(z - max)` of a non-empty row, and the max itself.
+/// `ln Σ e^(z - max)` of a non-empty row, and the max itself. The sum leaves out the first
+/// maximum's term, exactly 1, and the logarithm is `ln_1p` of the rest, so a row whose other
+/// terms are small keeps their low bits instead of losing them to `1 + e` rounded. A NaN or
+/// infinite max gives a NaN logarithm, as the sum of every term did.
 fn log_sum_exp<T: Real>(row: &[T]) -> (T, T) {
     let m = row_max(row);
-    let mut s = T::ZERO;
-    for &z in row {
-        s += (z - m).exp();
+    if !m.is_finite() {
+        // NaN for a NaN or infinite max, as the sum of every term gave.
+        return (m, T::ZERO * m);
     }
-    (m, s.ln())
+    let k = row.iter().position(|&z| z == m).unwrap_or(0);
+    let mut e = T::ZERO;
+    for (j, &z) in row.iter().enumerate() {
+        if j != k {
+            e += (z - m).exp();
+        }
+    }
+    (m, e.ln_1p())
 }
 
 /// The softmax of one row, `out[i] = e^(input[i] - max) / Σ e^(input - max)`, with the row's
@@ -1191,6 +1201,52 @@ mod tests {
             t.softmax_cross_entropy(x, &[1], Reduction::Mean)
         });
         assert_eq!(y, [2e4]);
+    }
+
+    /// On a confident row, `[0, −a, −a − 2, −a − 4]` labelled 0 for `a` from 8 to 20, the
+    /// loss is `ln(1 + e)` with `e` small. In `f32` each row's loss is within 16u of the `f64`
+    /// tape's, relative: the other terms' low bits are kept. With `1 + e` rounded to `f32`
+    /// before the logarithm, the larger `a` gave a loss of exactly 0, a relative error of 1.
+    #[test]
+    fn cross_entropy_confident_rows_keep_relative_accuracy() {
+        let u = f64::from(f32::EPSILON) / 2.0;
+        let mut worst = 0.0f64;
+        for step in 0..=120 {
+            let a = 8.0 + step as f32 / 10.0;
+            let row = [0.0f32, -a, -a - 2.0, -a - 4.0];
+            let store = ParamStore::new();
+            let mut graph = Graph::new();
+            let mut tape = graph.tape(&store.values);
+            let x = tape.input(Tensor::from_vec(row.to_vec(), &[1, 4]).unwrap().view());
+            let l = tape.softmax_cross_entropy(x, &[0], Reduction::Mean);
+            let got = f64::from(tape.value(l).data()[0]);
+            let wide: Vec<f64> = row.iter().map(|&v| f64::from(v)).collect();
+            let (want, _) = run(&wide, &[1, 4], |t, x| {
+                t.softmax_cross_entropy(x, &[0], Reduction::Mean)
+            });
+            let rel = (got - want[0]).abs() / want[0];
+            worst = worst.max(rel / u);
+            assert!(
+                rel <= 16.0 * u,
+                "a = {a}: {got} against {}, {rel:e} relative",
+                want[0]
+            );
+        }
+        println!("confident rows: worst {worst:.2}u");
+    }
+
+    /// A +∞ logit gives a NaN loss for its row, whatever the label, as when every term was
+    /// summed.
+    #[test]
+    fn cross_entropy_infinite_logit_gives_nan_loss() {
+        for bad in [f64::INFINITY] {
+            for label in [0, 1] {
+                let (y, _) = run(&[bad, 0.0], &[1, 2], |t, x| {
+                    t.softmax_cross_entropy(x, &[label], Reduction::Mean)
+                });
+                assert!(y[0].is_nan(), "logit {bad}, label {label}: {y:?}");
+            }
+        }
     }
 
     /// NaN in the logits gives a NaN loss, in every reduction and wherever it sits.

@@ -4,6 +4,10 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Tensors and autograd (`cavitation-core`)
+
+- `Tape::softmax_cross_entropy`, `log_softmax` and `log_softmax_row` take `ln Σ e^(z − max)` as `ln_1p` of the sum without the first maximum's term, so a confident row's small loss keeps its relative accuracy: on rows `[0, −a, −a − 2, −a − 4]` labelled 0, for `a` from 8 to 20, the `f32` loss is within 2.1u of the `f64` one (`u = 2⁻²⁴`), where rounding `1 + e` to `f32` first gave a loss of exactly 0 once `e` fell below `u`. On 4,096 × 10 logits with the label's raised by 12, the mean relative error of the loss over 20 batches is +3.3u instead of −166u (Intel Celeron N5105). Losses, log-probabilities and the cross-entropy's gradient change in their low bits on such rows. A +∞ or NaN logit still gives a NaN row (#321).
+
 ## v0.4.1 (2026-11-17)
 
 Training on the GPU now runs end to end: `fit` takes `FitConfig::device`, and `Device::Gpu(&gpu)` (with the `gpu` feature) trains through the new `GpuTrainer`, with the CPU run's batches, learning rates, dropout masks and health checks, a short last batch included. `GpuModel` runs a compiled model in evaluation mode (`infer_batch`, `evaluate`, `accuracy`), and `GpuTrainer::profile_next_step` times each layer on the GPU. The kernels gain the convolution's weight gradient and a neuron mask. On the CPU, `Sequential` fuses a batch norm with the ReLU after it by default, and convolution backward passes are faster. Two changes are breaking: the new `FitConfig::device` field, and the fused pair's trace and hooks behaviour; both entries below say how to keep the old behaviour.
