@@ -307,8 +307,8 @@ fn train_ours(
 }
 
 /// Trains `model` on the GPU with `GpuTrainer`, as [`train_ours`] does on the CPU: the same
-/// batch order, Adam at 1e-3, cross-entropy and dropout seed 0, and the test accuracy from
-/// the GPU model after each epoch. Each step reads its loss back, so the epoch's time is the
+/// batch order (a short last batch included), Adam at 1e-3, cross-entropy and dropout seed
+/// 0, and the test accuracy from the GPU model after each epoch. Each step reads its loss back, so the epoch's time is the
 /// GPU's. The parameters are copied back to `params` at the end.
 #[cfg(feature = "gpu")]
 fn train_ours_gpu(
@@ -321,15 +321,6 @@ fn train_ours_gpu(
 ) -> Result<Vec<Epoch>, String> {
     use cavitation_gpu::{Backend, Gpu};
     use cavitation_nn::{GpuTrainer, OptimizerConfig};
-    if train.len() % net.batch != 0 {
-        return Err(format!(
-            "--device gpu trains whole batches only: {} rows is not a multiple of the batch, {}; \
-             pass --rows with a multiple of {}",
-            train.len(),
-            net.batch,
-            net.batch
-        ));
-    }
     let gpu = match &o.backend {
         Some(b) => Gpu::with_backend(b.parse::<Backend>().map_err(|e| e.to_string())?),
         None => Gpu::new(),

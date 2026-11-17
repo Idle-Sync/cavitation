@@ -36,7 +36,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
-- `cavitation-bench mnist-cnn` and `cifar-cnn` take `--device gpu` (with the `gpu` feature) to train our side with `GpuTrainer` on the GPU, from the same initial weights, batch order and dropout seed as the CPU run, and `--backend vulkan|dx12|metal` to pick the backend. For now the GPU trainer takes whole batches only, so `--device gpu` needs a row count that is a multiple of the batch (`--rows`). `--torch-device cpu|cuda|mps` and `--deterministic` choose where and how the PyTorch side trains, and `scripts/bench/torch_cnn.py` gains `--device mps` and `--deterministic`. With the `gpu` feature, `cavitation-bench info` prints the GPU.
+- `cavitation-bench mnist-cnn` and `cifar-cnn` take `--device gpu` (with the `gpu` feature) to train our side with `GpuTrainer` on the GPU, from the same initial weights, batch order and dropout seed as the CPU run, and `--backend vulkan|dx12|metal` to pick the backend. `--torch-device cpu|cuda|mps` and `--deterministic` choose where and how the PyTorch side trains, and `scripts/bench/torch_cnn.py` gains `--device mps` and `--deterministic`. With the `gpu` feature, `cavitation-bench info` prints the GPU.
 - `scripts/bench/torch_cnn.py --device cuda` trains the PyTorch side of `mnist-cnn` and `cifar-cnn` on a CUDA GPU, from the same initial weights and batch order, with each step timed between `torch.cuda.synchronize()` calls and a median step time over every epoch but the first. `cudnn.benchmark` stays False unless `--cudnn-benchmark` is given. The CPU default's output is unchanged.
 
 ## v0.4.0 (2026-11-16)
