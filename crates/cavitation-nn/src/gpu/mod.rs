@@ -15,10 +15,12 @@ mod forward_tests;
 mod health_tests;
 mod model;
 #[cfg(test)]
+mod profile_tests;
+#[cfg(test)]
 mod short_batch_tests;
 mod trainer;
 #[cfg(test)]
 mod trainer_tests;
 
 pub use model::GpuModel;
-pub use trainer::{GpuOptimizerState, GpuTrainer};
+pub use trainer::{GpuOptimizerState, GpuStepProfile, GpuTrainer};
