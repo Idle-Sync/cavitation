@@ -30,6 +30,9 @@ pub enum OnNonFinite {
     /// momentum or moments) then already hold the NaN when the error comes back. Finding it
     /// sooner would mean reading every gradient once more on every step; to keep the last
     /// good values on any bad step, use [`Skip`](OnNonFinite::Skip), which pays that read.
+    /// The GPU trainer (`GpuTrainer`, with the `gpu` feature) never applies such a step:
+    /// under `Stop` its parameters and optimiser state keep the last good step's values in
+    /// every case.
     Stop,
     /// Send a [`Warning::NonFinite`] to the sink and keep training. The update is applied
     /// even so: after a NaN or infinite loss the optimiser steps on that loss's gradients,
@@ -674,7 +677,7 @@ struct ReluLayer {
 /// through element-wise and pooling layers only: a `Conv2d`'s output channels or a
 /// `BatchNorm2d`'s channels dividing `width`. Pooling keeps the NCHW channel order, so the
 /// channel count before it still splits the ReLU's width. `None` for a dense layer.
-fn channel_size(model: &Sequential, relu: usize, width: usize) -> Option<usize> {
+pub(crate) fn channel_size(model: &Sequential, relu: usize, width: usize) -> Option<usize> {
     let mut j = relu;
     while j > 0 {
         j -= 1;
@@ -1077,6 +1080,22 @@ impl<'s> HealthMonitor<'s> {
                 count: clamped,
             });
         }
+        self.check_loss(step, loss, inputs)?;
+        if self.health.dead_relu && !self.left_out(loss) {
+            self.track_relu_outputs(tape, trace, model);
+        }
+        Ok(())
+    }
+
+    /// The loss checks of [`after_backward`](Self::after_backward), without the tape: `loss`
+    /// must be finite (under [`OnNonFinite::Stop`]; else a warning, at most once per epoch),
+    /// and a loss that cannot be negative is reported when it is.
+    pub(crate) fn check_loss(
+        &mut self,
+        step: u64,
+        loss: f32,
+        inputs: StepInputs<'_>,
+    ) -> Result<(), Error> {
         if loss.is_finite() {
             let loss = f64::from(loss);
             if self.health.on_non_finite == OnNonFinite::Skip {
@@ -1114,20 +1133,60 @@ impl<'s> HealthMonitor<'s> {
                 OnNonFinite::Warn | OnNonFinite::Skip => {}
             }
         }
-        let left_out = !loss.is_finite() && self.health.on_non_finite == OnNonFinite::Skip;
-        if self.health.dead_relu && !left_out {
-            self.track_relu_outputs(tape, trace, model);
-        }
         Ok(())
+    }
+
+    /// Whether a step with this loss is left out of the dead-neuron check: a NaN or infinite
+    /// loss under [`OnNonFinite::Skip`].
+    pub(crate) fn left_out(&self, loss: f32) -> bool {
+        !loss.is_finite() && self.health.on_non_finite == OnNonFinite::Skip
+    }
+
+    /// The checks this monitor runs: its [`Health`].
+    #[cfg(feature = "gpu")]
+    pub(crate) fn health(&self) -> &Health<'s> {
+        &self.health
     }
 
     /// Marks every neuron of each ReLU and ReLU6 layer that output anything but 0 in this
     /// step, and every neuron masked off, as alive. Rebuilds the layer table when the
     /// layers or widths differ from the last step's; otherwise allocates nothing.
     fn track_relu_outputs(&mut self, tape: &Tape<'_, f32>, trace: &Trace, model: &Sequential) {
+        let layers = trace.len().min(model.len());
+        self.track_relus(
+            model,
+            layers,
+            |i| last_dim(*tape.value(trace.output(i)).shape()),
+            |i, _, alive| {
+                let out = tape.value(trace.output(i));
+                let width = alive.len();
+                if width > 0 {
+                    for row in out.data().chunks_exact(width) {
+                        for (a, &v) in alive.iter_mut().zip(row) {
+                            *a |= v != 0.0;
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Marks the neurons of each ReLU and ReLU6 layer among the first `layers` of `model`
+    /// that were alive this step: `width(i)` is layer `i`'s output width, and `mark(i,
+    /// spatial, alive)` ORs into `alive` (that layer's neurons) the ones that output anything
+    /// but 0, `spatial` being its values per channel ([`channel_size`], or 1). Neurons masked
+    /// off are then marked alive. Rebuilds the layer table when the layers or widths differ
+    /// from the last step's; otherwise allocates nothing.
+    pub(crate) fn track_relus(
+        &mut self,
+        model: &Sequential,
+        layers: usize,
+        width_of: impl Fn(usize) -> usize,
+        mut mark: impl FnMut(usize, usize, &mut [bool]),
+    ) {
         let mut k = 0;
         let mut offset = 0;
-        for i in 0..trace.len().min(model.len()) {
+        for i in 0..layers {
             let is_relu = model
                 .layer(i)
                 .activation()
@@ -1136,8 +1195,7 @@ impl<'s> HealthMonitor<'s> {
             if !is_relu {
                 continue;
             }
-            let out = tape.value(trace.output(i));
-            let width = last_dim(*out.shape());
+            let width = width_of(i);
             let entry = ReluLayer {
                 layer: i,
                 offset,
@@ -1151,13 +1209,7 @@ impl<'s> HealthMonitor<'s> {
                 self.alive.resize(offset + width, false);
             }
             let alive = &mut self.alive[offset..offset + width];
-            if width > 0 {
-                for row in out.data().chunks_exact(width) {
-                    for (a, &v) in alive.iter_mut().zip(row) {
-                        *a |= v != 0.0;
-                    }
-                }
-            }
+            mark(i, entry.spatial, alive);
             // A neuron masked on the layer's own output, on the layer before it (the
             // `Linear` that feeds the ReLU), or on an element-wise layer in the run right
             // after it (where `Sequential::neuron_layer` puts the mask) is off on purpose,
@@ -1252,10 +1304,29 @@ impl<'s> HealthMonitor<'s> {
         params: &ParamStore,
         names: &[(String, ParamId)],
     ) -> bool {
+        self.before_update_with(step, loss, names, |id| {
+            // `&` rather than a short-circuiting `all`, so the loop has no branch per value.
+            params
+                .grad(id)
+                .data()
+                .iter()
+                .fold(true, |finite, g| finite & g.is_finite())
+        })
+    }
+
+    /// [`before_update`](Self::before_update) with each gradient's finiteness given by
+    /// `finite`, for gradients the monitor cannot read itself (on the GPU).
+    pub(crate) fn before_update_with(
+        &mut self,
+        step: u64,
+        loss: f32,
+        names: &[(String, ParamId)],
+        finite: impl Fn(ParamId) -> bool,
+    ) -> bool {
         if self.health.on_non_finite != OnNonFinite::Skip {
             return true;
         }
-        let apply = loss.is_finite() && self.gradients_finite(step, params, names);
+        let apply = loss.is_finite() && self.gradients_finite(step, names, finite);
         if apply {
             self.trained_this_epoch = true;
         } else {
@@ -1271,19 +1342,13 @@ impl<'s> HealthMonitor<'s> {
     fn gradients_finite(
         &mut self,
         step: u64,
-        params: &ParamStore,
         names: &[(String, ParamId)],
+        finite: impl Fn(ParamId) -> bool,
     ) -> bool {
         self.warned.resize(names.len(), 0);
         let mut apply = true;
         for (k, (name, id)) in names.iter().enumerate() {
-            // `&` rather than a short-circuiting `all`, so the loop has no branch per value.
-            let finite = params
-                .grad(*id)
-                .data()
-                .iter()
-                .fold(true, |finite, g| finite & g.is_finite());
-            if finite {
+            if finite(*id) {
                 continue;
             }
             apply = false;

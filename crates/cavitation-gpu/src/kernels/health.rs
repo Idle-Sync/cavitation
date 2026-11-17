@@ -360,7 +360,11 @@ impl FiniteFlag {
                 dims
             })
             .collect();
-        let counts = pool.take(4 * grads.len().max(1) as u64, wgpu::BufferUsages::STORAGE);
+        // Copied out by a step that names the gradients that set the flag.
+        let counts = pool.take(
+            4 * grads.len().max(1) as u64,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+        );
         let tensors: Vec<ChannelSumsCall> = grads
             .iter()
             .zip(shapes)
@@ -417,6 +421,39 @@ pub struct FiniteFlagCall {
 }
 
 impl FiniteFlagCall {
+    /// Each gradient's count of NaN and infinite values, one `f32` per gradient in the order
+    /// [`FiniteFlag::call`] was given them, 0 for a finite gradient: read back to name the
+    /// gradients that set the flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::FiniteFlag;
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let mut pool = BufferPool::new(&gpu);
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let check = FiniteFlag::new(&gpu, &mut cache).unwrap();
+    ///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC;
+    ///     let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    ///     let (loss, a, b, flag) = (pool.take(4, usage), pool.take(8, usage), pool.take(12, usage), pool.take(4, usage));
+    ///     let call = check.call(&mut steps, &mut pool, (&loss, 0), &[(&a, 0, 2), (&b, 0, 3)], &flag);
+    ///     let mut step = steps.begin();
+    ///     step.upload(loss.buffer(), 0, &bytes(&[0.5]));
+    ///     step.upload(a.buffer(), 0, &bytes(&[1.0, 2.0]));
+    ///     step.upload(b.buffer(), 0, &bytes(&[f32::NAN, 1.0, f32::INFINITY]));
+    ///     check.record(&mut step, &call);
+    ///     step.read_back(call.counts().buffer(), 0, 8);
+    ///     assert_eq!(step.finish().bytes(), &bytes(&[0.0, 2.0])[..]);
+    ///     call.release(&mut pool);
+    /// }
+    /// ```
+    pub fn counts(&self) -> &PooledBuffer {
+        &self.counts
+    }
+
     /// Gives this call's buffers back to `pool`, once it is no longer recorded.
     ///
     /// # Examples
