@@ -2,7 +2,9 @@
 //! any sizes. Its CPU twin is the f64 product of the same f32 inputs; every output is within
 //! `2(k + 3) · u · (Σ|a·b| + |β·c|)` of it, and with small-integer inputs it is exact.
 
-use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder};
+use crate::{
+    Backend, BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder,
+};
 
 /// The GEMM shader: 64 × 64 tiles of `C` per workgroup of 16 × 16 threads, 4 × 4 outputs per
 /// thread, k in steps of 16 through 8.25 KiB of workgroup memory (padded against bank
@@ -66,16 +68,25 @@ pub(super) fn grid(m: u32, n: u32, batch: u32) -> (bool, [u32; 3]) {
     }
 }
 
-/// Whether the wide tile's pipelines are built on the cache's GPU: everywhere but on DX12
-/// without DXC named as its shader compiler (`WGPU_DX12_COMPILER=dxc`). FXC, which DX12
-/// may fall back to under the `auto` setting, takes about 27 s over each wide pipeline
-/// (measured on an NVIDIA GTX 1660 Super: a `cifar-cnn` trainer builds in 244 s with them
-/// against 134 s without, to save 2.6 ms a step), where DXC takes about 1 s and Vulkan
-/// and Metal nothing that shows.
+/// Whether the wide tile's pipelines are built on the cache's GPU: on Vulkan, and on DX12
+/// with DXC named as its shader compiler (`WGPU_DX12_COMPILER=dxc`).
+///
+/// - **DX12 without DXC named:** FXC, which DX12 may fall back to under the `auto` setting,
+///   takes about 27 s over each wide pipeline (measured on an NVIDIA GTX 1660 Super: a
+///   `cifar-cnn` trainer builds in 244 s with them against 134 s without, to save 2.6 ms a
+///   step), where DXC takes about 1 s.
+/// - **Metal:** on an Apple M4 the wide tile is slower than the square tile on every product
+///   the rule gives it, 1.13× to 1.79× (`gemm-gpu --shapes`, from 8 products of
+///   32 × 1024 × 288 to 128, and 64 of 10 × 256 × 128), and the `cifar-cnn` epoch took
+///   22.75 s against 22.47 s.
 pub(super) fn wide_allowed(cache: &PipelineCache) -> bool {
-    match &cache.gpu().info().dx12_compiler {
-        None => true,
-        Some(setting) => setting.starts_with("dxc"),
+    let info = cache.gpu().info();
+    match info.backend {
+        Backend::Metal => false,
+        _ => match &info.dx12_compiler {
+            None => true,
+            Some(setting) => setting.starts_with("dxc"),
+        },
     }
 }
 
@@ -506,8 +517,9 @@ impl Gemm {
     /// tiles in its dispatch) and the pipeline for its transposes is not built yet. Returns
     /// whether `call` runs on the wide tile from now on.
     ///
-    /// On DX12 it builds nothing and returns `false` unless DXC is named as the shader
-    /// compiler (`WGPU_DX12_COMPILER=dxc`): FXC takes about 27 s over each wide pipeline.
+    /// On Metal it builds nothing and returns `false`: there the wide tile is slower. On DX12
+    /// it does the same unless DXC is named as the shader compiler
+    /// (`WGPU_DX12_COMPILER=dxc`): FXC takes about 27 s over each wide pipeline.
     ///
     /// [`record`](Gemm::record) uses the wide tile only for a product this has been called
     /// for; without it the product runs on the square tile, with the same bits. Call it
