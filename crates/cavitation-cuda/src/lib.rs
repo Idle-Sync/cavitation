@@ -46,7 +46,12 @@
 //!   running statistics' update, as this crate's own kernels: the sums in a fixed tree
 //!   within a stated bound, everything else the CPU's bits (`tests/batch_norm.rs`).
 //!
-//! What is not here yet: dropout, the loss and the optimiser, and
+//! - [`SoftmaxCrossEntropy`] and [`MeanSquaredError`]: the training losses with
+//!   `Reduction::Mean`, the loss and its gradient, as this crate's own kernels: the mean
+//!   squared error's gradient the CPU's bits and its loss the fixed tree's, the
+//!   cross-entropy within the WGSL kernel's stated bounds (`tests/loss.rs`).
+//!
+//! What is not here yet: dropout and the optimiser, and
 //! no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
@@ -93,6 +98,7 @@ mod error;
 mod find;
 mod library;
 mod linear;
+mod loss;
 mod module;
 mod pooling;
 mod reduce;
@@ -105,6 +111,7 @@ pub use device::{Cuda, CudaInfo};
 pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
 pub use linear::{Linear, LinearShape};
+pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
 pub use reduce::ChannelDims;
