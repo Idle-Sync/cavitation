@@ -225,11 +225,15 @@ struct Exact {
     v_bound: f64,
 }
 
-/// The CPU optimisers' arithmetic for one element (`sgd_reference` and `adam_reference` in
-/// `cavitation_nn::optim`): the value `p`, its state `m` and `v`, its gradient `g`, and
-/// whether this is its first update, with constants `c`. The bounds are those
-/// `OptimizerKernel`'s docs state, with 5% to spare for second-order terms; plain SGD's is
-/// one rounding, `u·|p'|`.
+/// The CPU optimisers' formulas for one element (`sgd_reference` and `adam_reference` in
+/// `cavitation_nn::optim`) evaluated exactly in `f64`: the value `p`, its state `m` and `v`,
+/// its gradient `g`, and whether this is its first update, with constants `c`. With the CPU's
+/// own `f64` constants, stored as the CPU stores them, this is the CPU optimisers' bits
+/// ([`the_exact_arithmetic_is_the_cpu_optimisers`]); the card's twins evaluate it with the
+/// card's `f32` constants instead, so their bounds measure the kernels against the CPU's
+/// formulas, and [`the_card_against_the_cpu_optimisers`] measures the drift the constants'
+/// rounding adds. The bounds are those `OptimizerKernel`'s docs state, with 5% to spare for
+/// second-order terms; plain SGD's is one rounding, `u·|p'|`.
 fn exact(
     rule: &OptimizerRule,
     c: &Constants,
@@ -590,7 +594,8 @@ impl<'c> Twin<'c> {
                 active,
             )
             .expect("update");
-        self.kernel.commit(flag == 0).expect("commit");
+        let ran = self.kernel.commit().expect("commit");
+        assert_eq!(ran, flag == 0, "the step ran under flag {flag:#x}");
     }
 
     /// One step of [`LENS`] at step `t`'s activity.
@@ -971,7 +976,7 @@ fn refusals() {
     let mut kernel = OptimizerKernel::new(&cuda, adam, &[3, 5]).expect("optimizer");
     invalid(kernel.set_learning_rate(1e39), "finite as an f32");
     assert_eq!(kernel.rule(), adam);
-    invalid(kernel.commit(true), "no update was launched");
+    invalid(kernel.commit().map(|_| ()), "no update was launched");
     let [mut values, grads, mut m, mut v, mut other] = [(); 5].map(|_| upload(&cuda, &[0.0f32; 8]));
     let flag = upload(&cuda, &[0u32]);
     invalid(
@@ -1030,7 +1035,7 @@ fn refusals() {
         ),
         "was not committed",
     );
-    kernel.commit(true).expect("commit");
+    assert!(kernel.commit().expect("commit"));
     assert_eq!(kernel.steps(), &[1, 0]);
     invalid(
         kernel.update(
@@ -1071,6 +1076,131 @@ fn refusals() {
             &[true, true],
         )
         .expect("the first update's buffers");
-    kernel.commit(false).expect("commit");
-    assert_eq!(kernel.steps(), &[1, 0], "a skipped step counts nothing");
+    assert!(kernel.commit().expect("commit"));
+    assert_eq!(kernel.steps(), &[2, 1]);
+
+    // lr = 1e38 is finite as an f32, but Adam's first step size lr / (1 − β₁) is not.
+    let mut tiny = OptimizerKernel::new(&cuda, OptimizerRule::adam(1e38, 0.0), &[3, 5])
+        .expect("a learning rate finite as an f32");
+    let message = |r: Result<(), CudaError>| match r {
+        Err(CudaError::Invalid(text)) => text,
+        other => panic!("accepted: {other:?}"),
+    };
+    let text = message(tiny.update(
+        &mut values,
+        &grads,
+        &mut [&mut m, &mut v],
+        &flag,
+        &[true, true],
+    ));
+    assert!(text.contains("step size inf"), "{text}");
+    invalid(tiny.commit().map(|_| ()), "no update was launched");
+    let shrink = OptimizerRule::adam_w(1e38, 1e10);
+    let mut tiny = OptimizerKernel::new(&cuda, shrink, &[3, 5]).expect("settings finite as f32s");
+    let text = message(tiny.update(
+        &mut values,
+        &grads,
+        &mut [&mut m, &mut v],
+        &flag,
+        &[true, true],
+    ));
+    assert!(text.contains("is not finite as an f32"), "{text}");
+}
+
+/// The card's flag decides the count: `commit` reads back the flag the launch read, so a
+/// step whose flag was set when it launched counts nothing even if the flag is cleared before
+/// the commit, and a step launched under a clear flag counts even if it is set afterwards.
+#[test]
+fn commit_counts_from_the_flag_the_launch_read() {
+    let Some(cuda) = Cuda::new() else { return };
+    let rule = OptimizerRule::adam(1e-2, 0.0);
+    let total = LENS.iter().sum::<usize>();
+    let mut twin = Twin::new(&cuda, rule, &LENS, &seeded_values(15, total, -1.0, 1.0));
+    let all = [true; LENS.len()];
+    twin.grads.write(&gradients(15, 0)).expect("gradients");
+    twin.flag.write(&[1u32]).expect("flag");
+    let mut state: Vec<&mut DeviceBuffer<'_>> = twin.state.iter_mut().collect();
+    twin.kernel
+        .update(&mut twin.values, &twin.grads, &mut state, &twin.flag, &all)
+        .expect("update");
+    twin.flag.write(&[0u32]).expect("flag");
+    assert!(!twin.kernel.commit().expect("commit"), "a skipped step ran");
+    assert!(twin.kernel.steps().iter().all(|&c| c == 0));
+    twin.kernel
+        .update(&mut twin.values, &twin.grads, &mut state, &twin.flag, &all)
+        .expect("update");
+    twin.flag.write(&[1u32]).expect("flag");
+    assert!(
+        twin.kernel.commit().expect("commit"),
+        "a clear step was skipped"
+    );
+    assert!(twin.kernel.steps().iter().all(|&c| c == 1));
+}
+
+/// The card against `cavitation_nn`'s `Sgd`, `Adam` and `AdamW` themselves, side by side for
+/// 50 steps from the same seeded parameters and gradients, each on its own state: the card
+/// rounds the settings and per-step constants to `f32` and the CPU keeps them in `f64`, so
+/// the two drift apart. The worst difference of a value from the CPU's, relative to the
+/// largest value at that step, over every rule, element and step, is printed and held within
+/// 128u = 2⁻¹⁷; on an NVIDIA GTX 1660 Super it measured 2u to 7u for SGD and Adam and 50u
+/// for AdamW, whose shrink factor `1 − lr·wd` loses the most to its `f32` rounding.
+#[test]
+fn the_card_against_the_cpu_optimisers() {
+    let Some(cuda) = Cuda::new() else { return };
+    let total = LENS.iter().sum::<usize>();
+    let mut overall = 0.0f64;
+    for (r, rule) in rules().into_iter().enumerate() {
+        let start = seeded_values(300 + r as u64, total, -1.0, 1.0);
+        let mut twin = Twin::new(&cuda, rule, &LENS, &start);
+        let mut store = ParamStore::new();
+        let mut offset = 0;
+        let ids: Vec<_> = LENS
+            .iter()
+            .map(|&n| {
+                let id =
+                    store.add(Tensor::from_vec(start[offset..offset + n].to_vec(), &[n]).unwrap());
+                offset += n;
+                id
+            })
+            .collect();
+        let mut opt = CpuOptimizer::new(&rule);
+        let mut worst = 0.0f64;
+        for t in 0..STEPS {
+            let g = gradients(300 + r as u64, t);
+            twin.step(&g, 0, t);
+            store.zero_grad();
+            let mut offset = 0;
+            for (k, (&id, &n)) in ids.iter().zip(&LENS).enumerate() {
+                if active(k, t) {
+                    store
+                        .grads
+                        .accumulate(id)
+                        .0
+                        .data_mut()
+                        .copy_from_slice(&g[offset..offset + n]);
+                }
+                offset += n;
+            }
+            opt.step(&mut store);
+            let card = read(&twin.values, total);
+            let cpu: Vec<f32> = ids
+                .iter()
+                .flat_map(|&id| store.value(id).data().to_vec())
+                .collect();
+            let scale = cpu.iter().fold(0.0f64, |m, &b| m.max(f64::from(b).abs()));
+            for (&a, &b) in card.iter().zip(&cpu) {
+                worst = worst.max((f64::from(a) - f64::from(b)).abs() / scale);
+            }
+        }
+        println!(
+            "{rule:?}: after {STEPS} steps the card's values are within {worst:.3e} of the CPU's, \
+             relative to the largest value ({:.0}u)",
+            worst / U
+        );
+        overall = overall.max(worst);
+    }
+    assert!(
+        overall <= 128.0 * U,
+        "the card drifted {overall:e} from the CPU optimisers"
+    );
 }

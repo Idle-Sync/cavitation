@@ -273,6 +273,64 @@ fn cross_entropy_label_far_below_the_max() {
     );
 }
 
+/// Logits far below their row's maximum, where `expf` gives subnormals and 0: rows
+/// `[0, −100, −150]` with each label (e^−100 is subnormal and e^−150 underflows to 0), rows of
+/// 10 logits in `[−60, 60)` at `cifar-cnn`'s 128 and 80, and 1,000 rows of 3 in `[−200, 200)`.
+/// The loss and the gradient are within their bounds, the absolute floor included, of the
+/// `f64` tape's.
+#[test]
+fn cross_entropy_subnormal_exponentials() {
+    let Some(cuda) = Cuda::new() else { return };
+    let mut cases: Vec<(u32, u32, Vec<f32>, Vec<u32>)> =
+        vec![(3, 3, [0.0, -100.0, -150.0].repeat(3), vec![0, 1, 2])];
+    for (s, (batch, classes, range)) in [(128u32, 10u32, 60.0f32), (80, 10, 60.0), (1000, 3, 200.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let n = (batch * classes) as usize;
+        let z = seeded_values(60 + s as u64, n, -range, range);
+        cases.push((
+            batch,
+            classes,
+            z,
+            labels(70 + s as u64, batch as usize, classes),
+        ));
+    }
+    for (batch, classes, z, y) in cases {
+        let what = format!("{batch} × {classes}");
+        let ce = SoftmaxCrossEntropy::new(&cuda, (batch, classes)).expect("cross-entropy");
+        let (loss, grad) = cuda_ce(&cuda, &ce, &z, &y);
+        let (want_loss, want_grad) = tape_ce(batch as usize, classes as usize, &z, &y);
+        let (loss_bound, grad_bound) = ce_bounds(batch as usize, classes as usize, &z, &y);
+        let worst = assert_within(
+            &[loss],
+            &[want_loss],
+            |_| loss_bound,
+            &format!("loss, {what}"),
+        );
+        println!(
+            "far logits {what}: loss worst {:.3} of its bound",
+            worst.ratio()
+        );
+        let worst = assert_within(
+            &grad,
+            &want_grad,
+            |i| grad_bound[i],
+            &format!("gradient, {what}"),
+        );
+        println!(
+            "far logits {what}: gradient worst {:.3} of its bound",
+            worst.ratio()
+        );
+        if batch == 3 {
+            assert!(
+                grad.iter().any(|g| g.is_subnormal()),
+                "the [0, −100, −150] rows reach subnormal gradients: {grad:?}"
+            );
+        }
+    }
+}
+
 /// A row with a NaN, +∞ or −∞ logit, or a label not below the classes, gives a NaN loss and a
 /// NaN gradient row. The other rows' gradients are the bits of a run without the bad row.
 #[test]

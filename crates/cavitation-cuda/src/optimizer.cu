@@ -7,7 +7,8 @@
 // buffer holds SHARED floats, then four words per parameter: its end in the flat buffers, its
 // flags (bit 0 set when it updates this step, bit 1 on its first update), and its Adam bias
 // corrections for this step, step_size = lr / (1 - beta1^t) and 1 / sqrt(1 - beta2^t). Every
-// kernel does nothing when the step's finite flag is set.
+// kernel does nothing when the step's finite flag is set, and its first thread copies the
+// flag to `seen`, so the host counts the step from the flag the launch read.
 
 typedef unsigned int u32;
 
@@ -36,8 +37,12 @@ __device__ float store_state(float x) {
 // the block lies past the table, the parameter does not update this step, or the element is
 // past the parameter's end. `info` is set to the parameter's four words.
 __device__ long long element(const u32 *table, const float *consts, const u32 *finite,
-                             u32 groups, const float **info) {
-    if (finite[0] != 0u) {
+                             u32 groups, u32 *seen, const float **info) {
+    u32 flag = finite[0];
+    if (blockIdx.x == 0u && threadIdx.x == 0u) {
+        seen[0] = flag;
+    }
+    if (flag != 0u) {
         return -1;
     }
     u32 w = blockIdx.x;
@@ -63,9 +68,9 @@ __device__ bool first_update(const float *info) {
 // SGD without momentum: p = p - lr * (g + wd * p), the decay term left out when wd is 0, as
 // the CPU leaves it out.
 extern "C" __global__ void sgd(float *values, const float *grads, const u32 *table,
-                               const float *consts, const u32 *finite, u32 groups) {
+                               const float *consts, const u32 *finite, u32 groups, u32 *seen) {
     const float *info;
-    long long at = element(table, consts, finite, groups, &info);
+    long long at = element(table, consts, finite, groups, seen, &info);
     if (at < 0) {
         return;
     }
@@ -83,9 +88,9 @@ extern "C" __global__ void sgd(float *values, const float *grads, const u32 *tab
 // first update, then p = p - lr * b.
 extern "C" __global__ void sgd_momentum(float *values, const float *grads, const u32 *table,
                                         const float *consts, const u32 *finite, u32 groups,
-                                        float *buffer) {
+                                        u32 *seen, float *buffer) {
     const float *info;
-    long long at = element(table, consts, finite, groups, &info);
+    long long at = element(table, consts, finite, groups, seen, &info);
     if (at < 0) {
         return;
     }
@@ -108,10 +113,10 @@ extern "C" __global__ void sgd_momentum(float *values, const float *grads, const
 // v = beta2 * v + (1 - beta2) * g^2 are stored and
 // p = p - step_size * m / (sqrt(v) * c2 + eps), with the parameter's own bias corrections.
 extern "C" __global__ void adam(float *values, const float *grads, const u32 *table,
-                                const float *consts, const u32 *finite, u32 groups, float *m,
-                                float *v, u32 decoupled) {
+                                const float *consts, const u32 *finite, u32 groups, u32 *seen,
+                                float *m, float *v, u32 decoupled) {
     const float *info;
-    long long at = element(table, consts, finite, groups, &info);
+    long long at = element(table, consts, finite, groups, seen, &info);
     if (at < 0) {
         return;
     }

@@ -172,7 +172,10 @@ impl<'c> Kernels<'c> {
 ///   `w·p_j·(2u·(|z_j| + |max| + ln S) + Δ + (6 + 4|t_j|)·u) + 3u·|p_j − onehot|/B` of
 ///   `(p_j − onehot)/B`.
 ///
-/// Subnormals are kept, so nothing is flushed. Two runs give the same bits.
+/// Each bound also carries `2⁻¹²⁶` absolute for every exponential and every result that
+/// may be subnormal, where an ulp is absolute rather than relative: `expf`'s 2 ulp are
+/// about 2⁻¹⁴⁸ once `e^x` is below the smallest normal. Nothing is flushed. Two runs give
+/// the same bits.
 ///
 /// # Examples
 ///

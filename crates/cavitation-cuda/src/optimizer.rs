@@ -285,13 +285,15 @@ struct Bound {
 ///   `e_v = u·(6v + 2(1 − β₂)|g|·w)`, and the value within
 ///   `u·(|p'| + |p_s|) + step_size·(|m/d|·(17u + e_v/(2v)) + e_m/d)`.
 ///
-/// A moment or momentum buffer below the smallest normal `f32` is stored as 0, as the CPU
-/// stores it. A NaN or infinite gradient with the flag clear gives NaN or ±∞ where the
+/// Every bound also carries `2⁻¹²⁶` absolute: a moment or momentum buffer below the smallest
+/// normal `f32` is stored as 0, as the CPU stores it, and a subnormal result's rounding is
+/// absolute rather than relative. A NaN or infinite gradient with the flag clear gives NaN or ±∞ where the
 /// expression does.
 ///
 /// A step runs in two parts: [`update`](Self::update) uploads the step's constants and
-/// launches, and once the caller has read the step's finite flag, [`commit`](Self::commit)
-/// counts the update for each parameter it ran on, or for none when the flag stopped it. The
+/// launches, and the launch copies the finite flag it read to a word of the kernel's own;
+/// [`commit`](Self::commit) reads that word back and counts the update for each parameter it
+/// ran on, or for none when the flag stopped it, so the counts follow what the card did. The
 /// first update fixes the values and state buffers; a later update on others is refused.
 ///
 /// # Examples
@@ -307,7 +309,7 @@ struct Bound {
 ///     values.write(&[1.0f32, 2.0]).unwrap();
 ///     grads.write(&[1.0f32, -1.0]).unwrap();
 ///     sgd.update(&mut values, &grads, &mut [], &finite, &[true]).unwrap();
-///     sgd.commit(true).unwrap();
+///     assert!(sgd.commit().unwrap()); // the step ran
 ///     let mut out = [0.0f32; 2];
 ///     values.read(&mut out).unwrap();
 ///     assert_eq!(out, [0.5, 2.5]);
@@ -329,6 +331,8 @@ pub struct OptimizerKernel<'c> {
     table: DeviceBuffer<'c>,
     /// The shared and per-parameter constants for the step being launched.
     constants: DeviceBuffer<'c>,
+    /// The finite flag the last launch read, copied by the kernel for [`commit`](Self::commit).
+    seen: DeviceBuffer<'c>,
     /// The constants' words, rebuilt in place every step.
     words: Vec<u32>,
     /// Blocks per launch: one per [`BLOCK`] elements of each parameter.
@@ -440,6 +444,7 @@ impl<'c> OptimizerKernel<'c> {
             function,
             table: table_buffer,
             constants: cuda.buffer(4 * words)?,
+            seen: cuda.buffer(4)?,
             words: vec![0; words],
             blocks: blocks as u32,
             steps: vec![0; lens.len()],
@@ -502,13 +507,15 @@ impl<'c> OptimizerKernel<'c> {
     /// (SGD's momentum buffer, or Adam's first and second moments; none for SGD without
     /// momentum), each as long, and `finite` the step's finite flag, a `u32` at its start
     /// that is 0 when the step's gradients are all finite and any other value to skip the
-    /// update. Once the flag is known, [`commit`](Self::commit) says whether it ran.
+    /// update. [`commit`](Self::commit) then counts the step from the flag the launch read.
     ///
     /// # Errors
     ///
     /// [`CudaError::Invalid`] if `active` does not hold one entry per parameter, `state`
-    /// holds the wrong number of buffers, the last update was not committed, or `values` or
-    /// a state buffer is not the one the first update ran on; [`CudaError::Call`] if the
+    /// holds the wrong number of buffers, the last update was not committed, `values` or a
+    /// state buffer is not the one the first update ran on, a parameter's update count would
+    /// pass `u32::MAX`, or a constant derived from the settings is not finite as an `f32`
+    /// (such as Adam's `lr / (1 − β₁ᵗ)` or AdamW's `1 − lr·wd`); [`CudaError::Call`] if the
     /// upload or the launch is refused.
     ///
     /// # Panics
@@ -558,7 +565,7 @@ impl<'c> OptimizerKernel<'c> {
                     .into(),
             ));
         }
-        self.fill_constants(active);
+        self.fill_constants(active)?;
         self.constants.write(&self.words)?;
         let mut args = vec![
             Arg::Buffer(values),
@@ -567,6 +574,7 @@ impl<'c> OptimizerKernel<'c> {
             Arg::Buffer(&self.constants),
             Arg::Buffer(finite),
             Arg::U32(self.blocks),
+            Arg::Buffer(&self.seen),
         ];
         args.extend(state.iter().map(|s| Arg::Buffer(s)));
         if state.len() == 2 {
@@ -578,12 +586,13 @@ impl<'c> OptimizerKernel<'c> {
         // SAFETY: the handle was looked up in this module when it was compiled.
         let kernel = unsafe { self.module.kernel_from(self.function) };
         // SAFETY: every kernel takes (float *values, const float *grads, const u32 *table,
-        // const float *constants, const u32 *finite, u32 groups), then sgd_momentum its
-        // buffer and adam (float *m, float *v, u32 decoupled), which `args` holds for the
+        // const float *constants, const u32 *finite, u32 groups, u32 *seen), then
+        // sgd_momentum its buffer and adam (float *m, float *v, u32 decoupled), which `args` holds for the
         // rule's kernel (the state's count checked above). Block w < groups reads table
         // words 2w and 2w + 1, which the table holds, and the constants of the parameter
         // they name, below the constants' length; it touches elements below the parameter's
-        // end, at most the elements every buffer holds (checked above), and reads one flag.
+        // end, at most the elements every buffer holds (checked above), reads one flag, and
+        // its first thread writes the one word of `seen`, the kernel's own.
         // values and the state buffers, borrowed mutably, are distinct from each other and
         // from the inputs.
         unsafe { kernel.launch([self.blocks, 1, 1], [BLOCK, 1, 1], &args)? };
@@ -594,50 +603,78 @@ impl<'c> OptimizerKernel<'c> {
     }
 
     /// Writes the step's constants into the constants' words: the shared ones, then each
-    /// parameter's end, flags and Adam bias corrections for its next update.
-    fn fill_constants(&mut self, active: &[bool]) {
+    /// parameter's end, flags and Adam bias corrections for its next update; refuses
+    /// constants that are not finite as `f32`s and counts past `u32::MAX`.
+    fn fill_constants(&mut self, active: &[bool]) -> Result<(), CudaError> {
         let [lr, _, _, beta1, beta2, _] = self.rule.settings();
         let (beta1, beta2) = (as_stored(beta1), as_stored(beta2));
-        for (word, value) in self.words.iter_mut().zip(shared_constants(&self.rule)) {
+        let shared = shared_constants(&self.rule);
+        if !shared.iter().all(|v| v.is_finite()) {
+            return Err(CudaError::Invalid(format!(
+                "optimizer: a constant of {:?} is not finite as an f32: {shared:?}",
+                self.rule
+            )));
+        }
+        for (word, value) in self.words.iter_mut().zip(shared) {
             *word = value.to_bits();
         }
         let mut end = 0;
         let (infos, _) = self.words[SHARED_WORDS..].as_chunks_mut::<INFO_WORDS>();
         for (k, info) in infos.iter_mut().enumerate() {
             end += self.lens[k] as u32;
-            let t = self.steps[k] + 1;
+            let t = self.steps[k].checked_add(1).ok_or_else(|| {
+                CudaError::Invalid(format!(
+                    "optimizer: parameter {k} has {} updates, the most a count holds",
+                    u32::MAX
+                ))
+            })?;
             let flags = u32::from(active[k]) | (u32::from(self.steps[k] == 0) << 1);
-            let step_size = lr / (1.0 - beta1.powi(t as i32));
-            let inv_sqrt_correction2 = 1.0 / (1.0 - beta2.powi(t as i32)).sqrt();
+            // powi takes an i32; past i32::MAX the powers are 0 to the f64's precision.
+            let t = i32::try_from(t).unwrap_or(i32::MAX);
+            let step_size = (lr / (1.0 - beta1.powi(t))) as f32;
+            let inv_sqrt_correction2 = (1.0 / (1.0 - beta2.powi(t)).sqrt()) as f32;
+            if !(step_size.is_finite() && inv_sqrt_correction2.is_finite()) {
+                return Err(CudaError::Invalid(format!(
+                    "optimizer: parameter {k}'s bias-corrected step size {step_size} or second \
+                     correction {inv_sqrt_correction2} is not finite as an f32"
+                )));
+            }
             info.copy_from_slice(&[
                 end,
                 flags,
-                (step_size as f32).to_bits(),
-                (inv_sqrt_correction2 as f32).to_bits(),
+                step_size.to_bits(),
+                inv_sqrt_correction2.to_bits(),
             ]);
         }
+        Ok(())
     }
 
-    /// Counts the launched step's update for each parameter it was launched for when `ran`
-    /// (the step's finite flag was clear), and for none when the flag stopped it, so a
-    /// skipped step leaves every count, like every value and moment, as it was.
+    /// Reads back the finite flag the last launch read, waiting for the launch, and counts
+    /// the step's update for each parameter it was launched for when the flag was 0, and for
+    /// none when the flag stopped it, so a skipped step leaves every count, like every value
+    /// and moment, as it was. Returns whether the step ran.
     ///
     /// # Errors
     ///
-    /// [`CudaError::Invalid`] if no update was launched since the last commit.
-    pub fn commit(&mut self, ran: bool) -> Result<(), CudaError> {
+    /// [`CudaError::Invalid`] if no update was launched since the last commit;
+    /// [`CudaError::Call`] if the flag cannot be read, which is also how a launch that
+    /// failed after it returned is reported (the step then stays to be committed).
+    pub fn commit(&mut self) -> Result<bool, CudaError> {
         if !self.recorded {
             return Err(CudaError::Invalid(
                 "optimizer: no update was launched to commit".into(),
             ));
         }
+        let mut flag = [0u32];
+        self.seen.read(&mut flag)?;
+        let ran = flag[0] == 0;
         if ran {
             for (count, &active) in self.steps.iter_mut().zip(&self.pending) {
                 *count += u32::from(active);
             }
         }
         self.recorded = false;
-        Ok(())
+        Ok(ran)
     }
 }
 
