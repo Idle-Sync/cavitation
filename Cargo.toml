@@ -11,6 +11,7 @@ members = [
     "crates/cavitation-ml",
     "crates/cavitation-inspect",
     "crates/cavitation-gpu",
+    "crates/cavitation-cuda",
 ]
 
 [workspace.package]
