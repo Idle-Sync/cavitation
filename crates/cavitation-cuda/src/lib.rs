@@ -38,7 +38,10 @@
 //!   leaky ReLU, tanh, the sigmoid, GELU in both forms), forward and backward, as this
 //!   crate's own kernels, each the twin of its CPU code (`tests/elementwise.rs`).
 //!
-//! What is not here yet: batch norm, pooling, dropout, the loss and the optimiser, and
+//! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
+//!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
+//!
+//! What is not here yet: batch norm, dropout, the loss and the optimiser, and
 //! no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
@@ -85,6 +88,7 @@ mod find;
 mod library;
 mod linear;
 mod module;
+mod pooling;
 mod sys;
 
 pub use buffer::{DeviceBuffer, Scalar};
@@ -94,3 +98,4 @@ pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
 pub use linear::{Linear, LinearShape};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
+pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
