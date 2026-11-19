@@ -130,7 +130,9 @@ pub struct Options {
     /// steps) and print each layer's median forward and backward time.
     pub profile: Option<usize>,
     /// `--device gpu`: train our side on the GPU (`GpuTrainer`), which needs the `gpu`
-    /// feature; `cpu`, the default, trains with `Trainer`.
+    /// feature; `cpu`, the default, trains with `Trainer`; `auto` is the one of the two
+    /// that `cavitation_nn::devices` marks as chosen (the CPU with `--profile`, which times
+    /// the CPU trainer only).
     pub gpu: bool,
     /// `--backend vulkan|dx12|metal`: the GPU backend, or the platform's default.
     pub backend: Option<String>,
@@ -143,13 +145,35 @@ pub struct Options {
     pub no_fuse: bool,
 }
 
+/// Whether `--device auto` trains on the GPU: whether the device
+/// `cavitation_nn::devices` marks as chosen is one. Prints that device's line.
+///
+/// # Errors
+///
+/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cpu` or `gpu`, or asks for a
+/// device that is not available.
+fn auto_is_gpu() -> Result<bool, String> {
+    let list = cavitation_nn::devices().map_err(|e| e.to_string())?;
+    let entry = list.iter().find(|e| e.chosen).ok_or(
+        "--device auto: CAVITATION_DEVICE asks for a device that is not available (see the \
+         `devices` command)",
+    )?;
+    println!(
+        "--device auto: {} ({}, {})",
+        entry.kind, entry.name, entry.detail
+    );
+    Ok(entry.kind == cavitation_nn::DeviceKind::Gpu)
+}
+
 impl Options {
-    /// Parses the arguments after the command for `net`.
+    /// Parses the arguments after the command for `net`. `--device auto` is resolved here,
+    /// which with the `gpu` feature opens the GPU to see that there is one, and trains on
+    /// the CPU with `--profile`.
     ///
     /// # Errors
     ///
     /// Returns a message for an unknown argument, a missing value or a value that is not
-    /// a positive number (`--seed` may be 0).
+    /// a positive number (`--seed` may be 0), and as [`auto_is_gpu`] does.
     pub fn parse(net: Net, args: &[String]) -> Result<Options, String> {
         let mut o = Options {
             seed: 0,
@@ -164,6 +188,8 @@ impl Options {
             deterministic: false,
             no_fuse: false,
         };
+        // `--device auto`, resolved once every argument is read.
+        let mut auto = false;
         let mut rest = args.iter();
         let number = |flag: &str, v: Option<&String>, zero_ok: bool| -> Result<usize, String> {
             let v = v.ok_or_else(|| format!("{flag} needs a value"))?;
@@ -181,9 +207,12 @@ impl Options {
                 "--ours-only" => o.ours_only = true,
                 "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
                 "--device" => match rest.next().map(String::as_str) {
-                    Some("cpu") => o.gpu = false,
-                    Some("gpu") => o.gpu = true,
-                    other => return Err(format!("--device takes cpu or gpu, got {other:?}")),
+                    Some("cpu") => (o.gpu, auto) = (false, false),
+                    Some("gpu") => (o.gpu, auto) = (true, false),
+                    Some("auto") => (o.gpu, auto) = (false, true),
+                    other => {
+                        return Err(format!("--device takes auto, cpu or gpu, got {other:?}"));
+                    }
                 },
                 "--backend" => {
                     let b = rest.next().ok_or("--backend needs a value")?;
@@ -203,6 +232,13 @@ impl Options {
                 "--no-fuse" => o.no_fuse = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
+        }
+        if auto && o.backend.is_some() {
+            return Err("--backend needs --device gpu".into());
+        }
+        if auto {
+            // `--profile` times the CPU trainer only, whatever `auto` would pick.
+            o.gpu = auto_is_gpu()? && o.profile.is_none();
         }
         if o.backend.is_some() && !o.gpu {
             return Err("--backend needs --device gpu".into());
@@ -835,8 +871,14 @@ mod tests {
             (g.backend.as_deref(), g.torch_device.as_str()),
             (Some("metal"), "mps")
         );
+        // `auto` with `--profile` is the CPU, which is all `--profile` times; with
+        // `CAVITATION_DEVICE` set to something `devices` refuses, it is that error.
+        if let Ok(a) = Options::parse(CIFAR, &args(&["--device", "auto", "--profile", "3"])) {
+            assert!(!a.gpu && a.profile == Some(3));
+        }
         for bad in [
             &["--device", "tpu"][..],
+            &["--device", "auto", "--backend", "vulkan"],
             &["--backend", "vulkan"],
             &["--device", "gpu", "--backend", "opengl"],
             &["--torch-device", "xla"],

@@ -1242,6 +1242,18 @@ impl<'s> GpuTrainer<'s> {
     /// }
     /// ```
     pub fn set_health(&mut self, health: Health<'s>) -> Result<(), Error> {
+        Self::check_health(&health)?;
+        self.health = HealthMonitor::new(health).with_loss(self.loss);
+        Ok(())
+    }
+
+    /// Whether [`set_health`](Self::set_health) takes `health`, without a trainer to set it
+    /// on.
+    ///
+    /// # Errors
+    ///
+    /// As [`set_health`](Self::set_health) returns them.
+    pub(crate) fn check_health(health: &Health<'_>) -> Result<(), Error> {
         if health.on_non_finite == OnNonFinite::Warn {
             return Err(Error::Unsupported(
                 "GpuTrainer: OnNonFinite::Warn is not run on the GPU, which never applies a step \
@@ -1250,7 +1262,6 @@ impl<'s> GpuTrainer<'s> {
                     .to_string(),
             ));
         }
-        self.health = HealthMonitor::new(health).with_loss(self.loss);
         Ok(())
     }
 
