@@ -1,6 +1,7 @@
 //! `GpuTrainer::profile_next_step`: a profile with every layer of a CNN present, forward and
 //! backward, each part timed where the device times it and `None` with the reason named
-//! where it does not, the parts no longer than the whole step; a profile only for the step
+//! where it does not, the parts no longer than the whole step, a `Linear`'s or a `Conv2d`'s
+//! input gradient timed apart from its parameter gradients; a profile only for the step
 //! that asked; and a step left out under `Skip` passing the request to the next.
 //!
 //! Without a GPU every test says so and checks nothing; `CAVITATION_GPU_REQUIRED=1` makes
@@ -75,6 +76,14 @@ fn a_profile_has_every_layer() {
         parts.extend([p.copies, p.readback]);
         let sum: Duration = parts.iter().flatten().sum();
         assert!(sum <= p.total, "{sum:?} of parts against {:?}", p.total);
+        // The input gradient is timed apart for the two `Linear` layers and for no other: the
+        // convolution is the first layer and computes none. No time is asserted above 0: a
+        // short pass's two timestamps can read the same tick.
+        assert_eq!(p.backward_input.len(), net.len());
+        for (i, input) in p.backward_input.iter().enumerate() {
+            let split = i == 6 || i == 7;
+            assert_eq!(input.is_some(), split && timed, "layer {i}: {input:?}");
+        }
         // Each time is its own layer's: `Flatten` (no work) is the shortest both ways, which a
         // profile with the layers in the wrong order would not show. No ordering between layers
         // that do work is asserted: one step's times are single samples, and on some backends
@@ -121,7 +130,8 @@ fn a_skipped_step_passes_the_profile_on() {
 }
 
 /// A model with nine batch norms (each running update its own pass) is profiled: the timed
-/// passes are sized for them.
+/// passes are sized for them and for the input gradients of its eight convolutions after the
+/// first and of its `Linear`, each timed apart.
 #[test]
 fn nine_batch_norms_are_profiled() {
     let mut params = ParamStore::new();
@@ -159,8 +169,14 @@ fn nine_batch_norms_are_profiled() {
         t.step(&net, data.view()).unwrap();
         let p = t.last_profile().unwrap();
         assert_eq!(p.forward.len(), net.len());
-        if !matches!(p.timing, Timing::Untimed { .. }) {
+        let timed = !matches!(p.timing, Timing::Untimed { .. });
+        if timed {
             assert!(p.running.is_some());
+        }
+        // Layers 0, 3, ..., 24 are the convolutions and layer 28 the `Linear`.
+        for (i, input) in p.backward_input.iter().enumerate() {
+            let split = (i > 0 && i < 27 && i % 3 == 0) || i == 28;
+            assert_eq!(input.is_some(), split && timed, "layer {i}: {input:?}");
         }
     });
 }
