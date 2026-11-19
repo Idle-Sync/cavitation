@@ -38,6 +38,10 @@
 //!   leaky ReLU, tanh, the sigmoid, GELU in both forms), forward and backward, as this
 //!   crate's own kernels, each the twin of its CPU code (`tests/elementwise.rs`).
 //!
+//! - [`Dropout`]: dropout and the neuron mask (`Tape::keep_where`) with a bit-packed `u32`
+//!   mask, forward and backward, as this crate's own kernels, each the CPU's bits
+//!   (`tests/dropout.rs`).
+//!
 //! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
 //!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
 //!
@@ -57,8 +61,8 @@
 //!   `f32` expressions, within the WGSL kernels' stated bounds of the CPU optimisers'
 //!   arithmetic (`tests/optimizer.rs`).
 //!
-//! What is not here yet: dropout, and
-//! no part of `cavitation-nn` trains through this crate.
+//! What is not here yet: the health values, and no part of `cavitation-nn` trains through
+//! this crate.
 //!
 //! # What must be installed
 //!
@@ -99,6 +103,7 @@ mod batch_norm;
 mod buffer;
 mod conv;
 mod device;
+mod dropout;
 mod elementwise;
 mod error;
 mod find;
@@ -115,6 +120,7 @@ pub use batch_norm::{BatchNorm2d, BatchStats, RunningUpdate};
 pub use buffer::{DeviceBuffer, Scalar};
 pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
+pub use dropout::Dropout;
 pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
 pub use linear::{Linear, LinearShape};
