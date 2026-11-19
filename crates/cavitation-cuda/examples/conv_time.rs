@@ -1,5 +1,5 @@
 //! Times cuDNN's convolution passes on the `cifar-cnn` network's four convolutions at batch
-//! 128 (3 × 3 kernels, padding 1, f32): the forward pass (with the bias), the input
+//! 128 (3 × 3 kernels, padding 1, f32): the forward pass without and with the bias, the input
 //! gradient and the weight gradient, each on its own, as the median of 51 calls after 20
 //! warm-up calls, waiting for the card before the clock starts and before it stops. Prints
 //! the algorithm each pass runs.
@@ -46,9 +46,12 @@ fn main() {
         return;
     };
     println!("{}", cuda.info());
-    println!("| layer | forward ms | input gradient ms | weight gradient ms | algorithms |");
-    println!("|---|---|---|---|---|");
-    let mut totals = [0.0f64; 3];
+    println!(
+        "| layer | forward ms | forward with bias ms | input gradient ms | weight gradient ms | \
+         algorithms |"
+    );
+    println!("|---|---|---|---|---|---|");
+    let mut totals = [0.0f64; 4];
     for (cin, cout, size) in [(3, 32, 32), (32, 32, 32), (32, 64, 16), (64, 64, 16)] {
         let shape = ConvShape {
             padding: (1, 1),
@@ -66,19 +69,21 @@ fn main() {
             filled(&cuda, shape.x_len()),
             filled(&cuda, shape.w_len()),
         );
-        let forward = timed(&cuda, || conv.forward(&x, &w, Some(&b), &mut y));
+        let forward = timed(&cuda, || conv.forward(&x, &w, None, &mut y));
+        let biased = timed(&cuda, || conv.forward(&x, &w, Some(&b), &mut y));
         let input = timed(&cuda, || conv.input_grad(&w, &dy, &mut dx));
         let weight = timed(&cuda, || conv.weight_grad(&x, &dy, &mut dw));
-        for (total, t) in totals.iter_mut().zip([forward, input, weight]) {
+        for (total, t) in totals.iter_mut().zip([forward, biased, input, weight]) {
             *total += t;
         }
         println!(
-            "| {cin} -> {cout} at {size} x {size} | {forward:.3} | {input:.3} | {weight:.3} | {} |",
+            "| {cin} -> {cout} at {size} x {size} | {forward:.3} | {biased:.3} | {input:.3} | \
+             {weight:.3} | {} |",
             conv.algorithms()
         );
     }
     println!(
-        "| all four | {:.3} | {:.3} | {:.3} | |",
-        totals[0], totals[1], totals[2]
+        "| all four | {:.3} | {:.3} | {:.3} | {:.3} | |",
+        totals[0], totals[1], totals[2], totals[3]
     );
 }

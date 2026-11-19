@@ -21,8 +21,8 @@ const FLOOR: f64 = 1.0 / (1u128 << 126) as f64;
 
 /// The measured tolerance `t` of each pass, in units of `u · Σ|terms|`: forward (with the
 /// bias), input gradient, weight gradient, bias gradient. Each is about twice the worst
-/// ratio measured on an NVIDIA GTX 1660 Super with cuDNN 9.28.1 over the shapes here, at 3,
-/// 8 and 128 images: 54.4 (forward, `WINOGRAD_NONFUSED` on 64 → 64 channels at 16 × 16),
+/// ratio measured on an NVIDIA GTX 1660 Super with cuDNN 9.28.1 over the shapes here (the
+/// CPU geometries at 3 images, the networks' at 8 and at their training batches): 54.4 (forward, `WINOGRAD_NONFUSED` on 64 → 64 channels at 16 × 16),
 /// 3.8, 17.4 (weight gradient, `WINOGRAD_NONFUSED` on 32 → 32 at 32 × 32) and 0.48. A sum
 /// of `k` terms added in a loop is within about `(k − 1) · u · Σ|terms|` (576 u for a 3 × 3
 /// kernel over 64 channels).
@@ -78,7 +78,18 @@ fn shape(batch: u32, s: Shape) -> ConvShape {
     }
 }
 
-/// Every shape tested: the CPU geometries at 3 images, the networks' at 8.
+/// The networks' convolutions at the batches `cavitation-bench` trains them with: 128 for
+/// the CIFAR network and 64 for the MNIST network. cuDNN's heuristics pick other algorithms
+/// there than at 8 images.
+fn training_shapes() -> Vec<ConvShape> {
+    NETWORKS[..4]
+        .iter()
+        .map(|&s| shape(128, s))
+        .chain(NETWORKS[4..].iter().map(|&s| shape(64, s)))
+        .collect()
+}
+
+/// Every small shape tested: the CPU geometries at 3 images, the networks' at 8.
 fn all_shapes() -> Vec<ConvShape> {
     CPU_GEOMETRIES
         .iter()
@@ -263,11 +274,11 @@ fn within_measured_tolerance() {
     println!("worst over all shapes: {worst:.2?}");
 }
 
-/// Two runs of each pass give the same bits.
+/// Two runs of each pass give the same bits, at the small batches and the training ones.
 #[test]
 fn runs_are_identical() {
     let Some(cuda) = Cuda::new() else { return };
-    for s in all_shapes() {
+    for s in all_shapes().into_iter().chain(training_shapes()) {
         let conv = Conv2d::new(&cuda, s).expect("set up the convolution");
         let (a, b) = (run(&cuda, &conv), run(&cuda, &conv));
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
@@ -300,13 +311,12 @@ fn refusals() {
     assert!(text.contains("the input buffer holds 4 bytes"), "{text}");
 }
 
-/// The CIFAR network's four convolutions at its training batch of 128, where cuDNN's
-/// heuristics pick other algorithms than at 8 images, are within the same tolerances.
+/// The networks' convolutions at their training batches (128 for the CIFAR network, 64 for
+/// the MNIST network) are within the same tolerances.
 #[test]
-fn within_measured_tolerance_at_cifar_batch() {
+fn within_measured_tolerance_at_training_batches() {
     let Some(cuda) = Cuda::new() else { return };
-    for &s in &NETWORKS[..4] {
-        let s = shape(128, s);
+    for s in training_shapes() {
         let (r, algorithms) = ratios(&cuda, s);
         println!(
             "{s:?}\n  {algorithms}\n  worst |got - exact| / (u * sum|terms|): forward {:.2}, \

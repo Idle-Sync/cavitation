@@ -130,26 +130,36 @@ impl ConvShape {
         ))
     }
 
-    /// The input's length in floats: batch × in channels × height × width.
+    /// The product of four sizes, or `None` if it does not fit a `usize`.
+    fn product(sizes: [u32; 4]) -> Option<usize> {
+        sizes
+            .iter()
+            .try_fold(1usize, |acc, &s| acc.checked_mul(s as usize))
+    }
+
+    /// The input's length in floats: batch × in channels × height × width, saturating at
+    /// `usize::MAX` ([`Conv2d::new`] refuses a shape whose lengths do not fit).
     pub fn x_len(&self) -> usize {
-        self.batch as usize
-            * self.in_channels as usize
-            * self.input.0 as usize
-            * self.input.1 as usize
+        Self::product([self.batch, self.in_channels, self.input.0, self.input.1])
+            .unwrap_or(usize::MAX)
     }
 
-    /// The weight's length in floats: out channels × in channels × kernel height × width.
+    /// The weight's length in floats: out channels × in channels × kernel height × width,
+    /// saturating at `usize::MAX`.
     pub fn w_len(&self) -> usize {
-        self.out_channels as usize
-            * self.in_channels as usize
-            * self.kernel.0 as usize
-            * self.kernel.1 as usize
+        Self::product([
+            self.out_channels,
+            self.in_channels,
+            self.kernel.0,
+            self.kernel.1,
+        ])
+        .unwrap_or(usize::MAX)
     }
 
-    /// The output's length in floats, 0 when no window fits.
+    /// The output's length in floats, 0 when no window fits, saturating at `usize::MAX`.
     pub fn y_len(&self) -> usize {
         self.output().map_or(0, |(h, w)| {
-            self.batch as usize * self.out_channels as usize * h as usize * w as usize
+            Self::product([self.batch, self.out_channels, h, w]).unwrap_or(usize::MAX)
         })
     }
 }
@@ -248,8 +258,10 @@ impl<'c> Descriptor<'c> {
 /// The algorithms are chosen once, when the convolution is made: for each pass the first
 /// one cuDNN's heuristics rank that supports the shape, gives the same bits on every run
 /// (cuDNN's `CUDNN_DETERMINISTIC`), runs without tensor cores (`CUDNN_FMA_MATH`, so no
-/// product is rounded to a narrower type) and needs at most [`MAX_WORKSPACE`] bytes of
-/// scratch memory, which the convolution holds. cuDNN publishes no error bound for its
+/// product is rounded to a narrower type), needs at most [`MAX_WORKSPACE`] bytes of
+/// scratch memory, which the convolution holds, and is not Winograd unless the kernel is
+/// 3 × 3: on a 5 × 5 kernel cuDNN's Winograd weight gradient was measured 2,782 u · Σ|terms|
+/// from the exact result, where every other pass measured is within 55. cuDNN publishes no error bound for its
 /// algorithms, so how far each is from the exact result is measured, not proven: see this
 /// crate's `tests/conv.rs`.
 ///
@@ -324,14 +336,15 @@ fn factor(value: &f32) -> *const c_void {
     std::ptr::from_ref(value).cast()
 }
 
-/// The first algorithm of `ranked` that supports the shape, is deterministic and runs
-/// without tensor cores, among the first `returned`, with its number and its name in
+/// The first algorithm of `ranked` that supports the shape, is deterministic, runs
+/// without tensor cores and is not Winograd unless `winograd`, among the first `returned`, with its number and its name in
 /// `names`; its scratch bytes are found by `workspace`, and one needing more than
 /// [`MAX_WORKSPACE`] is passed over.
 fn pick(
     pass: &str,
     names: &[&'static str],
     ranked: &[AlgoPerf],
+    winograd: bool,
     mut workspace: impl FnMut(c_int) -> Result<usize, CudaError>,
 ) -> Result<(c_int, &'static str, usize), CudaError> {
     let mut seen = Vec::new();
@@ -343,7 +356,10 @@ fn pick(
         if perf.status != 0 {
             continue;
         }
-        if perf.determinism != CUDNN_DETERMINISTIC || perf.math_type != CUDNN_FMA_MATH {
+        if perf.determinism != CUDNN_DETERMINISTIC
+            || perf.math_type != CUDNN_FMA_MATH
+            || (!winograd && name.starts_with("WINOGRAD"))
+        {
             seen.push(name);
             continue;
         }
@@ -355,8 +371,9 @@ fn pick(
         return Ok((perf.algo, name, bytes));
     }
     Err(CudaError::Invalid(format!(
-        "cuDNN has no deterministic {pass} algorithm without tensor cores and within \
-         {MAX_WORKSPACE} bytes of scratch memory for this convolution; it offered {}",
+        "cuDNN has no deterministic {pass} algorithm without tensor cores, within \
+         {MAX_WORKSPACE} bytes of scratch memory and, for a kernel other than 3 × 3, other \
+         than Winograd, for this convolution; it offered {}",
         if seen.is_empty() {
             "none".to_string()
         } else {
@@ -457,6 +474,8 @@ impl<'c> Conv2d<'c> {
             )));
         }
 
+        // Winograd's transforms lose accuracy as the kernel grows; it is used for 3 × 3 only.
+        let winograd = shape.kernel == (3, 3);
         let handle = cuda.cudnn_handle;
         let mut ranked = [AlgoPerf::default(); 16];
         let mut returned: c_int = 0;
@@ -487,7 +506,7 @@ impl<'c> Conv2d<'c> {
             returned,
             &ranked,
         )?;
-        let forward = pick("forward", &FORWARD, &list, |algo| {
+        let forward = pick("forward", &FORWARD, &list, winograd, |algo| {
             let mut bytes = 0usize;
             // SAFETY: as above, with a pointer to a live `usize`.
             let status = unsafe {
@@ -518,7 +537,7 @@ impl<'c> Conv2d<'c> {
             returned,
             &ranked,
         )?;
-        let input_grad = pick("input-gradient", &INPUT_GRAD, &list, |algo| {
+        let input_grad = pick("input-gradient", &INPUT_GRAD, &list, winograd, |algo| {
             let mut bytes = 0usize;
             // SAFETY: as above, with a pointer to a live `usize`.
             let status = unsafe {
@@ -549,7 +568,7 @@ impl<'c> Conv2d<'c> {
             returned,
             &ranked,
         )?;
-        let weight_grad = pick("weight-gradient", &WEIGHT_GRAD, &list, |algo| {
+        let weight_grad = pick("weight-gradient", &WEIGHT_GRAD, &list, winograd, |algo| {
             let mut bytes = 0usize;
             // SAFETY: as above, with a pointer to a live `usize`.
             let status = unsafe {
@@ -594,11 +613,11 @@ impl<'c> Conv2d<'c> {
 
     /// Asserts that `buffer` holds at least `floats` floats.
     fn fits(buffer: &DeviceBuffer<'_>, floats: usize, what: &str) {
+        let needs = floats.saturating_mul(4);
         assert!(
-            buffer.bytes() >= floats * 4,
-            "the {what} buffer holds {} bytes, and the convolution needs {}",
-            buffer.bytes(),
-            floats * 4
+            buffer.bytes() >= needs,
+            "the {what} buffer holds {} bytes, and the convolution needs {needs}",
+            buffer.bytes()
         );
     }
 
@@ -797,6 +816,16 @@ impl<'c> Conv2d<'c> {
 mod tests {
     use super::*;
 
+    /// A length too large for a `usize` saturates instead of wrapping, and is refused by
+    /// `Conv2d::new` through cuDNN's `int` check.
+    #[test]
+    fn lengths_do_not_wrap() {
+        let huge = ConvShape::new(1 << 22, 1, 1, (1 << 21, 1 << 21), (1, 1));
+        assert_eq!(huge.x_len(), usize::MAX);
+        assert_eq!(huge.y_len(), usize::MAX);
+        assert_eq!(huge.w_len(), 1);
+    }
+
     /// The output size follows the CPU's formula, and a window that does not fit gives
     /// none.
     #[test]
@@ -847,12 +876,17 @@ mod tests {
         ];
         let big = |algo| Ok(if algo == 3 { MAX_WORKSPACE + 1 } else { 64 });
         assert_eq!(
-            pick("weight-gradient", &WEIGHT_GRAD, &ranked, big).unwrap(),
+            pick("weight-gradient", &WEIGHT_GRAD, &ranked, true, big).unwrap(),
             (5, "WINOGRAD_NONFUSED", 64)
         );
-        let err = pick("weight-gradient", &WEIGHT_GRAD, &ranked[..4], big)
+        let err = pick("weight-gradient", &WEIGHT_GRAD, &ranked[..4], true, big)
             .unwrap_err()
             .to_string();
         assert!(err.contains("it offered ALGO_0, FFT, ALGO_3"), "{err}");
+        // Without Winograd, the fifth (WINOGRAD_NONFUSED) is passed over too.
+        let err = pick("weight-gradient", &WEIGHT_GRAD, &ranked, false, big)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ALGO_3, WINOGRAD_NONFUSED"), "{err}");
     }
 }
