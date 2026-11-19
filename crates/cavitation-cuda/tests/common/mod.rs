@@ -1,4 +1,4 @@
-//! What the kernel tests share, ported from `cavitation-gpu`'s twin harness: seeded inputs for
+//! What the pooling tests use, ported from `cavitation-gpu`'s twin harness: seeded inputs for
 //! the exact and the rounding twins, the two assertions they end in, and buffers moved to and
 //! from the card.
 //!

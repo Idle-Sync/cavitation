@@ -93,6 +93,13 @@ fn avg_geometries() -> Vec<(Pool2dGeom, usize, bool, Option<usize>)> {
             true,
             Some(7),
         ),
+        // The override wins over `count_include_pad = false` too.
+        (
+            with(2, (8, 8), (3, 3), (1, 1), (1, 1), (1, 1), false).unwrap(),
+            2,
+            false,
+            Some(7),
+        ),
         (
             with(4, (7, 13), (2, 3), (1, 2), (0, 1), (1, 1), false).unwrap(),
             1,

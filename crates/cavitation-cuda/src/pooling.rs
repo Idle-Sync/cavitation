@@ -144,7 +144,7 @@ impl PoolShape {
 
     /// The output size, after checking the shape as the CPU's `Pool2dGeom` checks it and
     /// that every index the kernels form fits a `u32`.
-    fn check(&self, what: &str) -> Result<(u32, u32), CudaError> {
+    pub(crate) fn check(&self, what: &str) -> Result<(u32, u32), CudaError> {
         let refuse = |why: String| Err(CudaError::Invalid(format!("{what}: {why}: {self:?}")));
         if [self.batch, self.channels, self.input.0, self.input.1].contains(&0) {
             return refuse("the batch, channels and image must be at least 1".into());
@@ -438,7 +438,8 @@ impl<'c> MaxPool2d<'c> {
 /// counting the padding (`count_include_pad`), else by the pixels summed; the backward pass
 /// adds each output gradient divided by its divisor to every in-image pixel of its window,
 /// one thread per pixel adding its outputs in the CPU's order. The division is correctly
-/// rounded and nothing is flushed, so subnormals, ±∞ and NaN go where the CPU's do.
+/// rounded and nothing is flushed, so subnormals and ±∞ go where the CPU's do, and NaN
+/// appears wherever the CPU has NaN (with CUDA's own NaN bits).
 ///
 /// # Examples
 ///
@@ -570,5 +571,61 @@ impl<'c> AvgPool2d<'c> {
         // outputs below `outputs` and touches input pixels below `inputs`, which the buffers
         // hold (checked above); dx, borrowed mutably, is not dy.
         unsafe { k.launch(k.backward, k.inputs, &[Arg::Buffer(dy), Arg::Buffer(dx)]) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cavitation_core::Pool2dGeom;
+
+    /// `PoolShape` refuses what the CPU's `Pool2dGeom` refuses and gives its output size, on
+    /// every square shape with an image of 1 to 6, a kernel of 1 to 4, a stride of 1 to 3,
+    /// padding of 0 to 2, dilation of 1 to 3 and either `ceil_mode`.
+    #[test]
+    fn shapes_are_refused_as_the_cpu_refuses_them() {
+        let mut compared = 0;
+        for size in 1..=6u32 {
+            for kernel in 1..=4u32 {
+                for stride in 1..=3u32 {
+                    for padding in 0..=2u32 {
+                        for dilation in 1..=3u32 {
+                            for ceil_mode in [false, true] {
+                                let shape = PoolShape {
+                                    stride: (stride, stride),
+                                    padding: (padding, padding),
+                                    dilation: (dilation, dilation),
+                                    ceil_mode,
+                                    ..PoolShape::new(1, 2, (size, size), (kernel, kernel))
+                                };
+                                let u = |v: u32| (v as usize, v as usize);
+                                let cpu = Pool2dGeom::with_options(
+                                    2,
+                                    u(size),
+                                    u(kernel),
+                                    u(stride),
+                                    u(padding),
+                                    u(dilation),
+                                    ceil_mode,
+                                );
+                                let ours = shape.check("test");
+                                assert_eq!(ours.is_ok(), cpu.is_ok(), "{shape:?}");
+                                if let (Ok(out), Ok(geom)) = (ours, cpu) {
+                                    let (h, w) = geom.out_size();
+                                    assert_eq!(
+                                        (out.0 as usize, out.1 as usize),
+                                        (h, w),
+                                        "{shape:?}"
+                                    );
+                                    assert_eq!(shape.output(), Some(out), "{shape:?}");
+                                }
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(compared, 1296);
     }
 }
