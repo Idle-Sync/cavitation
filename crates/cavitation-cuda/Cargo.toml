@@ -16,3 +16,8 @@ workspace = true
 # (LoadLibraryExW on Windows, dlopen on Linux), so a build links to none of them and starts
 # on a machine that has none.
 [dependencies]
+
+[dev-dependencies]
+# The CPU's f64 convolution reference the cuDNN convolution is measured against
+# (tests/conv.rs).
+cavitation-core = { path = "../cavitation-core" }
