@@ -36,8 +36,8 @@ pub(crate) const ERROR_NO_DEVICE: c_int = 100;
 pub(crate) const CUBLAS_OP_N: c_int = 0;
 /// `CUBLAS_OP_T`: the matrix transposed.
 pub(crate) const CUBLAS_OP_T: c_int = 1;
-/// `CUBLAS_PEDANTIC_MATH`: the prescribed precision in every phase, no tensor cores and no
-/// reduced-precision shortcuts, whatever `NVIDIA_TF32_OVERRIDE` says.
+/// `CUBLAS_PEDANTIC_MATH`: the prescribed f32 arithmetic in every phase of a routine, and no
+/// tensor cores.
 pub(crate) const CUBLAS_PEDANTIC_MATH: c_int = 2;
 
 /// `CUDNN_TENSOR_NCHW`.

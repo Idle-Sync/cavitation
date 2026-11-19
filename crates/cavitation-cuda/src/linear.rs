@@ -54,7 +54,8 @@ impl LinearShape {
 /// cuBLAS publishes no error bound for how it orders a product's sums, so how far each pass
 /// is from the exact result is measured, not proven: see this crate's `tests/linear.rs`.
 ///
-/// Every pass is queued on the card and returns without waiting for it.
+/// Every pass is queued on the card and returns without waiting for it. A layer is set up
+/// for one batch size: a run whose last batch is shorter needs a second one for it.
 ///
 /// # Examples
 ///

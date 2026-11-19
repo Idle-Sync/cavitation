@@ -406,7 +406,7 @@ impl Cuda {
             self.cublas_handle = std::ptr::null_mut();
             return Err(self.cublas_error("cublasCreate_v2", status));
         }
-        // Every product in f32 as written, on any card and whatever the environment asks.
+        // The prescribed f32 arithmetic in every phase, and no tensor cores, on any card.
         // SAFETY: the handle was just created, and the mode is cuBLAS's constant.
         let status =
             unsafe { (self.cublas.cublasSetMathMode)(self.cublas_handle, CUBLAS_PEDANTIC_MATH) };
