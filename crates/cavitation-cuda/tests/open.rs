@@ -56,6 +56,25 @@ fn opens_twice() {
     let mut back = [0u32];
     a.read(&mut back).expect("read");
     assert_eq!(back, [5]);
+    // Dropping the other left the thread with no current context; compiling and launching
+    // make the card's current again.
+    let module = first
+        .compile("open test", SOURCE)
+        .expect("compile after the other is dropped");
+    let sum_args = module.kernel("sum_args").expect("find the kernel");
+    let out = first.buffer(4).expect("allocate");
+    // SAFETY: the arguments are the kernel's, as in `integer_arguments_arrive`.
+    unsafe {
+        sum_args.launch(
+            [1, 1, 1],
+            [1, 1, 1],
+            &[Arg::Buffer(&out), Arg::I32(1), Arg::U32(2), Arg::I32(3)],
+        )
+    }
+    .expect("launch");
+    let mut sum = [0i32];
+    out.read(&mut sum).expect("read");
+    assert_eq!(sum, [6]);
 }
 
 /// A buffer starts as zeros and gives back the bits written to it, for each scalar type
@@ -217,4 +236,78 @@ fn failures_are_reported() {
     // The context still works after the refusals.
     cuda.synchronize().expect("synchronize");
     assert!(MAX_KERNEL_ARGS >= args.len());
+}
+
+/// A buffer and a module dropped while a kernel that uses them may still run wait for it,
+/// and the context keeps working.
+#[test]
+fn dropping_waits_for_running_work() {
+    let Some(cuda) = Cuda::new() else { return };
+    let n = 1 << 22;
+    let mut x = cuda.buffer(n * 4).expect("allocate");
+    let y = cuda.buffer(n * 4).expect("allocate");
+    x.write(&vec![1.0f32; n]).expect("write");
+    {
+        let module = cuda.compile("open test", SOURCE).expect("compile");
+        let scale_add = module.kernel("scale_add").expect("find the kernel");
+        for _ in 0..8 {
+            // SAFETY: as in `a_kernel_matches_the_host_without_fusing`, over `n` floats.
+            unsafe {
+                scale_add.launch(
+                    [(n / 256) as u32, 1, 1],
+                    [256, 1, 1],
+                    &[
+                        Arg::Buffer(&x),
+                        Arg::Buffer(&y),
+                        Arg::F32(2.0),
+                        Arg::U32(n as u32),
+                    ],
+                )
+            }
+            .expect("launch");
+        }
+        // The module is dropped here, with its kernels possibly still running.
+    }
+    drop(y);
+    let mut last = [0.0f32];
+    x.read(&mut last).expect("read after the drops");
+    assert_eq!(last, [256.0]);
+    cuda.synchronize().expect("synchronize");
+}
+
+/// A write or read larger than the buffer, and a launch with more arguments than
+/// `MAX_KERNEL_ARGS`, panic before anything reaches the driver.
+#[test]
+fn oversized_calls_panic() {
+    let Some(cuda) = Cuda::new() else { return };
+    let panics = |f: &dyn Fn()| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+            .expect_err("the call should panic")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default()
+    };
+    let buffer = std::cell::RefCell::new(cuda.buffer(8).expect("allocate"));
+    let text = panics(&|| {
+        let _ = buffer.borrow_mut().write(&[0u32; 3]);
+    });
+    assert!(text.contains("12 bytes do not fit a buffer of 8"), "{text}");
+    let text = panics(&|| {
+        let _ = buffer.borrow().read(&mut [0.0f32; 3]);
+    });
+    assert!(
+        text.contains("12 bytes are more than a buffer of 8"),
+        "{text}"
+    );
+
+    let module = cuda.compile("open test", SOURCE).expect("compile");
+    let sum_args = module.kernel("sum_args").expect("find the kernel");
+    let args = [Arg::U32(0); MAX_KERNEL_ARGS + 1];
+    let text = panics(&|| {
+        // SAFETY: the call panics on the count before the driver reads any argument.
+        let _ = unsafe { sum_args.launch([1, 1, 1], [1, 1, 1], &args) };
+    });
+    assert!(text.contains("at most 16 arguments, not 17"), "{text}");
+    // The context still works after the panics.
+    cuda.synchronize().expect("synchronize");
 }

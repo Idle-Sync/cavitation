@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::CudaError;
 use crate::find::{
-    CUDA_MAJORS, CUDNN_MAJOR, Platform, cublas_name, cudnn_name, cudnn_parts, driver_name,
-    is_nvrtc_builtins, locate, nvrtc_name, search_dirs, siblings,
+    CUDA_MAJORS, CUDNN_MAJOR, Platform, cublas_name, cublaslt_name, cudnn_name, cudnn_parts,
+    driver_name, is_nvrtc_builtins, locate, nvrtc_name, search_dirs, siblings,
 };
 use crate::library::Library;
 use crate::sys::{
@@ -55,6 +55,9 @@ pub struct CudaInfo {
     pub cublas: (u32, u32, u32),
     /// NVRTC's version, major and minor.
     pub nvrtc: (u32, u32),
+    /// The compute capability kernels are compiled for: the card's, or the newest older
+    /// one NVRTC compiles for, which the card also runs.
+    pub compiles_for: (u32, u32),
     /// The files cuDNN, cuBLAS and NVRTC were loaded from, in that order; a bare file name
     /// for one the operating system's linker found in its own folders.
     pub libraries: Vec<PathBuf>,
@@ -75,7 +78,7 @@ impl fmt::Display for CudaInfo {
         writeln!(
             f,
             "driver supports CUDA {}.{}; cuDNN {}.{}.{} (built for CUDA {}.{}), cuBLAS \
-             {}.{}.{}, NVRTC {}.{}",
+             {}.{}.{}, NVRTC {}.{} (compiling for {}.{})",
             self.driver_cuda.0,
             self.driver_cuda.1,
             self.cudnn.0,
@@ -87,7 +90,9 @@ impl fmt::Display for CudaInfo {
             self.cublas.1,
             self.cublas.2,
             self.nvrtc.0,
-            self.nvrtc.1
+            self.nvrtc.1,
+            self.compiles_for.0,
+            self.compiles_for.1
         )?;
         let files: Vec<String> = self
             .libraries
@@ -106,9 +111,17 @@ impl fmt::Display for CudaInfo {
 /// The card is the driver's first; the context is the card's primary context, which other
 /// CUDA code in the process shares.
 ///
-/// A `Cuda` belongs to the thread that opened it: CUDA binds a context to a thread, so the
-/// type is neither `Send` nor `Sync`. Buffers and modules borrow it and are dropped before
-/// it.
+/// A `Cuda` belongs to the thread that opened it, so the type is neither `Send` nor `Sync`.
+/// Buffers and modules borrow it and are dropped before it. Each call makes the card's
+/// context current on the thread first, so other CUDA code on the same thread may change
+/// the current context between calls; when the `Cuda` is dropped, the thread is left with
+/// no current context. Two `Cuda`s on one thread share the card's primary context, so a
+/// buffer of one may be passed to a kernel of the other.
+///
+/// ```compile_fail
+/// fn send<T: Send>(_: T) {}
+/// send(cavitation_cuda::Cuda::open().unwrap());
+/// ```
 ///
 /// # Examples
 ///
@@ -234,9 +247,18 @@ impl Cuda {
             Some(found) => vec![found.cuda.0],
             None => CUDA_MAJORS.to_vec(),
         };
-        let cublas = load_versioned(platform, &dirs, &majors, "cuBLAS", cublas_name, |_, _| {
-            Vec::new()
-        });
+        // cuBLAS imports cuBLASLt, which is loaded first from beside it when it is there.
+        let cublas = load_versioned(
+            platform,
+            &dirs,
+            &majors,
+            "cuBLAS",
+            cublas_name,
+            |major, path| {
+                let lt = path.with_file_name(cublaslt_name(platform, major));
+                if lt.is_file() { vec![lt] } else { Vec::new() }
+            },
+        );
         let nvrtc = load_versioned(
             platform,
             &dirs,
@@ -284,6 +306,35 @@ impl Cuda {
         if code != 0 {
             return Err(nvrtc_error(&nvrtc_table, "nvrtcVersion", code));
         }
+        let nvrtc_version = (
+            u32::try_from(major).unwrap_or(0),
+            u32::try_from(minor).unwrap_or(0),
+        );
+        let driver_cuda = (version / 1000, version % 1000 / 10);
+        // The driver compiles the PTX NVRTC writes, and a driver older than NVRTC does not
+        // read its PTX.
+        if driver_cuda < nvrtc_version {
+            return Err(CudaError::Version(format!(
+                "the NVIDIA driver supports CUDA {}.{}, older than NVRTC {}.{}: update the \
+                 driver",
+                driver_cuda.0, driver_cuda.1, nvrtc_version.0, nvrtc_version.1
+            )));
+        }
+        let card = compute_capability.0 * 10 + compute_capability.1;
+        let archs = supported_archs(&nvrtc_table)?;
+        let Some(arch) = pick_arch(card, &archs) else {
+            return Err(CudaError::Version(format!(
+                "the card's compute capability {}.{} is older than any NVRTC {}.{} compiles \
+                 for (from {})",
+                compute_capability.0,
+                compute_capability.1,
+                nvrtc_version.0,
+                nvrtc_version.1,
+                archs
+                    .first()
+                    .map_or("none".to_string(), |a| format!("{}.{}", a / 10, a % 10))
+            )));
+        };
 
         let mut cuda = Cuda {
             driver,
@@ -298,14 +349,12 @@ impl Cuda {
                 name,
                 memory: memory as u64,
                 compute_capability,
-                driver_cuda: (version / 1000, version % 1000 / 10),
+                driver_cuda,
                 cudnn: cudnn.version,
                 cudnn_cuda: cudnn.cuda,
                 cublas: (0, 0, 0),
-                nvrtc: (
-                    u32::try_from(major).unwrap_or(0),
-                    u32::try_from(minor).unwrap_or(0),
-                ),
+                nvrtc: nvrtc_version,
+                compiles_for: (arch / 10, arch % 10),
                 libraries: vec![cudnn.path, cublas.1, nvrtc.1],
             },
         };
@@ -385,6 +434,7 @@ impl Cuda {
     /// }
     /// ```
     pub fn free_memory(&self) -> Result<u64, CudaError> {
+        self.bind()?;
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: both pointers are to live `usize`s, each written once, and this
         // thread's current context is the one opened.
@@ -411,10 +461,26 @@ impl Cuda {
     /// }
     /// ```
     pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.bind()?;
         // SAFETY: the function takes no arguments and works on this thread's current
         // context, the one opened.
         let code = unsafe { (self.driver.cuCtxSynchronize)() };
         self.check("cuCtxSynchronize", code)
+    }
+
+    /// Makes the card's context current on the calling thread, which is the thread that
+    /// opened it (the type is not `Send`), so that the driver call after it works on this
+    /// card whatever other code made current in between.
+    pub(crate) fn bind(&self) -> Result<(), CudaError> {
+        // SAFETY: the context is retained until `self` drops.
+        let code = unsafe { (self.driver.cuCtxSetCurrent)(self.context) };
+        self.check("cuCtxSetCurrent", code)
+    }
+
+    /// The compute architecture kernels are compiled for, as `10 * major + minor`: the
+    /// card's, or the newest older one NVRTC knows.
+    pub(crate) fn arch(&self) -> u32 {
+        self.info.compiles_for.0 * 10 + self.info.compiles_for.1
     }
 
     /// `Ok` for a driver status of 0, and the driver's name for any other.
@@ -451,16 +517,18 @@ impl Cuda {
 }
 
 impl Drop for Cuda {
-    /// Waits for the card's work, destroys the handles and gives the context back. Errors
-    /// are not reported: there is no one to report them to.
+    /// Waits for the card's work, destroys the handles, gives the context back and leaves
+    /// the thread with no current context. Errors are not reported: there is no one to
+    /// report them to.
     fn drop(&mut self) {
         if self.context.is_null() {
             return;
         }
-        // SAFETY: the context is retained and current on this thread (the type is not
-        // `Send`), each handle is destroyed once and only if it was created, and the
-        // context's reference is the one `start` took.
+        // SAFETY: the context is retained and is made current on this thread first, each
+        // handle is destroyed once and only if it was created, the context's reference is
+        // the one `start` took, and a null context is a valid argument to `cuCtxSetCurrent`.
         unsafe {
+            (self.driver.cuCtxSetCurrent)(self.context);
             (self.driver.cuCtxSynchronize)();
             if !self.cudnn_handle.is_null() {
                 (self.cudnn.cudnnDestroy)(self.cudnn_handle);
@@ -469,6 +537,7 @@ impl Drop for Cuda {
                 (self.cublas.cublasDestroy_v2)(self.cublas_handle);
             }
             (self.driver.cuDevicePrimaryCtxRelease_v2)(self.device);
+            (self.driver.cuCtxSetCurrent)(std::ptr::null_mut());
         }
     }
 }
@@ -543,21 +612,41 @@ fn nvrtc_error(nvrtc: &Nvrtc, function: &'static str, code: c_int) -> CudaError 
     }
 }
 
+/// Why [`load`] did not load a library.
+#[derive(Debug, PartialEq, Eq)]
+enum LoadFailure {
+    /// No folder holds the file.
+    NotFound(String),
+    /// The file, or one loaded before it, was found and would not load: one sentence.
+    Failed(String),
+}
+
+impl LoadFailure {
+    /// The failure as one sentence.
+    fn text(self) -> String {
+        match self {
+            LoadFailure::NotFound(name) => format!("{name} was not found"),
+            LoadFailure::Failed(why) => why,
+        }
+    }
+}
+
 /// Loads the library called `name`: from the first of `dirs` that holds it, after the
 /// files `before` lists for that path, or, on Linux, from the linker's own folders.
 ///
 /// # Errors
 ///
-/// One sentence saying the file was not found, or that it or a file loaded before it
+/// [`LoadFailure::NotFound`], or [`LoadFailure::Failed`] when it or a file loaded before it
 /// would not load.
 fn load(
     platform: Platform,
     dirs: &[PathBuf],
     name: &str,
     before: impl Fn(&Path) -> Vec<PathBuf>,
-) -> Result<(Library, PathBuf), String> {
-    let failed =
-        |path: &Path, why: String| format!("{} could not be loaded: {why}", path.display());
+) -> Result<(Library, PathBuf), LoadFailure> {
+    let failed = |path: &Path, why: String| {
+        LoadFailure::Failed(format!("{} could not be loaded: {why}", path.display()))
+    };
     if let Some(path) = locate(dirs, name) {
         for other in before(&path) {
             Library::open(&other).map_err(|why| failed(&other, why))?;
@@ -572,7 +661,38 @@ fn load(
     {
         return Ok((library, PathBuf::from(name)));
     }
-    Err(format!("{name} was not found"))
+    Err(LoadFailure::NotFound(name.to_string()))
+}
+
+/// The compute architectures NVRTC compiles for, as `10 * major + minor`, oldest first.
+fn supported_archs(nvrtc: &Nvrtc) -> Result<Vec<u32>, CudaError> {
+    let mut count: c_int = 0;
+    // SAFETY: the pointer is to a live `c_int`, which the function writes once.
+    let code = unsafe { (nvrtc.nvrtcGetNumSupportedArchs)(&mut count) };
+    if code != 0 {
+        return Err(nvrtc_error(nvrtc, "nvrtcGetNumSupportedArchs", code));
+    }
+    let mut archs: Vec<c_int> = vec![0; usize::try_from(count).unwrap_or(0)];
+    if !archs.is_empty() {
+        // SAFETY: the buffer holds as many `c_int`s as the function just counted.
+        let code = unsafe { (nvrtc.nvrtcGetSupportedArchs)(archs.as_mut_ptr()) };
+        if code != 0 {
+            return Err(nvrtc_error(nvrtc, "nvrtcGetSupportedArchs", code));
+        }
+    }
+    let mut archs: Vec<u32> = archs
+        .into_iter()
+        .filter_map(|a| u32::try_from(a).ok())
+        .collect();
+    archs.sort_unstable();
+    Ok(archs)
+}
+
+/// The architecture to compile for on a card of compute capability `card` (as
+/// `10 * major + minor`): the newest of `archs` that is not newer than the card, whose PTX
+/// the card runs. `None` when every one is newer than the card.
+fn pick_arch(card: u32, archs: &[u32]) -> Option<u32> {
+    archs.iter().copied().filter(|&a| a <= card).max()
 }
 
 /// Loads the driver library and its functions, and initialises the driver API.
@@ -587,7 +707,7 @@ fn open_driver(platform: Platform, dirs: &[PathBuf]) -> Result<Driver, CudaError
         Library::open_system(name).map_err(no_driver)?
     } else {
         load(platform, dirs, name, |_| Vec::new())
-            .map_err(no_driver)?
+            .map_err(|failure| no_driver(failure.text()))?
             .0
     };
     let driver = Driver::load(&library).map_err(|symbol| CudaError::Symbol {
@@ -646,8 +766,10 @@ fn load_cudnn(platform: Platform, dirs: &[PathBuf]) -> Result<LoadedCudnn, LoadE
     let name = cudnn_name(platform);
     // cuDNN loads its parts by bare name when first called. Loading them here by path,
     // before it, is what lets it find them in a folder the loader is not pointed at.
-    let (library, path) = load(platform, dirs, &name, |path| cudnn_parts(platform, path))
-        .map_err(|why| LoadError::Missing(format!("cuDNN {CUDNN_MAJOR}: {why}")))?;
+    let (library, path) =
+        load(platform, dirs, &name, |path| cudnn_parts(platform, path)).map_err(|failure| {
+            LoadError::Missing(format!("cuDNN {CUDNN_MAJOR}: {}", failure.text()))
+        })?;
     let table = Cudnn::load(&library).map_err(|symbol| {
         LoadError::Fatal(CudaError::Symbol {
             library: path.display().to_string(),
@@ -701,8 +823,8 @@ fn load_versioned(
         let file = name(platform, major);
         match load(platform, dirs, &file, |path| before(major, path)) {
             Ok(found) => return Ok(found),
-            Err(why) if why.ends_with("was not found") => tried.push(file),
-            Err(why) => return Err(format!("{what}: {why}")),
+            Err(LoadFailure::NotFound(_)) => tried.push(file),
+            Err(LoadFailure::Failed(why)) => return Err(format!("{what}: {why}")),
         }
     }
     Err(format!("{what}: {} was not found", tried.join(" or ")))
@@ -742,6 +864,32 @@ mod tests {
         );
     }
 
+    /// The architecture is the card's when NVRTC has it, else the newest older one, else
+    /// none.
+    #[test]
+    fn the_architecture_is_the_cards_or_older() {
+        let archs = [75, 80, 86, 89, 90, 100, 120];
+        assert_eq!(pick_arch(75, &archs), Some(75));
+        assert_eq!(pick_arch(87, &archs), Some(86));
+        assert_eq!(pick_arch(121, &archs), Some(120));
+        assert_eq!(pick_arch(130, &[75, 120]), Some(120));
+        assert_eq!(pick_arch(61, &archs), None);
+        assert_eq!(pick_arch(75, &[]), None);
+    }
+
+    /// A load that finds nothing says so by its kind, not by its message.
+    #[test]
+    fn not_found_is_its_own_failure() {
+        let failure = load(Platform::Windows, &[], "cublas64_13.dll", |_| Vec::new())
+            .map(|_| ())
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            LoadFailure::NotFound("cublas64_13.dll".to_string())
+        );
+        assert_eq!(failure.text(), "cublas64_13.dll was not found");
+    }
+
     /// The info's text names the card, each version and each file.
     #[test]
     fn info_prints_versions_and_files() {
@@ -754,13 +902,14 @@ mod tests {
             cudnn_cuda: (13, 3),
             cublas: (13, 0, 0),
             nvrtc: (13, 0),
+            compiles_for: (7, 5),
             libraries: vec![PathBuf::from("cudnn64_9.dll")],
         };
         assert_eq!(
             info.to_string(),
             "NVIDIA GeForce GTX 1660 SUPER, 6.0 GiB, compute capability 7.5\n\
              driver supports CUDA 13.1; cuDNN 9.24.0 (built for CUDA 13.3), cuBLAS 13.0.0, \
-             NVRTC 13.0\n\
+             NVRTC 13.0 (compiling for 7.5)\n\
              loaded: cudnn64_9.dll"
         );
     }

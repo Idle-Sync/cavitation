@@ -14,9 +14,9 @@ const _: () = assert!(cfg!(target_endian = "little"));
 /// The most arguments [`Kernel::launch`] passes.
 pub const MAX_KERNEL_ARGS: usize = 16;
 
-/// The options every source is compiled with: no fused multiply-add, so `a * b + c` is two
+/// The option every source is compiled with: no fused multiply-add, so `a * b + c` is two
 /// roundings, as on the CPU.
-const OPTIONS: [&CStr; 1] = [c"--fmad=false"];
+const NO_FMAD: &CStr = c"--fmad=false";
 
 /// Kernels compiled from one CUDA C++ source text, unloaded when dropped.
 ///
@@ -60,7 +60,8 @@ pub struct Kernel<'m> {
 /// One argument of a kernel launch.
 #[derive(Clone, Copy, Debug)]
 pub enum Arg<'a> {
-    /// A pointer parameter: the buffer's address on the card.
+    /// A pointer parameter: the buffer's address on the card. The buffer may come from any
+    /// [`Cuda`] on this thread, since they share the card's primary context.
     Buffer(&'a DeviceBuffer<'a>),
     /// An `unsigned int` parameter.
     U32(u32),
@@ -116,7 +117,8 @@ impl Cuda {
     /// A kernel is a function declared `extern "C" __global__ void`, so that
     /// [`Module::kernel`] finds it under the name it is written with. The source is
     /// compiled with `--fmad=false`: a multiply followed by an add is never fused into one
-    /// rounding, so a kernel's arithmetic is what the same expressions give on the CPU.
+    /// rounding, so a kernel's arithmetic is what the same expressions give on the CPU. It
+    /// is compiled for the compute capability in [`CudaInfo::compiles_for`](crate::CudaInfo).
     ///
     /// # Errors
     ///
@@ -163,7 +165,9 @@ impl Cuda {
         }
         let program = Program { nvrtc, raw };
 
-        let options = OPTIONS.map(CStr::as_ptr);
+        let arch = CString::new(format!("--gpu-architecture=compute_{}", self.arch()))
+            .expect("an architecture option holds no NUL character");
+        let options = [NO_FMAD.as_ptr(), arch.as_ptr()];
         // SAFETY: the program is live, and `options` holds as many NUL-terminated strings
         // as the count passed.
         let code = unsafe {
@@ -186,6 +190,7 @@ impl Cuda {
             .text(nvrtc.nvrtcGetPTXSize, nvrtc.nvrtcGetPTX)
             .ok_or_else(|| failed("the compiler returned no PTX".into()))?;
 
+        self.bind()?;
         let mut module: CuModule = std::ptr::null_mut();
         // SAFETY: the pointer is to a live handle, and `ptx` is a NUL-terminated PTX text.
         let code =
@@ -208,6 +213,7 @@ impl<'c> Module<'c> {
     /// If `name` holds a NUL character.
     pub fn kernel(&self, name: &str) -> Result<Kernel<'_>, CudaError> {
         let c_name = CString::new(name).expect("a kernel name holds no NUL character");
+        self.cuda.bind()?;
         let mut function: CuFunction = std::ptr::null_mut();
         // SAFETY: the pointer is to a live handle, the module is loaded, and the name is
         // NUL-terminated and lives across the call.
@@ -227,8 +233,11 @@ impl Drop for Module<'_> {
     /// Waits for the card's work, which may still run the module's kernels, and unloads
     /// it. Errors are not reported: there is no one to report them to.
     fn drop(&mut self) {
-        // SAFETY: the module came from `cuModuleLoadData` in the context that is current
-        // on this thread, and is unloaded once.
+        // Made current first; if that fails, the calls below fail too, and nothing else
+        // can be done.
+        let _ = self.cuda.bind();
+        // SAFETY: the module came from `cuModuleLoadData` in the card's context, now
+        // current on this thread, and is unloaded once.
         unsafe {
             (self.cuda.driver.cuCtxSynchronize)();
             (self.cuda.driver.cuModuleUnload)(self.module);
@@ -310,6 +319,7 @@ impl Kernel<'_> {
                 Arg::F32(value) => u64::from(value.to_bits()),
             };
         }
+        self.cuda.bind()?;
         let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_KERNEL_ARGS];
         for (pointer, value) in pointers.iter_mut().zip(values.iter_mut()) {
             *pointer = std::ptr::from_mut(value).cast::<c_void>();

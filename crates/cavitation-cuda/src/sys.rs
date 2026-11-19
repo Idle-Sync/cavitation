@@ -21,6 +21,10 @@ pub(crate) type CuStream = *mut c_void;
 /// An address in device memory (`CUdeviceptr`).
 pub(crate) type DevicePtr = u64;
 
+// `CUdeviceptr` is as wide as a pointer, and NVIDIA ships CUDA for 64-bit targets only.
+#[cfg(not(target_pointer_width = "64"))]
+compile_error!("cavitation-cuda builds for 64-bit targets only: NVIDIA ships CUDA for no other");
+
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR`.
 pub(crate) const COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 /// `CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR`.
@@ -194,5 +198,10 @@ api! {
         fn nvrtcDestroyProgram(program: *mut *mut c_void) -> c_int;
         /// The text of a status code, as a static NUL-terminated string.
         fn nvrtcGetErrorString(code: c_int) -> *const c_char;
+        /// How many compute architectures the compiler compiles for.
+        fn nvrtcGetNumSupportedArchs(count: *mut c_int) -> c_int;
+        /// The compute architectures the compiler compiles for, as `10 * major + minor`,
+        /// into an array of the length the count gave.
+        fn nvrtcGetSupportedArchs(archs: *mut c_int) -> c_int;
     }
 }

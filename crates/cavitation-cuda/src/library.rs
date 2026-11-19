@@ -17,7 +17,8 @@ pub(crate) struct Library {
 
 impl Library {
     /// Loads the library in the file at `path`, which must be absolute. On Windows the
-    /// libraries it imports are looked for in its own folder first.
+    /// libraries it imports are looked for in its own folder and the system folder only,
+    /// never in the current folder or the folders of `PATH`.
     ///
     /// # Errors
     ///
@@ -67,9 +68,9 @@ mod os {
     use std::path::Path;
     use std::ptr::NonNull;
 
-    /// `LOAD_WITH_ALTERED_SEARCH_PATH`: look for the libraries the loaded one imports in
-    /// its own folder first. Valid only with an absolute path.
-    const ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+    /// `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR`: look for the libraries the loaded one imports
+    /// in its own folder. Valid only with an absolute path.
+    const SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
     /// `LOAD_LIBRARY_SEARCH_SYSTEM32`: look in the system folder only.
     const SEARCH_SYSTEM32: u32 = 0x0000_0800;
 
@@ -83,7 +84,17 @@ mod os {
 
     /// Loads `name` (a path or a file name) with `flags`.
     fn load(name: &std::ffi::OsStr, flags: u32) -> Result<NonNull<c_void>, String> {
-        let mut wide: Vec<u16> = name.encode_wide().collect();
+        // The loader takes only backslashes as separators in a path it searches beside.
+        let mut wide: Vec<u16> = name
+            .encode_wide()
+            .map(|c| {
+                if c == u16::from(b'/') {
+                    u16::from(b'\\')
+                } else {
+                    c
+                }
+            })
+            .collect();
         if wide.contains(&0) {
             return Err(format!("{name:?} holds a NUL character"));
         }
@@ -94,9 +105,10 @@ mod os {
         NonNull::new(handle).ok_or_else(|| std::io::Error::last_os_error().to_string())
     }
 
-    /// Loads the library at the absolute `path`.
+    /// Loads the library at the absolute `path`; what it imports comes from its own folder
+    /// or the system folder, and from nowhere else.
     pub(super) fn open_path(path: &Path) -> Result<NonNull<c_void>, String> {
-        load(path.as_os_str(), ALTERED_SEARCH_PATH)
+        load(path.as_os_str(), SEARCH_DLL_LOAD_DIR | SEARCH_SYSTEM32)
     }
 
     /// Loads `name` from the system folder.
@@ -137,8 +149,25 @@ mod os {
         fn dlerror() -> *mut c_char;
     }
 
+    /// A folder of `LD_LIBRARY_PATH` that is empty or relative, which the linker reads
+    /// against the current folder, if there is one.
+    fn relative_loader_folder() -> Option<String> {
+        let value = std::env::var_os("LD_LIBRARY_PATH")?;
+        std::env::split_paths(&value)
+            .find(|dir| !dir.is_absolute())
+            .map(|dir| format!("{:?}", dir.display().to_string()))
+    }
+
     /// Loads `name`: a path, or a file name the linker looks up in its configured folders.
+    /// The linker also looks up the libraries it imports in the folders of
+    /// `LD_LIBRARY_PATH`, so nothing is loaded while one of them is empty or relative.
     fn load(name: &[u8]) -> Result<NonNull<c_void>, String> {
+        if let Some(dir) = relative_loader_folder() {
+            return Err(format!(
+                "LD_LIBRARY_PATH holds the folder {dir}, which the linker would read from the \
+                 current folder: remove it or make it absolute"
+            ));
+        }
         let name = CString::new(name).map_err(|_| "the name holds a NUL character")?;
         // SAFETY: `name` is a NUL-terminated string that lives across the call, and the
         // flags are ones `dlopen` documents.
@@ -164,8 +193,8 @@ mod os {
         load(path.as_os_str().as_bytes())
     }
 
-    /// Loads `name` from the linker's configured folders. A name without a slash is never
-    /// looked up in the folder the program was started in.
+    /// Loads `name` from the linker's configured folders: those of `LD_LIBRARY_PATH`, all
+    /// absolute (see `load`), and the system's.
     pub(super) fn open_system(name: &str) -> Result<NonNull<c_void>, String> {
         if name.contains('/') {
             return Err(format!("{name:?} is a path, not a file name"));

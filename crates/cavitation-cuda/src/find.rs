@@ -97,6 +97,15 @@ pub(crate) fn cublas_name(platform: Platform, cuda_major: u32) -> String {
     }
 }
 
+/// cuBLASLt's file name for a CUDA major version: the library cuBLAS imports.
+pub(crate) fn cublaslt_name(platform: Platform, cuda_major: u32) -> String {
+    if platform.windows() {
+        format!("cublasLt64_{cuda_major}.dll")
+    } else {
+        format!("libcublasLt.so.{cuda_major}")
+    }
+}
+
 /// NVRTC's file name for a CUDA major version.
 pub(crate) fn nvrtc_name(platform: Platform, cuda_major: u32) -> String {
     if platform.windows() {
@@ -266,6 +275,8 @@ mod tests {
         assert_eq!(nvrtc_name(w, 13), "nvrtc64_130_0.dll");
         assert_eq!(nvrtc_name(w, 12), "nvrtc64_120_0.dll");
         assert_eq!(nvrtc_name(l, 13), "libnvrtc.so.13");
+        assert_eq!(cublaslt_name(w, 13), "cublasLt64_13.dll");
+        assert_eq!(cublaslt_name(l, 12), "libcublasLt.so.12");
     }
 
     /// cuDNN's parts and NVRTC's built-ins are told from their neighbours by name.

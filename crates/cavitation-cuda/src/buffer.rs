@@ -71,9 +71,10 @@ impl Cuda {
     pub fn buffer(&self, bytes: usize) -> Result<DeviceBuffer<'_>, CudaError> {
         // The driver refuses an allocation of no bytes, so an empty buffer takes four.
         let allocated = bytes.max(4);
+        self.bind()?;
         let mut pointer: DevicePtr = 0;
-        // SAFETY: the pointer is to a live address, written once, and this thread's
-        // current context is the one opened.
+        // SAFETY: the pointer is to a live address, written once, and the card's context
+        // is current on this thread.
         let code = unsafe { (self.driver.cuMemAlloc_v2)(&mut pointer, allocated) };
         self.check("cuMemAlloc_v2", code)?;
         let buffer = DeviceBuffer {
@@ -124,6 +125,7 @@ impl DeviceBuffer<'_> {
         if bytes == 0 {
             return Ok(());
         }
+        self.cuda.bind()?;
         // SAFETY: `data` is `bytes` readable bytes, and the buffer holds at least as many.
         let code = unsafe {
             (self.cuda.driver.cuMemcpyHtoD_v2)(self.pointer, data.as_ptr().cast::<c_void>(), bytes)
@@ -165,6 +167,7 @@ impl DeviceBuffer<'_> {
         if bytes == 0 {
             return Ok(());
         }
+        self.cuda.bind()?;
         // SAFETY: `out` is `bytes` writable bytes, the buffer holds at least as many, and
         // every bit pattern is a value of a `Scalar`.
         let code = unsafe {
@@ -182,8 +185,11 @@ impl Drop for DeviceBuffer<'_> {
     /// Waits for the card's work, which may still use the buffer, and frees it. Errors are
     /// not reported: there is no one to report them to.
     fn drop(&mut self) {
-        // SAFETY: the address came from `cuMemAlloc_v2` in the context that is current on
-        // this thread, and is freed once.
+        // Made current first; if that fails, the calls below fail too, and nothing else
+        // can be done.
+        let _ = self.cuda.bind();
+        // SAFETY: the address came from `cuMemAlloc_v2` in the card's context, now current
+        // on this thread, and is freed once.
         unsafe {
             (self.cuda.driver.cuCtxSynchronize)();
             (self.cuda.driver.cuMemFree_v2)(self.pointer);
