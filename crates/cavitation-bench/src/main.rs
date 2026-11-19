@@ -26,7 +26,7 @@
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--ours-only] [--profile N] [--no-fuse] [--device cpu|gpu] [--backend B]
+//!   [--ours-only] [--profile N] [--no-fuse] [--device auto|cpu|gpu] [--backend B]
 //!   [--torch-device D] [--deterministic]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
 //!   epochs) here and then
@@ -119,7 +119,7 @@ use cavitation_core::kernels::{detected, level, threads};
 use runs::{Comparison, TrainSpec, Unit};
 
 /// How to call the runner, printed on a usage error.
-const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|gemm-gpu|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info> [options]\n\
+const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gemm|gemm-gpu|conv|mnist-cnn|cifar-cnn|subnormal|small|activation|shrink|inspect|info|devices> [options]\n\
     \x20 mnist   [--batch 32|128] [--adam] [--python PATH] [--numpy-best]\n\
     \x20 cifar   [--batch 32|128] [--steps N] [--python PATH] [--numpy-best]\n\
     \x20 digits  [--python PATH] [--numpy-best]\n\
@@ -130,14 +130,15 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 conv    [--batch N] [--parts]\n\
     \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
     \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
-    \x20     (both CNNs) [--device cpu|gpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
-    \x20     [--deterministic]; --device gpu needs the gpu feature\n\
+    \x20     (both CNNs) [--device auto|cpu|gpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
+    \x20     [--deterministic]; --device gpu needs the gpu feature, and auto is what `devices` marks\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
     \x20 shrink\n\
     \x20 inspect [--rounds N]\n\
-    \x20 info";
+    \x20 info\n\
+    \x20 devices";
 
 /// Set once a command has read its arguments and begun to run: an error after that is a
 /// failure of the run (numpy's output not matching, say), not of the command line, so the
@@ -173,6 +174,8 @@ fn main() -> ExitCode {
             .is_empty()
             .then(info)
             .ok_or_else(|| "info takes no arguments".to_string()),
+        "devices" if rest.is_empty() => devices(),
+        "devices" => Err("devices takes no arguments".to_string()),
         "gemm" => gemm(rest),
         #[cfg(feature = "gpu")]
         "gemm-gpu" => gemm_gpu::run(rest),
@@ -244,6 +247,47 @@ fn info() {
         Some(gpu) => println!("{}", gpu.info()),
         None => println!("gpu: none found"),
     }
+}
+
+/// Prints the devices this machine and this build can train on, best first, with the one
+/// `Device::Auto` and `--device auto` pick marked, and how to choose another.
+///
+/// # Errors
+///
+/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cpu` or `gpu`.
+fn devices() -> Result<(), String> {
+    let list = cavitation_nn::devices().map_err(|e| e.to_string())?;
+    println!("cpu: {}", machine::detect().cpu_model);
+    println!("Devices this build can train on, best first:");
+    for (i, entry) in list.iter().enumerate() {
+        let mark = if entry.chosen { "  <- chosen" } else { "" };
+        if entry.available {
+            println!(
+                "  {}. {:<4} {}, {}{mark}",
+                i + 1,
+                entry.kind,
+                entry.name,
+                entry.detail
+            );
+        } else {
+            println!("  {}. {:<4} not available{mark}", i + 1, entry.kind);
+        }
+        if let Some(note) = &entry.note {
+            println!("          {note}");
+        }
+    }
+    match list.iter().find(|e| e.chosen) {
+        Some(entry) => println!(
+            "Device::Auto and --device auto train on the {}.",
+            entry.kind
+        ),
+        None => println!("CAVITATION_DEVICE asks for a device that is not available."),
+    }
+    println!(
+        "Choose with --device auto|cpu|gpu (mnist-cnn, cifar-cnn), with FitConfig::device in a \
+         program, or for Device::Auto with CAVITATION_DEVICE=auto|cpu|gpu."
+    );
+    Ok(())
 }
 
 /// The options of the training and latency commands.

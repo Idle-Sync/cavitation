@@ -220,17 +220,17 @@ pub mod prelude {
     pub use cavitation_ml::{LinearModel, LinearRegression, LogisticModel, LogisticRegression};
     pub use cavitation_nn::{
         Activation, ActivationLayer, Adagrad, Adam, AdamW, AdaptiveAvgPool2d, AvgPool2d, BadInput,
-        Batch, BatchNorm2d, BatchView, Batcher, Celu, Conv2d, Dataset, Device, Dropout,
-        EarlyStopping, Elu, EpochReport, Evaluation, Evaluator, FitConfig, Flatten, Flow, Gelu,
-        Glu, GradStats, Hardsigmoid, Hardswish, Hardtanh, Health, HealthMonitor, History, Hooks,
-        Identity, InferenceModel, Init, Layer, LayerEvent, LeakyRelu, Linear, LoadOptions,
-        LogSigmoid, LogSoftmax, Loss, LrSchedule, MaxPool2d, Mish, ModelHandle, Monitor,
-        NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu, Relu6, RmsProp, Selu,
-        Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign, Standardizer, StepControl,
-        StepInfo, StepInputs, StepLog, StepProfile, StepRecord, Tanh, Targets, TargetsView,
-        TensorInfo, Threshold, Trace, Trainer, TrainerHandle, Warning, WarningKind, accuracy,
-        confusion_matrix, evaluate, fit, fit_controlled, fit_with_hooks, inspect_file, load,
-        load_lenient, load_with, save,
+        Batch, BatchNorm2d, BatchView, Batcher, Celu, Conv2d, Dataset, Device, DeviceEntry,
+        DeviceKind, Dropout, EarlyStopping, Elu, EpochReport, Evaluation, Evaluator, FitConfig,
+        Flatten, Flow, Gelu, Glu, GradStats, Hardsigmoid, Hardswish, Hardtanh, Health,
+        HealthMonitor, History, Hooks, Identity, InferenceModel, Init, Layer, LayerEvent,
+        LeakyRelu, Linear, LoadOptions, LogSigmoid, LogSoftmax, Loss, LrSchedule, MaxPool2d, Mish,
+        ModelHandle, Monitor, NeuronMask, OnNonFinite, Optimizer, OptimizerConfig, Prelu, Relu,
+        Relu6, RmsProp, Selu, Sequential, Sgd, Sigmoid, Silu, Softmax, Softplus, Softsign,
+        Standardizer, StepControl, StepInfo, StepInputs, StepLog, StepProfile, StepRecord, Tanh,
+        Targets, TargetsView, TensorInfo, Threshold, Trace, Trainer, TrainerHandle, Warning,
+        WarningKind, accuracy, confusion_matrix, devices, evaluate, fit, fit_controlled,
+        fit_with_hooks, inspect_file, load, load_lenient, load_with, save,
     };
 }
 

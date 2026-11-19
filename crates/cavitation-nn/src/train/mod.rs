@@ -4,10 +4,12 @@
 //! ([`Evaluator`] and [`evaluate`], in `evaluate`), [`Standardizer`], which standardises
 //! inputs or targets and folds that into a network (in `standardize`), [`StepLog`], a
 //! [`StepControl`] that records every step (in `step_log`), [`EarlyStopping`] and the
-//! [`Monitor`] and [`Threshold`] it and the plateau schedule watch with (in `stopping`), and
-//! [`Flow`], which a progress callback returns to go on or stop.
+//! [`Monitor`] and [`Threshold`] it and the plateau schedule watch with (in `stopping`),
+//! [`devices`], the list of devices a run can train on (in `device`), and [`Flow`], which a
+//! progress callback returns to go on or stop.
 
 mod data;
+mod device;
 mod evaluate;
 mod fit;
 mod standardize;
@@ -15,11 +17,16 @@ mod step_log;
 mod stopping;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) use device::Choice;
+pub use device::{DeviceEntry, DeviceKind, devices};
 #[cfg(feature = "gpu")]
 pub(crate) use evaluate::measure;
 pub use evaluate::{Evaluation, Evaluator, confusion_matrix, evaluate};
 #[cfg(feature = "gpu")]
 pub(crate) use fit::argmax;
+#[cfg(all(test, feature = "gpu"))]
+pub(crate) use fit::fit_choosing;
 pub use fit::{
     Device, EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig,
     StepControl, StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled,

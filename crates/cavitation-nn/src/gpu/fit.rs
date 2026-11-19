@@ -1,5 +1,7 @@
-//! [`fit`](crate::fit) on the GPU, for [`Device::Gpu`](crate::Device): the epoch loop that
-//! trains through a [`GpuTrainer`] and measures the validation set with its
+//! [`fit`](crate::fit) on the GPU, for [`Device::Gpu`](crate::Device) and for a
+//! [`Device::Auto`](crate::Device) that picks a GPU: the trainer built for the run, with
+//! every reason the GPU cannot train it found before any training, and the epoch loop that
+//! trains through that [`GpuTrainer`] and measures the validation set with its
 //! [`GpuModel`](super::GpuModel), copying the parameters back when the host reads them.
 
 use std::time::Instant;
@@ -9,32 +11,31 @@ use cavitation_gpu::Gpu;
 
 use super::GpuTrainer;
 use crate::train::{StepRates, Watching};
-use crate::{Batch, Batcher, Dataset, EpochReport, FitConfig, History, Sequential};
+use crate::{Batch, Batcher, Dataset, DeviceKind, EpochReport, FitConfig, History, Sequential};
 
-/// [`fit`](crate::fit)'s run on `gpu`, after its checks of the data and of `watching`'s
-/// rules: trains `model` from the values in `params` epoch by epoch through a
-/// [`GpuTrainer`], measures `validation` with the trainer's model, and copies the parameters
-/// back into `params` before `config.on_epoch`, when early stopping keeps a best epoch,
-/// before an error met during training is returned, and at the end.
+/// The [`GpuTrainer`] for [`fit`](crate::fit)'s run of `model` on `gpu` under `config`,
+/// from the values in `params`, or the first reason the GPU cannot train the run: every
+/// reason known before the first step is found here, so a run under
+/// [`Device::Auto`](crate::Device) can still train on the CPU. An error of a step, or of the
+/// step for an epoch's short last batch, compiled when that batch comes, ends the run.
 ///
 /// # Errors
 ///
-/// As [`GpuTrainer::new`], [`GpuTrainer::set_health`] and [`GpuTrainer::step`] return them,
-/// and [`Error::InvalidData`] (starting `validation: `) if a batch-norm layer that keeps no
-/// running statistics would see a short last batch of `validation`.
+/// As [`GpuTrainer::new`] returns them; [`Error::InvalidData`] (starting `validation: `) if
+/// a batch-norm layer that keeps no running statistics would see a short last batch of
+/// `validation`; and [`Error::Unsupported`] for a `config.health` that
+/// [`GpuTrainer::set_health`] refuses.
 ///
 /// # Panics
 ///
 /// If `config.batch` is 0.
-pub(crate) fn fit_on_gpu(
+pub(crate) fn trainer_for<'s>(
     model: &Sequential,
-    params: &mut ParamStore,
-    train: &Dataset,
-    mut config: FitConfig<'_>,
-    validation_set: Option<Dataset>,
-    mut watching: Watching,
+    params: &ParamStore,
+    config: &FitConfig<'_>,
+    validation: Option<&Dataset>,
     gpu: &Gpu,
-) -> Result<History, Error> {
+) -> Result<GpuTrainer<'s>, Error> {
     assert!(
         config.batch > 0,
         "Trainer::new: the batch size must be at least 1"
@@ -47,18 +48,43 @@ pub(crate) fn fit_on_gpu(
         config.batch,
         gpu,
     )?;
-    if let Some(held_out) = &validation_set {
+    if let Some(held_out) = validation {
         trainer.model().check_rows(held_out).map_err(|e| match e {
             Error::InvalidData(msg) => Error::InvalidData(format!("validation: {msg}")),
             other => other,
         })?;
     }
+    GpuTrainer::check_health(&config.health)?;
+    Ok(trainer)
+}
+
+/// [`fit`](crate::fit)'s run through `trainer`, built by [`trainer_for`] for this `model`,
+/// `params`, `config` and `validation_set`, after `fit`'s checks of the data and of
+/// `watching`'s rules: trains `model` epoch by epoch, measures `validation_set` with the
+/// trainer's model, and copies the parameters back into `params` before `config.on_epoch`,
+/// when early stopping keeps a best epoch, before an error met during training is returned,
+/// and at the end.
+///
+/// # Errors
+///
+/// As [`GpuTrainer::step`] and [`GpuTrainer::end_epoch`] return them, and the validation's
+/// measurement.
+pub(crate) fn fit_on_gpu<'s>(
+    model: &Sequential,
+    params: &mut ParamStore,
+    train: &Dataset,
+    mut config: FitConfig<'s>,
+    validation_set: Option<Dataset>,
+    mut watching: Watching,
+    mut trainer: GpuTrainer<'s>,
+) -> Result<History, Error> {
     trainer.set_health(config.health)?;
     trainer.set_dropout_seed(config.dropout_seed);
     let mut batcher = Batcher::new(train.len(), config.batch, config.shuffle_seed);
     let mut batch = Batch::new(train, config.batch);
     let mut history = History {
         epochs: Vec::with_capacity(config.epochs.min(1024)),
+        device: DeviceKind::Gpu,
         ..History::default()
     };
     params.zero_grad();

@@ -4,9 +4,19 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+### Breaking changes
+
+- `History` has two new public fields: `device` (a `DeviceKind`: the device the run trained on) and `device_note` (under `Device::Auto`, why a GPU that opened was left for the CPU). A `History { .. }` that names every field no longer compiles: add `device: Default::default(), device_note: None`, or end the literal with `..History::default()`.
+
 ### Tensors and autograd (`cavitation-core`)
 
 - `Tape::softmax_cross_entropy`, `log_softmax` and `log_softmax_row` take `ln Σ e^(z − max)` as `ln_1p` of the sum without the first maximum's term, so a confident row's small loss keeps its relative accuracy: on rows `[0, −a, −a − 2, −a − 4]` labelled 0, for `a` from 8 to 20, the `f32` loss is within 2.1u of the `f64` one (`u = 2⁻²⁴`), where rounding `1 + e` to `f32` first gave a loss of exactly 0 once `e` fell below `u`. On 4,096 × 10 logits with the label's raised by 12, the mean relative error of the loss over 20 batches is +3.3u instead of −166u (Intel Celeron N5105). Losses, log-probabilities and the cross-entropy's gradient change in their low bits on such rows. A +∞ or NaN logit still gives a NaN row (#321).
+
+### Layers, training and inference (`cavitation-nn`)
+
+- `devices()` lists the devices this machine and this build can train on, best first: the GPU (with the `gpu` feature, the adapter `Gpu::open` picks, with the platform's other backends that also open it), then the CPU with its kernel level and thread count. A device that cannot be used is listed with the reason, such as a build without the `gpu` feature. Each `DeviceEntry` has its `DeviceKind` (`Cpu` or `Gpu`), name, detail, whether it is available, whether it is the chosen one, and a note; on an NVIDIA card the note says that NVIDIA's CUDA and cuDNN would train faster and that the library has no CUDA engine yet (#342).
+- `Device::Auto` lets `fit` pick: the GPU when the build has the `gpu` feature, a GPU opens, the run has no hook and no `StepControl`, and a `GpuTrainer` can be built for it (every layer, the loss, the optimiser, the health settings and the validation set are ones the GPU trains); the CPU otherwise. `History::device` says which trained, and `History::device_note` gives the reason when a GPU that opened was left for the CPU (the error `Device::Gpu` would have returned); the health settings are looked at before the trainer is built, so a run they keep off the GPU compiles no shader. Each `Device::Auto` run opens the GPU anew. On the GPU the run is `Device::Gpu`'s on that GPU, bit for bit, and on the CPU it is `Device::Cpu`'s. `FitConfig::default()` still trains on the CPU. The pick does not weigh the model's size. Measured on an NVIDIA GTX 1660 Super (Vulkan) and an AMD Ryzen 7 2700X (avx2, 16 threads) with `cavitation-bench <net> --ours-only --rows 12800 --epochs 3 --device cpu|gpu|auto` (built with `--features gpu`), the steady epoch of 12,800 rows takes 0.45 s on the GPU against 0.97 s on the CPU for `mnist-cnn` and 2.54 s against 14.21 s for `cifar-cnn`, and `auto` trains on the GPU (0.44 s and 2.54 s); on the digits network's shape (64 → 256 → 128 → 10) at batch 32 an epoch of 36 steps takes 19.9 to 20.8 ms on the GPU against 18.9 to 19.5 ms on the CPU (`CAVITATION_GPU_BACKEND=vulkan cargo test --release -p cavitation-nn --features gpu --lib epoch_time_of_a_small_network_by_device -- --ignored --nocapture`, two runs), so a GPU gains nothing there.
+- The environment variable `CAVITATION_DEVICE` (`auto`, `cpu` or `gpu`) restricts what `Device::Auto` and `devices()` choose; it does not change a run that names `Device::Cpu` or `Device::Gpu`. With `gpu`, a run the GPU cannot train is an error and does not fall back to the CPU. Any other value is an error that names the values accepted.
 
 ### GPU
 
@@ -15,6 +25,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Data, examples, guide and benchmark
 
+- `cavitation-bench devices` prints the device list with the chosen device marked and how to choose another, and `mnist-cnn` and `cifar-cnn` take `--device auto`.
 - `cavitation-bench gemm-gpu` takes `--shapes MxNxK[xBATCH],...`: products of any shape (`C` is `M` by `N`), each optionally as a batch of products in one dispatch, timed like the squares. `--sizes none` times no squares.
 
 ## v0.4.1 (2026-11-17)
