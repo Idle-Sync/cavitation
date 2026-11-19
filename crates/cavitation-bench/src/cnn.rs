@@ -124,8 +124,8 @@ pub struct Options {
     pub rows: Option<usize>,
     /// `--python`: the interpreter for the PyTorch side.
     pub python: String,
-    /// `--ours-only`: skip the PyTorch side.
-    pub ours_only: bool,
+    /// `--cav-only`: train Cavitation's side only and skip the PyTorch side.
+    pub cav_only: bool,
     /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
     /// steps) and print each layer's median forward and backward time.
     pub profile: Option<usize>,
@@ -180,7 +180,7 @@ impl Options {
             epochs: net.epochs,
             rows: None,
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
-            ours_only: false,
+            cav_only: false,
             profile: None,
             gpu: false,
             backend: None,
@@ -204,7 +204,7 @@ impl Options {
                 "--epochs" => o.epochs = number("--epochs", rest.next(), false)?,
                 "--rows" => o.rows = Some(number("--rows", rest.next(), false)?),
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
-                "--ours-only" => o.ours_only = true,
+                "--cav-only" => o.cav_only = true,
                 "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
                 "--device" => match rest.next().map(String::as_str) {
                     Some("cpu") => (o.gpu, auto) = (false, false),
@@ -332,7 +332,7 @@ fn train_ours(
             seconds,
         };
         println!(
-            "  ours  epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s",
+            "  cav   epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s",
             epoch.loss,
             epoch.accuracy * 100.0,
             epoch.seconds
@@ -389,7 +389,7 @@ fn train_ours_gpu(
             seconds,
         };
         println!(
-            "  ours  epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s (gpu)",
+            "  cav   epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s (gpu)",
             epoch.loss,
             epoch.accuracy * 100.0,
             epoch.seconds
@@ -661,7 +661,7 @@ fn epochs_json(epochs: &[Epoch]) -> String {
 }
 
 /// Runs `mnist-cnn` or `cifar-cnn` (`net`) with options `o`: writes the run's files under
-/// `dir_root`, trains here, then in PyTorch unless `--ours-only`, prints the comparison and
+/// `dir_root`, trains here, then in PyTorch unless `--cav-only`, prints the comparison and
 /// writes `result.json`.
 ///
 /// # Errors
@@ -729,7 +729,7 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     };
     let rows = train.len();
     drop(train);
-    let (theirs, about) = if o.ours_only {
+    let (theirs, about) = if o.cav_only {
         (Vec::new(), Vec::new())
     } else {
         train_torch(net, o, &dir, rows)?
@@ -739,7 +739,7 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     }
     let last = |e: &[Epoch]| e.last().map_or(f64::NAN, |e| e.accuracy * 100.0);
     print!(
-        "final test accuracy: ours {:.2}%; steady epoch time: ours {:.2} s",
+        "final test accuracy: cav {:.2}%; steady epoch time: cav {:.2} s",
         last(&ours),
         steady_seconds(&ours)
     );
@@ -748,14 +748,14 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     } else {
         let (a, b) = (steady_seconds(&ours), steady_seconds(&theirs));
         println!(
-            ", torch {b:.2} s, ours / torch {:.2}; torch final test accuracy {:.2}%",
+            ", torch {b:.2} s, cav / torch {:.2}; torch final test accuracy {:.2}%",
             a / b,
             last(&theirs)
         );
     }
     let json = format!(
         "{{\"net\": \"{}\", \"seed\": {}, \"epochs\": {}, \"rows\": {rows}, \"batch\": {}, \
-         \"kernel\": \"{}\", \"threads\": {}, \"ours\": {}, \"torch\": {}, \"torch_about\": [{}]}}\n",
+         \"kernel\": \"{}\", \"threads\": {}, \"cav\": {}, \"torch\": {}, \"torch_about\": [{}]}}\n",
         net.name,
         o.seed,
         o.epochs,
@@ -839,11 +839,11 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let o = Options::parse(
             CIFAR,
-            &args(&["--seed", "2", "--rows", "100", "--ours-only"]),
+            &args(&["--seed", "2", "--rows", "100", "--cav-only"]),
         )
         .unwrap();
         assert_eq!(
-            (o.seed, o.epochs, o.rows, o.ours_only),
+            (o.seed, o.epochs, o.rows, o.cav_only),
             (2, 10, Some(100), true)
         );
         assert_eq!(Options::parse(MNIST, &[]).unwrap().epochs, 5);

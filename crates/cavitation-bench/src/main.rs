@@ -26,7 +26,7 @@
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--ours-only] [--profile N] [--no-fuse] [--device auto|cpu|gpu] [--backend B]
+//!   [--cav-only] [--profile N] [--no-fuse] [--device auto|cpu|gpu] [--backend B]
 //!   [--torch-device D] [--deterministic]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
 //!   epochs) here and then
@@ -34,7 +34,7 @@
 //!   weights and batch order, which the run writes to `bench/cnn/<name>-seed<seed>/` under
 //!   the target folder (see the `cnn` module). Each epoch's mean loss, test accuracy and
 //!   training time are printed for both, then the final accuracies and the median epoch
-//!   time after the first, with ours over PyTorch's; `result.json` in the same folder keeps
+//!   time after the first, with Cavitation's (`cav`) over PyTorch's; `result.json` in the same folder keeps
 //!   them. `--rows` trains on the first N training images only, for a quick run.
 //!   `--profile N` runs only N training steps, after 3 warm-up steps, with
 //!   `Trainer::profile_next_step`, and prints each layer's median forward and backward time,
@@ -128,8 +128,8 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 gemm    [--shapes mnist128|digits128]\n\
     \x20 gemm-gpu [--backend vulkan|dx12|metal] [--sizes 1024,2048,4096|none] [--shapes MxNxK[xBATCH],...] [--warm-up SECONDS] (with the gpu feature)\n\
     \x20 conv    [--batch N] [--parts]\n\
-    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
-    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--ours-only] [--profile N] [--no-fuse]\n\
+    \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--cav-only] [--profile N] [--no-fuse]\n\
+    \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--cav-only] [--profile N] [--no-fuse]\n\
     \x20     (both CNNs) [--device auto|cpu|gpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
     \x20     [--deterministic]; --device gpu needs the gpu feature, and auto is what `devices` marks\n\
     \x20 subnormal [--steps N]\n\
