@@ -130,6 +130,10 @@ struct TrainPass {
     backward: Vec<Op>,
     /// Where each layer's backward calls end in `backward`, last layer first.
     backward_ends: Vec<usize>,
+    /// Where a `Linear`'s or a `Conv2d`'s input gradient begins in `backward`, after its
+    /// parameter gradients, last layer first; `None` for a layer whose backward calls are
+    /// one part: every other kind, and a first layer, which has no input gradient.
+    backward_inputs: Vec<Option<usize>>,
     /// The loss.
     loss: LossCall,
     /// The finite flag over the loss and the parameter gradients.
@@ -374,6 +378,13 @@ pub struct GpuStepProfile {
     pub loss: Option<Duration>,
     /// Each layer's backward passes, in layer order.
     pub backward: Vec<Option<Duration>>,
+    /// The part of each [`backward`](Self::backward) time that is the layer's input gradient,
+    /// for a `Linear` or a `Conv2d`, in layer order; the rest of the layer's time is its
+    /// parameter gradients (the weight's and the bias's, after the layer's mask if it has
+    /// one). The two parts run in compute passes of their own. `None` for a layer whose
+    /// backward pass is one part: every other kind of layer, and a first layer, which
+    /// computes no input gradient.
+    pub backward_input: Vec<Option<Duration>>,
     /// The health values: the finite flag, the sums of squares and the ReLU bits.
     pub health: Option<Duration>,
     /// The optimiser's update.
@@ -397,13 +408,16 @@ pub struct GpuStepProfile {
 }
 
 /// The labels of a profiled step's spans, in the order recorded: each layer's forward pass,
-/// the loss, each layer's backward pass (last layer first), the health values, the update,
-/// the running statistics and the readback.
+/// the loss, each layer's backward pass (last layer first; a `Linear`'s or a `Conv2d`'s
+/// input gradient is a span of its own, [`BACKWARD_INPUT`], after the layer's
+/// [`BACKWARD`]), the health values, the update, the running statistics and the readback.
 const FORWARD: &str = "forward";
 /// See [`FORWARD`].
 const LOSS: &str = "loss";
 /// See [`FORWARD`].
 const BACKWARD: &str = "backward";
+/// See [`FORWARD`].
+const BACKWARD_INPUT: &str = "backward, input gradient";
 /// See [`FORWARD`].
 const HEALTH: &str = "health";
 /// See [`FORWARD`].
@@ -413,11 +427,12 @@ const RUNNING: &str = "running statistics";
 /// See [`FORWARD`].
 const READBACK: &str = "readback";
 
-/// The timed passes a profiled step of `layers` layers, `norms` of them batch norms, needs
-/// (see `GpuTrainer::new`), or 0 if that many passes' timestamps do not fit wgpu's queries
-/// on `gpu`: two per pass, and with encoder timestamps as many again for the copy runs.
-fn profiled_passes(layers: usize, norms: usize, gpu: &Gpu) -> u32 {
-    let passes = (2 * layers + 6 + norms).max(64);
+/// The timed passes a profiled step of `layers` layers, `norms` of them batch norms and
+/// `splits` of them with an input gradient timed apart, needs (see `GpuTrainer::new`), or 0
+/// if that many passes' timestamps do not fit wgpu's queries on `gpu`: two per pass, and with
+/// encoder timestamps as many again for the copy runs.
+fn profiled_passes(layers: usize, norms: usize, splits: usize, gpu: &Gpu) -> u32 {
+    let passes = (2 * layers + 6 + norms + splits).max(64);
     let per_pass = if gpu.info().encoder_timestamps { 4 } else { 2 };
     if passes * per_pass <= wgpu::QUERY_SET_MAX_QUERIES as usize {
         passes as u32
@@ -426,15 +441,28 @@ fn profiled_passes(layers: usize, norms: usize, gpu: &Gpu) -> u32 {
     }
 }
 
-/// The profile of a step of `layers` layers from its `output`, as [`FORWARD`] orders the spans.
-fn profile_of(output: &StepOutput<'_>, layers: usize, timing: Timing) -> GpuStepProfile {
+/// The profile of a step from its `output`, as [`FORWARD`] orders the spans. `split` says,
+/// last layer first, which layers' input gradients are spans of their own
+/// (`TrainPass::backward_inputs`).
+fn profile_of(output: &StepOutput<'_>, split: &[Option<usize>], timing: Timing) -> GpuStepProfile {
     let time = |ns: Option<f64>| ns.map(|ns| Duration::from_secs_f64(ns * 1e-9));
     let spans = output.spans();
-    let after = 2 * layers + 1;
+    let layers = split.len();
     let labels: Vec<&str> = spans.iter().map(|s| s.0).collect();
     let mut want = vec![FORWARD; layers];
     want.push(LOSS);
-    want.extend(std::iter::repeat_n(BACKWARD, layers));
+    // Each layer's backward span and, where it has one, its input gradient's.
+    let mut at = vec![(0, None); layers];
+    for (r, s) in split.iter().enumerate() {
+        let layer = layers - 1 - r;
+        at[layer].0 = want.len();
+        want.push(BACKWARD);
+        if s.is_some() {
+            at[layer].1 = Some(want.len());
+            want.push(BACKWARD_INPUT);
+        }
+    }
+    let after = want.len();
     want.extend([HEALTH, OPTIMIZER, RUNNING, READBACK]);
     assert_eq!(
         labels, want,
@@ -457,7 +485,13 @@ fn profile_of(output: &StepOutput<'_>, layers: usize, timing: Timing) -> GpuStep
     GpuStepProfile {
         forward: (0..layers).map(span).collect(),
         loss: span(layers),
-        backward: (0..layers).map(|i| span(2 * layers - i)).collect(),
+        backward: (at.iter())
+            .map(|&(own, input)| match input {
+                Some(k) => span(own).zip(span(k)).map(|(a, b)| a + b),
+                None => span(own),
+            })
+            .collect(),
+        backward_input: at.iter().map(|&(_, input)| input.and_then(span)).collect(),
         health: span(after),
         optimizer: kind(after + 1, TimedKind::Pass),
         copies: copies(after + 1),
@@ -608,6 +642,13 @@ impl<'s> GpuTrainer<'s> {
             .iter()
             .filter(|l| matches!(l.kind, Kind::BatchNorm2d(_)))
             .count();
+        // The layers whose input gradient is a span of its own: the first layer has none.
+        let splits = m
+            .layers
+            .iter()
+            .skip(1)
+            .filter(|l| matches!(l.kind, Kind::Linear { .. } | Kind::Conv2d { .. }))
+            .count();
         let sizes = StepSizes {
             upload_bytes: round(4 * batch * m.input_width)
                 + round(target_bytes)
@@ -615,12 +656,13 @@ impl<'s> GpuTrainer<'s> {
                 + kernel.upload_bytes()
                 + 64 * norms as u64
                 + 4096,
-            // A profiled step's spans: two per layer and five more. Each opens a pass, the update
-            // two (its copies end the first), and each batch norm's running update one more
-            // (its upload ends the pass before it). A model too deep for wgpu's timestamp
+            // A profiled step's spans: two per layer, one more for each `Linear` and `Conv2d`
+            // after the first layer (its input gradient) and five more. Each opens a pass, the
+            // update two (its copies end the first), and each batch norm's running update one
+            // more (its upload ends the pass before it). A model too deep for wgpu's timestamp
             // queries is not timed.
-            spans: (2 * m.layers.len() as u32 + 5).max(16),
-            timed_passes: profiled_passes(m.layers.len(), norms, gpu),
+            spans: (u32_of(2 * m.layers.len() + splits) + 5).max(16),
+            timed_passes: profiled_passes(m.layers.len(), norms, splits, gpu),
             // The loss, the flag and the health values each step, or one flat buffer.
             readback_bytes: round(4 * elements)
                 .max(16 + 2 * round(4 * lens.len()) + round(4 * relu_words)),
@@ -846,7 +888,6 @@ impl<'s> GpuTrainer<'s> {
             step.clear(b.buffer(), 0, b.len());
         }
         let kernels = &self.model.kernels;
-        let layers = pass.forward_ends.len();
         if profiling {
             let mut start = 0;
             for &end in &pass.forward_ends {
@@ -876,8 +917,19 @@ impl<'s> GpuTrainer<'s> {
         }
         if profiling {
             let mut start = 0;
-            for &end in &pass.backward_ends {
+            for (&end, &input) in pass.backward_ends.iter().zip(&pass.backward_inputs) {
                 step.span(BACKWARD);
+                if let Some(from) = input {
+                    record(
+                        &pass.backward[start..from],
+                        kernels,
+                        &self.kernels,
+                        &pass.pools,
+                        &mut step,
+                    );
+                    step.span(BACKWARD_INPUT);
+                    start = from;
+                }
                 record(
                     &pass.backward[start..end],
                     kernels,
@@ -948,6 +1000,7 @@ impl<'s> GpuTrainer<'s> {
         let (seed, masks, next) = (self.dropout_seed, &pass.masks, &mut self.next);
         let read = &mut self.read;
         let profile = &mut self.profile;
+        let split = &pass.backward_inputs;
         let (value, flag) = thread::scope(|scope| {
             let drawing = (short.is_none() && !masks.is_empty()).then(|| {
                 scope.spawn(move || {
@@ -957,7 +1010,7 @@ impl<'s> GpuTrainer<'s> {
                 })
             });
             let output = step.finish();
-            *profile = profiling.then(|| profile_of(&output, layers, timing));
+            *profile = profiling.then(|| profile_of(&output, split, timing));
             let bytes = output.bytes();
             let word = |at: usize| [bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]];
             let value = f32::from_le_bytes(word(loss_at));
@@ -1034,7 +1087,8 @@ impl<'s> GpuTrainer<'s> {
     /// [`last_profile`](Self::last_profile), as [`Trainer::profile_next_step`](crate::Trainer::profile_next_step)
     /// does on the CPU. Only that step is profiled; it runs each layer's forward and backward
     /// passes, the loss, the health values, the update, the running statistics and the
-    /// readback in compute passes of their own, timed on the GPU. A step left out under
+    /// readback in compute passes of their own, timed on the GPU, a `Linear`'s or a `Conv2d`'s
+    /// input gradient apart from its parameter gradients. A step left out under
     /// [`OnNonFinite::Skip`] has no profile, and the next step is asked instead.
     ///
     /// # Examples
@@ -1068,6 +1122,9 @@ impl<'s> GpuTrainer<'s> {
     ///     assert_eq!((profile.forward.len(), profile.backward.len()), (3, 3));
     ///     if !matches!(profile.timing, Timing::Untimed { .. }) {
     ///         assert!(profile.forward.iter().all(|t| t.is_some()));
+    ///         // The last `Linear`'s input gradient is timed apart; the first has none.
+    ///         let input: Vec<bool> = profile.backward_input.iter().map(|t| t.is_some()).collect();
+    ///         assert_eq!(input, [false, false, true]);
     ///     }
     ///     trainer.step(&net, batch).unwrap();
     ///     assert!(trainer.last_profile().is_none()); // not asked
@@ -1916,6 +1973,7 @@ impl TrainPass {
             .collect();
         let mut backward = Vec::new();
         let mut backward_ends = Vec::with_capacity(m.layers.len());
+        let mut backward_inputs = Vec::with_capacity(m.layers.len());
         let mut cleared = Vec::new();
         for (i, layer) in m.layers.iter().enumerate().rev() {
             let s = &saved[i];
@@ -1938,6 +1996,7 @@ impl TrainPass {
             }
             let first = i == 0;
             let x = &values[s.input];
+            let mut input_at = None;
             g = match layer.kind {
                 Kind::Linear {
                     inputs,
@@ -1973,6 +2032,7 @@ impl TrainPass {
                     } else {
                         let dx = new_grad(&mut grads, pool, n_in);
                         let dims = GemmDims::new(u32_of(batch), u32_of(inputs), u32_of(outputs));
+                        input_at = Some(backward.len());
                         backward.push(Op::Gemm(k.gemm.call(
                             steps,
                             pool,
@@ -2014,6 +2074,7 @@ impl TrainPass {
                         g
                     } else {
                         let dx = new_grad(&mut grads, pool, n_in);
+                        input_at = Some(backward.len());
                         backward.push(Op::ConvInput(train.conv_input.call(
                             steps,
                             pool,
@@ -2102,6 +2163,7 @@ impl TrainPass {
                 Kind::Identity => g,
             };
             backward_ends.push(backward.len());
+            backward_inputs.push(input_at);
         }
 
         // The finite flag over the loss and every parameter's gradient, then the running
@@ -2191,6 +2253,7 @@ impl TrainPass {
             forward_ends,
             backward,
             backward_ends,
+            backward_inputs,
             loss,
             finite,
             running,

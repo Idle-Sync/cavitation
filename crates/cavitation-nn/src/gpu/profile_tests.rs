@@ -1,6 +1,7 @@
 //! `GpuTrainer::profile_next_step`: a profile with every layer of a CNN present, forward and
 //! backward, each part timed where the device times it and `None` with the reason named
-//! where it does not, the parts no longer than the whole step; a profile only for the step
+//! where it does not, the parts no longer than the whole step, a `Linear`'s or a `Conv2d`'s
+//! input gradient timed apart from its parameter gradients; a profile only for the step
 //! that asked; and a step left out under `Skip` passing the request to the next.
 //!
 //! Without a GPU every test says so and checks nothing; `CAVITATION_GPU_REQUIRED=1` makes
@@ -75,6 +76,18 @@ fn a_profile_has_every_layer() {
         parts.extend([p.copies, p.readback]);
         let sum: Duration = parts.iter().flatten().sum();
         assert!(sum <= p.total, "{sum:?} of parts against {:?}", p.total);
+        // The input gradient is timed apart for the two `Linear` layers and for no other: the
+        // convolution is the first layer and computes none. It is a part of the layer's
+        // backward time, and the parameter gradients, a pass of their own, are the rest. Neither
+        // part is asserted above 0: a short pass's two timestamps can read the same tick.
+        assert_eq!(p.backward_input.len(), net.len());
+        for (i, (input, whole)) in p.backward_input.iter().zip(&p.backward).enumerate() {
+            let split = i == 6 || i == 7;
+            assert_eq!(input.is_some(), split && timed, "layer {i}: {input:?}");
+            if let (Some(input), Some(whole)) = (input, whole) {
+                assert!(input <= whole, "layer {i}: {input:?} of {whole:?}");
+            }
+        }
         // Each time is its own layer's: `Flatten` (no work) is the shortest both ways, which a
         // profile with the layers in the wrong order would not show. No ordering between layers
         // that do work is asserted: one step's times are single samples, and on some backends
