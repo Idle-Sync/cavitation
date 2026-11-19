@@ -11,7 +11,7 @@ use crate::device::Cuda;
 use crate::error::CudaError;
 use crate::module::{Arg, Module};
 use crate::reduce::{self, BLOCK, ChannelDims};
-use crate::sys::CuFunction;
+use crate::sys::{CuFunction, DevicePtr};
 
 /// The kernels' source, a port of `cavitation-gpu`'s `kernels/batch_norm.rs`, compiled after
 /// the sums' source.
@@ -34,6 +34,20 @@ pub enum BatchStats<'a> {
         /// The running variance.
         var: &'a DeviceBuffer<'a>,
     },
+}
+
+/// What the backward pass and the running update must agree with: the last forward pass that
+/// succeeded.
+#[derive(Clone, Copy, Debug)]
+struct LastForward {
+    /// Whether it took the batch's statistics.
+    batch: bool,
+    /// Whether it was affine.
+    affine: bool,
+    /// The input it read, by its address on the card.
+    x: DevicePtr,
+    /// The statistics it wrote, by their address on the card.
+    stats: DevicePtr,
 }
 
 /// Panics unless every buffer holds at least `values` four-byte values, naming the first
@@ -190,8 +204,13 @@ impl<'c> Kernels<'c> {
 /// 2-D batch normalisation on the card for one shape, over NCHW tensors
 /// (`ChannelDims::new(batch, C, h · w)`), as `cavitation_core`'s `Tape::batch_norm2d`
 /// computes it: [`forward`](BatchNorm2d::forward) from the batch's statistics or from
-/// running ones, [`backward`](BatchNorm2d::backward) through either, and
+/// running ones, [`backward`](BatchNorm2d::backward) through the same statistics, and
 /// [`update_running`](BatchNorm2d::update_running) after a forward pass from the batch.
+///
+/// The layer remembers its last forward pass that succeeded: whether it took the batch's
+/// statistics, whether it was affine, and which `x` and `stats` buffers it used. A backward
+/// pass or a running update that does not match it, or that comes before any, is refused with
+/// [`CudaError::Invalid`] rather than computed with the wrong formula or statistics.
 ///
 /// The statistics buffer holds `3 · C` values, `[mean | inv | unbiased]`, as the CPU's stats
 /// node holds them: the mean, `1 / √(var + eps)` and the unbiased variance (0 for running
@@ -250,6 +269,9 @@ pub struct BatchNorm2d<'c> {
     sum_dy: DeviceBuffer<'c>,
     /// `Σ dy · x̂` of a backward pass without `dγ` to hold it.
     sum_dy_xhat: DeviceBuffer<'c>,
+    /// The last forward pass that succeeded, which the backward pass and the running update
+    /// are checked against; none before the first and after one that failed.
+    last: Option<LastForward>,
 }
 
 impl fmt::Debug for BatchNorm2d<'_> {
@@ -282,6 +304,7 @@ impl<'c> BatchNorm2d<'c> {
             squares: cuda.buffer(c)?,
             sum_dy: cuda.buffer(c)?,
             sum_dy_xhat: cuda.buffer(c)?,
+            last: None,
         })
     }
 
@@ -321,6 +344,7 @@ impl<'c> BatchNorm2d<'c> {
     ) -> Result<(), CudaError> {
         const WHAT: &str = "batch_norm2d forward";
         let dims = self.dims;
+        self.last = None;
         if !(eps.is_finite() && eps >= 0.0) {
             return Err(CudaError::Invalid(format!(
                 "{WHAT}: eps must be finite and non-negative, got {eps}"
@@ -436,7 +460,7 @@ impl<'c> BatchNorm2d<'c> {
         // `total` values of x, 2 · C statistics and, when affine, C values of γ and β, and
         // writes `total` values of y, which the buffers hold (checked above); y, borrowed
         // mutably, is none of the inputs.
-        unsafe {
+        let launched = unsafe {
             k.launch(
                 k.normalise,
                 [total.div_ceil(BLOCK), 1],
@@ -452,18 +476,39 @@ impl<'c> BatchNorm2d<'c> {
                     Arg::U32(u32::from(affine.is_some())),
                 ],
             )
+        };
+        if launched.is_ok() {
+            self.last = Some(LastForward {
+                batch: matches!(from, BatchStats::Batch),
+                affine: affine.is_some(),
+                x: x.pointer,
+                stats: stats.pointer,
+            });
         }
+        launched
     }
 
-    /// The backward pass of a forward pass that took its statistics `from` the batch or
-    /// running ones (whose buffers are not read here), from the same input `x` and
-    /// statistics `stats`: the input gradient `grad_in` from the output gradient `grad_out`,
-    /// and, for an affine layer, `(γ, dγ, dβ)`, the weight and the two gradients `Σ dy·x̂`
-    /// and `Σ dy`. Every gradient is overwritten.
+    /// The last forward pass, which a call named `what` must follow: refused before any.
+    fn last(&self, what: &str) -> Result<LastForward, CudaError> {
+        self.last.ok_or_else(|| {
+            CudaError::Invalid(format!(
+                "{what}: no forward pass has run on this layer, or the last one failed"
+            ))
+        })
+    }
+
+    /// The backward pass of the last forward pass, through the statistics it took (the
+    /// batch's or the running ones), from the same input `x` and statistics `stats`: the
+    /// input gradient `grad_in` from the output gradient `grad_out`, and, for an affine
+    /// layer, `(γ, dγ, dβ)`, the weight and the two gradients `Σ dy·x̂` and `Σ dy`. Every
+    /// gradient is overwritten.
     ///
     /// # Errors
     ///
-    /// [`CudaError::Call`] if a launch is refused.
+    /// [`CudaError::Invalid`] before any forward pass (or after one that failed), if
+    /// `affine` is given for a forward pass without `γ`, `β` or the other way round, or if
+    /// `x` or `stats` is not the forward pass's own buffer; [`CudaError::Call`] if a launch
+    /// is refused.
     ///
     /// # Panics
     ///
@@ -486,7 +531,7 @@ impl<'c> BatchNorm2d<'c> {
     ///     let (w, b, mut dw, mut db) = (buffer(&[1.0]), buffer(&[0.0]), buffer(&[0.0]), buffer(&[0.0]));
     ///     let (mut y, mut dx, mut stats) = (buffer(&[0.0; 4]), buffer(&[0.0; 4]), buffer(&[0.0; 3]));
     ///     bn.forward(0.0, BatchStats::Batch, &x, Some((&w, &b)), &mut y, &mut stats).unwrap();
-    ///     bn.backward(BatchStats::Batch, &x, &stats, &dy, &mut dx, Some((&w, &mut dw, &mut db))).unwrap();
+    ///     bn.backward(&x, &stats, &dy, &mut dx, Some((&w, &mut dw, &mut db))).unwrap();
     ///     let (mut grad, mut bias_grad) = ([1.0f32; 4], [0.0f32]);
     ///     dx.read(&mut grad).unwrap();
     ///     db.read(&mut bias_grad).unwrap();
@@ -496,7 +541,6 @@ impl<'c> BatchNorm2d<'c> {
     /// ```
     pub fn backward(
         &mut self,
-        from: BatchStats<'_>,
         x: &DeviceBuffer<'_>,
         stats: &DeviceBuffer<'_>,
         grad_out: &DeviceBuffer<'_>,
@@ -529,7 +573,21 @@ impl<'c> BatchNorm2d<'c> {
                 ],
             );
         }
-        let batch = matches!(from, BatchStats::Batch);
+        let last = self.last(WHAT)?;
+        if affine.is_some() != last.affine {
+            return Err(CudaError::Invalid(format!(
+                "{WHAT}: γ, dγ and dβ must be given exactly when the forward pass was affine \
+                 (it was {})",
+                if last.affine { "affine" } else { "not affine" }
+            )));
+        }
+        if x.pointer != last.x || stats.pointer != last.stats {
+            return Err(CudaError::Invalid(format!(
+                "{WHAT}: the backward pass must read the forward pass's own input and \
+                 statistics buffers"
+            )));
+        }
+        let batch = last.batch;
         let k = &self.kernels;
         let (w, targets) = match &affine {
             Some((w, dw, db)) => (*w, Some((&**db, &**dw))),
@@ -594,7 +652,8 @@ impl<'c> BatchNorm2d<'c> {
     }
 
     /// Moves the running `(mean, var)` towards the batch mean and unbiased variance in
-    /// `stats`, written by a forward pass from the batch's statistics, with the rates
+    /// `stats`, written by the last forward pass, which must have taken the batch's
+    /// statistics, with the rates
     /// `update` gives ([`RunningUpdate::rates`]): `r ← momentum · b + (1 − momentum) · r`,
     /// the CPU's `Graph::apply_buffer_updates` on `f32`. Nothing changes when the `u32` at
     /// the start of `finite` is non-zero (the step's finite flag: 0 when every value was
@@ -603,7 +662,9 @@ impl<'c> BatchNorm2d<'c> {
     ///
     /// # Errors
     ///
-    /// [`CudaError::Call`] if the launch is refused.
+    /// [`CudaError::Invalid`] before any forward pass (or after one that failed), after one
+    /// from running statistics (whose unbiased variance slot is 0), or if `stats` is not its
+    /// own buffer; [`CudaError::Call`] if the launch is refused.
     ///
     /// # Panics
     ///
@@ -642,9 +703,10 @@ impl<'c> BatchNorm2d<'c> {
         (mean, var): (&mut DeviceBuffer<'_>, &mut DeviceBuffer<'_>),
         finite: &DeviceBuffer<'_>,
     ) -> Result<(), CudaError> {
+        const WHAT: &str = "batch_norm2d running update";
         let c = u64::from(self.dims.channels);
         check_buffers(
-            "batch_norm2d running update",
+            WHAT,
             &[
                 (stats, "statistics", 3 * c),
                 (mean, "running mean", c),
@@ -652,6 +714,18 @@ impl<'c> BatchNorm2d<'c> {
                 (finite, "finite flag", 1),
             ],
         );
+        let last = self.last(WHAT)?;
+        if !last.batch {
+            return Err(CudaError::Invalid(format!(
+                "{WHAT}: the last forward pass took running statistics, and the update needs \
+                 one from the batch's"
+            )));
+        }
+        if stats.pointer != last.stats {
+            return Err(CudaError::Invalid(format!(
+                "{WHAT}: the update must read the forward pass's own statistics buffer"
+            )));
+        }
         let (momentum, keep) = update.rates();
         let k = &self.kernels;
         // SAFETY: running_update takes (const float *stats, const u32 *finite, float

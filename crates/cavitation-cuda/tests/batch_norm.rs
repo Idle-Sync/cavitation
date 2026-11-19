@@ -81,8 +81,12 @@ fn weights(seed: u64, n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// One run on the card: a forward pass of `x` (or, with `stats` given, statistics uploaded
-/// by hand and no forward pass), then with `dy` a backward pass.
+/// A running `(mean, var)`, one value per channel each.
+type Pair<'a> = (&'a [f32], &'a [f32]);
+
+/// One run on the card: a forward pass of `x` (its statistics then overwritten by hand when
+/// `stats` is given), a running update when `update` is given, then with `dy` a backward
+/// pass.
 #[derive(Clone, Copy)]
 struct Case<'a> {
     /// The tensor's shape.
@@ -97,8 +101,11 @@ struct Case<'a> {
     running: Option<(&'a [f32], &'a [f32])>,
     /// The output gradient, for a backward pass.
     dy: Option<&'a [f32]>,
-    /// Statistics `[mean | inv | unbiased]` uploaded in place of the forward pass's.
+    /// Statistics `[mean | inv | unbiased]` written over the forward pass's.
     stats: Option<&'a [f32]>,
+    /// A running update after the forward pass, of running `(mean, var)` starting at these
+    /// values, under a clear finite flag.
+    update: Option<(RunningUpdate, Pair<'a>)>,
     /// Values of [`SENTINEL`] past the tensor in every tensor buffer.
     pad: usize,
 }
@@ -114,6 +121,7 @@ impl<'a> Case<'a> {
             running: None,
             dy: None,
             stats: None,
+            update: None,
             pad: 0,
         }
     }
@@ -134,6 +142,8 @@ struct Run {
     dw: Vec<f32>,
     /// `dβ = Σ dy`, for an affine layer.
     db: Vec<f32>,
+    /// The running `(mean, var)` after the update, when there is one.
+    running: (Vec<f32>, Vec<f32>),
 }
 
 /// Runs `case` on the card with `bn`, every output written over NaNs (and [`SENTINEL`]s
@@ -150,10 +160,7 @@ fn run(cuda: &Cuda, bn: &mut BatchNorm2d<'_>, case: Case<'_>) -> Run {
     let unwritten = |len: usize| upload(cuda, &padded(&vec![f32::NAN; len]));
     let x = upload(cuda, &padded(case.x));
     let mut y = unwritten(n);
-    let mut stats = match case.stats {
-        Some(s) => upload(cuda, &padded(s)),
-        None => unwritten(3 * c),
-    };
+    let mut stats = unwritten(3 * c);
     let affine = case.affine.map(|(w, b)| (upload(cuda, w), upload(cuda, b)));
     let running = case
         .running
@@ -162,21 +169,31 @@ fn run(cuda: &Cuda, bn: &mut BatchNorm2d<'_>, case: Case<'_>) -> Run {
         Some((mean, var)) => BatchStats::Running { mean, var },
         None => BatchStats::Batch,
     };
-    if case.stats.is_none() {
-        bn.forward(
-            case.eps,
-            from,
-            &x,
-            affine.as_ref().map(|(w, b)| (w, b)),
-            &mut y,
-            &mut stats,
-        )
-        .expect("forward");
+    bn.forward(
+        case.eps,
+        from,
+        &x,
+        affine.as_ref().map(|(w, b)| (w, b)),
+        &mut y,
+        &mut stats,
+    )
+    .expect("forward");
+    if let Some(s) = case.stats {
+        stats.write(&padded(s)).expect("write the statistics");
+    }
+    let mut running_after = (Vec::new(), Vec::new());
+    if let Some((update, (rm, rv))) = case.update {
+        let (mut mean, mut var) = (upload(cuda, rm), upload(cuda, rv));
+        let finite = upload(cuda, &[0u32]);
+        bn.update_running(&update, &stats, (&mut mean, &mut var), &finite)
+            .expect("running update");
+        running_after = (read(&mean, c), read(&var, c));
     }
     let mut out = Run {
         y: read(&y, n + case.pad),
         stats: read(&stats, 3 * c + case.pad),
         sums: (read(bn.sums().0, c), read(bn.sums().1, c)),
+        running: running_after,
         ..Run::default()
     };
     if let Some(dy) = case.dy {
@@ -184,7 +201,7 @@ fn run(cuda: &Cuda, bn: &mut BatchNorm2d<'_>, case: Case<'_>) -> Run {
         let mut dx = unwritten(n);
         let (mut dw, mut db) = (nans(cuda, c), nans(cuda, c));
         let parts = affine.as_ref().map(|(w, _)| (w, &mut dw, &mut db));
-        bn.backward(from, &x, &stats, &dy, &mut dx, parts)
+        bn.backward(&x, &stats, &dy, &mut dx, parts)
             .expect("backward");
         out.dx = read(&dx, n + case.pad);
         if affine.is_some() {
@@ -214,9 +231,10 @@ fn tree(dims: ChannelDims, term: impl Fn(usize, usize) -> f32) -> Vec<f32> {
                     let mut acc = 0.0f32;
                     for t in 0..16 {
                         let j = chunk * 4096 + lane + t * 256;
-                        if j < l {
-                            acc += term((j / p * c + k) * p + j % p, k);
+                        if j >= l {
+                            break;
                         }
+                        acc += term((j / p * c + k) * p + j % p, k);
                     }
                     *slot = acc;
                 }
@@ -336,7 +354,10 @@ fn sum_bound(l: usize, abs: f64) -> f64 {
 fn kernel_twins() {
     let Some(cuda) = Cuda::new() else { return };
     let mut worst = [0.0f64; 4];
-    for (s, dims) in shapes().into_iter().enumerate() {
+    let mut all = shapes();
+    // The most channels the grid takes.
+    all.push(ChannelDims::rows(2, 65_535));
+    for (s, dims) in all.into_iter().enumerate() {
         let mut bn = BatchNorm2d::new(&cuda, dims).expect("batch norm");
         let (c, s) = (dims.channels as usize, 100 * s as u64);
         let l = dims.summed() as usize;
@@ -648,6 +669,8 @@ fn exact_inputs_give_the_tapes_bits() {
                 affine: Some((&w, &b)),
                 running: (!training).then_some((&rm[..], &rv[..])),
                 dy: Some(&dy),
+                update: training
+                    .then_some((RunningUpdate::new(Some(0.1), None), (&rm[..], &rv[..]))),
                 ..Case::new(dims, &x)
             };
             let got = run(&cuda, &mut bn, case);
@@ -658,19 +681,13 @@ fn exact_inputs_give_the_tapes_bits() {
                 continue;
             }
             assert_exact(&got.dw, &want.dw, &format!("dγ, {what}"));
-            let stats = upload(&cuda, &got.stats);
-            let (mut mean, mut var) = (upload(&cuda, &rm), upload(&cuda, &rv));
-            let finite = upload(&cuda, &[0u32]);
-            let update = RunningUpdate::new(Some(0.1), None);
-            bn.update_running(&update, &stats, (&mut mean, &mut var), &finite)
-                .expect("running update");
             assert_exact(
-                &read(&mean, c),
+                &got.running.0,
                 &want.running.0,
                 &format!("running mean, {what}"),
             );
             assert_exact(
-                &read(&var, c),
+                &got.running.1,
                 &want.running.1,
                 &format!("running variance, {what}"),
             );
@@ -678,44 +695,81 @@ fn exact_inputs_give_the_tapes_bits() {
     }
 }
 
-/// NaN in the input or the output gradient goes where the CPU's goes: the `f32` tape on the
-/// exact inputs of [`exact_inputs_give_the_tapes_bits`] with a NaN in one channel's input and
-/// an infinity in another's, then a NaN in a third channel's output gradient. Every output
-/// and gradient is NaN exactly where the tape's is, and elsewhere has its bits.
+/// NaN goes where the CPU's goes: the `f32` tape on the exact inputs of
+/// [`exact_inputs_give_the_tapes_bits`], first with a NaN in one channel's input, an infinity
+/// in another's and a NaN in a third channel's output gradient, then with a NaN in one
+/// channel's `γ`, another's `β`, another's running mean and another's running variance.
+/// Through the batch statistics and through the running ones, the output, the gradients and
+/// (in training) the running statistics after the update are NaN exactly where the tape's
+/// are, and elsewhere have its bits.
 #[test]
 fn nan_goes_where_the_cpus_goes() {
     let Some(cuda) = Cuda::new() else { return };
     let dims = ChannelDims::new(4, 5, 6);
     let mut bn = BatchNorm2d::new(&cuda, dims).expect("batch norm");
     let c = 5;
-    let mut x: Vec<f32> = zero_mean(dims, 1).iter().map(|v| v.signum()).collect();
-    let mut dy = exact_values(2, x.len());
-    let (w, b) = (weights(3, c), seeded_values(5, c, -1.0, 1.0));
-    let (rm, rv) = (
+    let x0: Vec<f32> = zero_mean(dims, 1).iter().map(|v| v.signum()).collect();
+    let dy0 = exact_values(2, x0.len());
+    let (w0, b0) = (weights(3, c), seeded_values(5, c, -1.0, 1.0));
+    let (rm0, rv0) = (
         seeded_values(6, c, -1.0, 1.0),
         seeded_values(7, c, 0.5, 2.0),
     );
+    let (mut x, mut dy) = (x0.clone(), dy0.clone());
     x[6] = f32::NAN; // channel 1
     x[14] = f32::INFINITY; // channel 2
     dy[20] = f32::NAN; // channel 3
-    for training in [true, false] {
-        let what = format!("training {training}");
-        let eps = if training { 0.0 } else { EPS };
-        let want = tape_f32(dims, eps, (&x, &dy), (&w, &b), (&rm, &rv), training);
-        let case = Case {
-            eps,
-            affine: Some((&w, &b)),
-            running: (!training).then_some((&rm[..], &rv[..])),
-            dy: Some(&dy),
-            ..Case::new(dims, &x)
-        };
-        let got = run(&cuda, &mut bn, case);
-        assert!(want.y.iter().any(|v| v.is_nan()) && want.dx.iter().any(|v| v.is_nan()));
-        assert_exact(&got.y, &want.y, &format!("y, {what}"));
-        assert_exact(&got.dx, &want.dx, &format!("dx, {what}"));
-        assert_exact(&got.db, &want.db, &format!("dβ, {what}"));
-        if training {
-            assert_exact(&got.dw, &want.dw, &format!("dγ, {what}"));
+    let (mut w, mut b, mut rm, mut rv) = (w0.clone(), b0.clone(), rm0.clone(), rv0.clone());
+    w[4] = f32::NAN;
+    b[0] = f32::NAN;
+    rm[2] = f32::NAN;
+    rv[3] = f32::NAN;
+    let cases = [
+        (
+            "input and output gradient",
+            (&x, &dy),
+            (&w0, &b0),
+            (&rm0, &rv0),
+        ),
+        (
+            "γ, β and running statistics",
+            (&x0, &dy0),
+            (&w, &b),
+            (&rm, &rv),
+        ),
+    ];
+    for (name, (x, dy), (w, b), (rm, rv)) in cases {
+        for training in [true, false] {
+            let what = format!("NaN in the {name}, training {training}");
+            let eps = if training { 0.0 } else { EPS };
+            let want = tape_f32(dims, eps, (x, dy), (w, b), (rm, rv), training);
+            let case = Case {
+                eps,
+                affine: Some((w, b)),
+                running: (!training).then_some((&rm[..], &rv[..])),
+                dy: Some(dy),
+                update: training
+                    .then_some((RunningUpdate::new(Some(0.1), None), (&rm[..], &rv[..]))),
+                ..Case::new(dims, x)
+            };
+            let got = run(&cuda, &mut bn, case);
+            assert!(want.y.iter().any(|v| v.is_nan()), "{what}: no NaN to check");
+            assert_exact(&got.y, &want.y, &format!("y, {what}"));
+            assert_exact(&got.dx, &want.dx, &format!("dx, {what}"));
+            assert_exact(&got.db, &want.db, &format!("dβ, {what}"));
+            if training {
+                assert_exact(&got.dw, &want.dw, &format!("dγ, {what}"));
+                assert_exact(
+                    &got.running.0,
+                    &want.running.0,
+                    &format!("running mean, {what}"),
+                );
+                assert_exact(
+                    &got.running.1,
+                    &want.running.1,
+                    &format!("running variance, {what}"),
+                );
+            }
         }
     }
 }
@@ -1100,7 +1154,8 @@ fn running_statistics_match_the_cpu() {
     }
 }
 
-/// A set finite flag leaves the running statistics as they were, bit for bit, and a step
+/// A set finite flag (1, the top bit alone, or a NaN's bits) leaves the running statistics as
+/// they were, bit for bit, and a step
 /// committed as not run leaves the count and the next rates as they were; the next clear
 /// step updates them as usual.
 #[test]
@@ -1117,18 +1172,31 @@ fn a_set_finite_flag_skips_the_update() {
     let xb = upload(&cuda, &x);
     let (mut y, mut stats) = (nans(&cuda, x.len()), nans(&cuda, 3 * c));
     let (mut mean, mut var) = (upload(&cuda, &rm), upload(&cuda, &rv));
-    let mut finite = upload(&cuda, &[1u32]);
+    let mut finite = upload(&cuda, &[0u32]);
     bn.forward(EPS, BatchStats::Batch, &xb, None, &mut y, &mut stats)
         .expect("forward");
     let mut update = RunningUpdate::new(None, Some(3.0));
     let rates = update.rates();
-    bn.update_running(&update, &stats, (&mut mean, &mut var), &finite)
-        .expect("running update");
-    update.commit(false);
-    assert_exact(&read(&mean, c), &rm, "the running mean under a set flag");
-    assert_exact(&read(&var, c), &rv, "the running variance under a set flag");
-    assert_eq!(update.count(), Some(3.0), "the count of a skipped step");
-    assert_eq!(update.rates(), rates, "the rates after a skipped step");
+    // Any non-zero flag skips: the lowest bit, the highest, and a NaN's bits.
+    for flag in [1u32, 0x8000_0000, 0x7fc0_0000] {
+        finite.write(&[flag]).expect("set the flag");
+        bn.update_running(&update, &stats, (&mut mean, &mut var), &finite)
+            .expect("running update");
+        update.commit(false);
+        let what = format!("under the flag 0x{flag:08x}");
+        assert_exact(&read(&mean, c), &rm, &format!("the running mean {what}"));
+        assert_exact(&read(&var, c), &rv, &format!("the running variance {what}"));
+        assert_eq!(
+            update.count(),
+            Some(3.0),
+            "the count of a skipped step, {what}"
+        );
+        assert_eq!(
+            update.rates(),
+            rates,
+            "the rates after a skipped step, {what}"
+        );
+    }
     assert_eq!(rates, (0.25, 0.75), "one over the count after this batch");
 
     finite.write(&[0u32]).expect("clear the flag");
@@ -1309,7 +1377,7 @@ fn refusals() {
     );
     let mut dx = nans(&cuda, 15);
     let text = panic_message(|| {
-        let _ = bn.backward(BatchStats::Batch, &x, &stats, &x, &mut dx, None);
+        let _ = bn.backward(&x, &stats, &x, &mut dx, None);
     });
     assert!(
         text.contains("the input gradient buffer holds 60 bytes"),
@@ -1318,14 +1386,7 @@ fn refusals() {
     let (w, mut dw, mut db) = (upload(&cuda, &[1.0f32; 2]), nans(&cuda, 2), nans(&cuda, 1));
     let mut dx = nans(&cuda, 16);
     let text = panic_message(|| {
-        let _ = bn.backward(
-            BatchStats::Batch,
-            &x,
-            &stats,
-            &x,
-            &mut dx,
-            Some((&w, &mut dw, &mut db)),
-        );
+        let _ = bn.backward(&x, &stats, &x, &mut dx, Some((&w, &mut dw, &mut db)));
     });
     assert!(
         text.contains("the bias gradient buffer holds 4 bytes"),
@@ -1345,6 +1406,119 @@ fn refusals() {
         text.contains("the finite flag buffer holds 0 bytes"),
         "{text}"
     );
+}
+
+/// A backward pass or a running update that does not match the layer's last forward pass is
+/// `CudaError::Invalid`, as is one before any forward pass or after one that failed:
+/// - a backward pass with `γ`, `dγ`, `dβ` after a forward pass without `γ`, `β`, or without
+///   them after one with;
+/// - a backward pass reading another input or statistics buffer than the forward pass's;
+/// - a running update after a forward pass from running statistics, or reading another
+///   statistics buffer.
+///
+/// Statistics written over by hand in the forward pass's own buffer are taken.
+#[test]
+fn misuse_against_the_forward_pass_is_refused() {
+    let Some(cuda) = Cuda::new() else { return };
+    let dims = ChannelDims::new(2, 2, 4);
+    let mut bn = BatchNorm2d::new(&cuda, dims).expect("batch norm");
+    let x = upload(&cuda, &seeded_values(1, 16, -2.0, 2.0));
+    let other_x = upload(&cuda, &seeded_values(1, 16, -2.0, 2.0));
+    let dy = upload(&cuda, &seeded_values(2, 16, -1.0, 1.0));
+    let (mut y, mut dx) = (nans(&cuda, 16), nans(&cuda, 16));
+    let (mut stats, mut other_stats) = (nans(&cuda, 6), nans(&cuda, 6));
+    let (w, b) = (
+        upload(&cuda, &[1.0f32, 2.0]),
+        upload(&cuda, &[0.5f32, -0.5]),
+    );
+    let (mut dw, mut db) = (nans(&cuda, 2), nans(&cuda, 2));
+    let (mut rm, mut rv) = (upload(&cuda, &[0.0f32; 2]), upload(&cuda, &[1.0f32; 2]));
+    let finite = upload(&cuda, &[0u32]);
+    let update = RunningUpdate::new(Some(0.1), None);
+    let refused = |r: Result<(), CudaError>, why: &str| {
+        let Err(CudaError::Invalid(text)) = r else {
+            panic!("not refused: {why}");
+        };
+        assert!(text.contains(why), "{text}");
+    };
+
+    let no_forward = "no forward pass has run";
+    refused(bn.backward(&x, &stats, &dy, &mut dx, None), no_forward);
+    refused(
+        bn.update_running(&update, &stats, (&mut rm, &mut rv), &finite),
+        no_forward,
+    );
+
+    bn.forward(EPS, BatchStats::Batch, &x, None, &mut y, &mut stats)
+        .expect("forward");
+    let affine_mismatch = "exactly when the forward pass was affine";
+    refused(
+        bn.backward(&x, &stats, &dy, &mut dx, Some((&w, &mut dw, &mut db))),
+        affine_mismatch,
+    );
+    let not_its_own = "the forward pass's own input and statistics";
+    refused(
+        bn.backward(&other_x, &stats, &dy, &mut dx, None),
+        not_its_own,
+    );
+    refused(
+        bn.backward(&x, &other_stats, &dy, &mut dx, None),
+        not_its_own,
+    );
+    refused(
+        bn.update_running(&update, &other_stats, (&mut rm, &mut rv), &finite),
+        "the forward pass's own statistics",
+    );
+    bn.backward(&x, &stats, &dy, &mut dx, None)
+        .expect("the matching backward pass");
+    bn.update_running(&update, &stats, (&mut rm, &mut rv), &finite)
+        .expect("the matching running update");
+    stats
+        .write(&[0.0f32, 0.0, 1.0, 1.0, 0.0, 0.0])
+        .expect("write");
+    bn.backward(&x, &stats, &dy, &mut dx, None)
+        .expect("statistics written in the forward pass's own buffer");
+
+    bn.forward(
+        EPS,
+        BatchStats::Batch,
+        &x,
+        Some((&w, &b)),
+        &mut y,
+        &mut other_stats,
+    )
+    .expect("affine forward");
+    refused(
+        bn.backward(&x, &other_stats, &dy, &mut dx, None),
+        affine_mismatch,
+    );
+    refused(
+        bn.backward(&x, &stats, &dy, &mut dx, Some((&w, &mut dw, &mut db))),
+        not_its_own,
+    );
+    bn.backward(&x, &other_stats, &dy, &mut dx, Some((&w, &mut dw, &mut db)))
+        .expect("the matching affine backward pass");
+
+    let (mean, var) = (upload(&cuda, &[0.0f32; 2]), upload(&cuda, &[1.0f32; 2]));
+    let running_ok = BatchStats::Running {
+        mean: &mean,
+        var: &var,
+    };
+    bn.forward(EPS, running_ok, &x, None, &mut y, &mut stats)
+        .expect("forward from running statistics");
+    refused(
+        bn.update_running(&update, &stats, (&mut rm, &mut rv), &finite),
+        "took running statistics",
+    );
+    bn.backward(&x, &stats, &dy, &mut dx, None)
+        .expect("the backward pass through running statistics");
+
+    // A forward pass that fails leaves no forward pass to match.
+    assert!(
+        bn.forward(-1.0, BatchStats::Batch, &x, None, &mut y, &mut stats)
+            .is_err()
+    );
+    refused(bn.backward(&x, &stats, &dy, &mut dx, None), no_forward);
 }
 
 /// The rates are the CPU's own `f32` momentum and `1 − momentum`, bit for bit, for each way

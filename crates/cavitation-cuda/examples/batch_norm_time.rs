@@ -70,14 +70,7 @@ fn main() {
             )
         });
         let backward = timed(&cuda, || {
-            bn.backward(
-                BatchStats::Batch,
-                &x,
-                &stats,
-                &dy,
-                &mut dx,
-                Some((&w, &mut dw, &mut db)),
-            )
+            bn.backward(&x, &stats, &dy, &mut dx, Some((&w, &mut dw, &mut db)))
         });
         println!("| {channels} x {size} x {size} | {forward:.3} | {backward:.3} |");
     }
