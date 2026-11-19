@@ -21,3 +21,5 @@ workspace = true
 # The CPU's f64 convolution reference the cuDNN convolution is measured against
 # (tests/conv.rs).
 cavitation-core = { path = "../cavitation-core" }
+# The CPU optimisers the optimiser kernels are measured against (tests/optimizer.rs).
+cavitation-nn = { path = "../cavitation-nn" }
