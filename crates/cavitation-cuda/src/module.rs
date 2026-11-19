@@ -213,7 +213,8 @@ impl<'c> Module<'c> {
     /// If `name` holds a NUL character.
     pub fn kernel(&self, name: &str) -> Result<Kernel<'_>, CudaError> {
         let function = self.function(name)?;
-        Ok(self.kernel_from(function))
+        // SAFETY: the handle was just looked up in this module.
+        Ok(unsafe { self.kernel_from(function) })
     }
 
     /// The handle of the kernel the source declares under `name`, for a type that keeps the
@@ -239,8 +240,14 @@ impl<'c> Module<'c> {
         Ok(function)
     }
 
-    /// The kernel whose handle `function` came from this module's [`Module::function`].
-    pub(crate) fn kernel_from(&self, function: CuFunction) -> Kernel<'_> {
+    /// The kernel whose handle is `function`.
+    ///
+    /// # Safety
+    ///
+    /// `function` must come from this module's [`Module::function`]: a handle from another
+    /// module is invalid once that module is unloaded, and launching it is undefined
+    /// behaviour.
+    pub(crate) unsafe fn kernel_from(&self, function: CuFunction) -> Kernel<'_> {
         Kernel {
             cuda: self.cuda,
             function,

@@ -82,6 +82,8 @@ __device__ float erf_one(float x) {
     }
     if (ix < 0x3f580000u) {
         if (ix < 0x38800000u) {
+            // musl's extra branch below 2^-119 only avoids an underflow flag; this formula
+            // differs from it in at most the last bits of a tiny erf, and GELU adds erf to 1.
             return x + 1.28379166e-01f * x;
         }
         float z = x * x;

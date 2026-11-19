@@ -1,8 +1,10 @@
 //! The element-wise kernels against their CPU twins, as `cavitation-gpu`'s tests check its
 //! WGSL ones. The one-rounding operations (add, multiply, scale, ReLU and leaky ReLU forward
-//! and backward) give the CPU's bits on normal values, NaN, ±0 and ±∞ included. tanh, the
-//! sigmoid and GELU (both forms), forward and backward, are within the same stated bounds of
-//! the f64 tape's values as the WGSL kernels. Each test skips without CUDA, unless
+//! and backward) give the CPU's bits, NaN, ±0, ±∞ and subnormals included. tanh, the
+//! sigmoid and GELU's tanh form give the bits of the CPU's reference kernels
+//! (`Level::Reference`) over every 61st f32 bit pattern. tanh, the sigmoid and GELU (both
+//! forms), forward and backward, are within the same stated bounds of the f64 tape's values
+//! as the WGSL kernels. Each test skips without CUDA, unless
 //! `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
 
 use cavitation_core::{GeluApprox, Graph, ParamStore, Tape, Tensor, Var};
@@ -355,6 +357,39 @@ fn gelu_twins() {
             &format!("{backward:?}"),
         );
         println!("{backward:?}: worst {worst:.3} of its bound");
+    }
+}
+
+/// A CPU activation kernel at a chosen level, over a slice in place.
+type CpuKernel = fn(cavitation_core::kernels::Level, &mut [f32]);
+
+/// tanh, the sigmoid and GELU's tanh form give the bits of the CPU's reference kernels on
+/// every 61st f32 bit pattern (70,409,300 values: subnormals, ±∞ and NaNs among them). Their
+/// operations are each one correctly rounded f32 step, as on the CPU, since NVRTC keeps
+/// subnormals, divides correctly rounded, and fuses no multiply-add here.
+#[test]
+fn tanh_sigmoid_and_gelu_tanh_give_the_reference_bits() {
+    use cavitation_core::kernels::Level;
+    use cavitation_core::kernels::activation::{
+        gelu_tanh_f32_with, sigmoid_f32_with, tanh_f32_with,
+    };
+    let Some(cuda) = Cuda::new() else { return };
+    let kernels = Elementwise::new(&cuda).expect("compile");
+    let x: Vec<f32> = (0..=u32::MAX).step_by(61).map(f32::from_bits).collect();
+    let cases: [(ElementwiseOp, CpuKernel); 3] = [
+        (ElementwiseOp::Tanh, tanh_f32_with),
+        (ElementwiseOp::Sigmoid, sigmoid_f32_with),
+        (ElementwiseOp::GeluTanh, gelu_tanh_f32_with),
+    ];
+    for (op, cpu) in cases {
+        let got = run(&cuda, &kernels, op, &x, None, 0.0);
+        let mut want = x.clone();
+        cpu(Level::Reference, &mut want);
+        assert_exact(
+            &got,
+            &want,
+            &format!("{op:?} against the CPU's reference kernel"),
+        );
     }
 }
 

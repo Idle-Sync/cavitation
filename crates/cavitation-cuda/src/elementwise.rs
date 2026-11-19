@@ -19,9 +19,10 @@ const BLOCK: u32 = 256;
 /// One element-wise operation, applied to every element of `a` (and `b`).
 ///
 /// The one-rounding operations (`Add`, `Mul`, `Scale`, the ReLUs forward and backward) give
-/// the CPU's bits, NaN, ±0 and ±∞ included. tanh, the sigmoid and GELU are the CPU's formulas
-/// ported operation for operation and are checked against bounds of the f64 tape's values in
-/// `tests/elementwise.rs`.
+/// the CPU's bits, NaN, ±0, ±∞ and subnormals included. tanh, the sigmoid and GELU's tanh
+/// form give the bits of the CPU's reference kernels (`Level::Reference`; the CPU's SIMD
+/// kernels fuse operations and may differ from these by an ulp). GELU's erf form uses CUDA's
+/// `expf` and is within a stated bound of the f64 tape. `tests/elementwise.rs` checks each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ElementwiseOp {
@@ -59,7 +60,7 @@ pub enum ElementwiseOp {
 
 impl ElementwiseOp {
     /// Every operation, each once.
-    pub const ALL: [ElementwiseOp; 15] = [
+    pub const ALL: &'static [ElementwiseOp] = &[
         ElementwiseOp::Add,
         ElementwiseOp::Mul,
         ElementwiseOp::Scale,
@@ -135,8 +136,9 @@ impl ElementwiseOp {
 pub struct Elementwise<'c> {
     /// The compiled kernels.
     module: Module<'c>,
-    /// Each operation's kernel handle, in [`ElementwiseOp::ALL`]'s order.
-    functions: [CuFunction; 15],
+    /// Each operation's kernel handle, in [`ElementwiseOp::ALL`]'s order, which is the
+    /// declaration order.
+    functions: [CuFunction; ElementwiseOp::ALL.len()],
 }
 
 impl fmt::Debug for Elementwise<'_> {
@@ -153,8 +155,8 @@ impl<'c> Elementwise<'c> {
     /// [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the driver refuses them.
     pub fn new(cuda: &'c Cuda) -> Result<Elementwise<'c>, CudaError> {
         let module = cuda.compile("elementwise.cu", SOURCE)?;
-        let mut functions = [std::ptr::null_mut(); 15];
-        for (function, op) in functions.iter_mut().zip(ElementwiseOp::ALL) {
+        let mut functions = [std::ptr::null_mut(); ElementwiseOp::ALL.len()];
+        for (function, &op) in functions.iter_mut().zip(ElementwiseOp::ALL) {
             *function = module.function(op.kernel())?;
         }
         Ok(Elementwise { module, functions })
@@ -203,11 +205,9 @@ impl<'c> Elementwise<'c> {
         if n == 0 {
             return Ok(());
         }
-        let index = ElementwiseOp::ALL
-            .iter()
-            .position(|&o| o == op)
-            .expect("every operation is in ALL");
-        let kernel = self.module.kernel_from(self.functions[index]);
+        // SAFETY: the handles were looked up in this module when it was compiled, in `ALL`'s
+        // order, which is the declaration order (a unit test holds it).
+        let kernel = unsafe { self.module.kernel_from(self.functions[op as usize]) };
         let blocks = count.div_ceil(BLOCK);
         // SAFETY: every kernel in the source takes (const float *a, const float *b, float
         // *out, unsigned n, float alpha) and touches elements below n only; a, b and out hold
@@ -225,6 +225,19 @@ impl<'c> Elementwise<'c> {
                     Arg::F32(alpha),
                 ],
             )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ALL` lists every operation once, in declaration order, so `op as usize` indexes it.
+    #[test]
+    fn all_is_in_declaration_order() {
+        for (i, &op) in ElementwiseOp::ALL.iter().enumerate() {
+            assert_eq!(op as usize, i, "{op:?}");
         }
     }
 }
