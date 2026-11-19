@@ -582,3 +582,75 @@ fn copy_share_of_a_cifar_step() {
         );
     });
 }
+
+/// The backward time of each `Linear` and `Conv2d` of a `cifar-cnn` training step at batch
+/// 128 with Adam, with its parameter gradients and its input gradient apart: each the median
+/// of 11 profiled steps after 5 warm-up steps and 21 steps without a profile, whose median
+/// is the step's own time. A measurement, printed, not asserted. Run with `--ignored`.
+#[test]
+#[ignore = "a measurement: run with --ignored"]
+fn backward_parts_of_a_cifar_step() {
+    use std::time::{Duration, Instant};
+
+    let t = twin(cifar_cnn::<f64>, cifar_cnn::<f32>, 28);
+    let data = Data::new(8, 128, 3 * 32 * 32, 10, (-1.0, 1.0));
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    for_each_gpu(|gpu| {
+        let adam = OptimizerConfig::Adam {
+            lr: 1e-3,
+            weight_decay: 0.0,
+        };
+        let mut trainer =
+            GpuTrainer::new(&t.net, &t.params, &adam, Loss::CrossEntropy, 128, gpu).unwrap();
+        for _ in 0..5 {
+            trainer.step(&t.net, data.view()).unwrap();
+        }
+        let mut plain = Vec::new();
+        for _ in 0..21 {
+            let start = Instant::now();
+            trainer.step(&t.net, data.view()).unwrap();
+            plain.push(ms(start.elapsed()));
+        }
+        let mut profiles = Vec::new();
+        for _ in 0..11 {
+            trainer.profile_next_step();
+            trainer.step(&t.net, data.view()).unwrap();
+            let profile = trainer.last_profile();
+            profiles.push(profile.expect("the step was asked for a profile").clone());
+        }
+        let backend = gpu.info().backend;
+        println!(
+            "{backend}: a step without a profile {:.3} ms",
+            median(plain)
+        );
+        let row = |pick: &dyn Fn(&super::GpuStepProfile) -> Option<Duration>| {
+            let times: Option<Vec<f64>> = profiles.iter().map(|p| pick(p).map(ms)).collect();
+            times.map(median)
+        };
+        for i in 0..t.net.len() {
+            let name = t.net.layer(i).name();
+            if name != "linear" && name != "conv2d" {
+                continue;
+            }
+            let Some(whole) = row(&|p| p.backward[i]) else {
+                println!("{backend}: {i} {name}: not timed");
+                continue;
+            };
+            let input = row(&|p| p.backward_input[i]);
+            let params = row(&|p| {
+                let rest = |x| p.backward[i].map(|w: Duration| w.saturating_sub(x));
+                p.backward_input[i].map_or(p.backward[i], rest)
+            });
+            println!(
+                "{backend}: {i} {name}: backward {whole:.3} ms, parameter gradients {:.3} ms, \
+                 input gradient {}",
+                params.unwrap_or(whole),
+                input.map_or("none".to_string(), |v| format!("{v:.3} ms"))
+            );
+        }
+    });
+}
