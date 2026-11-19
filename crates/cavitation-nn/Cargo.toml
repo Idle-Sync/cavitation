@@ -29,3 +29,10 @@ serde_json = "1"
 [[test]]
 name = "no_alloc"
 harness = false
+
+# Counts host allocations across warm GPU training steps; it installs its own global
+# allocator, so it runs alone, without the test harness.
+[[test]]
+name = "gpu_step_alloc"
+harness = false
+required-features = ["gpu"]

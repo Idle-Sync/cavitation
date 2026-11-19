@@ -124,13 +124,15 @@ pub struct Options {
     pub rows: Option<usize>,
     /// `--python`: the interpreter for the PyTorch side.
     pub python: String,
-    /// `--ours-only`: skip the PyTorch side.
-    pub ours_only: bool,
+    /// `--cav-only`: train Cavitation's side only and skip the PyTorch side.
+    pub cav_only: bool,
     /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
     /// steps) and print each layer's median forward and backward time.
     pub profile: Option<usize>,
     /// `--device gpu`: train our side on the GPU (`GpuTrainer`), which needs the `gpu`
-    /// feature; `cpu`, the default, trains with `Trainer`.
+    /// feature; `cpu`, the default, trains with `Trainer`; `auto` is the one of the two
+    /// that `cavitation_nn::devices` marks as chosen (the CPU with `--profile`, which times
+    /// the CPU trainer only).
     pub gpu: bool,
     /// `--backend vulkan|dx12|metal`: the GPU backend, or the platform's default.
     pub backend: Option<String>,
@@ -143,20 +145,42 @@ pub struct Options {
     pub no_fuse: bool,
 }
 
+/// Whether `--device auto` trains on the GPU: whether the device
+/// `cavitation_nn::devices` marks as chosen is one. Prints that device's line.
+///
+/// # Errors
+///
+/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cpu` or `gpu`, or asks for a
+/// device that is not available.
+fn auto_is_gpu() -> Result<bool, String> {
+    let list = cavitation_nn::devices().map_err(|e| e.to_string())?;
+    let entry = list.iter().find(|e| e.chosen).ok_or(
+        "--device auto: CAVITATION_DEVICE asks for a device that is not available (see the \
+         `devices` command)",
+    )?;
+    println!(
+        "--device auto: {} ({}, {})",
+        entry.kind, entry.name, entry.detail
+    );
+    Ok(entry.kind == cavitation_nn::DeviceKind::Gpu)
+}
+
 impl Options {
-    /// Parses the arguments after the command for `net`.
+    /// Parses the arguments after the command for `net`. `--device auto` is resolved here,
+    /// which with the `gpu` feature opens the GPU to see that there is one, and trains on
+    /// the CPU with `--profile`.
     ///
     /// # Errors
     ///
     /// Returns a message for an unknown argument, a missing value or a value that is not
-    /// a positive number (`--seed` may be 0).
+    /// a positive number (`--seed` may be 0), and as [`auto_is_gpu`] does.
     pub fn parse(net: Net, args: &[String]) -> Result<Options, String> {
         let mut o = Options {
             seed: 0,
             epochs: net.epochs,
             rows: None,
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
-            ours_only: false,
+            cav_only: false,
             profile: None,
             gpu: false,
             backend: None,
@@ -164,6 +188,8 @@ impl Options {
             deterministic: false,
             no_fuse: false,
         };
+        // `--device auto`, resolved once every argument is read.
+        let mut auto = false;
         let mut rest = args.iter();
         let number = |flag: &str, v: Option<&String>, zero_ok: bool| -> Result<usize, String> {
             let v = v.ok_or_else(|| format!("{flag} needs a value"))?;
@@ -178,12 +204,15 @@ impl Options {
                 "--epochs" => o.epochs = number("--epochs", rest.next(), false)?,
                 "--rows" => o.rows = Some(number("--rows", rest.next(), false)?),
                 "--python" => o.python = rest.next().ok_or("--python needs a value")?.clone(),
-                "--ours-only" => o.ours_only = true,
+                "--cav-only" => o.cav_only = true,
                 "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
                 "--device" => match rest.next().map(String::as_str) {
-                    Some("cpu") => o.gpu = false,
-                    Some("gpu") => o.gpu = true,
-                    other => return Err(format!("--device takes cpu or gpu, got {other:?}")),
+                    Some("cpu") => (o.gpu, auto) = (false, false),
+                    Some("gpu") => (o.gpu, auto) = (true, false),
+                    Some("auto") => (o.gpu, auto) = (false, true),
+                    other => {
+                        return Err(format!("--device takes auto, cpu or gpu, got {other:?}"));
+                    }
                 },
                 "--backend" => {
                     let b = rest.next().ok_or("--backend needs a value")?;
@@ -203,6 +232,13 @@ impl Options {
                 "--no-fuse" => o.no_fuse = true,
                 other => return Err(format!("unknown argument `{other}`")),
             }
+        }
+        if auto && o.backend.is_some() {
+            return Err("--backend needs --device gpu".into());
+        }
+        if auto {
+            // `--profile` times the CPU trainer only, whatever `auto` would pick.
+            o.gpu = auto_is_gpu()? && o.profile.is_none();
         }
         if o.backend.is_some() && !o.gpu {
             return Err("--backend needs --device gpu".into());
@@ -296,7 +332,7 @@ fn train_ours(
             seconds,
         };
         println!(
-            "  ours  epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s",
+            "  cav   epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s",
             epoch.loss,
             epoch.accuracy * 100.0,
             epoch.seconds
@@ -353,7 +389,7 @@ fn train_ours_gpu(
             seconds,
         };
         println!(
-            "  ours  epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s (gpu)",
+            "  cav   epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s (gpu)",
             epoch.loss,
             epoch.accuracy * 100.0,
             epoch.seconds
@@ -625,7 +661,7 @@ fn epochs_json(epochs: &[Epoch]) -> String {
 }
 
 /// Runs `mnist-cnn` or `cifar-cnn` (`net`) with options `o`: writes the run's files under
-/// `dir_root`, trains here, then in PyTorch unless `--ours-only`, prints the comparison and
+/// `dir_root`, trains here, then in PyTorch unless `--cav-only`, prints the comparison and
 /// writes `result.json`.
 ///
 /// # Errors
@@ -693,7 +729,7 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     };
     let rows = train.len();
     drop(train);
-    let (theirs, about) = if o.ours_only {
+    let (theirs, about) = if o.cav_only {
         (Vec::new(), Vec::new())
     } else {
         train_torch(net, o, &dir, rows)?
@@ -703,7 +739,7 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     }
     let last = |e: &[Epoch]| e.last().map_or(f64::NAN, |e| e.accuracy * 100.0);
     print!(
-        "final test accuracy: ours {:.2}%; steady epoch time: ours {:.2} s",
+        "final test accuracy: cav {:.2}%; steady epoch time: cav {:.2} s",
         last(&ours),
         steady_seconds(&ours)
     );
@@ -712,14 +748,14 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
     } else {
         let (a, b) = (steady_seconds(&ours), steady_seconds(&theirs));
         println!(
-            ", torch {b:.2} s, ours / torch {:.2}; torch final test accuracy {:.2}%",
+            ", torch {b:.2} s, cav / torch {:.2}; torch final test accuracy {:.2}%",
             a / b,
             last(&theirs)
         );
     }
     let json = format!(
         "{{\"net\": \"{}\", \"seed\": {}, \"epochs\": {}, \"rows\": {rows}, \"batch\": {}, \
-         \"kernel\": \"{}\", \"threads\": {}, \"ours\": {}, \"torch\": {}, \"torch_about\": [{}]}}\n",
+         \"kernel\": \"{}\", \"threads\": {}, \"cav\": {}, \"torch\": {}, \"torch_about\": [{}]}}\n",
         net.name,
         o.seed,
         o.epochs,
@@ -803,11 +839,11 @@ mod tests {
         let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let o = Options::parse(
             CIFAR,
-            &args(&["--seed", "2", "--rows", "100", "--ours-only"]),
+            &args(&["--seed", "2", "--rows", "100", "--cav-only"]),
         )
         .unwrap();
         assert_eq!(
-            (o.seed, o.epochs, o.rows, o.ours_only),
+            (o.seed, o.epochs, o.rows, o.cav_only),
             (2, 10, Some(100), true)
         );
         assert_eq!(Options::parse(MNIST, &[]).unwrap().epochs, 5);
@@ -835,8 +871,14 @@ mod tests {
             (g.backend.as_deref(), g.torch_device.as_str()),
             (Some("metal"), "mps")
         );
+        // `auto` with `--profile` is the CPU, which is all `--profile` times; with
+        // `CAVITATION_DEVICE` set to something `devices` refuses, it is that error.
+        if let Ok(a) = Options::parse(CIFAR, &args(&["--device", "auto", "--profile", "3"])) {
+            assert!(!a.gpu && a.profile == Some(3));
+        }
         for bad in [
             &["--device", "tpu"][..],
+            &["--device", "auto", "--backend", "vulkan"],
             &["--backend", "vulkan"],
             &["--device", "gpu", "--backend", "opengl"],
             &["--torch-device", "xla"],

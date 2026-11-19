@@ -91,6 +91,40 @@ The formulas match; the last bits of a value need not. In f32, `Tanh` and `Sigmo
 
 **Shape errors panic.** Building a network and stepping it by hand is code you write next to the model, so a wrong shape inside it is a programming error: `Trainer::step` and the `Sequential` mask calls panic with a message naming the shapes. The calls that a program drives from data or from a user's input, such as `InferenceModel::set_mask` and `Evaluator::set_neuron_mask`, return a `Result`.
 
+## Choosing a device
+
+In PyTorch you move the model and every batch to a device (`model.to("cuda")`, `x.to("cuda")`). In Cavitation the model and the data stay where they are, and the run is told where to train, in `FitConfig::device`:
+
+```rust,ignore
+let config = FitConfig { device: Device::Auto, ..FitConfig::default() };
+let history = fit(&net, &mut params, &data, config)?;
+println!("trained on the {}", history.device); // "gpu" or "cpu"
+```
+
+- `Device::Cpu` is the default.
+- `Device::Gpu(&gpu)` trains on a GPU you opened with `cavitation_gpu::Gpu::new()`. It needs the `gpu` feature, which is off by default, and runs through Vulkan, DX12 or Metal, so it works on NVIDIA, AMD, Intel and Apple GPUs.
+- `Device::Auto` trains on the GPU when the build and the machine have one and it can train the run, and on the CPU otherwise. `history.device` says which, and `history.device_note` gives the reason when a GPU was there and was not used.
+
+`devices()` lists what a machine offers, and `cavitation-bench devices` prints the list:
+
+```text
+cpu: AMD Ryzen 7 2700X Eight-Core Processor
+Devices this build can train on, best first:
+  1. gpu  NVIDIA GeForce GTX 1660 SUPER, vulkan (also: dx12)  <- chosen
+          an NVIDIA card: NVIDIA's CUDA and cuDNN would train faster, and this library has no CUDA engine yet
+  2. cpu  CPU, avx2, 16 threads
+Device::Auto and --device auto train on the gpu.
+Choose with --device auto|cpu|gpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cpu|gpu.
+```
+
+Three things differ from PyTorch's `cuda`:
+
+- There is no CUDA engine. On an NVIDIA card the GPU path is Vulkan or DX12, which is slower than cuDNN; the list says so.
+- A GPU run agrees with the CPU run within the GPU kernels' stated error bounds, not bit for bit. A run that must give the same bits on every machine names its device instead of using `Device::Auto`.
+- Hooks and a `StepControl` (the inspector uses one) run on the CPU only: `Device::Auto` trains such a run on the CPU, and `Device::Gpu` refuses it.
+
+The environment variable `CAVITATION_DEVICE` (`auto`, `cpu` or `gpu`) restricts what `Device::Auto` picks, without a change to the program.
+
 ## Early stopping and plateaus
 
 PyTorch has `ReduceLROnPlateau` and leaves early stopping to your own loop. In Cavitation both are settings of `fit`, and both read each whole epoch's report.

@@ -17,6 +17,8 @@ mod forward;
 mod forward_tests;
 #[cfg(test)]
 mod health_tests;
+#[cfg(test)]
+mod memory_tests;
 mod model;
 #[cfg(test)]
 mod profile_tests;
@@ -26,6 +28,6 @@ mod trainer;
 #[cfg(test)]
 mod trainer_tests;
 
-pub(crate) use fit::fit_on_gpu;
+pub(crate) use fit::{fit_on_gpu, trainer_for};
 pub use model::GpuModel;
 pub use trainer::{GpuOptimizerState, GpuStepProfile, GpuTrainer};

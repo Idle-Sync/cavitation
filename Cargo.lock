@@ -126,6 +126,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cavitation-cuda"
+version = "0.4.1"
+
+[[package]]
 name = "cavitation-datasets"
 version = "0.4.1"
 dependencies = [

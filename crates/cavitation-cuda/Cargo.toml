@@ -1,0 +1,18 @@
+# Package manifest for cavitation-cuda: NVIDIA's CUDA, cuDNN, cuBLAS and NVRTC, loaded at run time, for the cavitation neural network library.
+
+[package]
+name = "cavitation-cuda"
+description = "NVIDIA CUDA, cuDNN, cuBLAS and NVRTC, found and loaded at run time, for the cavitation neural network library."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+# No dependencies: NVIDIA's libraries are opened with the operating system's own loader
+# (LoadLibraryExW on Windows, dlopen on Linux), so a build links to none of them and starts
+# on a machine that has none.
+[dependencies]

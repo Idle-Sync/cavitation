@@ -145,6 +145,34 @@ let net = Sequential::new()
 assert_eq!(net.layer(1).name(), "cube");
 ```
 
+## Choosing a device
+
+Training runs on the CPU unless you ask otherwise. With the `gpu` feature (off by default) it can also run on a GPU through Vulkan, DX12 or Metal, and `cavitation-bench devices` lists what a machine offers, best first:
+
+```sh
+cargo run --release -p cavitation-bench --features gpu -- devices
+```
+
+```text
+cpu: AMD Ryzen 7 2700X Eight-Core Processor
+Devices this build can train on, best first:
+  1. gpu  NVIDIA GeForce GTX 1660 SUPER, vulkan (also: dx12)  <- chosen
+          an NVIDIA card: NVIDIA's CUDA and cuDNN would train faster, and this library has no CUDA engine yet
+  2. cpu  CPU, avx2, 16 threads
+Device::Auto and --device auto train on the gpu.
+Choose with --device auto|cpu|gpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cpu|gpu.
+```
+
+In a program, `devices()` returns the same list, and `FitConfig::device` chooses:
+
+- `Device::Cpu`, the default: the CPU.
+- `Device::Gpu(&gpu)`: a GPU you opened with `cavitation_gpu::Gpu`.
+- `Device::Auto`: the GPU when there is one and it can train the run, the CPU otherwise. A run with hooks or a `StepControl`, or with a layer, loss or optimiser the GPU has no kernel for, trains on the CPU. `History::device` says where the run trained, and `History::device_note` why a GPU was left for the CPU.
+
+The environment variable `CAVITATION_DEVICE` (`auto`, `cpu` or `gpu`) restricts what `Device::Auto` picks. A GPU run agrees with the CPU run within the GPU kernels' stated error bounds, not bit for bit, so a run that must give the same bits on every machine names its device.
+
+Measured on an NVIDIA GTX 1660 Super (Vulkan) and an AMD Ryzen 7 2700X (avx2, 16 threads) with `cargo run --release -p cavitation-bench --features gpu -- cifar-cnn --cav-only --rows 12800 --epochs 3 --device gpu` and `--device cpu`: an epoch of 12,800 CIFAR-10 images takes 2.54 s on the GPU and 14.21 s on the CPU; for `mnist-cnn`, 0.45 s and 0.97 s. On a small network the GPU gains nothing: the digits network's shape (64 → 256 → 128 → 10) at batch 32 takes 19.9 to 20.8 ms an epoch on the GPU and 18.9 to 19.5 ms on the CPU (`CAVITATION_GPU_BACKEND=vulkan cargo test --release -p cavitation-nn --features gpu --lib epoch_time_of_a_small_network_by_device -- --ignored --nocapture`). `Device::Auto` does not weigh the model's size, so name `Device::Cpu` for a network that small.
+
 ## The inspector
 
 The inspector shows a training run in the browser while it trains. Turn on the `inspect` feature, start an `Inspector`, open the address it gives, and train with `cavitation_inspect::fit` in place of `fit`:

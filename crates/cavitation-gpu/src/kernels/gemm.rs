@@ -2,7 +2,9 @@
 //! any sizes. Its CPU twin is the f64 product of the same f32 inputs; every output is within
 //! `2(k + 3) · u · (Σ|a·b| + |β·c|)` of it, and with small-integer inputs it is exact.
 
-use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder};
+use crate::{
+    Backend, BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder,
+};
 
 /// The GEMM shader: 64 × 64 tiles of `C` per workgroup of 16 × 16 threads, 4 × 4 outputs per
 /// thread, k in steps of 16 through 8.25 KiB of workgroup memory (padded against bank
@@ -18,8 +20,98 @@ const GEMM: Shader = Shader {
     ),
 };
 
+/// The GEMM on the wide tile, for a `C` of at most [`WIDE_ROWS`] rows: 32 × 128 tiles of `C`
+/// per workgroup of 16 × 16 threads, 2 × 8 outputs per thread, with the same loaders, store
+/// and order of sums as [`GEMM`], so each output has the same bits from either.
+const GEMM_WIDE: Shader = Shader {
+    name: "gemm_wide",
+    source: concat!(
+        include_str!("gemm_head.wgsl"),
+        include_str!("gemm_load.wgsl"),
+        include_str!("gemm_store.wgsl"),
+        include_str!("gemm_core_wide.wgsl")
+    ),
+};
+
 /// The side of the square tile of `C` one workgroup computes.
 pub(super) const TILE: u32 = 64;
+
+/// The rows of the wide tile: a `C` of at most this many rows is computed on it, where the
+/// square tile's 64 rows would be half empty or worse.
+pub(super) const WIDE_ROWS: u32 = 32;
+
+/// The columns of the wide tile.
+pub(super) const WIDE_COLS: u32 = 128;
+
+/// The fewest workgroups a dispatch on the wide tile must have for the wide tile to be used.
+/// Below it the square tile is faster although half of each of its tiles is empty: it has
+/// twice the workgroups, and so few do not fill the GPU.
+///
+/// Measured on an NVIDIA GTX 1660 Super (Vulkan, `cavitation-bench gemm-gpu --shapes`), the
+/// wide tile's time over the square tile's, by the wide tile's workgroups: 1.45 at 8, 1.38
+/// at 24, 0.93 to 1.11 at 32, 0.72 to 0.73 at 64, and 0.64 to 0.71 from 128 up.
+pub(super) const WIDE_MIN_WORKGROUPS: u64 = 64;
+
+/// Whether a product whose `C` is `m × n` runs on the wide tile, and its grid of workgroups
+/// for `batch` products: tiles across `n`, tiles down `m`, products. The wide tile is used
+/// when all three hold:
+/// - `m` is at most [`WIDE_ROWS`], so one row of wide tiles holds every row of `C`;
+/// - `n` is above [`TILE`], so the wide tile takes fewer workgroups than the square one (a
+///   `C` that fits one square tile stays on it, where each thread loads less of `B`);
+/// - the dispatch has at least [`WIDE_MIN_WORKGROUPS`] wide tiles.
+pub(super) fn grid(m: u32, n: u32, batch: u32) -> (bool, [u32; 3]) {
+    let wide_tiles = u64::from(n.div_ceil(WIDE_COLS)) * u64::from(batch);
+    if m <= WIDE_ROWS && n > TILE && wide_tiles >= WIDE_MIN_WORKGROUPS {
+        (true, [n.div_ceil(WIDE_COLS), 1, batch])
+    } else {
+        (false, square_grid(m, n, batch))
+    }
+}
+
+/// Whether the wide tile's pipelines are built on the cache's GPU: on Vulkan, and on DX12
+/// with DXC named as its shader compiler (`WGPU_DX12_COMPILER=dxc`).
+///
+/// - **DX12 without DXC named:** FXC, which DX12 may fall back to under the `auto` setting,
+///   takes about 27 s over each wide pipeline (measured on an NVIDIA GTX 1660 Super: a
+///   `cifar-cnn` trainer builds in 244 s with them against 134 s without, to save 2.6 ms a
+///   step), where DXC takes about 1 s.
+/// - **Metal:** on an Apple M4 the wide tile is slower than the square tile on every product
+///   the rule gives it, 1.13× to 1.79× (`gemm-gpu --shapes`, from 8 products of
+///   32 × 1024 × 288 to 128, and 64 of 10 × 256 × 128), and the `cifar-cnn` epoch took
+///   22.75 s against 22.47 s.
+pub(super) fn wide_allowed(cache: &PipelineCache) -> bool {
+    let info = cache.gpu().info();
+    match info.backend {
+        Backend::Metal => false,
+        _ => match &info.dx12_compiler {
+            None => true,
+            Some(setting) => setting.starts_with("dxc"),
+        },
+    }
+}
+
+/// The square tile's grid of workgroups for `batch` products whose `C` is `m × n`: any
+/// product can run on it.
+pub(super) fn square_grid(m: u32, n: u32, batch: u32) -> [u32; 3] {
+    [n.div_ceil(TILE), m.div_ceil(TILE), batch]
+}
+
+/// The pipeline of `shader` (the GEMM on one of its tiles) for one pair of transposes.
+fn pipeline(
+    cache: &mut PipelineCache,
+    layout: &wgpu::PipelineLayout,
+    shader: Shader,
+    trans_a: bool,
+    trans_b: bool,
+) -> Result<wgpu::ComputePipeline, GpuError> {
+    let flag = |on: bool| if on { 1.0 } else { 0.0 };
+    cache.get_with_layout(
+        shader,
+        "main",
+        &[("TRANS_A", flag(trans_a)), ("TRANS_B", flag(trans_b))],
+        layout,
+    )
+}
 
 /// The bytes of the shader's `Dims` uniform: sixteen 4-byte fields.
 pub(super) const DIMS_BYTES: u64 = 64;
@@ -343,12 +435,21 @@ pub struct Gemm {
     /// The layout of group 0: `A`, `B` (read-only storage), `C` (read-write storage) and
     /// the `Dims` uniform.
     group: wgpu::BindGroupLayout,
-    /// The pipelines, indexed by `2 · trans_a + trans_b`.
+    /// The square tile's pipelines, indexed by `2 · trans_a + trans_b`.
     pipelines: [wgpu::ComputePipeline; 4],
+    /// The wide tile's pipelines, indexed the same way, each built by
+    /// [`ensure_wide`](Gemm::ensure_wide) for the first product that needs it.
+    wide: [Option<wgpu::ComputePipeline>; 4],
+    /// The pipeline layout every pipeline is built with.
+    layout: wgpu::PipelineLayout,
 }
 
 impl Gemm {
-    /// Builds the GEMM's bind group layout and its four pipelines on `gpu`, through `cache`.
+    /// Builds the GEMM's bind group layout and the square tile's four pipelines on `gpu`,
+    /// through `cache`. The wide tile's pipelines are built later, by
+    /// [`ensure_wide`](Gemm::ensure_wide), for the products that use them: a backend's
+    /// shader compiler may take seconds over each (FXC about 26 s on an NVIDIA GTX 1660
+    /// Super), which a model with no such product should not pay.
     ///
     /// # Examples
     ///
@@ -397,22 +498,80 @@ impl Gemm {
             bind_group_layouts: &[Some(&group)],
             immediate_size: 0,
         });
-        let build = |cache: &mut PipelineCache, trans_a: bool, trans_b: bool| {
-            let flag = |on: bool| if on { 1.0 } else { 0.0 };
-            cache.get_with_layout(
-                GEMM,
-                "main",
-                &[("TRANS_A", flag(trans_a)), ("TRANS_B", flag(trans_b))],
-                &layout,
-            )
-        };
         let pipelines = [
-            build(cache, false, false)?,
-            build(cache, false, true)?,
-            build(cache, true, false)?,
-            build(cache, true, true)?,
+            pipeline(cache, &layout, GEMM, false, false)?,
+            pipeline(cache, &layout, GEMM, false, true)?,
+            pipeline(cache, &layout, GEMM, true, false)?,
+            pipeline(cache, &layout, GEMM, true, true)?,
         ];
-        Ok(Gemm { group, pipelines })
+        Ok(Gemm {
+            group,
+            pipelines,
+            wide: [None, None, None, None],
+            layout,
+        })
+    }
+
+    /// Builds the wide tile's pipeline for `call`, through `cache`, if `call` is a product
+    /// the wide tile computes (at most 32 rows, more than 64 columns and at least 64 wide
+    /// tiles in its dispatch) and the pipeline for its transposes is not built yet. Returns
+    /// whether `call` runs on the wide tile from now on.
+    ///
+    /// On Metal it builds nothing and returns `false`: there the wide tile is slower. On DX12
+    /// it does the same unless DXC is named as the shader compiler
+    /// (`WGPU_DX12_COMPILER=dxc`): FXC takes about 27 s over each wide pipeline.
+    ///
+    /// [`record`](Gemm::record) uses the wide tile only for a product this has been called
+    /// for; without it the product runs on the square tile, with the same bits. Call it
+    /// once for each prepared call, when a model is compiled.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if the wide kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::{Gemm, GemmDims};
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let (mut cache, mut pool) = (PipelineCache::new(&gpu), BufferPool::new(&gpu));
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let mut gemm = Gemm::new(&gpu, &mut cache).unwrap();
+    ///     let take = |pool: &mut BufferPool, n: u64| pool.take(4 * n, wgpu::BufferUsages::STORAGE);
+    ///     // 64 products of 8 × 128 × 4, sharing A and B: 64 wide tiles.
+    ///     let dims = GemmDims { batch: 64, c_batch: 8 * 128, ..GemmDims::new(8, 128, 4) };
+    ///     let (a, b, c) = (take(&mut pool, 32), take(&mut pool, 512), take(&mut pool, 64 * 1024));
+    ///     let call = gemm.call(&mut steps, &mut pool, dims, &a, &b, &c);
+    ///     // True except on DX12 without DXC named as its compiler.
+    ///     let wide = gemm.ensure_wide(&mut cache, &call).unwrap();
+    ///     assert_eq!(cache.pipelines_built(), 4 + usize::from(wide));
+    ///     // One product of the same shape is one wide tile: it stays on the square tile.
+    ///     let one = gemm.call(&mut steps, &mut pool, GemmDims::new(8, 128, 4), &a, &b, &c);
+    ///     assert!(!gemm.ensure_wide(&mut cache, &one).unwrap());
+    /// }
+    /// ```
+    pub fn ensure_wide(
+        &mut self,
+        cache: &mut PipelineCache,
+        call: &GemmCall,
+    ) -> Result<bool, GpuError> {
+        let d = call.dims;
+        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch.max(1)).0 {
+            return Ok(false);
+        }
+        let at = 2 * usize::from(d.trans_a) + usize::from(d.trans_b);
+        if self.wide[at].is_none() {
+            self.wide[at] = Some(pipeline(
+                cache,
+                &self.layout,
+                GEMM_WIDE,
+                d.trans_a,
+                d.trans_b,
+            )?);
+        }
+        Ok(true)
     }
 
     /// Prepares one GEMM of shape `dims` on `a`, `b` and `c`: its `Dims` uniform, taken
@@ -524,24 +683,33 @@ impl Gemm {
     }
 
     /// Adds the GEMM `call` to `step`: one dispatch of `ceil(n / 64) × ceil(m / 64) × batch`
-    /// workgroups.
+    /// workgroups, or of `ceil(n / 128) × 1 × batch` on the wide tile when `m` is at most 32,
+    /// `n` is above 64, that grid has at least 64 workgroups (measured: below that the
+    /// square tile is faster) and [`ensure_wide`](Gemm::ensure_wide) has built the wide
+    /// pipeline for the call. Each output is the same bits on either tile.
     ///
     /// # Panics
     ///
-    /// If `m` or `n` needs more than 65,535 tiles of 64 (more than 4,194,240), or `batch` is
-    /// above 65,535: split such products into several calls.
+    /// If the grid has more than 65,535 workgroups along a side: on the square tile `m` or
+    /// `n` above 4,194,240 (65,535 tiles of 64), on the wide tile `n` above 8,388,480
+    /// (65,535 tiles of 128), or `batch` above 65,535. Split such products into several
+    /// calls.
     ///
     /// # Examples
     ///
     /// See [`Gemm`].
     pub fn record(&self, step: &mut Step<'_>, call: &GemmCall) {
         let d = call.dims;
-        let pipeline = &self.pipelines[2 * usize::from(d.trans_a) + usize::from(d.trans_b)];
-        step.dispatch_grid(
-            pipeline,
-            &call.group,
-            [d.n.div_ceil(TILE), d.m.div_ceil(TILE), d.batch.max(1)],
-        );
+        let at = 2 * usize::from(d.trans_a) + usize::from(d.trans_b);
+        let batch = d.batch.max(1);
+        match (grid(d.m, d.n, batch), &self.wide[at]) {
+            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
+            _ => step.dispatch_grid(
+                &self.pipelines[at],
+                &call.group,
+                square_grid(d.m, d.n, batch),
+            ),
+        }
     }
 }
 
@@ -578,5 +746,33 @@ impl GemmCall {
     /// See [`Gemm::call`].
     pub fn release(self, pool: &mut BufferPool) {
         pool.give(self.params);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The rule that chooses the tile; the products themselves are checked on a GPU in
+    //! `tests/gemm.rs`.
+
+    use super::grid;
+
+    /// The wide tile is chosen for at most 32 rows, more than 64 columns and at least 64 wide
+    /// tiles; every other product keeps the square tile, with its grid.
+    #[test]
+    fn the_wide_tile_is_chosen_when_it_pays() {
+        // A 32-channel convolution over a batch: 8 wide tiles per image, 128 images.
+        assert_eq!(grid(32, 1024, 128), (true, [8, 1, 128]));
+        assert_eq!(grid(32, 1024, 8), (true, [8, 1, 8]));
+        assert_eq!(grid(1, 65, 64), (true, [1, 1, 64]));
+        // One wide tile short of 64.
+        assert_eq!(grid(32, 1024, 7), (false, [16, 1, 7]));
+        // One product of few rows, as the last layer's weight gradient is.
+        assert_eq!(grid(10, 256, 1), (false, [4, 1, 1]));
+        // A C that fits one square tile.
+        assert_eq!(grid(32, 64, 4096), (false, [1, 1, 4096]));
+        assert_eq!(grid(32, 27, 128), (false, [1, 1, 128]));
+        // More than 32 rows.
+        assert_eq!(grid(33, 1024, 128), (false, [16, 1, 128]));
+        assert_eq!(grid(200, 1000, 1), (false, [16, 4, 1]));
     }
 }

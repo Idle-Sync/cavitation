@@ -58,7 +58,7 @@ Every run uses 4 threads (`CAVITATION_THREADS=4`, and `torch.set_num_threads(4)`
 
 ## PyTorch as a fixed baseline
 
-The PyTorch numbers above are the baseline for each machine and seed. With the same network, data, seed, batch size, epochs, learning rate, thread count and PyTorch version, PyTorch's run would be the same again, so a later measurement of Cavitation runs only Cavitation's half (`--ours-only`) and compares it with these rows. A new PyTorch version, or a change to the benchmark's settings, needs a new baseline. Compare epoch times only on a machine as quiet as it was for the baseline row.
+The PyTorch numbers above are the baseline for each machine and seed. With the same network, data, seed, batch size, epochs, learning rate, thread count and PyTorch version, PyTorch's run would be the same again, so a later measurement of Cavitation runs only Cavitation's half (`--cav-only`) and compares it with these rows. A new PyTorch version, or a change to the benchmark's settings, needs a new baseline. Compare epoch times only on a machine as quiet as it was for the baseline row.
 
 ## Running them
 
@@ -66,7 +66,7 @@ The PyTorch numbers above are the baseline for each machine and seed. With the s
 scripts/data/get-cifar10.sh                       # CIFAR-10 into data/cifar10/
 cargo run --release -p cavitation-bench -- mnist-cnn --seed 0 --python <python with torch>
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --python <python with torch>
-cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --ours-only   # Cavitation's half only
+cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --cav-only    # Cavitation's half only
 cargo run --release -p cavitation-bench -- cifar-cnn --profile 15            # time per layer, no training run
 ```
 

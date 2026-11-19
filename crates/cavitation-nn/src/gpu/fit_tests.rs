@@ -2,10 +2,14 @@
 //! rates, masks and short last batch, bit for bit against a loop written by hand); the
 //! parameters reach the host before `on_epoch`, when early stopping keeps a best epoch,
 //! before an error of a step or of an epoch's end, and at the end; the run tracks the CPU's `fit` within 2⁻¹⁰; and what
-//! the GPU does not run is refused before any training.
+//! the GPU does not run is refused before any training. [`Device::Auto`] trains on the GPU
+//! it opens, to the bits of `Device::Gpu` on that GPU, and on the CPU, to the bits of
+//! `Device::Cpu`, what the GPU does not run.
 //!
-//! Without a GPU every test says so and checks nothing; `CAVITATION_GPU_REQUIRED=1` makes
-//! that a failure.
+//! Without a GPU every test of `Device::Gpu` says so and checks nothing;
+//! `CAVITATION_GPU_REQUIRED=1` makes that a failure. The tests of `Device::Auto` open the GPU
+//! with `Gpu::open`, which that variable does not govern: without a GPU they check that the
+//! run trains on the CPU.
 
 use std::sync::{Arc, Mutex};
 
@@ -15,9 +19,10 @@ use super::GpuTrainer;
 use super::forward_tests::mlp;
 use super::health_tests::for_each_gpu;
 use crate::{
-    Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Device, Dropout, EarlyStopping, Evaluation,
-    FitConfig, Flatten, Health, Hooks, Linear, Loss, LrSchedule, MaxPool2d, Monitor, OnNonFinite,
-    OptimizerConfig, Relu, Sequential, StepControl, Targets, fit, fit_controlled, fit_with_hooks,
+    Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Device, DeviceKind, Dropout, EarlyStopping,
+    Evaluation, FitConfig, Flatten, Health, Hooks, Linear, Loss, LrSchedule, MaxPool2d, Monitor,
+    OnNonFinite, OptimizerConfig, Relu, Sequential, StepControl, Targets, fit, fit_controlled,
+    fit_with_hooks,
 };
 
 /// A CNN on 2 × 8 × 8 images: a convolution, batch norm with running statistics, ReLU, max
@@ -679,4 +684,238 @@ fn the_default_device_is_the_cpu() {
         };
         assert!(format!("{config:?}").contains("device: Gpu("));
     });
+}
+
+/// Whether `CAVITATION_DEVICE` is unset or empty, so that `Device::Auto` picks by its own
+/// rule, as the tests of it assume; says so when it is not.
+fn auto_is_unrestricted() -> bool {
+    let unrestricted = std::env::var_os("CAVITATION_DEVICE").is_none_or(|v| v.is_empty());
+    if !unrestricted {
+        println!("CAVITATION_DEVICE is set: the Device::Auto tests check nothing");
+    }
+    unrestricted
+}
+
+/// What a run left: the device it trained on, the parameters and each epoch's mean loss, by
+/// their bits.
+type Outcome = (DeviceKind, Vec<u32>, Vec<u64>);
+
+/// The run of [`settings`] on the CNN and `data`, on `device`.
+fn cnn_run(device: Device<'_>, data: &Dataset) -> Outcome {
+    let mut params = ParamStore::new();
+    let net = cnn(&mut params, 5);
+    let config = FitConfig {
+        device,
+        ..settings()
+    };
+    let history = fit(&net, &mut params, data, config).unwrap();
+    let losses = history.epochs.iter().map(|e| e.mean_loss.to_bits());
+    (history.device, bits(&net, &params), losses.collect())
+}
+
+/// `Device::Auto` trains a model the GPU runs on the GPU `Gpu::open` picks on this
+/// platform's backends, to the bits of `Device::Gpu` on that GPU, and says so in the
+/// history; on a machine without a GPU it trains on the CPU, to the bits of `Device::Cpu`.
+#[test]
+fn auto_trains_on_the_gpu_it_opens() {
+    use cavitation_gpu::{Backend, Gpu};
+
+    if !auto_is_unrestricted() {
+        return;
+    }
+    let data = classes(31, 22, 2 * 64, 5);
+    let auto = cnn_run(Device::Auto, &data);
+    match Gpu::open(Backend::on_this_platform()) {
+        Ok(gpu) => {
+            assert_eq!(auto.0, DeviceKind::Gpu);
+            assert_eq!(auto, cnn_run(Device::Gpu(&gpu), &data));
+        }
+        Err(why) => {
+            println!("no GPU ({why}): Device::Auto trains on the CPU");
+            assert_eq!(auto, cnn_run(Device::Cpu, &data));
+            assert_eq!(auto.0, DeviceKind::Cpu);
+        }
+    }
+}
+
+/// `Device::Auto` leaves to the CPU what the GPU refuses under `Device::Gpu` (an optimiser
+/// without a GPU kernel, `OnNonFinite::Warn`, a registered hook and `fit_controlled`): each
+/// run trains, to the bits of `Device::Cpu`, and its history says the CPU.
+#[test]
+fn auto_leaves_to_the_cpu_what_the_gpu_does_not_run() {
+    if !auto_is_unrestricted() {
+        return;
+    }
+    let mut start = ParamStore::new();
+    let mut net = mlp::<f32>(&mut start, 71);
+    let train = classes(72, 16, 12, 4);
+    let rms = OptimizerConfig::RmsProp {
+        lr: 1e-3,
+        alpha: 0.99,
+        momentum: 0.0,
+        weight_decay: 0.0,
+        centered: false,
+    };
+    let gpu_opens = cavitation_gpu::Gpu::open(cavitation_gpu::Backend::on_this_platform()).is_ok();
+    // The settings of case `case` on `device`.
+    let config = |case: &str, device: Device<'static>| {
+        let mut config = FitConfig {
+            epochs: 2,
+            batch: 8,
+            health: Health::quiet(),
+            device,
+            ..FitConfig::default()
+        };
+        match case {
+            "RMSprop" => config.optimizer = rms,
+            "OnNonFinite::Warn" => config.health.on_non_finite = OnNonFinite::Warn,
+            _ => {}
+        }
+        config
+    };
+    for case in ["RMSprop", "OnNonFinite::Warn", "a hook", "a control"] {
+        let mut outcomes = Vec::new();
+        for device in [Device::Auto, Device::Cpu] {
+            let mut params = start.clone();
+            let mut hooks = Hooks::new();
+            if case == "a hook" {
+                hooks.on_forward(0, |_| {});
+            }
+            let config = config(case, device);
+            let history = if case == "a control" {
+                let mut control = NoControl;
+                fit_controlled(
+                    &mut net,
+                    &mut params,
+                    &train,
+                    config,
+                    &mut hooks,
+                    &mut control,
+                )
+            } else {
+                fit_with_hooks(&net, &mut params, &train, config, &mut hooks)
+            }
+            .unwrap_or_else(|e| panic!("{case}: {e}"));
+            drop(hooks);
+            let losses: Vec<u64> = (history.epochs.iter())
+                .map(|e| e.mean_loss.to_bits())
+                .collect();
+            assert_eq!(history.device, DeviceKind::Cpu, "{case}");
+            // The history says why a GPU that opened was left: the reason `Device::Gpu`
+            // gives. A hook or a control keeps the run on the CPU without opening one.
+            let left = matches!(device, Device::Auto)
+                && gpu_opens
+                && matches!(case, "RMSprop" | "OnNonFinite::Warn");
+            assert_eq!(history.device_note.is_some(), left, "{case}");
+            if let Some(note) = &history.device_note {
+                assert!(note.contains("GpuTrainer"), "{case}: {note}");
+            }
+            outcomes.push((bits(&net, &params), losses));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "{case}");
+    }
+}
+
+/// The epoch time of a small network on each device: the digits network's shape
+/// (64 → 256 → 128 → 10, 50,826 parameters) on 1,152 random rows at batch 32 with Adam, 12
+/// epochs on `Device::Cpu` and on each GPU, the median of the last 10. A measurement,
+/// printed, not asserted. Run with `--ignored`.
+#[test]
+#[ignore = "a measurement: run with --ignored"]
+fn epoch_time_of_a_small_network_by_device() {
+    let data = classes(91, 1152, 64, 10);
+    let run = |device: Device<'_>| {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(92);
+        let net = Sequential::new()
+            .push(Linear::new(&mut params, 64, 256, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 256, 128, &mut rng))
+            .push(Relu)
+            .push(Linear::new(&mut params, 128, 10, &mut rng));
+        let config = FitConfig {
+            epochs: 12,
+            batch: 32,
+            health: Health::quiet(),
+            device,
+            ..FitConfig::default()
+        };
+        let history = fit(&net, &mut params, &data, config).unwrap();
+        let mut seconds: Vec<f64> = history.epochs[2..].iter().map(|e| e.seconds).collect();
+        seconds.sort_by(f64::total_cmp);
+        1e3 * seconds[seconds.len() / 2]
+    };
+    println!("cpu: an epoch of 36 steps {:.2} ms", run(Device::Cpu));
+    for_each_gpu(|gpu| {
+        println!(
+            "{}: an epoch of 36 steps {:.2} ms",
+            gpu.info().backend,
+            run(Device::Gpu(gpu))
+        );
+    });
+}
+
+/// With `CAVITATION_DEVICE` asking for a GPU, `Device::Auto` does not fall back: a run the
+/// GPU does not train is the error `Device::Gpu` returns, with the parameters untouched, and
+/// one it trains is `Device::Gpu`'s run. Asking for the CPU trains there with a GPU present.
+#[test]
+fn the_variable_keeps_auto_on_the_kind_it_names() {
+    use crate::train::{Choice, fit_choosing};
+    use cavitation_gpu::{Backend, Gpu};
+
+    let Ok(gpu) = Gpu::open(Backend::on_this_platform()) else {
+        println!("no GPU: nothing to check");
+        return;
+    };
+    let mut start = ParamStore::new();
+    let net = mlp::<f32>(&mut start, 71);
+    let train = classes(72, 16, 12, 4);
+    let config = |device: Device<'static>| FitConfig {
+        epochs: 2,
+        batch: 8,
+        health: Health::quiet(),
+        device,
+        ..FitConfig::default()
+    };
+    let only_gpu = Choice::Only(DeviceKind::Gpu);
+
+    let mut params = start.clone();
+    let rms = FitConfig {
+        optimizer: OptimizerConfig::RmsProp {
+            lr: 1e-3,
+            alpha: 0.99,
+            momentum: 0.0,
+            weight_decay: 0.0,
+            centered: false,
+        },
+        ..config(Device::Auto)
+    };
+    let error = fit_choosing(&net, &mut params, &train, rms, only_gpu).unwrap_err();
+    assert!(matches!(error, Error::Unsupported(_)), "{error}");
+    assert_eq!(bits(&net, &params), bits(&net, &start));
+
+    let mut asked = start.clone();
+    let history = fit_choosing(&net, &mut asked, &train, config(Device::Auto), only_gpu).unwrap();
+    assert_eq!(
+        (history.device, &history.device_note),
+        (DeviceKind::Gpu, &None)
+    );
+    let mut named = start.clone();
+    let on_gpu = FitConfig {
+        device: Device::Gpu(&gpu),
+        ..config(Device::Cpu)
+    };
+    fit(&net, &mut named, &train, on_gpu).unwrap();
+    assert_eq!(bits(&net, &asked), bits(&net, &named));
+
+    let mut on_cpu = start.clone();
+    let only_cpu = Choice::Only(DeviceKind::Cpu);
+    let history = fit_choosing(&net, &mut on_cpu, &train, config(Device::Auto), only_cpu).unwrap();
+    assert_eq!(
+        (history.device, &history.device_note),
+        (DeviceKind::Cpu, &None)
+    );
+    let mut cpu = start.clone();
+    fit(&net, &mut cpu, &train, config(Device::Cpu)).unwrap();
+    assert_eq!(bits(&net, &on_cpu), bits(&net, &cpu));
 }
