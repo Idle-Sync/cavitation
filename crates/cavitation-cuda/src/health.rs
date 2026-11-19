@@ -404,9 +404,16 @@ impl<'c> FiniteFlag<'c> {
     /// changes. Run it after the kernels that write the loss and the gradients, and before
     /// those that read the flag.
     ///
+    /// The flag is set to 1 (skip) before the first count is launched and the fold overwrites
+    /// it, so a run that fails partway leaves a flag that skips the step rather than the last
+    /// step's value: a check that did not finish never lets an unchecked step through. No test
+    /// provokes a failing launch, which the driver gives no cheap way to cause; the tests check
+    /// that a run that succeeds writes the rule's flag over the 1.
+    ///
     /// # Errors
     ///
-    /// [`CudaError::Call`] if a launch is refused.
+    /// [`CudaError::Call`] if a launch is refused or the 1 cannot be written; when the write
+    /// itself fails, `flag` may still hold its old value.
     ///
     /// # Panics
     ///
@@ -427,6 +434,9 @@ impl<'c> FiniteFlag<'c> {
                 (flag, "flag", 1),
             ],
         );
+        // Skip until the fold says otherwise: the copy follows the work already queued and
+        // precedes the launches below.
+        flag.write(&[1u32])?;
         let k = &self.kernels;
         for (at, &(start, len)) in (0u32..).zip(&self.tensors) {
             // SAFETY: the gradients hold start + len values, at most 2³¹ (checked when the

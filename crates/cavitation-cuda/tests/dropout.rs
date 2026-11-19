@@ -143,7 +143,7 @@ fn keep_where_follows_its_mask() {
 }
 
 /// The twins above are the CPU's own operations: the tape's dropout multipliers and
-/// `keep_where` give the same bits on the specials, forward and backward.
+/// `keep_where` give the same bits on the specials, forward and backward, at p = 0.025.
 #[test]
 fn the_twins_are_the_tapes() {
     let Some(cuda) = Cuda::new() else { return };
@@ -155,8 +155,15 @@ fn the_twins_are_the_tapes() {
     let n = x.len();
     let words = [0xAAAA_5555u32];
     let keep: Vec<bool> = (0..n).map(|i| bit(&words, i)).collect();
-    let p = 0.3;
+    // At 0.025 the CPU's 1 / f32(1 − p) and 1 / (1 − p) rounded once differ, so the tape
+    // tells the two roundings apart.
+    let p = 0.025;
     let scale = Dropout::scale(p).expect("p");
+    assert_ne!(
+        scale,
+        (1.0 / (1.0 - p)) as f32,
+        "p tells the roundings apart"
+    );
     let g: Vec<f32> = (0..n).map(|i| [1.5, -0.25, f32::NAN][i % 3]).collect();
     let mut params: ParamStore<f32> = ParamStore::default();
     let id = params.add(Tensor::from_vec(x.clone(), &[n]).expect("shape"));
