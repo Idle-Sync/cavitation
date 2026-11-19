@@ -34,7 +34,11 @@
 //!   pedantic math (f32 throughout, no tensor cores): forward with a bias, input gradient,
 //!   weight gradient, bias gradient; measured in `tests/linear.rs`.
 //!
-//! What is not here yet: batch norm, pooling, activations, the loss and the optimiser, and
+//! - [`Elementwise`] and [`ElementwiseOp`]: add, multiply, scale and the activations (ReLU,
+//!   leaky ReLU, tanh, the sigmoid, GELU in both forms), forward and backward, as this
+//!   crate's own kernels, each the twin of its CPU code (`tests/elementwise.rs`).
+//!
+//! What is not here yet: batch norm, pooling, dropout, the loss and the optimiser, and
 //! no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
@@ -75,6 +79,7 @@
 mod buffer;
 mod conv;
 mod device;
+mod elementwise;
 mod error;
 mod find;
 mod library;
@@ -85,6 +90,7 @@ mod sys;
 pub use buffer::{DeviceBuffer, Scalar};
 pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
+pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
 pub use linear::{Linear, LinearShape};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};

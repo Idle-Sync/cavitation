@@ -212,6 +212,21 @@ impl<'c> Module<'c> {
     ///
     /// If `name` holds a NUL character.
     pub fn kernel(&self, name: &str) -> Result<Kernel<'_>, CudaError> {
+        let function = self.function(name)?;
+        Ok(self.kernel_from(function))
+    }
+
+    /// The handle of the kernel the source declares under `name`, for a type that keeps the
+    /// module and looks each kernel up once; [`Module::kernel_from`] makes it a [`Kernel`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Module::kernel`].
+    ///
+    /// # Panics
+    ///
+    /// If `name` holds a NUL character.
+    pub(crate) fn function(&self, name: &str) -> Result<CuFunction, CudaError> {
         let c_name = CString::new(name).expect("a kernel name holds no NUL character");
         self.cuda.bind()?;
         let mut function: CuFunction = std::ptr::null_mut();
@@ -221,11 +236,16 @@ impl<'c> Module<'c> {
             (self.cuda.driver.cuModuleGetFunction)(&mut function, self.module, c_name.as_ptr())
         };
         self.cuda.check("cuModuleGetFunction", code)?;
-        Ok(Kernel {
+        Ok(function)
+    }
+
+    /// The kernel whose handle `function` came from this module's [`Module::function`].
+    pub(crate) fn kernel_from(&self, function: CuFunction) -> Kernel<'_> {
+        Kernel {
             cuda: self.cuda,
             function,
             module: PhantomData,
-        })
+        }
     }
 }
 
