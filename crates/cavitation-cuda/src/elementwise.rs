@@ -58,7 +58,7 @@ pub enum ElementwiseOp {
 }
 
 impl ElementwiseOp {
-    /// Every operation, in the order of [`ElementwiseOp::kernel`]'s names.
+    /// Every operation, each once.
     pub const ALL: [ElementwiseOp; 15] = [
         ElementwiseOp::Add,
         ElementwiseOp::Mul,
