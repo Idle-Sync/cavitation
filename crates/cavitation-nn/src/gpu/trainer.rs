@@ -367,10 +367,15 @@ struct HealthRead {
 /// are timed and names what is missing. A profiled step runs each part in compute passes of
 /// its own, so its parts describe a step structured for profiling.
 ///
+/// The struct is `#[non_exhaustive]`, so a later field is not a breaking change: outside
+/// this crate a profile comes from [`GpuTrainer::last_profile`] and is read through its
+/// public fields.
+///
 /// # Examples
 ///
 /// See [`GpuTrainer::profile_next_step`].
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct GpuStepProfile {
     /// Each layer's forward passes, in layer order.
     pub forward: Vec<Option<Duration>>,
@@ -383,7 +388,8 @@ pub struct GpuStepProfile {
     /// parameter gradients (the weight's and the bias's, after the layer's mask if it has
     /// one). The two parts run in compute passes of their own. `None` for a layer whose
     /// backward pass is one part: every other kind of layer, and a first layer, which
-    /// computes no input gradient.
+    /// computes no input gradient; and, as for every part, where the device could not time
+    /// it. A layer with a `backward` time and no `backward_input` is one that is not split.
     pub backward_input: Vec<Option<Duration>>,
     /// The health values: the finite flag, the sums of squares and the ReLU bits.
     pub health: Option<Duration>,

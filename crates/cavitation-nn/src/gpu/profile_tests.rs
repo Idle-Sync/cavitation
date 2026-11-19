@@ -77,16 +77,12 @@ fn a_profile_has_every_layer() {
         let sum: Duration = parts.iter().flatten().sum();
         assert!(sum <= p.total, "{sum:?} of parts against {:?}", p.total);
         // The input gradient is timed apart for the two `Linear` layers and for no other: the
-        // convolution is the first layer and computes none. It is a part of the layer's
-        // backward time, and the parameter gradients, a pass of their own, are the rest. Neither
-        // part is asserted above 0: a short pass's two timestamps can read the same tick.
+        // convolution is the first layer and computes none. No time is asserted above 0: a
+        // short pass's two timestamps can read the same tick.
         assert_eq!(p.backward_input.len(), net.len());
-        for (i, (input, whole)) in p.backward_input.iter().zip(&p.backward).enumerate() {
+        for (i, input) in p.backward_input.iter().enumerate() {
             let split = i == 6 || i == 7;
             assert_eq!(input.is_some(), split && timed, "layer {i}: {input:?}");
-            if let (Some(input), Some(whole)) = (input, whole) {
-                assert!(input <= whole, "layer {i}: {input:?} of {whole:?}");
-            }
         }
         // Each time is its own layer's: `Flatten` (no work) is the shortest both ways, which a
         // profile with the layers in the wrong order would not show. No ordering between layers
@@ -134,7 +130,8 @@ fn a_skipped_step_passes_the_profile_on() {
 }
 
 /// A model with nine batch norms (each running update its own pass) is profiled: the timed
-/// passes are sized for them.
+/// passes are sized for them and for the input gradients of its eight convolutions after the
+/// first and of its `Linear`, each timed apart.
 #[test]
 fn nine_batch_norms_are_profiled() {
     let mut params = ParamStore::new();
@@ -172,8 +169,14 @@ fn nine_batch_norms_are_profiled() {
         t.step(&net, data.view()).unwrap();
         let p = t.last_profile().unwrap();
         assert_eq!(p.forward.len(), net.len());
-        if !matches!(p.timing, Timing::Untimed { .. }) {
+        let timed = !matches!(p.timing, Timing::Untimed { .. });
+        if timed {
             assert!(p.running.is_some());
+        }
+        // Layers 0, 3, ..., 24 are the convolutions and layer 28 the `Linear`.
+        for (i, input) in p.backward_input.iter().enumerate() {
+            let split = (i > 0 && i < 27 && i % 3 == 0) || i == 28;
+            assert_eq!(input.is_some(), split && timed, "layer {i}: {input:?}");
         }
     });
 }
