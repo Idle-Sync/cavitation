@@ -49,6 +49,9 @@ pub enum CudaError {
     },
     /// A library was found in a version this crate's calls are not written for.
     Version(String),
+    /// A call was asked for something it cannot do, such as a convolution where no window
+    /// fits, or one cuDNN has no suitable algorithm for.
+    Invalid(String),
     /// A library does not export a function this crate calls.
     Symbol {
         /// The library's file name.
@@ -118,7 +121,7 @@ impl fmt::Display for CudaError {
                     (false, false) => write!(f, "{}, and {loader}", dirs.join(", ")),
                 }
             }
-            CudaError::Version(message) => write!(f, "{message}"),
+            CudaError::Version(message) | CudaError::Invalid(message) => write!(f, "{message}"),
             CudaError::Symbol { library, symbol } => {
                 write!(f, "{library} has no function {symbol}")
             }

@@ -24,8 +24,14 @@
 //!   by NVRTC and launched on the card. The sources are compiled without fused
 //!   multiply-add, so their arithmetic is the CPU's for the same expressions.
 //!
-//! What is not here yet: the layers. Nothing in this crate calls a cuDNN or cuBLAS routine
-//! beyond creating its handle, and no part of `cavitation-nn` trains through it.
+//! - [`Conv2d`] and [`ConvShape`]: the 2-D convolution through cuDNN (forward with a bias,
+//!   input gradient, weight gradient, bias gradient), with deterministic algorithms that
+//!   use no tensor cores, chosen once per shape ([`ConvAlgorithms`]). cuDNN publishes no
+//!   error bound; each pass's distance from the exact result is measured in
+//!   `tests/conv.rs`.
+//!
+//! What is not here yet: the other layers. Nothing calls cuBLAS beyond creating its handle,
+//! and no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
 //!
@@ -63,6 +69,7 @@
 //! ```
 
 mod buffer;
+mod conv;
 mod device;
 mod error;
 mod find;
@@ -71,6 +78,7 @@ mod module;
 mod sys;
 
 pub use buffer::{DeviceBuffer, Scalar};
+pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
 pub use error::CudaError;
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};

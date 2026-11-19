@@ -32,6 +32,39 @@ pub(crate) const COMPUTE_CAPABILITY_MINOR: c_int = 76;
 /// `CUDA_ERROR_NO_DEVICE`: the driver found no CUDA-capable device.
 pub(crate) const ERROR_NO_DEVICE: c_int = 100;
 
+/// `CUDNN_TENSOR_NCHW`.
+pub(crate) const CUDNN_NCHW: c_int = 0;
+/// `CUDNN_DATA_FLOAT`.
+pub(crate) const CUDNN_FLOAT: c_int = 0;
+/// `CUDNN_CROSS_CORRELATION`: the kernel is not flipped, as in the CPU's convolution.
+pub(crate) const CUDNN_CROSS_CORRELATION: c_int = 1;
+/// `CUDNN_FMA_MATH`: no tensor cores, so no lower-precision products.
+pub(crate) const CUDNN_FMA_MATH: c_int = 3;
+/// `CUDNN_DETERMINISTIC`.
+pub(crate) const CUDNN_DETERMINISTIC: c_int = 1;
+
+/// One algorithm as cuDNN's heuristics describe it: `cudnnConvolutionFwdAlgoPerf_t`, which
+/// `cudnnConvolutionBwdDataAlgoPerf_t` and `cudnnConvolutionBwdFilterAlgoPerf_t` share the
+/// layout of.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AlgoPerf {
+    /// The algorithm's number in its pass's enumeration.
+    pub(crate) algo: c_int,
+    /// `CUDNN_STATUS_SUCCESS` (0) when the algorithm supports the convolution.
+    pub(crate) status: c_int,
+    /// The time in milliseconds; -1 from the heuristics, which do not time.
+    pub(crate) time: f32,
+    /// The scratch memory it needs, in bytes.
+    pub(crate) memory: usize,
+    /// `CUDNN_DETERMINISTIC` when it gives the same bits on every run.
+    pub(crate) determinism: c_int,
+    /// The math type it runs with.
+    pub(crate) math_type: c_int,
+    /// Reserved by cuDNN.
+    pub(crate) reserved: [c_int; 3],
+}
+
 /// Declares a table of functions and how to fill it from a loaded library.
 macro_rules! api {
     (
@@ -153,6 +186,195 @@ api! {
         fn cudnnDestroy(handle: *mut c_void) -> c_int;
         /// The text of a status code, as a static NUL-terminated string.
         fn cudnnGetErrorString(status: c_int) -> *const c_char;
+        /// Creates a tensor descriptor.
+        fn cudnnCreateTensorDescriptor(desc: *mut *mut c_void) -> c_int;
+        /// Sets a 4-D tensor descriptor: layout, data type, then N, C, H and W.
+        fn cudnnSetTensor4dDescriptor(
+            desc: *mut c_void,
+            format: c_int,
+            data_type: c_int,
+            n: c_int,
+            c: c_int,
+            h: c_int,
+            w: c_int,
+        ) -> c_int;
+        /// Destroys a tensor descriptor.
+        fn cudnnDestroyTensorDescriptor(desc: *mut c_void) -> c_int;
+        /// Creates a filter descriptor.
+        fn cudnnCreateFilterDescriptor(desc: *mut *mut c_void) -> c_int;
+        /// Sets a 4-D filter descriptor: data type, layout, then K (outputs), C, H and W.
+        fn cudnnSetFilter4dDescriptor(
+            desc: *mut c_void,
+            data_type: c_int,
+            format: c_int,
+            k: c_int,
+            c: c_int,
+            h: c_int,
+            w: c_int,
+        ) -> c_int;
+        /// Destroys a filter descriptor.
+        fn cudnnDestroyFilterDescriptor(desc: *mut c_void) -> c_int;
+        /// Creates a convolution descriptor.
+        fn cudnnCreateConvolutionDescriptor(desc: *mut *mut c_void) -> c_int;
+        /// Sets a 2-D convolution descriptor: padding, stride and dilation (each height then
+        /// width), the mode and the type the sums are computed in.
+        fn cudnnSetConvolution2dDescriptor(
+            desc: *mut c_void,
+            pad_h: c_int,
+            pad_w: c_int,
+            stride_h: c_int,
+            stride_w: c_int,
+            dilation_h: c_int,
+            dilation_w: c_int,
+            mode: c_int,
+            compute_type: c_int,
+        ) -> c_int;
+        /// Sets which units the convolution may use (`CUDNN_FMA_MATH` keeps it off tensor
+        /// cores and their lower precision).
+        fn cudnnSetConvolutionMathType(desc: *mut c_void, math_type: c_int) -> c_int;
+        /// Destroys a convolution descriptor.
+        fn cudnnDestroyConvolutionDescriptor(desc: *mut c_void) -> c_int;
+        /// The output's dimensions for an input, a filter and a convolution.
+        fn cudnnGetConvolution2dForwardOutputDim(
+            conv: *mut c_void,
+            x: *mut c_void,
+            w: *mut c_void,
+            n: *mut c_int,
+            c: *mut c_int,
+            h: *mut c_int,
+            width: *mut c_int,
+        ) -> c_int;
+        /// The forward algorithms cuDNN's heuristics rank for a convolution, best first.
+        fn cudnnGetConvolutionForwardAlgorithm_v7(
+            handle: *mut c_void,
+            x: *mut c_void,
+            w: *mut c_void,
+            conv: *mut c_void,
+            y: *mut c_void,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+        ) -> c_int;
+        /// The input-gradient algorithms cuDNN's heuristics rank, best first.
+        fn cudnnGetConvolutionBackwardDataAlgorithm_v7(
+            handle: *mut c_void,
+            w: *mut c_void,
+            dy: *mut c_void,
+            conv: *mut c_void,
+            dx: *mut c_void,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+        ) -> c_int;
+        /// The weight-gradient algorithms cuDNN's heuristics rank, best first.
+        fn cudnnGetConvolutionBackwardFilterAlgorithm_v7(
+            handle: *mut c_void,
+            x: *mut c_void,
+            dy: *mut c_void,
+            conv: *mut c_void,
+            dw: *mut c_void,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+        ) -> c_int;
+        /// The scratch memory a forward algorithm needs.
+        fn cudnnGetConvolutionForwardWorkspaceSize(
+            handle: *mut c_void,
+            x: *mut c_void,
+            w: *mut c_void,
+            conv: *mut c_void,
+            y: *mut c_void,
+            algo: c_int,
+            bytes: *mut usize,
+        ) -> c_int;
+        /// The scratch memory an input-gradient algorithm needs.
+        fn cudnnGetConvolutionBackwardDataWorkspaceSize(
+            handle: *mut c_void,
+            w: *mut c_void,
+            dy: *mut c_void,
+            conv: *mut c_void,
+            dx: *mut c_void,
+            algo: c_int,
+            bytes: *mut usize,
+        ) -> c_int;
+        /// The scratch memory a weight-gradient algorithm needs.
+        fn cudnnGetConvolutionBackwardFilterWorkspaceSize(
+            handle: *mut c_void,
+            x: *mut c_void,
+            dy: *mut c_void,
+            conv: *mut c_void,
+            dw: *mut c_void,
+            algo: c_int,
+            bytes: *mut usize,
+        ) -> c_int;
+        /// `y = alpha · conv(x, w) + beta · y`.
+        fn cudnnConvolutionForward(
+            handle: *mut c_void,
+            alpha: *const c_void,
+            x_desc: *mut c_void,
+            x: DevicePtr,
+            w_desc: *mut c_void,
+            w: DevicePtr,
+            conv: *mut c_void,
+            algo: c_int,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+            beta: *const c_void,
+            y_desc: *mut c_void,
+            y: DevicePtr,
+        ) -> c_int;
+        /// `dx = alpha · (the input gradient of w and dy) + beta · dx`.
+        fn cudnnConvolutionBackwardData(
+            handle: *mut c_void,
+            alpha: *const c_void,
+            w_desc: *mut c_void,
+            w: DevicePtr,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            conv: *mut c_void,
+            algo: c_int,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+            beta: *const c_void,
+            dx_desc: *mut c_void,
+            dx: DevicePtr,
+        ) -> c_int;
+        /// `dw = alpha · (the weight gradient of x and dy) + beta · dw`.
+        fn cudnnConvolutionBackwardFilter(
+            handle: *mut c_void,
+            alpha: *const c_void,
+            x_desc: *mut c_void,
+            x: DevicePtr,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            conv: *mut c_void,
+            algo: c_int,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+            beta: *const c_void,
+            dw_desc: *mut c_void,
+            dw: DevicePtr,
+        ) -> c_int;
+        /// `db = alpha · (dy summed over all but the channels) + beta · db`.
+        fn cudnnConvolutionBackwardBias(
+            handle: *mut c_void,
+            alpha: *const c_void,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            beta: *const c_void,
+            db_desc: *mut c_void,
+            db: DevicePtr,
+        ) -> c_int;
+        /// `c = alpha · a + beta · c`, with `a` broadcast over the dimensions where it is 1.
+        fn cudnnAddTensor(
+            handle: *mut c_void,
+            alpha: *const c_void,
+            a_desc: *mut c_void,
+            a: DevicePtr,
+            beta: *const c_void,
+            c_desc: *mut c_void,
+            c: DevicePtr,
+        ) -> c_int;
     }
 }
 

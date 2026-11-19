@@ -142,7 +142,7 @@ pub struct Cuda {
     /// The driver API's functions.
     pub(crate) driver: Driver,
     /// cuDNN's functions.
-    cudnn: Cudnn,
+    pub(crate) cudnn: Cudnn,
     /// cuBLAS's functions.
     cublas: Cublas,
     /// NVRTC's functions.
@@ -153,7 +153,7 @@ pub struct Cuda {
     /// until it is retained.
     context: CuContext,
     /// The cuDNN handle, or null until it is created.
-    cudnn_handle: *mut c_void,
+    pub(crate) cudnn_handle: *mut c_void,
     /// The cuBLAS handle, or null until it is created.
     cublas_handle: *mut c_void,
     /// What was opened.
@@ -504,7 +504,7 @@ impl Cuda {
     }
 
     /// The error for a cuDNN status.
-    fn cudnn_error(&self, function: &'static str, status: c_int) -> CudaError {
+    pub(crate) fn cudnn_error(&self, function: &'static str, status: c_int) -> CudaError {
         // SAFETY: the function takes any status and returns a static string.
         let text = unsafe { (self.cudnn.cudnnGetErrorString)(status) };
         CudaError::Call {
