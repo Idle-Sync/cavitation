@@ -32,6 +32,14 @@ pub(crate) const COMPUTE_CAPABILITY_MINOR: c_int = 76;
 /// `CUDA_ERROR_NO_DEVICE`: the driver found no CUDA-capable device.
 pub(crate) const ERROR_NO_DEVICE: c_int = 100;
 
+/// `CUBLAS_OP_N`: the matrix as stored.
+pub(crate) const CUBLAS_OP_N: c_int = 0;
+/// `CUBLAS_OP_T`: the matrix transposed.
+pub(crate) const CUBLAS_OP_T: c_int = 1;
+/// `CUBLAS_PEDANTIC_MATH`: the prescribed f32 arithmetic in every phase of a routine, and no
+/// tensor cores.
+pub(crate) const CUBLAS_PEDANTIC_MATH: c_int = 2;
+
 /// `CUDNN_TENSOR_NCHW`.
 pub(crate) const CUDNN_NCHW: c_int = 0;
 /// `CUDNN_DATA_FLOAT`.
@@ -389,6 +397,41 @@ api! {
         fn cublasGetVersion_v2(handle: *mut c_void, version: *mut c_int) -> c_int;
         /// The text of a status code, as a static NUL-terminated string.
         fn cublasGetStatusString(status: c_int) -> *const c_char;
+        /// Sets which units and precisions the handle's routines may use.
+        fn cublasSetMathMode(handle: *mut c_void, mode: c_int) -> c_int;
+        /// `C = alpha · op(A) · op(B) + beta · C` on column-major matrices: `op(A)` is
+        /// `m × k`, `op(B)` `k × n`, `C` `m × n`, with the scalars read from the host.
+        fn cublasSgemm_v2(
+            handle: *mut c_void,
+            transa: c_int,
+            transb: c_int,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            alpha: *const f32,
+            a: DevicePtr,
+            lda: c_int,
+            b: DevicePtr,
+            ldb: c_int,
+            beta: *const f32,
+            c: DevicePtr,
+            ldc: c_int,
+        ) -> c_int;
+        /// `y = alpha · op(A) · x + beta · y` on a column-major `m × n` matrix `A`.
+        fn cublasSgemv_v2(
+            handle: *mut c_void,
+            trans: c_int,
+            m: c_int,
+            n: c_int,
+            alpha: *const f32,
+            a: DevicePtr,
+            lda: c_int,
+            x: DevicePtr,
+            incx: c_int,
+            beta: *const f32,
+            y: DevicePtr,
+            incy: c_int,
+        ) -> c_int;
     }
 }
 
