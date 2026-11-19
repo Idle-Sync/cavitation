@@ -12,8 +12,8 @@ use crate::find::{
 };
 use crate::library::Library;
 use crate::sys::{
-    COMPUTE_CAPABILITY_MAJOR, COMPUTE_CAPABILITY_MINOR, CuContext, CuDevice, Cublas, Cudnn, Driver,
-    ERROR_NO_DEVICE, Nvrtc,
+    COMPUTE_CAPABILITY_MAJOR, COMPUTE_CAPABILITY_MINOR, CUBLAS_PEDANTIC_MATH, CuContext, CuDevice,
+    Cublas, Cudnn, Driver, ERROR_NO_DEVICE, Nvrtc,
 };
 
 /// The environment variable that turns "CUDA cannot be used" into a panic in
@@ -144,7 +144,7 @@ pub struct Cuda {
     /// cuDNN's functions.
     pub(crate) cudnn: Cudnn,
     /// cuBLAS's functions.
-    cublas: Cublas,
+    pub(crate) cublas: Cublas,
     /// NVRTC's functions.
     pub(crate) nvrtc: Nvrtc,
     /// The card.
@@ -155,7 +155,7 @@ pub struct Cuda {
     /// The cuDNN handle, or null until it is created.
     pub(crate) cudnn_handle: *mut c_void,
     /// The cuBLAS handle, or null until it is created.
-    cublas_handle: *mut c_void,
+    pub(crate) cublas_handle: *mut c_void,
     /// What was opened.
     info: CudaInfo,
 }
@@ -406,6 +406,13 @@ impl Cuda {
             self.cublas_handle = std::ptr::null_mut();
             return Err(self.cublas_error("cublasCreate_v2", status));
         }
+        // Every product in f32 as written, on any card and whatever the environment asks.
+        // SAFETY: the handle was just created, and the mode is cuBLAS's constant.
+        let status =
+            unsafe { (self.cublas.cublasSetMathMode)(self.cublas_handle, CUBLAS_PEDANTIC_MATH) };
+        if status != 0 {
+            return Err(self.cublas_error("cublasSetMathMode", status));
+        }
         let mut version: c_int = 0;
         // SAFETY: the handle was just created, and the pointer is to a live `c_int`.
         let status = unsafe { (self.cublas.cublasGetVersion_v2)(self.cublas_handle, &mut version) };
@@ -515,7 +522,7 @@ impl Cuda {
     }
 
     /// The error for a cuBLAS status.
-    fn cublas_error(&self, function: &'static str, status: c_int) -> CudaError {
+    pub(crate) fn cublas_error(&self, function: &'static str, status: c_int) -> CudaError {
         // SAFETY: the function takes any status and returns a static string.
         let text = unsafe { (self.cublas.cublasGetStatusString)(status) };
         CudaError::Call {

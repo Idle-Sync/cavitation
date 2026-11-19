@@ -30,8 +30,12 @@
 //!   error bound; each pass's distance from the exact result is measured in
 //!   `tests/conv.rs`.
 //!
-//! What is not here yet: the other layers. Nothing calls cuBLAS beyond creating its handle,
-//! and no part of `cavitation-nn` trains through this crate.
+//! - [`Linear`] and [`LinearShape`]: the fully connected layer's passes through cuBLAS in
+//!   pedantic math (f32 throughout, no tensor cores): forward with a bias, input gradient,
+//!   weight gradient, bias gradient; measured in `tests/linear.rs`.
+//!
+//! What is not here yet: batch norm, pooling, activations, the loss and the optimiser, and
+//! no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
 //!
@@ -74,6 +78,7 @@ mod device;
 mod error;
 mod find;
 mod library;
+mod linear;
 mod module;
 mod sys;
 
@@ -81,4 +86,5 @@ pub use buffer::{DeviceBuffer, Scalar};
 pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
 pub use error::CudaError;
+pub use linear::{Linear, LinearShape};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
