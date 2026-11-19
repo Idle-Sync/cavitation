@@ -41,7 +41,12 @@
 //! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
 //!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
 //!
-//! What is not here yet: batch norm, dropout, the loss and the optimiser, and
+//! - [`BatchNorm2d`], [`BatchStats`], [`RunningUpdate`] and [`ChannelDims`]: 2-D batch
+//!   normalisation, forward from the batch's or the running statistics, backward and the
+//!   running statistics' update, as this crate's own kernels: the sums in a fixed tree
+//!   within a stated bound, everything else the CPU's bits (`tests/batch_norm.rs`).
+//!
+//! What is not here yet: dropout, the loss and the optimiser, and
 //! no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
@@ -79,6 +84,7 @@
 //! }
 //! ```
 
+mod batch_norm;
 mod buffer;
 mod conv;
 mod device;
@@ -89,8 +95,10 @@ mod library;
 mod linear;
 mod module;
 mod pooling;
+mod reduce;
 mod sys;
 
+pub use batch_norm::{BatchNorm2d, BatchStats, RunningUpdate};
 pub use buffer::{DeviceBuffer, Scalar};
 pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
@@ -99,3 +107,4 @@ pub use error::CudaError;
 pub use linear::{Linear, LinearShape};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
+pub use reduce::ChannelDims;
