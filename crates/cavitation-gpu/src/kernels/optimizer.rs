@@ -311,12 +311,16 @@ impl OptimizerRule {
     }
 
     /// Panics, naming the rule, unless every setting is finite once rounded to the `f32` the
-    /// kernel receives, and the betas are in `[0, 1)`, as the CPU's Adam requires.
+    /// kernel receives, and the betas are in `[0, 1)`, as the CPU's Adam requires, both as
+    /// given and as the kernel holds them: a beta from `1 − 2⁻²⁵` up rounds to 1 in `f32`,
+    /// which would make its bias correction infinite.
     fn check(&self) {
         let [.., beta1, beta2, _] = self.settings();
+        let in_range = |b: f64| (0.0..1.0).contains(&b) && (0.0..1.0).contains(&as_stored(b));
         assert!(
-            (0.0..1.0).contains(&beta1) && (0.0..1.0).contains(&beta2),
-            "optimizer: Adam betas must be in [0, 1), got ({beta1}, {beta2})"
+            in_range(beta1) && in_range(beta2),
+            "optimizer: Adam betas must be in [0, 1), also once rounded to f32, got ({beta1}, \
+             {beta2})"
         );
         assert!(
             self.settings().iter().all(|&v| (v as f32).is_finite()),
@@ -698,6 +702,7 @@ impl OptimizerKernel {
             "optimizer: the last recorded step was not committed"
         );
         let [lr, _, _, beta1, beta2, _] = self.rule.settings();
+        let (beta1, beta2) = (as_stored(beta1), as_stored(beta2));
         let mut end = 0;
         for (k, info) in self
             .info_bytes
@@ -799,11 +804,27 @@ impl OptimizerKernel {
     }
 }
 
+/// `beta` as the kernels hold it: rounded to `f32`, back in `f64`.
+///
+/// One minus each beta and the bias corrections are taken from this value, not from the
+/// `f64` setting, so a moment's two weights add up to 1 and its corrections match the decay
+/// the kernel applies. With one minus the `f64` β₂ = 0.999 and β₂ rounded to `f32`, the
+/// weights add up to 1 + 1.3e-8, and the second moment settles 1.29e-5 above `g²` (a
+/// constant gradient's `v` tends to `(1 − β₂)g² / (1 − β₂_f32)`). Each step was then about
+/// 6.5e-6 shorter than the CPU's: on the digits (64 → 64 → 32 → 10, Adam at 0.002, 5
+/// epochs) the GPU's training loss ended about 5e-7 above the CPU's, relative, on every
+/// seed.
+fn as_stored(beta: f64) -> f64 {
+    f64::from(beta as f32)
+}
+
 /// The shared constants of `rule` as the kernels' `Shared` uniform lays them out, each
 /// rounded to `f32` from its `f64`: the learning rate, momentum, weight decay, betas, one
-/// minus each beta, eps, AdamW's shrink factor `1 − lr·wd`, and padding.
+/// minus each beta (from the beta as stored, [`as_stored`]), eps, AdamW's shrink factor
+/// `1 − lr·wd`, and padding.
 fn shared_constants(rule: &OptimizerRule) -> [f32; SHARED_WORDS] {
     let [lr, momentum, wd, beta1, beta2, eps] = rule.settings();
+    let (beta1, beta2) = (as_stored(beta1), as_stored(beta2));
     let values = [
         lr,
         momentum,
@@ -819,4 +840,50 @@ fn shared_constants(rule: &OptimizerRule) -> [f32; SHARED_WORDS] {
         0.0,
     ];
     values.map(|v| v as f32)
+}
+
+#[cfg(test)]
+mod tests {
+    //! The shared constants' moment weights.
+
+    use super::{OptimizerRule, shared_constants};
+
+    /// A beta below 1 that rounds to 1 in `f32` is refused, as 1 itself is.
+    #[test]
+    #[should_panic(expected = "also once rounded to f32")]
+    fn a_beta_that_rounds_to_one_is_refused() {
+        OptimizerRule::Adam {
+            lr: 1e-3,
+            beta1: 0.9,
+            beta2: 0.999_999_99,
+            eps: 1e-8,
+            weight_decay: 0.0,
+        }
+        .check();
+    }
+
+    /// For each beta, the weight on the new term over one minus the weight on the old, both
+    /// as the kernels hold them, is 1, so a moment of a constant input settles on that
+    /// input: `v → (1 − β₂)g² / (1 − β₂)` with the same `β₂` on both sides. With one minus
+    /// the `f64` beta it was 1 + 1.29e-5 for β₂ = 0.999.
+    #[test]
+    fn a_moment_of_a_constant_input_settles_on_it() {
+        for (beta1, beta2) in [(0.9, 0.999), (0.8, 0.99), (0.95, 0.9999), (0.5, 0.999_99)] {
+            let rule = OptimizerRule::Adam {
+                lr: 1e-3,
+                beta1,
+                beta2,
+                eps: 1e-8,
+                weight_decay: 0.0,
+            };
+            let c = shared_constants(&rule).map(f64::from);
+            for (beta, one_minus) in [(c[3], c[5]), (c[4], c[6])] {
+                let settles = one_minus / (1.0 - beta);
+                assert!(
+                    (settles - 1.0).abs() <= (2.0f64).powi(-20),
+                    "betas ({beta1}, {beta2}): a moment settles at {settles} of its input"
+                );
+            }
+        }
+    }
 }

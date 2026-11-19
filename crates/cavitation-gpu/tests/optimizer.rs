@@ -126,6 +126,9 @@ impl Constants {
             } => (lr, 0.0, weight_decay, beta1, beta2, eps),
         };
         let round = |v: f64| if gpu { f64::from(v as f32) } else { v };
+        // The kernels take one minus each beta and the bias corrections from the beta as
+        // they hold it, rounded to `f32`.
+        let (beta1, beta2) = (round(beta1), round(beta2));
         Constants {
             lr: round(lr),
             momentum: round(momentum),
