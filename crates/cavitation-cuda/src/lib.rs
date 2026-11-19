@@ -37,8 +37,11 @@
 //! The libraries are looked for in the folders of `CAVITATION_CUDA_PATH`, `CUDNN_PATH` and
 //! `CUDA_PATH` (each with its `bin`, `bin/x64`, `lib`, `lib64` and `lib/x64`), then where
 //! the operating system's loader looks: the folders of `PATH` on Windows, and of
-//! `LD_LIBRARY_PATH` and the linker's configuration on Linux. The folder the program was
-//! started in is never searched. macOS has no CUDA.
+//! `LD_LIBRARY_PATH` and the linker's configuration on Linux. Neither the libraries loaded
+//! here nor the ones they import are looked for in the folder the program was started in;
+//! the libraries NVIDIA's code loads by name later and that are known (cuDNN's parts,
+//! cuBLASLt, NVRTC's built-ins, `zlibwapi.dll`) are loaded here first from beside the ones
+//! that need them. macOS has no CUDA.
 //!
 //! Two environment variables steer this, mainly for tests and benchmarks:
 //!

@@ -123,6 +123,11 @@ impl fmt::Display for CudaInfo {
 /// send(cavitation_cuda::Cuda::open().unwrap());
 /// ```
 ///
+/// ```compile_fail
+/// fn share<T: Sync>(_: &T) {}
+/// share(&cavitation_cuda::Cuda::open().unwrap());
+/// ```
+///
 /// # Examples
 ///
 /// ```
@@ -207,9 +212,13 @@ impl Cuda {
     /// 4. The card's primary context is made current on this thread, and cuDNN and cuBLAS
     ///    each give a handle in it.
     ///
-    /// Libraries are loaded by absolute path, or by the linker from its configured folders;
-    /// the folder the program was started in is never searched. Once loaded they stay
-    /// loaded until the process ends.
+    /// Libraries are loaded by absolute path, or by the linker from its configured folders,
+    /// and neither these nor the libraries they import are looked for in the folder the
+    /// program was started in. A library NVIDIA's code loads by name later, while it runs,
+    /// is looked for as the operating system does by default; the ones known (cuDNN's parts,
+    /// cuBLASLt, NVRTC's built-ins and, on Windows, `zlibwapi.dll`) are loaded here first
+    /// from beside the library that needs them. Once loaded they stay loaded until the
+    /// process ends.
     ///
     /// `CAVITATION_CUDA_REQUIRED` does not apply here: it makes [`Cuda::new`] panic.
     ///
@@ -244,6 +253,18 @@ impl Cuda {
         // With cuDNN loaded, the CUDA major version is the one it was built for; without
         // it, either is looked for, so that the error names everything that is missing.
         let majors: Vec<u32> = match &cudnn {
+            Some(found) if !CUDA_MAJORS.contains(&found.cuda.0) => {
+                return Err(CudaError::Version(format!(
+                    "{} is cuDNN {}.{}.{} built for CUDA {}.{}, and this library uses cuDNN \
+                     {CUDNN_MAJOR} built for CUDA 12 or 13: install that build",
+                    found.path.display(),
+                    found.version.0,
+                    found.version.1,
+                    found.version.2,
+                    found.cuda.0,
+                    found.cuda.1
+                )));
+            }
             Some(found) => vec![found.cuda.0],
             None => CUDA_MAJORS.to_vec(),
         };
@@ -313,13 +334,7 @@ impl Cuda {
         let driver_cuda = (version / 1000, version % 1000 / 10);
         // The driver compiles the PTX NVRTC writes, and a driver older than NVRTC does not
         // read its PTX.
-        if driver_cuda < nvrtc_version {
-            return Err(CudaError::Version(format!(
-                "the NVIDIA driver supports CUDA {}.{}, older than NVRTC {}.{}: update the \
-                 driver",
-                driver_cuda.0, driver_cuda.1, nvrtc_version.0, nvrtc_version.1
-            )));
-        }
+        check_driver_reads(driver_cuda, nvrtc_version)?;
         let card = compute_capability.0 * 10 + compute_capability.1;
         let archs = supported_archs(&nvrtc_table)?;
         let Some(arch) = pick_arch(card, &archs) else {
@@ -656,12 +671,36 @@ fn load(
             Err(why) => Err(failed(&path, why)),
         };
     }
-    if platform == Platform::Linux
-        && let Ok(library) = Library::open_system(name)
-    {
-        return Ok((library, PathBuf::from(name)));
+    if platform == Platform::Linux {
+        return match Library::open_system(name) {
+            Ok(library) => Ok((library, PathBuf::from(name))),
+            Err(why) => Err(system_failure(name, why)),
+        };
     }
     Err(LoadFailure::NotFound(name.to_string()))
+}
+
+/// What a failed load by bare name through the linker means: not found when the linker
+/// says it found no such file, and its own message otherwise (a library that is there and
+/// does not load, or a folder of `LD_LIBRARY_PATH` refused as relative).
+fn system_failure(name: &str, why: String) -> LoadFailure {
+    if why.contains("No such file or directory") {
+        LoadFailure::NotFound(name.to_string())
+    } else {
+        LoadFailure::Failed(format!("{name} could not be loaded: {why}"))
+    }
+}
+
+/// `Ok` when the driver reads the PTX NVRTC writes, which it does when it supports at
+/// least NVRTC's CUDA version, both as major and minor.
+fn check_driver_reads(driver_cuda: (u32, u32), nvrtc: (u32, u32)) -> Result<(), CudaError> {
+    if driver_cuda < nvrtc {
+        return Err(CudaError::Version(format!(
+            "the NVIDIA driver supports CUDA {}.{}, older than NVRTC {}.{}: update the driver",
+            driver_cuda.0, driver_cuda.1, nvrtc.0, nvrtc.1
+        )));
+    }
+    Ok(())
 }
 
 /// The compute architectures NVRTC compiles for, as `10 * major + minor`, oldest first.
@@ -761,15 +800,24 @@ fn device_attribute(driver: &Driver, device: CuDevice, attribute: c_int) -> Resu
     Ok(u32::try_from(value).unwrap_or(0))
 }
 
+/// The zlib build NVIDIA's Windows libraries name, loaded by cuDNN by name when it is not
+/// loaded already.
+const ZLIB: &str = "zlibwapi.dll";
+
 /// Finds and loads cuDNN with the parts beside it, and reads its versions.
 fn load_cudnn(platform: Platform, dirs: &[PathBuf]) -> Result<LoadedCudnn, LoadError> {
     let name = cudnn_name(platform);
     // cuDNN loads its parts by bare name when first called. Loading them here by path,
     // before it, is what lets it find them in a folder the loader is not pointed at.
-    let (library, path) =
-        load(platform, dirs, &name, |path| cudnn_parts(platform, path)).map_err(|failure| {
-            LoadError::Missing(format!("cuDNN {CUDNN_MAJOR}: {}", failure.text()))
-        })?;
+    let (library, path) = load(platform, dirs, &name, |path| {
+        let mut first = cudnn_parts(platform, path);
+        let zlib = path.with_file_name(ZLIB);
+        if platform == Platform::Windows && zlib.is_file() {
+            first.insert(0, zlib);
+        }
+        first
+    })
+    .map_err(|failure| LoadError::Missing(format!("cuDNN {CUDNN_MAJOR}: {}", failure.text())))?;
     let table = Cudnn::load(&library).map_err(|symbol| {
         LoadError::Fatal(CudaError::Symbol {
             library: path.display().to_string(),
@@ -875,6 +923,37 @@ mod tests {
         assert_eq!(pick_arch(130, &[75, 120]), Some(120));
         assert_eq!(pick_arch(61, &archs), None);
         assert_eq!(pick_arch(75, &[]), None);
+    }
+
+    /// The linker's message decides between not found and found but not loaded.
+    #[test]
+    fn the_linkers_message_is_kept() {
+        let missing = "libcudnn.so.9: cannot open shared object file: No such file or directory";
+        assert_eq!(
+            system_failure("libcudnn.so.9", missing.to_string()),
+            LoadFailure::NotFound("libcudnn.so.9".to_string())
+        );
+        let refused = "LD_LIBRARY_PATH holds the folder \"\", which the linker would read";
+        assert_eq!(
+            system_failure("libcuda.so.1", refused.to_string()).text(),
+            format!("libcuda.so.1 could not be loaded: {refused}")
+        );
+    }
+
+    /// A driver reads NVRTC's PTX when it supports NVRTC's CUDA version or a newer one.
+    #[test]
+    fn the_driver_must_be_as_new_as_nvrtc() {
+        assert!(check_driver_reads((13, 1), (13, 1)).is_ok());
+        assert!(check_driver_reads((13, 1), (13, 0)).is_ok());
+        assert!(check_driver_reads((13, 0), (12, 9)).is_ok());
+        let err = check_driver_reads((13, 0), (13, 1))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "the NVIDIA driver supports CUDA 13.0, older than NVRTC 13.1: update the driver"
+        );
+        assert!(check_driver_reads((12, 9), (13, 0)).is_err());
     }
 
     /// A load that finds nothing says so by its kind, not by its message.

@@ -101,12 +101,16 @@ impl fmt::Display for CudaError {
                      for, or set {PATH_VAR} to the folder that holds these files. Searched: "
                 )?;
                 let dirs: Vec<String> = searched.iter().map(|d| d.display().to_string()).collect();
-                let loader = format!(
+                let platform = Platform::here();
+                let mut loader = format!(
                     "the {} folder{} of {}",
                     loader_folders.len(),
                     if loader_folders.len() == 1 { "" } else { "s" },
-                    loader_var(Platform::here())
+                    loader_var(platform)
                 );
+                if platform == Platform::Linux {
+                    loader.push_str(" and the linker's own");
+                }
                 match (dirs.is_empty(), loader_folders.is_empty()) {
                     (true, true) => write!(f, "no folder"),
                     (true, false) => write!(f, "{loader}"),

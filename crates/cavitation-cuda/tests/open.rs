@@ -238,10 +238,11 @@ fn failures_are_reported() {
     assert!(MAX_KERNEL_ARGS >= args.len());
 }
 
-/// A buffer and a module dropped while a kernel that uses them may still run wait for it,
-/// and the context keeps working.
+/// Dropping a module and a buffer right after launching kernels that use them leaves the
+/// context working and the results right. That the drops wait for the kernels is not shown
+/// here: the read waits for them too.
 #[test]
-fn dropping_waits_for_running_work() {
+fn dropping_mid_work_leaves_the_context_working() {
     let Some(cuda) = Cuda::new() else { return };
     let n = 1 << 22;
     let mut x = cuda.buffer(n * 4).expect("allocate");

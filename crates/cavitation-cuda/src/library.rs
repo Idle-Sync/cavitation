@@ -150,9 +150,10 @@ mod os {
     }
 
     /// A folder of `LD_LIBRARY_PATH` that is empty or relative, which the linker reads
-    /// against the current folder, if there is one.
+    /// against the current folder, if there is one. An empty value, which the linker
+    /// ignores, has none.
     fn relative_loader_folder() -> Option<String> {
-        let value = std::env::var_os("LD_LIBRARY_PATH")?;
+        let value = std::env::var_os("LD_LIBRARY_PATH").filter(|v| !v.is_empty())?;
         std::env::split_paths(&value)
             .find(|dir| !dir.is_absolute())
             .map(|dir| format!("{:?}", dir.display().to_string()))
