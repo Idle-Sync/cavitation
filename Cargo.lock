@@ -130,6 +130,7 @@ name = "cavitation-cuda"
 version = "0.4.1"
 dependencies = [
  "cavitation-core",
+ "cavitation-nn",
 ]
 
 [[package]]

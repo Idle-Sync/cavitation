@@ -46,7 +46,18 @@
 //!   running statistics' update, as this crate's own kernels: the sums in a fixed tree
 //!   within a stated bound, everything else the CPU's bits (`tests/batch_norm.rs`).
 //!
-//! What is not here yet: dropout, the loss and the optimiser, and
+//! - [`SoftmaxCrossEntropy`] and [`MeanSquaredError`]: the training losses with
+//!   `Reduction::Mean`, the loss and its gradient, as this crate's own kernels: the mean
+//!   squared error's gradient the CPU's bits and its loss the fixed tree's, the
+//!   cross-entropy within the WGSL kernel's stated bounds (`tests/loss.rs`).
+//!
+//! - [`OptimizerKernel`] and [`OptimizerRule`]: SGD (with momentum and weight decay), Adam
+//!   and AdamW over a model's parameters in flat buffers, one launch per step, skipped when
+//!   the step's finite flag is set, as this crate's own kernels: the bits of the kernels'
+//!   `f32` expressions, within the WGSL kernels' stated bounds of the CPU optimisers'
+//!   arithmetic (`tests/optimizer.rs`).
+//!
+//! What is not here yet: dropout, and
 //! no part of `cavitation-nn` trains through this crate.
 //!
 //! # What must be installed
@@ -93,7 +104,9 @@ mod error;
 mod find;
 mod library;
 mod linear;
+mod loss;
 mod module;
+mod optimizer;
 mod pooling;
 mod reduce;
 mod sys;
@@ -105,6 +118,8 @@ pub use device::{Cuda, CudaInfo};
 pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
 pub use linear::{Linear, LinearShape};
+pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
+pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
 pub use reduce::ChannelDims;
