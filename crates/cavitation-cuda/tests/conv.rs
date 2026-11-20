@@ -428,26 +428,42 @@ fn every_candidate_within_measured_tolerance() {
     );
 }
 
-/// Every convolution of one shape in a process runs the algorithms the first one chose, and
-/// that choice is one of the candidates; a name that is not a candidate is refused.
+/// By default each pass runs the heuristics' first allowed algorithm; with timing on, every
+/// convolution of one shape in a process runs the algorithms the first one chose, one of the
+/// candidates. A name that is not a candidate is refused.
 #[test]
 fn the_choice_is_fixed_and_allowed() {
     let Some(cuda) = Cuda::new() else { return };
-    for s in training_shapes() {
-        let first = Conv2d::new(&cuda, s).expect("set up").algorithms();
-        let again = Conv2d::new(&cuda, s).expect("set up").algorithms();
-        assert_eq!(first, again, "{s:?}");
-        let allowed = Conv2d::candidates(&cuda, s).expect("list the algorithms");
-        assert!(allowed.forward.contains(&first.forward), "{s:?}: {first}");
-        assert!(
-            allowed.input_grad.contains(&first.input_grad),
-            "{s:?}: {first}"
-        );
-        assert!(
-            allowed.weight_grad.contains(&first.weight_grad),
-            "{s:?}: {first}"
-        );
+    for timed in [false, true] {
+        cuda.set_cudnn_benchmark(timed);
+        for s in training_shapes() {
+            let first = Conv2d::new(&cuda, s).expect("set up").algorithms();
+            let again = Conv2d::new(&cuda, s).expect("set up").algorithms();
+            assert_eq!(first, again, "{s:?}");
+            let allowed = Conv2d::candidates(&cuda, s).expect("list the algorithms");
+            if !timed {
+                assert_eq!(
+                    (first.forward, first.input_grad, first.weight_grad),
+                    (
+                        allowed.forward[0],
+                        allowed.input_grad[0],
+                        allowed.weight_grad[0]
+                    ),
+                    "{s:?}"
+                );
+            }
+            assert!(allowed.forward.contains(&first.forward), "{s:?}: {first}");
+            assert!(
+                allowed.input_grad.contains(&first.input_grad),
+                "{s:?}: {first}"
+            );
+            assert!(
+                allowed.weight_grad.contains(&first.weight_grad),
+                "{s:?}: {first}"
+            );
+        }
     }
+    cuda.set_cudnn_benchmark(false);
     let s = shape(8, NETWORKS[4]);
     let allowed = Conv2d::candidates(&cuda, s).expect("list the algorithms");
     let (f, i) = (allowed.forward[0].0, allowed.input_grad[0].0);

@@ -311,16 +311,16 @@ impl<'c> Descriptors<'c> {
 /// One 2-D convolution shape on the card, through cuDNN: the forward pass with an optional
 /// bias, the input gradient, the weight gradient and the bias gradient, in `f32`.
 ///
-/// The algorithms are chosen once, when the convolution is made: for each pass the fastest,
-/// timed on the card, of those that support the shape, give the same bits on every run
-/// (cuDNN's `CUDNN_DETERMINISTIC`), run without tensor cores (`CUDNN_FMA_MATH`, so no
-/// product is rounded to a narrower type), need at most [`MAX_WORKSPACE`] bytes of
-/// scratch memory, which the convolution holds, are not Winograd unless the kernel is
-/// 3 × 3, and are not among the few measured too far from the exact result: the forward
-/// pass's `WINOGRAD_NONFUSED`, and the input gradient's `FFT`, `FFT_TILING` and
-/// `WINOGRAD_NONFUSED`. [`Conv2d::candidates`] lists the rest. The first convolution of a
-/// shape on a card in a process times them, and every later one runs its choice, so one
-/// program's runs give the same bits (see [`Conv2d::new`]).
+/// The algorithms are chosen once, when the convolution is made, among those that support
+/// the shape, give the same bits on every run (cuDNN's `CUDNN_DETERMINISTIC`), run without
+/// tensor cores (`CUDNN_FMA_MATH`, so no product is rounded to a narrower type), need at most
+/// [`MAX_WORKSPACE`] bytes of scratch memory, which the convolution holds, are not Winograd
+/// unless the kernel is 3 × 3, and are not among the few measured too far from the exact
+/// result: the forward pass's `WINOGRAD_NONFUSED`, and the input gradient's `FFT`,
+/// `FFT_TILING` and `WINOGRAD_NONFUSED`. [`Conv2d::candidates`] lists the rest. By default
+/// each pass runs the first of them cuDNN's heuristics rank, so two runs of a program on one
+/// card give the same bits; with [`Cuda::set_cudnn_benchmark`] (or
+/// `CAVITATION_CUDNN_BENCHMARK=1`) they are timed instead (see [`Conv2d::new`]).
 ///
 /// On a 5 × 5 kernel cuDNN's Winograd weight gradient was measured 2,782 u · Σ|terms| from
 /// the exact result, where every algorithm allowed is within 18. cuDNN publishes no error
@@ -474,8 +474,9 @@ fn fastest(candidates: &[Algo], timed: &[AlgoPerf]) -> Algo {
 
 /// The algorithms each pass of a convolution may run on this card, in the order cuDNN's
 /// heuristics rank them, each with the scratch bytes it needs: the ones that meet the
-/// conditions in [`Conv2d`]'s description. [`Conv2d::new`] runs the fastest of each list
-/// when timed; [`Conv2d::with_algorithms`] runs any of them.
+/// conditions in [`Conv2d`]'s description. [`Conv2d::new`] runs the first of each list, or
+/// the fastest when [`Cuda::set_cudnn_benchmark`] is on; [`Conv2d::with_algorithms`] runs
+/// any of them.
 ///
 /// # Examples
 ///
@@ -512,9 +513,9 @@ struct Setup<'c> {
     weight_grad: Vec<Algo>,
 }
 
-/// The algorithms chosen in this process for each card and shape, so that every
-/// [`Conv2d::new`] of one shape on one card runs the same ones, and so gives the same bits,
-/// whatever the timing of a later set-up would say.
+/// The algorithms timing chose in this process for each card and shape, so that every
+/// [`Conv2d::new`] of one shape on one card with timing on runs the same ones, and so gives
+/// the same bits, whatever the timing of a later set-up would say.
 static CHOSEN: Mutex<Vec<Chosen>> = Mutex::new(Vec::new());
 
 /// One entry of [`CHOSEN`]: the card and the shape, and the forward, input-gradient and
@@ -524,12 +525,15 @@ type Chosen = ((CuDevice, ConvShape), [Algo; 3]);
 impl<'c> Conv2d<'c> {
     /// Sets up the convolution `shape` on `cuda`'s card and chooses its algorithms.
     ///
-    /// The first convolution of a shape on a card in a process times every allowed algorithm
-    /// of each pass on scratch buffers (cuDNN's `cudnnFindConvolution*AlgorithmEx`) and keeps
-    /// the fastest; every later one of that shape runs the same algorithms without timing.
-    /// Timing may choose differently in another process or on another card, and so may round
-    /// differently; each choice is one of [`Conv2d::candidates`], within the measured
-    /// tolerances of this crate's `tests/conv.rs`.
+    /// By default each pass runs the first allowed algorithm cuDNN's heuristics rank. With
+    /// [`Cuda::set_cudnn_benchmark`] on (or `CAVITATION_CUDNN_BENCHMARK=1` when `cuda` was
+    /// opened), the first convolution of a shape on a card in a process times every allowed
+    /// algorithm of each pass on scratch buffers (cuDNN's `cudnnFindConvolution*AlgorithmEx`)
+    /// and keeps the fastest; every later one of that shape in the process runs the same
+    /// ones without timing, so its runs give the same bits. Timing may choose differently in
+    /// another process or on another card, which may then differ in the last bits; each
+    /// choice is one of [`Conv2d::candidates`], within the measured tolerances of this
+    /// crate's `tests/conv.rs`.
     ///
     /// # Errors
     ///
@@ -539,6 +543,10 @@ impl<'c> Conv2d<'c> {
     /// allocated.
     pub fn new(cuda: &'c Cuda, shape: ConvShape) -> Result<Conv2d<'c>, CudaError> {
         let setup = Self::set_up(cuda, shape)?;
+        if !cuda.cudnn_benchmark() {
+            let algos = [setup.forward[0], setup.input_grad[0], setup.weight_grad[0]];
+            return Self::build(cuda, shape, setup, algos);
+        }
         let key = (cuda.device(), shape);
         let mut chosen = CHOSEN.lock().unwrap_or_else(PoisonError::into_inner);
         let algos = match chosen.iter().find(|(k, _)| *k == key) {

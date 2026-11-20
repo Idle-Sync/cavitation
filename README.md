@@ -191,7 +191,7 @@ Device::Auto and --device auto train on the cuda.
 Choose with --device auto|cuda|gpu|cpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cuda|gpu|cpu.
 ```
 
-The convolution runs through cuDNN, with deterministic algorithms only, and `Linear` through cuBLAS; NVIDIA publishes no error bounds for either, so a CUDA run agrees with the CPU run within measured tolerances, and two CUDA runs give the same bits. An epoch of `cifar-cnn --cav-only --rows 12800 --epochs 3` takes 1.48 s with `--device cuda` on the machine above.
+The convolution runs through cuDNN, with deterministic algorithms only, and `Linear` through cuBLAS; NVIDIA publishes no error bounds for either, so a CUDA run agrees with the CPU run within measured tolerances, and two CUDA runs give the same bits. Each convolution pass runs the algorithm cuDNN's heuristics choose among the allowed ones. Setting `CAVITATION_CUDNN_BENCHMARK=1` (or calling `Cuda::set_cudnn_benchmark(true)` before training), like PyTorch's `cudnn.benchmark`, times the allowed algorithms once per shape and keeps the fastest: runs in one process still give the same bits, but another process or card may choose differently and differ in the last bits. An epoch of `cifar-cnn --cav-only --rows 12800 --epochs 3` takes 1.48 s with `--device cuda` on the machine above.
 
 ## The inspector
 

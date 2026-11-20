@@ -4,6 +4,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::error::CudaError;
@@ -20,6 +21,10 @@ use crate::sys::{
 /// The environment variable that turns "CUDA cannot be used" into a panic in
 /// [`Cuda::new`], for test runs that must use it.
 const REQUIRED_VAR: &str = "CAVITATION_CUDA_REQUIRED";
+
+/// The environment variable that turns on timing the convolution algorithms
+/// ([`Cuda::set_cudnn_benchmark`]) for every [`Cuda`] opened while it is `1`.
+const BENCHMARK_VAR: &str = "CAVITATION_CUDNN_BENCHMARK";
 
 /// What a [`Cuda`] runs on, as [`Cuda::info`] gives it.
 ///
@@ -162,6 +167,9 @@ pub struct Cuda {
     /// Held across every call into the driver and the libraries, so that one thread at a
     /// time uses the context and the handles.
     lock: Mutex<()>,
+    /// Whether a new [`Conv2d`](crate::Conv2d) times its algorithms instead of taking cuDNN's
+    /// heuristic choice.
+    cudnn_benchmark: AtomicBool,
 }
 
 // SAFETY: `Cuda`'s raw pointers are the primary context and the cuDNN and cuBLAS handles,
@@ -406,6 +414,9 @@ impl Cuda {
             cudnn_handle: std::ptr::null_mut(),
             cublas_handle: std::ptr::null_mut(),
             lock: Mutex::new(()),
+            cudnn_benchmark: AtomicBool::new(parse_required(
+                std::env::var(BENCHMARK_VAR).ok().as_deref(),
+            )),
             info: CudaInfo {
                 name,
                 memory: memory as u64,
@@ -484,6 +495,41 @@ impl Cuda {
     /// ```
     pub fn info(&self) -> &CudaInfo {
         &self.info
+    }
+
+    /// Turns timing the convolution algorithms on or off for every [`Conv2d`](crate::Conv2d)
+    /// set up on this `Cuda` from now on, as PyTorch's `torch.backends.cudnn.benchmark` does.
+    /// It starts off, or on when the environment variable `CAVITATION_CUDNN_BENCHMARK` is `1`
+    /// when the `Cuda` is opened.
+    ///
+    /// Off, each pass runs the first allowed algorithm cuDNN's heuristics rank, the same on
+    /// every run of every program on one card and cuDNN version, so runs give the same bits.
+    /// On, the first convolution of a shape in a process times every allowed algorithm and
+    /// keeps the fastest for every later one of that shape: runs within one process still
+    /// give the same bits, but another process or card may time differently, choose another
+    /// algorithm, and differ in the last bits. Either way each algorithm run is one of
+    /// [`Conv2d::candidates`](crate::Conv2d::candidates).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::Cuda;
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     cuda.set_cudnn_benchmark(true);
+    ///     assert!(cuda.cudnn_benchmark());
+    ///     cuda.set_cudnn_benchmark(false);
+    ///     assert!(!cuda.cudnn_benchmark());
+    /// }
+    /// ```
+    pub fn set_cudnn_benchmark(&self, on: bool) {
+        self.cudnn_benchmark.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether a new [`Conv2d`](crate::Conv2d) times its algorithms: see
+    /// [`set_cudnn_benchmark`](Self::set_cudnn_benchmark).
+    pub fn cudnn_benchmark(&self) -> bool {
+        self.cudnn_benchmark.load(Ordering::Relaxed)
     }
 
     /// The card's free memory in bytes, as the driver counts it now. Other programs using

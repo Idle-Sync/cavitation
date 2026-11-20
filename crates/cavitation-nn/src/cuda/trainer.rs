@@ -189,7 +189,11 @@ pub struct CudaStepProfile {
 /// The convolution's passes run through cuDNN and `Linear`'s through cuBLAS, which publish no
 /// error bounds; their distance from the CPU is measured in `cavitation-cuda`'s tests and in
 /// this crate's, which hold each step's gradients within a tolerance of the `f64` tape's.
-/// cuDNN runs deterministic algorithms only, so two runs give the same bits.
+/// cuDNN runs deterministic algorithms only, chosen by its heuristics, so two runs give the
+/// same bits. With [`Cuda::set_cudnn_benchmark`] on (or `CAVITATION_CUDNN_BENCHMARK=1`), the
+/// algorithms are timed once per shape and the fastest kept: runs within one process still
+/// give the same bits, but another process or card may choose others and differ in the last
+/// bits.
 ///
 /// Every step runs the CPU trainer's [`Health`] checks (the default unless
 /// [`set_health`](CudaTrainer::set_health) changes it) on values the step reads back with its
