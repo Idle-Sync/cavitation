@@ -8,12 +8,14 @@ use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_cuda::{
-    ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, MeanSquaredError, OptimizerKernel,
+    ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, GluOp, MeanSquaredError, OptimizerKernel,
     OptimizerRule, PreluOp, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
 };
 
 use super::model::{CudaModel, ran, refused};
-use super::pass::{DropoutMask, Forward, Op, Parts, Store, backward_op, prelu_shape, run};
+use super::pass::{
+    DropoutMask, Forward, Op, Parts, Store, backward_op, glu_gate, prelu_shape, run,
+};
 use crate::health::channel_size;
 use crate::plan::{Act, Kind, Running};
 use crate::{
@@ -1655,6 +1657,19 @@ impl<'c> TrainPass<'c> {
                         channels,
                         x,
                         slope: params[weight],
+                        dy: Some(g),
+                        y: dx,
+                    });
+                    dx
+                }
+                Kind::Glu(gate) => {
+                    let dx = s.values(n_in)?;
+                    backward.push(Op::Glu {
+                        op: GluOp::Backward,
+                        gate: glu_gate(gate),
+                        rows,
+                        width: layer.inputs,
+                        x,
                         dy: Some(g),
                         y: dx,
                     });

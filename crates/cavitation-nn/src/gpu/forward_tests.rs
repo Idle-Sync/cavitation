@@ -10,21 +10,22 @@
 //!   magnitude, so on the CNNs this bound is loose; the printed ratio and the bound's width
 //!   say how loose.
 //!
-//! An MLP with a softmax or a log-softmax after each `Linear`, and one with a PReLU before each
-//! `Linear`, are checked against the CPU's `InferenceModel` instead, within 2⁻¹⁰ of its
-//! largest output.
+//! An MLP with a softmax or a log-softmax after each `Linear`, one with a PReLU before each
+//! `Linear`, and one with a GLU of each gate after its first two `Linear`s, are checked against
+//! the CPU's `InferenceModel` instead, within 2⁻¹⁰ of its largest output.
 //!
 //! Without a GPU every test says so and checks nothing; `CAVITATION_GPU_REQUIRED=1` makes
 //! that a failure.
 
 use cavitation_core::{
-    Conv2dGeom, Graph, ParamId, ParamStore, Pool2dGeom, Real, Rng, Tape, Tensor, Var,
+    Conv2dGeom, Gate, GeluApprox, Graph, ParamId, ParamStore, Pool2dGeom, Real, Rng, Tape, Tensor,
+    Var,
 };
 use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuModel;
 use crate::{
-    ActivationKind, ActivationLayer, BatchNorm2d, Conv2d, Dropout, Flatten, InferenceLayer,
+    ActivationKind, ActivationLayer, BatchNorm2d, Conv2d, Dropout, Flatten, Glu, InferenceLayer,
     InferenceModel, Init, Linear, LogSoftmax, MaxPool2d, NeuronMask, Prelu, Relu, Sequential,
     Softmax, Tanh, Trace,
 };
@@ -115,6 +116,37 @@ pub(super) fn prelu_mlp<T: Real>(
         .push(third)
         .push(Linear::new(params, 9, 4, &mut rng))
 }
+
+/// An MLP 12 → 16 → 9 → 4 with a GLU of `gate` after each of the first two `Linear`s
+/// (16 → 8 into a `Linear` 8 → 18, and 18 → 9), in either precision; with `lead`, a GLU before
+/// the first `Linear` too, so the input is 24 wide.
+pub(super) fn glu_mlp<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    gate: Gate,
+    lead: bool,
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let net = if lead {
+        Sequential::new_generic().push(Glu { gate })
+    } else {
+        Sequential::new_generic()
+    };
+    net.push(Linear::new(params, 12, 16, &mut rng))
+        .push(Glu { gate })
+        .push(Linear::new(params, 8, 18, &mut rng))
+        .push(Glu { gate })
+        .push(Linear::new(params, 9, 4, &mut rng))
+}
+
+/// Every gate a GLU takes.
+pub(super) const GLU_GATES: [Gate; 5] = [
+    Gate::Sigmoid,
+    Gate::Gelu(GeluApprox::Tanh),
+    Gate::Gelu(GeluApprox::Exact),
+    Gate::Relu,
+    Gate::Silu,
+];
 
 /// The activations the GPU engines run besides ReLU, leaky ReLU, tanh, the sigmoid and GELU,
 /// each with settings that take both of its branches on the test data: softplus with a low
@@ -646,6 +678,32 @@ fn prelu_layers_infer_as_the_cpu() {
         let what = if shared { "shared PReLU" } else { "PReLU" };
         let mut params = ParamStore::new();
         let net = prelu_mlp::<f32>(&mut params, seed, shared);
+        let batch = 23;
+        let input = Tensor::from_vec(uniform(seed, batch * 12, -2.0, 2.0), &[batch, 12]).unwrap();
+        let mut cpu = InferenceModel::compile(&net, &params).unwrap();
+        let want = cpu.infer_batch(input.view()).data().to_vec();
+        for_each_gpu(|gpu| {
+            let mut model = GpuModel::compile(&net, &params, batch, gpu).unwrap();
+            let got = model.infer_batch(input.view()).data().to_vec();
+            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let off = (got.iter().zip(&want))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("{what}: off by {off:.3e} of a largest output {scale:.3e}");
+            assert!(off <= scale / 1024.0, "{what}: off by {off:e} of {scale:e}");
+        });
+    }
+}
+
+/// A GLU of each gate after the first two `Linear`s of an MLP: the model's evaluation-mode
+/// outputs against the CPU's `InferenceModel`, within 2⁻¹⁰ of the CPU's largest output.
+#[test]
+fn glu_layers_infer_as_the_cpu() {
+    for (k, gate) in GLU_GATES.into_iter().enumerate() {
+        let what = format!("GLU with {gate:?}");
+        let seed = 110 + k as u64;
+        let mut params = ParamStore::new();
+        let net = glu_mlp::<f32>(&mut params, seed, gate, false);
         let batch = 23;
         let input = Tensor::from_vec(uniform(seed, batch * 12, -2.0, 2.0), &[batch, 12]).unwrap();
         let mut cpu = InferenceModel::compile(&net, &params).unwrap();

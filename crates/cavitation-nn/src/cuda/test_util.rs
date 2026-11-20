@@ -4,12 +4,14 @@
 //! Without CUDA every test says so and checks nothing; `CAVITATION_CUDA_REQUIRED=1` makes
 //! that a failure, through [`Cuda::new`].
 
-use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Real, Rng, Tensor, TensorView};
+use cavitation_core::{
+    Conv2dGeom, Gate, GeluApprox, ParamStore, Pool2dGeom, Real, Rng, Tensor, TensorView,
+};
 use cavitation_cuda::Cuda;
 
 use crate::{
     ActivationKind, ActivationLayer, BatchNorm2d, BatchView, Conv2d, Dataset, Dropout, Flatten,
-    Init, Linear, LogSoftmax, MaxPool2d, Prelu, Relu, Sequential, Softmax, Tanh, Targets,
+    Glu, Init, Linear, LogSoftmax, MaxPool2d, Prelu, Relu, Sequential, Softmax, Tanh, Targets,
     TargetsView,
 };
 
@@ -92,6 +94,37 @@ pub(super) fn prelu_mlp<T: Real>(
         .push(third)
         .push(Linear::new(params, 9, 4, &mut rng))
 }
+
+/// An MLP 12 → 16 → 9 → 4 with a GLU of `gate` after each of the first two `Linear`s
+/// (16 → 8 into a `Linear` 8 → 18, and 18 → 9), in either precision; with `lead`, a GLU before
+/// the first `Linear` too, so the input is 24 wide.
+pub(super) fn glu_mlp<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    gate: Gate,
+    lead: bool,
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let net = if lead {
+        Sequential::new_generic().push(Glu { gate })
+    } else {
+        Sequential::new_generic()
+    };
+    net.push(Linear::new(params, 12, 16, &mut rng))
+        .push(Glu { gate })
+        .push(Linear::new(params, 8, 18, &mut rng))
+        .push(Glu { gate })
+        .push(Linear::new(params, 9, 4, &mut rng))
+}
+
+/// Every gate a GLU takes.
+pub(super) const GLU_GATES: [Gate; 5] = [
+    Gate::Sigmoid,
+    Gate::Gelu(GeluApprox::Tanh),
+    Gate::Gelu(GeluApprox::Exact),
+    Gate::Relu,
+    Gate::Silu,
+];
 
 /// The activations the GPU engines run besides ReLU, leaky ReLU, tanh, the sigmoid and GELU,
 /// each with settings that take both of its branches on the test data: softplus with a low
