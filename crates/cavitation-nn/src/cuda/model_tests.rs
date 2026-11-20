@@ -12,13 +12,14 @@ use cavitation_core::{Conv2dGeom, Gate, GeluApprox, ParamId, ParamStore, Pool2dG
 
 use super::CudaModel;
 use super::test_util::{
-    cifar_cnn, classes, mlp, mnist_cnn, off, prelu_mlp, twin, uniform, with_cuda,
+    GLU_GATES, cifar_cnn, classes, glu_mlp, mlp, mnist_cnn, off, prelu_mlp, twin, uniform,
+    with_cuda,
 };
 use crate::plan::{Engine, Plan, pack_rows};
 use crate::{
-    AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh, InferenceModel,
-    Init, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d, NeuronMask, Prelu, Relu, Sequential,
-    Sigmoid, Softmax, Tanh, accuracy, evaluate,
+    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh,
+    InferenceModel, Init, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d, NeuronMask, Prelu, Relu,
+    Sequential, Sigmoid, Softmax, Tanh, accuracy, evaluate,
 };
 
 /// A small CNN with every kind of layer the card runs, two of them masked: 1 × 6 × 6 images
@@ -62,12 +63,21 @@ fn every_kind(params: &mut ParamStore) -> Sequential {
 /// The plan names `CudaModel::compile` in its refusals, and the wgpu engine's limits (a
 /// convolution's batch above 65,535, a softmax's above 16,776,960, a PReLU's slope gradient
 /// over more than 268,431,360 values per slope, a batch norm's eps below 2⁻¹²⁶) do not apply;
-/// a PReLU of more than 65,535 slopes, or over more than 2³¹ values per batch, is refused on
-/// both.
+/// a PReLU of more than 65,535 slopes, or over more than 2³¹ values per batch, and a GLU over
+/// an odd width are refused on both.
 #[test]
 fn the_plan_refuses_under_cudas_name() {
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(0);
+    let net = Sequential::new()
+        .push(Linear::new(&mut params, 4, 3, &mut rng))
+        .push(AdaptiveAvgPool2d::new(3, (1, 1), (1, 1)).unwrap());
+    let err = Plan::build_for(&net, &params, 8, Engine::CUDA).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported: CudaModel::compile: layer 1 (adaptive_avg_pool2d) is not a layer the GPU \
+         runs"
+    );
     let net = Sequential::new()
         .push(Linear::new(&mut params, 4, 3, &mut rng))
         .push(Glu {
@@ -76,7 +86,8 @@ fn the_plan_refuses_under_cudas_name() {
     let err = Plan::build_for(&net, &params, 8, Engine::CUDA).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "unsupported: CudaModel::compile: layer 1 (glu) is not a layer the GPU runs"
+        "invalid data: CudaModel::compile: layer 1 (glu) is a GLU over width 3, which must be \
+         even"
     );
     let err = Plan::build_for(&Sequential::new(), &params, 8, Engine::CUDA).unwrap_err();
     assert_eq!(
@@ -343,5 +354,18 @@ fn prelu_layers_match_the_cpu() {
                 assert_eq!(back.value(id).data(), params.value(id).data(), "{what}");
             }
         });
+    }
+}
+
+/// A GLU of each gate after the first two `Linear`s of an MLP: the evaluation-mode outputs
+/// against the CPU's `InferenceModel`.
+#[test]
+fn glu_layers_match_the_cpu() {
+    for (k, gate) in GLU_GATES.into_iter().enumerate() {
+        let seed = 110 + k as u64;
+        let mut params = ParamStore::new();
+        let net = glu_mlp::<f32>(&mut params, seed, gate, false);
+        let what = format!("GLU with {gate:?}");
+        check_outputs(&net, &params, 23, &uniform(seed, 23 * 12, -2.0, 2.0), &what);
     }
 }

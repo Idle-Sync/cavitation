@@ -11,9 +11,9 @@ use cavitation_gpu::kernels::{
     AvgPool2d, BatchNormBackward, BatchNormForward, BatchStats, BiasAddCall, ChannelDims,
     ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
     ConvWeightGradCall, CrossEntropyCall, DeadRelu, DeadReluCall, Elementwise, ElementwiseCall,
-    FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, MaxPool2d, MeanSquaredError, MseCall,
-    OptimizerKernel, OptimizerRule, Prelu, PreluCall, RowSoftmax, RowSoftmaxCall, RunningUpdate,
-    SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
+    FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, Glu, GluCall, MaxPool2d, MeanSquaredError,
+    MseCall, OptimizerKernel, OptimizerRule, Prelu, PreluCall, RowSoftmax, RowSoftmaxCall,
+    RunningUpdate, SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepOutput,
@@ -93,6 +93,8 @@ enum Op {
     Prelu(PreluCall),
     /// A PReLU's slope gradient.
     PreluSlope(ChannelSumsCall),
+    /// A gated linear unit, forward or backward.
+    Glu(GluCall),
     /// Pooling forward: the kernel's index in [`TrainPass::pools`] and the bind group.
     PoolForward(usize, wgpu::BindGroup),
     /// Pooling backward: the kernel's index and the bind group.
@@ -1724,6 +1726,7 @@ fn record(ops: &[Op], model: &Kernels, train: &TrainKernels, pools: &[Pool], ste
             Op::Softmax(call) => model.softmax.record(step, call),
             Op::Prelu(call) => model.prelu.record(step, call),
             Op::PreluSlope(call) => model.prelu.record_slope_grad(step, call),
+            Op::Glu(call) => model.glu.record(step, call),
             Op::PoolForward(k, group) => match &pools[*k] {
                 Pool::Max(p) => p.forward(step, group),
                 Pool::Avg(p) => p.forward(step, group),
@@ -1885,6 +1888,20 @@ impl TrainPass {
                         prelu_shape(batch, layer.inputs, channels),
                         &values[x],
                         &m.params[weight].buffer,
+                        None,
+                        &values[out],
+                    )));
+                    out
+                }
+                Kind::Glu(gate) => {
+                    let out = take(&mut values, pool);
+                    forward.push(Op::Glu(k.glu.call(
+                        steps,
+                        pool,
+                        Glu::Forward,
+                        gate,
+                        (u32_of(batch), u32_of(layer.inputs)),
+                        &values[x],
                         None,
                         &values[out],
                     )));
@@ -2202,6 +2219,20 @@ impl TrainPass {
                         shape,
                         x,
                         &m.params[weight].buffer,
+                        Some(&grads[g]),
+                        &grads[dx],
+                    )));
+                    dx
+                }
+                Kind::Glu(gate) => {
+                    let dx = new_grad(&mut grads, pool, n_in);
+                    backward.push(Op::Glu(k.glu.call(
+                        steps,
+                        pool,
+                        Glu::Backward,
+                        gate,
+                        (u32_of(batch), u32_of(layer.inputs)),
+                        x,
                         Some(&grads[g]),
                         &grads[dx],
                     )));

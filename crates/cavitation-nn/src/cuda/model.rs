@@ -4,7 +4,7 @@
 //! neuron masks.
 
 use cavitation_core::{Error, ParamId, ParamStore};
-use cavitation_cuda::{Cuda, CudaError, Dropout, Elementwise, Prelu, RowSoftmax};
+use cavitation_cuda::{Cuda, CudaError, Dropout, Elementwise, Glu, Prelu, RowSoftmax};
 
 use super::pass::{Forward, Parts, Shared, Store};
 use crate::Sequential;
@@ -50,9 +50,9 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// [`Identity`](crate::Identity) and every built-in activation (ReLU, leaky ReLU, tanh, the
 /// sigmoid, GELU in both forms, ELU, SELU, CELU with a positive `alpha`, SiLU, Mish, softplus,
 /// softsign, hardtanh with `min <= max`, ReLU6, the hard sigmoid, the hard swish and log-sigmoid),
-/// [`Softmax`](crate::Softmax) and [`LogSoftmax`](crate::LogSoftmax) over each row, and
+/// [`Softmax`](crate::Softmax) and [`LogSoftmax`](crate::LogSoftmax) over each row,
 /// [`Prelu`](crate::Prelu) with one slope per column or one shared slope (at most 65,535), its
-/// slopes trained as parameters.
+/// slopes trained as parameters, and [`Glu`](crate::Glu) with every gate, over an even width.
 /// [`compile`](CudaModel::compile) refuses any other layer, naming its index and name. Neuron masks
 /// set on the model when it is compiled are compiled in; a mask set later needs a new compile.
 ///
@@ -136,11 +136,12 @@ impl<'c> CudaModel<'c> {
     ///   card or NVIDIA's libraries refuse a layer's shape or its memory: a size cuDNN's or
     ///   cuBLAS's `int` does not hold, a convolution with no deterministic algorithm that
     ///   uses no tensor cores, a batch norm of more than 65,535 channels, or memory the card
-    ///   does not have. Also a PReLU of more than 65,535 slopes or
-    ///   of more than 2³¹ values per batch.
+    ///   does not have. Also a PReLU of more than 65,535 slopes or of more than 2³¹ values per
+    ///   batch, and a GLU of more than 4,294,967,295 values per batch.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
-    ///   a mask is not as wide as its layer's output, a batch count does not hold one value,
+    ///   a GLU's input width is odd (the CPU's GLU panics on it), a mask is not as wide as its
+    ///   layer's output, a batch count does not hold one value,
     ///   a PReLU's weight does not hold one value per slope, or a batch norm that keeps no
     ///   running statistics would see one value per channel; the message names the layer (and
     ///   both widths, where two differ).
@@ -154,17 +155,17 @@ impl<'c> CudaModel<'c> {
     /// A layer the card does not run is refused by index and name:
     ///
     /// ```
-    /// use cavitation_core::{Gate, ParamStore, Rng};
+    /// use cavitation_core::{ParamStore, Rng};
     /// use cavitation_cuda::Cuda;
-    /// use cavitation_nn::{CudaModel, Glu, Linear, Sequential};
+    /// use cavitation_nn::{AdaptiveAvgPool2d, CudaModel, Linear, Sequential};
     ///
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new()
     ///     .push(Linear::new(&mut params, 4, 4, &mut Rng::seed(0)))
-    ///     .push(Glu { gate: Gate::Sigmoid });
+    ///     .push(AdaptiveAvgPool2d::new(1, (2, 2), (1, 1)).unwrap());
     /// if let Some(cuda) = Cuda::new() {
     ///     let err = CudaModel::compile(&net, &params, 8, &cuda).unwrap_err();
-    ///     assert!(err.to_string().contains("layer 1 (glu)"), "{err}");
+    ///     assert!(err.to_string().contains("layer 1 (adaptive_avg_pool2d)"), "{err}");
     /// }
     /// ```
     pub fn compile(
@@ -210,6 +211,7 @@ impl<'c> CudaModel<'c> {
             dropout: Dropout::new(cuda).map_err(refuse)?,
             softmax: RowSoftmax::new(cuda).map_err(refuse)?,
             prelu: Prelu::new(cuda).map_err(refuse)?,
+            glu: Glu::new(cuda).map_err(refuse)?,
         };
         let param_at: Vec<usize> = gpu_params.iter().map(|t| t.at).collect();
         let buffer_at: Vec<usize> = gpu_buffers.iter().map(|t| t.at).collect();

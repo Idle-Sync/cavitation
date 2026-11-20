@@ -29,6 +29,8 @@
 //!   backward, one thread per row in the CPU's order.
 //! - [`kernels::PreluKernels`]: PReLU with one slope per column or one shared slope, forward,
 //!   the input's gradient and the slopes' gradient in a fixed tree.
+//! - [`kernels::GluKernels`]: gated linear units with a sigmoid, GELU, ReLU or SiLU gate,
+//!   forward and backward, the gates the element-wise kernels' own.
 //! - [`kernels::MaxPool2d`] and [`kernels::AvgPool2d`]: max and average pooling, forward
 //!   and backward, max pooling bit for bit with the CPU's (winners, ties and NaNs) and
 //!   average pooling within a stated rounding bound.

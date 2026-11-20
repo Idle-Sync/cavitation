@@ -24,12 +24,12 @@
 
 use std::time::Duration;
 
-use cavitation_core::{Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
+use cavitation_core::{Gate, Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
 
 use super::CudaTrainer;
 use super::test_util::{
-    Data, Twin, activation_mlp, cifar_cnn, mlp, mnist_cnn, more_activations, off, prelu_mlp,
-    small_cnn, softmax_mlp, twin, with_cuda,
+    Data, GLU_GATES, Twin, activation_mlp, cifar_cnn, glu_mlp, mlp, mnist_cnn, more_activations,
+    off, prelu_mlp, small_cnn, softmax_mlp, twin, with_cuda,
 };
 use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
@@ -259,6 +259,26 @@ fn prelu_layers_match_the_tape() {
         );
         let what = if shared { "shared PReLU" } else { "PReLU" };
         check_gradients(t, &Data::within(seed, 24, 12, 4, (-2.0, 2.0)), what);
+    }
+}
+
+/// A GLU of each gate after the first two `Linear`s of an MLP, and with the ReLU and SiLU
+/// gates a GLU as the first layer too (the input 24 wide): the card's gradients against the
+/// `f64` tape's, within the tolerance above.
+#[test]
+fn glu_layers_match_the_tape() {
+    let leading = [(Gate::Relu, true), (Gate::Silu, true)];
+    let cases = GLU_GATES.into_iter().map(|g| (g, false)).chain(leading);
+    for (k, (gate, lead)) in cases.enumerate() {
+        let seed = 120 + k as u64;
+        let t = twin(
+            |p, s| glu_mlp(p, s, gate, lead),
+            |p, s| glu_mlp(p, s, gate, lead),
+            seed,
+        );
+        let width = if lead { 24 } else { 12 };
+        let what = format!("GLU with {gate:?}{}", if lead { ", leading" } else { "" });
+        check_gradients(t, &Data::within(seed, 24, width, 4, (-2.0, 2.0)), &what);
     }
 }
 

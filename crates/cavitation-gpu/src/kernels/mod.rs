@@ -6,6 +6,7 @@ mod bindings;
 mod conv;
 mod elementwise;
 mod gemm;
+mod glu;
 mod health;
 mod loss;
 mod optimizer;
@@ -21,6 +22,7 @@ pub use conv::{
 };
 pub use elementwise::{Elementwise, ElementwiseCall, ElementwiseKernels};
 pub use gemm::{Gemm, GemmCall, GemmDims};
+pub use glu::{Glu, GluCall, GluKernels};
 pub use health::{DeadRelu, DeadReluCall, FiniteFlag, FiniteFlagCall, SumSquares, SumSquaresCall};
 pub use loss::{CrossEntropyCall, MeanSquaredError, MseCall, SoftmaxCrossEntropy};
 pub use optimizer::{OptimizerKernel, OptimizerRule};

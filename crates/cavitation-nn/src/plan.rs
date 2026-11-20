@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use cavitation_core::{Conv2dGeom, Error, GeluApprox, ParamId, ParamStore, Pool2dGeom};
+use cavitation_core::{Conv2dGeom, Error, Gate, GeluApprox, ParamId, ParamStore, Pool2dGeom};
 
 use crate::layer::private::Token;
 use crate::{ActivationKind, InferenceLayer, Layer, Sequential};
@@ -35,6 +35,10 @@ const MAX_PRELU_ROWS: usize = 65_535 * 4096;
 /// The most values a PReLU may take per batch on either engine: its kernels index them with
 /// 32-bit integers, and the slope gradient's sums take at most 2³¹.
 const MAX_PRELU_VALUES: usize = 1 << 31;
+
+/// The most values a GLU may take per batch on either engine: its kernels index them with
+/// 32-bit integers.
+const MAX_GLU_VALUES: usize = u32::MAX as usize;
 
 /// The engine a plan is built for: the name its messages start with, and whether the wgpu
 /// engine's own limits apply.
@@ -196,6 +200,9 @@ pub(crate) enum Kind {
         /// The slopes' index.
         weight: usize,
     },
+    /// A gated linear unit with this gate: each row's first half times the gate of its
+    /// second, halving the width.
+    Glu(Gate),
     /// Softmax over each row, or log-softmax if `log`.
     Softmax {
         /// Whether it is the log-softmax.
@@ -238,7 +245,11 @@ impl Kind {
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => Some(geom.in_width()),
             Kind::BatchNorm2d(norm) => Some(norm.channels * norm.spatial),
             Kind::Prelu { channels, .. } => (*channels > 1).then_some(*channels),
-            Kind::Activation(_) | Kind::Softmax { .. } | Kind::Dropout(_) | Kind::Identity => None,
+            Kind::Activation(_)
+            | Kind::Softmax { .. }
+            | Kind::Glu(_)
+            | Kind::Dropout(_)
+            | Kind::Identity => None,
         }
     }
 
@@ -248,6 +259,7 @@ impl Kind {
             Kind::Linear { outputs, .. } => *outputs,
             Kind::Conv2d { geom, .. } => geom.out_width(),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => geom.out_width(),
+            Kind::Glu(_) => width / 2,
             Kind::Activation(_)
             | Kind::Prelu { .. }
             | Kind::Softmax { .. }
@@ -307,15 +319,16 @@ impl Plan {
     /// - [`Error::Unsupported`] if the model has no layers, a layer is not one a GPU runs or
     ///   has parameters its GPU form does not use (by index and name), an id is used in two
     ///   roles, no layer fixes the input width, a PReLU has more than 65,535 slopes or takes
-    ///   more than 2³¹ values per batch, or (on the wgpu engine) a convolution's batch is
-    ///   above 65,535, a softmax's above 16,776,960, a PReLU's slope gradient would sum more
-    ///   than 268,431,360 values per slope, a GEMM's side is above 4,194,240, or a batch
-    ///   norm's eps is below 2⁻¹²⁶ in `f32` and not 0.
+    ///   more than 2³¹ values per batch, a GLU takes more than 4,294,967,295 values per batch,
+    ///   or (on the wgpu engine) a convolution's batch is above 65,535, a softmax's above
+    ///   16,776,960, a PReLU's slope gradient would sum more than 268,431,360 values per
+    ///   slope, a GEMM's side is above 4,194,240, or a batch norm's eps is below 2⁻¹²⁶ in
+    ///   `f32` and not 0.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports, a
-    ///   mask is not as wide as its layer's output, a batch count does not hold one value, a
-    ///   PReLU's weight does not hold one value per slope, or a batch norm that keeps no
-    ///   running statistics would see one value per channel.
+    ///   GLU's input width is odd, a mask is not as wide as its layer's output, a batch count
+    ///   does not hold one value, a PReLU's weight does not hold one value per slope, or a
+    ///   batch norm that keeps no running statistics would see one value per channel.
     pub(crate) fn build_for(
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
@@ -338,13 +351,7 @@ impl Plan {
         for i in 0..model.len() {
             kinds.push(kind(model.layer(i), i, params, &mut slots, who)?);
         }
-        let input_width = (0..model.len())
-            .find_map(|i| model.layer(i).input_width().or(kinds[i].declared_input()))
-            .ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{who}: no layer of the model fixes its input width"
-                ))
-            })?;
+        let input_width = input_width(model, &kinds, who)?;
         let mut layers = Vec::with_capacity(model.len());
         let mut masks = Vec::new();
         let mut width = input_width;
@@ -357,6 +364,12 @@ impl Plan {
                 return Err(Error::InvalidData(format!(
                     "{who}: layer {i} ({name}) expects input width {expected}, but its input \
                      has width {width}"
+                )));
+            }
+            if matches!(kind, Kind::Glu(_)) && !width.is_multiple_of(2) {
+                // The CPU's `Tape::glu` panics on an odd width, so no device trains it.
+                return Err(Error::InvalidData(format!(
+                    "{who}: layer {i} ({name}) is a GLU over width {width}, which must be even"
                 )));
             }
             if let Kind::BatchNorm2d(norm) = kind
@@ -380,6 +393,14 @@ impl Plan {
                 return Err(Error::Unsupported(format!(
                     "{who}: layer {i} ({name}) is a PReLU over {batch} rows of {width} values, \
                      more than the {MAX_PRELU_VALUES} per batch the GPU takes"
+                )));
+            }
+            if matches!(kind, Kind::Glu(_))
+                && batch.checked_mul(width).is_none_or(|n| n > MAX_GLU_VALUES)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{who}: layer {i} ({name}) is a GLU over {batch} rows of {width} values, \
+                     more than the {MAX_GLU_VALUES} per batch the GPU takes"
                 )));
             }
             let outputs = kind.output_width(width);
@@ -427,6 +448,37 @@ impl Plan {
             masks,
         })
     }
+}
+
+/// The width of one input row of `model`, whose layers are `kinds`: the input width of the
+/// first layer that fixes one, doubled for each GLU before it (the layers before it keep the
+/// width otherwise). `who` starts the message.
+///
+/// # Errors
+///
+/// [`Error::Unsupported`] if no layer fixes its input width, or the doubled width overflows.
+fn input_width(model: &Sequential<f32>, kinds: &[Kind], who: &str) -> Result<usize, Error> {
+    let (first, width) = (0..model.len())
+        .find_map(|i| {
+            let fixed = model.layer(i).input_width().or(kinds[i].declared_input());
+            fixed.map(|w| (i, w))
+        })
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{who}: no layer of the model fixes its input width"
+            ))
+        })?;
+    kinds[..first]
+        .iter()
+        .filter(|k| matches!(k, Kind::Glu(_)))
+        .try_fold(width, |w, _| w.checked_mul(2))
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{who}: layer {first} ({}) takes input width {width}, which the GLUs before \
+                 it double past what memory can index",
+                model.layer(first).name()
+            ))
+        })
 }
 
 /// Refuses what the wgpu kernels cannot run: a convolution over more than 65,535 images, a
@@ -680,6 +732,7 @@ fn kind(
         Some(InferenceLayer::Activation(kind)) => kind,
         Some(InferenceLayer::Softmax) => return Ok(Kind::Softmax { log: false }),
         Some(InferenceLayer::LogSoftmax) => return Ok(Kind::Softmax { log: true }),
+        Some(InferenceLayer::Glu(gate)) => return Ok(Kind::Glu(gate)),
         Some(_) => return refuse("is not a layer the GPU runs"),
         None => return refuse("has no inference form, so the GPU cannot run it"),
     };
@@ -744,5 +797,137 @@ mod tests {
             super::MAX_SOFTMAX_ROWS as u64,
             u64::from(cavitation_gpu::kernels::MAX_SOFTMAX_ROWS)
         );
+    }
+}
+
+/// The plan's GLU widths and refusals, on both engines; nothing here touches a device.
+#[cfg(all(test, any(feature = "gpu", feature = "cuda")))]
+mod glu_tests {
+    use cavitation_core::{Gate, ParamId, ParamStore, ParamValues, Real, Rng, Tape, Var};
+
+    use super::{Engine, Plan};
+    use crate::{Glu, InferenceLayer, Layer, Linear, Prelu, Sequential};
+
+    /// Both engines.
+    const ENGINES: [Engine; 2] = [Engine::WGPU, Engine::CUDA];
+
+    /// A layer that passes its input on and fixes the input width it holds.
+    struct Fixed(usize);
+
+    impl<T: Real> Layer<T> for Fixed {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        fn input_width(&self) -> Option<usize> {
+            Some(self.0)
+        }
+        fn forward(&self, _: &mut Tape<'_, T>, x: Var) -> Var {
+            x
+        }
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+        fn inference(&self, _: &ParamValues<f32>) -> Option<InferenceLayer> {
+            Some(InferenceLayer::Identity)
+        }
+    }
+
+    /// A GLU.
+    fn glu() -> Glu {
+        Glu {
+            gate: Gate::Sigmoid,
+        }
+    }
+
+    /// Each GLU before the first layer that fixes a width doubles the model's input width, a
+    /// `Linear`'s or a per-column PReLU's; without the GLUs the width is that layer's own.
+    #[test]
+    fn leading_glus_double_the_input_width() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(6);
+        let cases: Vec<(Sequential, usize)> = vec![
+            (
+                Sequential::new().push(Linear::new(&mut params, 4, 3, &mut rng)),
+                4,
+            ),
+            (
+                Sequential::new()
+                    .push(glu())
+                    .push(Linear::new(&mut params, 4, 3, &mut rng)),
+                8,
+            ),
+            (
+                Sequential::new().push(glu()).push(glu()).push(Linear::new(
+                    &mut params,
+                    4,
+                    3,
+                    &mut rng,
+                )),
+                16,
+            ),
+            (Sequential::new().push(Prelu::new(&mut params, 3)), 3),
+            (
+                Sequential::new()
+                    .push(glu())
+                    .push(Prelu::new(&mut params, 3)),
+                6,
+            ),
+        ];
+        for engine in ENGINES {
+            for (net, width) in &cases {
+                let plan = Plan::build_for(net, &params, 8, engine).unwrap();
+                assert_eq!(plan.input_width, *width, "{} layers", net.len());
+                assert_eq!(plan.layers[0].inputs, *width, "{} layers", net.len());
+            }
+        }
+    }
+
+    /// 64 GLUs before a `Linear` of 4 inputs would double its width past `usize`: refused,
+    /// naming the layer that fixes the width.
+    #[test]
+    fn leading_glus_past_usize_are_refused() {
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new();
+        for _ in 0..64 {
+            net = net.push(glu());
+        }
+        let net = net.push(Linear::new(&mut params, 4, 3, &mut Rng::seed(7)));
+        for engine in ENGINES {
+            let err = Plan::build_for(&net, &params, 8, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: {}: layer 64 (linear) takes input width 4, which the GLUs \
+                     before it double past what memory can index",
+                    engine.name
+                )
+            );
+        }
+    }
+
+    /// A GLU over 4,294,967,296 values per batch (2³⁰ rows of 4) is refused on both engines,
+    /// whose kernels index with 32-bit integers, and one row fewer is planned. The width is
+    /// fixed by a layer that passes its input on, so no other layer's limit comes first (a
+    /// `Linear` over 2³¹ rows is above the wgpu GEMM's side).
+    #[test]
+    fn glu_over_more_than_u32_values_is_refused() {
+        let params = ParamStore::new();
+        let net = Sequential::new().push(glu()).push(Fixed(2));
+        let rows = (u32::MAX / 4) as usize + 1;
+        for engine in ENGINES {
+            assert!(Plan::build_for(&net, &params, rows - 1, engine).is_ok());
+            let err = Plan::build_for(&net, &params, rows, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: {}: layer 0 (glu) is a GLU over 1073741824 rows of 4 values, \
+                     more than the 4294967295 per batch the GPU takes",
+                    engine.name
+                )
+            );
+        }
     }
 }
