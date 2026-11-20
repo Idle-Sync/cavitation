@@ -19,8 +19,8 @@ use cavitation_core::kernels::{level, threads};
 use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng};
 use cavitation_datasets::{cifar10, mnist};
 use cavitation_nn::{
-    Adam, Batch, BatchNorm2d, Batcher, Conv2d, Dataset, DeviceKind, Dropout, Flatten, Health, Init,
-    Linear, Loss, MaxPool2d, Relu, Sequential, StepProfile, Trainer, accuracy, save,
+    Adam, Batch, BatchNorm2d, BatchView, Batcher, Conv2d, Dataset, DeviceKind, Dropout, Flatten,
+    Health, Init, Linear, Loss, MaxPool2d, Relu, Sequential, StepProfile, Trainer, accuracy, save,
 };
 
 /// One of the two benchmark networks with its pinned schedule.
@@ -127,13 +127,14 @@ pub struct Options {
     /// `--cav-only`: train Cavitation's side only and skip the PyTorch side.
     pub cav_only: bool,
     /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
-    /// steps) and print each layer's median forward and backward time.
+    /// steps) and print each layer's median forward and backward time, on the CPU or, with
+    /// `--device gpu`, on the GPU.
     pub profile: Option<usize>,
     /// `--device`: where our side trains. `gpu` is the GPU through wgpu (`GpuTrainer`),
     /// which needs the `gpu` feature; `cuda` an NVIDIA card through CUDA (`CudaTrainer`),
     /// which needs the `cuda` feature; `cpu`, the default, trains with `Trainer`; `auto` is
     /// the device `cavitation_nn::devices` marks as chosen (the CPU with `--profile`, which
-    /// times the CPU trainer only).
+    /// times the CPU and GPU trainers, not CUDA's).
     pub device: DeviceKind,
     /// `--backend vulkan|dx12|metal`: the GPU backend, or the platform's default.
     pub backend: Option<String>,
@@ -241,7 +242,7 @@ impl Options {
             return Err("--backend needs --device gpu".into());
         }
         if auto {
-            // `--profile` times the CPU trainer only, whatever `auto` would pick.
+            // `--profile` with `auto` times the CPU trainer, whatever `auto` would pick.
             o.device = auto_device()?;
             if o.profile.is_some() {
                 o.device = DeviceKind::Cpu;
@@ -250,11 +251,12 @@ impl Options {
         if o.backend.is_some() && o.device != DeviceKind::Gpu {
             return Err("--backend needs --device gpu".into());
         }
-        if o.device != DeviceKind::Cpu && o.profile.is_some() {
-            return Err(format!(
-                "--profile times the CPU trainer only; leave out --device {}",
-                o.device
-            ));
+        if o.device == DeviceKind::Cuda && o.profile.is_some() {
+            return Err(
+                "--profile times the CPU trainer, or the GPU trainer with --device gpu; not \
+                 --device cuda"
+                    .into(),
+            );
         }
         if o.deterministic && o.torch_device == "cpu" {
             return Err("--deterministic needs --torch-device cuda or mps".into());
@@ -352,6 +354,21 @@ fn train_ours(
     Ok(epochs)
 }
 
+/// The GPU `--backend` names, or the platform's default.
+///
+/// # Errors
+///
+/// Returns a message for an unknown backend or when there is no GPU.
+#[cfg(feature = "gpu")]
+fn open_gpu(o: &Options) -> Result<cavitation_gpu::Gpu, String> {
+    use cavitation_gpu::{Backend, Gpu};
+    match &o.backend {
+        Some(b) => Gpu::with_backend(b.parse::<Backend>().map_err(|e| e.to_string())?),
+        None => Gpu::new(),
+    }
+    .ok_or_else(|| "no GPU found; --device gpu needs one".to_string())
+}
+
 /// Trains `model` on the GPU with `GpuTrainer`, as [`train_ours`] does on the CPU: the same
 /// batch order (a short last batch included), Adam at 1e-3, cross-entropy and dropout seed
 /// 0, and the test accuracy from the GPU model after each epoch. Each step reads its loss back, so the epoch's time is the
@@ -365,13 +382,8 @@ fn train_ours_gpu(
     net: Net,
     o: &Options,
 ) -> Result<Vec<Epoch>, String> {
-    use cavitation_gpu::{Backend, Gpu};
     use cavitation_nn::{GpuTrainer, OptimizerConfig};
-    let gpu = match &o.backend {
-        Some(b) => Gpu::with_backend(b.parse::<Backend>().map_err(|e| e.to_string())?),
-        None => Gpu::new(),
-    }
-    .ok_or("no GPU found; --device gpu needs one")?;
+    let gpu = open_gpu(o)?;
     println!("{}", gpu.info());
     let adam = OptimizerConfig::Adam {
         lr: 1e-3,
@@ -491,10 +503,49 @@ fn train_ours_cuda(
     Err("--device cuda needs the cuda feature: build with --features cuda".into())
 }
 
-/// The `--profile` run: trains `steps` + 3 batches of `train` in the seeded batch order, the
-/// last `steps` with [`Trainer::profile_next_step`], and prints each layer's median forward
-/// and backward time, then the loss's, the optimiser's and the whole step's. Nothing is
-/// written.
+/// Steps through `steps` + 3 batches of `train` in the seeded batch order, calling `step`
+/// with each batch and whether it is one of the last `steps`, the ones to profile.
+///
+/// # Errors
+///
+/// Returns the first error `step` returns.
+fn profiled_steps(
+    train: &Dataset,
+    net: Net,
+    seed: u64,
+    steps: usize,
+    mut step: impl FnMut(BatchView<'_, f32>, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut batcher = Batcher::new(train.len(), net.batch, Some(seed));
+    let mut batch = Batch::new(train, net.batch);
+    let mut taken = 0;
+    while taken < steps + 3 {
+        batcher.epoch();
+        for range in batcher.batches() {
+            if taken == steps + 3 {
+                break;
+            }
+            step(batcher.gather(train, range, &mut batch), taken >= 3)?;
+            taken += 1;
+        }
+    }
+    Ok(())
+}
+
+/// The row label of layer `i` of `model`: a ReLU fused into the batch norm before it says so,
+/// as that batch norm's row carries its times.
+fn layer_label(model: &Sequential, i: usize) -> String {
+    if i > 0 && model.fuses_at(i - 1) {
+        format!("{} (in {})", model.layer(i).name(), i - 1)
+    } else {
+        model.layer(i).name().to_string()
+    }
+}
+
+/// The `--profile` run on the CPU: trains `steps` + 3 batches of `train` in the seeded batch
+/// order, the last `steps` with [`Trainer::profile_next_step`], and prints each layer's
+/// median forward and backward time, then the loss's, the optimiser's and the whole step's.
+/// Nothing is written.
 ///
 /// # Errors
 ///
@@ -509,34 +560,24 @@ fn profile(
 ) -> Result<(), String> {
     let mut trainer = Trainer::new(model, Adam::new(1e-3), Loss::CrossEntropy, net.batch);
     trainer.set_health(Health::quiet());
-    let mut batcher = Batcher::new(train.len(), net.batch, Some(seed));
-    let mut batch = Batch::new(train, net.batch);
     let mut profiles = Vec::with_capacity(steps);
-    let mut step = 0;
-    while step < steps + 3 {
-        batcher.epoch();
-        for range in batcher.batches() {
-            if step == steps + 3 {
-                break;
-            }
-            let view = batcher.gather(train, range, &mut batch);
-            if step >= 3 {
-                trainer.profile_next_step();
-            }
-            trainer
-                .step(model, params, view)
-                .map_err(|e| e.to_string())?;
-            if step >= 3 {
-                profiles.push(
-                    trainer
-                        .last_profile()
-                        .expect("this step was profiled")
-                        .clone(),
-                );
-            }
-            step += 1;
+    profiled_steps(train, net, seed, steps, |view, timed| {
+        if timed {
+            trainer.profile_next_step();
         }
-    }
+        trainer
+            .step(model, params, view)
+            .map_err(|e| e.to_string())?;
+        if timed {
+            profiles.push(
+                trainer
+                    .last_profile()
+                    .expect("this step was profiled")
+                    .clone(),
+            );
+        }
+        Ok(())
+    })?;
     println!(
         "{} profile: batch {}, kernel {}, {} threads, medians of {steps} steps after 3 warm-up steps",
         net.name,
@@ -557,15 +598,9 @@ fn profile(
         "", "layer", "forward ms", "backward ms"
     );
     for i in 0..model.len() {
-        // A fused batch norm carries its ReLU's times; the ReLU's row says so.
-        let name = if i > 0 && model.fuses_at(i - 1) {
-            format!("{} (in {})", model.layer(i).name(), i - 1)
-        } else {
-            model.layer(i).name().to_string()
-        };
         println!(
             "{i:>3}  {:<22} {:>12.2} {:>12.2}",
-            name,
+            layer_label(model, i),
             ms(&|p| p.forward[i]),
             ms(&|p| p.backward[i])
         );
@@ -583,6 +618,143 @@ fn profile(
         ms(&|p| p.total)
     );
     Ok(())
+}
+
+/// The `--profile` run on the GPU (`--device gpu`): as [`profile`], with `GpuTrainer`, Adam at
+/// 1e-3 and dropout seed 0, and `GpuTrainer::profile_next_step`. Prints each layer's median
+/// forward and backward pass time on the GPU's clock, with a `Linear`'s or a `Conv2d`'s input
+/// gradient apart from its parameter gradients; then the loss, health values, update,
+/// running statistics, copies and readback where the device times them; then the timed parts'
+/// sum against the whole step on the host's clock, whose difference is the time no pass
+/// covers (the host's work, its waits and the untimed copies). A part the device does not time
+/// prints `-`. Nothing is written.
+///
+/// # Errors
+///
+/// Returns a message if there is no GPU or a training step fails.
+#[cfg(feature = "gpu")]
+fn profile_gpu(
+    model: &Sequential,
+    params: &ParamStore,
+    train: &Dataset,
+    net: Net,
+    o: &Options,
+    steps: usize,
+) -> Result<(), String> {
+    use cavitation_nn::{GpuStepProfile, GpuTrainer, OptimizerConfig};
+    let gpu = open_gpu(o)?;
+    println!("{}", gpu.info());
+    let adam = OptimizerConfig::Adam {
+        lr: 1e-3,
+        weight_decay: 0.0,
+    };
+    let mut trainer = GpuTrainer::new(model, params, &adam, Loss::CrossEntropy, net.batch, &gpu)
+        .map_err(|e| e.to_string())?;
+    trainer
+        .set_health(Health::quiet())
+        .map_err(|e| e.to_string())?;
+    trainer.set_dropout_seed(0);
+    let mut profiles = Vec::with_capacity(steps);
+    profiled_steps(train, net, o.seed, steps, |view, timed| {
+        if timed {
+            trainer.profile_next_step();
+        }
+        trainer.step(model, view).map_err(|e| e.to_string())?;
+        if timed {
+            profiles.push(
+                trainer
+                    .last_profile()
+                    .expect("this step was profiled")
+                    .clone(),
+            );
+        }
+        Ok(())
+    })?;
+    let timing = profiles[0].timing;
+    println!(
+        "{} profile on the GPU: batch {}, medians of {steps} steps after 3 warm-up steps; {timing:?}",
+        net.name, net.batch
+    );
+    let ms = |pick: &dyn Fn(&GpuStepProfile) -> Option<Duration>| -> Option<f64> {
+        let times: Option<Vec<f64>> = profiles
+            .iter()
+            .map(|p| pick(p).map(|d| d.as_secs_f64() * 1e3))
+            .collect();
+        times.map(|t| median(&t))
+    };
+    let cell = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.2}"));
+    println!(
+        "{:>3}  {:<22} {:>12} {:>12} {:>14}",
+        "", "layer", "forward ms", "backward ms", "of it input ms"
+    );
+    for i in 0..model.len() {
+        println!(
+            "{i:>3}  {:<22} {:>12} {:>12} {:>14}",
+            layer_label(model, i),
+            cell(ms(&|p| p.forward[i])),
+            cell(ms(&|p| p.backward[i])),
+            cell(ms(&|p| p.backward_input[i]))
+        );
+    }
+    let forward: Option<f64> = (0..model.len()).map(|i| ms(&|p| p.forward[i])).sum();
+    let backward: Option<f64> = (0..model.len()).map(|i| ms(&|p| p.backward[i])).sum();
+    println!(
+        "{:>3}  {:<22} {:>12} {:>12}",
+        "",
+        "all layers",
+        cell(forward),
+        cell(backward)
+    );
+    println!(
+        "loss {} ms, health {} ms, optimizer {} ms, running statistics {} ms, copies {} ms, \
+         readback {} ms",
+        cell(ms(&|p| p.loss)),
+        cell(ms(&|p| p.health)),
+        cell(ms(&|p| p.optimizer)),
+        cell(ms(&|p| p.running)),
+        cell(ms(&|p| p.copies)),
+        cell(ms(&|p| p.readback))
+    );
+    // Each step's own sum, then the median, so the untimed share is one step's.
+    let timed_sum = |p: &GpuStepProfile| -> Duration {
+        let rest = [
+            p.loss,
+            p.health,
+            p.optimizer,
+            p.running,
+            p.copies,
+            p.readback,
+        ];
+        p.forward
+            .iter()
+            .chain(&p.backward)
+            .chain(&rest)
+            .flatten()
+            .sum()
+    };
+    let timed = ms(&|p| Some(timed_sum(p)));
+    let total = ms(&|p| Some(p.total));
+    let untimed = ms(&|p| Some(p.total.saturating_sub(timed_sum(p))));
+    println!(
+        "timed parts {} ms, whole step {} ms on the host's clock, not covered by a timed part {} ms",
+        cell(timed),
+        cell(total),
+        cell(untimed)
+    );
+    Ok(())
+}
+
+/// Without the `gpu` feature, `--profile` with `--device gpu` says how to get it.
+#[cfg(not(feature = "gpu"))]
+fn profile_gpu(
+    _: &Sequential,
+    _: &ParamStore,
+    _: &Dataset,
+    _: Net,
+    _: &Options,
+    _: usize,
+) -> Result<(), String> {
+    Err("--device gpu needs the gpu feature: build with --features gpu".into())
 }
 
 /// Runs `torch_cnn.py --mode train` on the run's files and reads its epoch lines, each
@@ -767,6 +939,9 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
             _ => mnist_network(&mut params, o.seed),
         }
         .fuse(!o.no_fuse);
+        if o.device == DeviceKind::Gpu {
+            return profile_gpu(&model, &params, &train, net, o, steps);
+        }
         return profile(&model, &mut params, &train, net, o.seed, steps);
     }
     let dir = dir_root
@@ -954,8 +1129,8 @@ mod tests {
             (g.backend.as_deref(), g.torch_device.as_str()),
             (Some("metal"), "mps")
         );
-        // `auto` with `--profile` is the CPU, which is all `--profile` times; with
-        // `CAVITATION_DEVICE` set to something `devices` refuses, it is that error.
+        // `auto` with `--profile` is the CPU; with `CAVITATION_DEVICE` set to something
+        // `devices` refuses, it is that error.
         if let Ok(a) = Options::parse(CIFAR, &args(&["--device", "auto", "--profile", "3"])) {
             assert!(a.device == DeviceKind::Cpu && a.profile == Some(3));
         }
@@ -968,7 +1143,6 @@ mod tests {
             &["--device", "gpu", "--backend", "opengl"],
             &["--torch-device", "xla"],
             &["--deterministic"],
-            &["--device", "gpu", "--profile", "3"],
             &["--device", "cuda", "--profile", "3"],
             &["--device", "cuda", "--backend", "vulkan"],
         ] {
@@ -981,6 +1155,8 @@ mod tests {
                 .no_fuse
         );
         assert!(Options::parse(CIFAR, &args(&["--profile", "0"])).is_err());
+        let gp = Options::parse(CIFAR, &args(&["--device", "gpu", "--profile", "3"])).unwrap();
+        assert!(gp.device == DeviceKind::Gpu && gp.profile == Some(3));
     }
 
     /// The steady time is the median after the first epoch.
