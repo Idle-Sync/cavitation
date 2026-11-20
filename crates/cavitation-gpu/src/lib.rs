@@ -70,6 +70,12 @@
 //!   [`Gpu::with_backend`] for a backend this platform tries, so a test run that must use
 //!   the GPU fails instead of skipping.
 //!
+//! On a Metal adapter (macOS), the [`BufferPool`] makes its buffers on wgpu's own
+//! `MTLDevice` and hands them to wgpu, so Apple's Metal Performance Shaders can run on the
+//! same buffers, on the same queue, in a step's order: the convolutions run through MPSGraph
+//! there. [`MPS_VAR`] (`CAVITATION_MPS=0`) turns that off: wgpu's own buffers and the WGSL
+//! kernels only, as on Vulkan and DX12.
+//!
 //! On DX12, shaders are compiled by DXC when `dxcompiler.dll` can be loaded and by the
 //! older FXC otherwise, as wgpu decides; `WGPU_DX12_COMPILER=dxc` makes DXC required, and
 //! `fxc` forces FXC. DXC builds a large shader in about a second where FXC can take tens of
@@ -101,11 +107,13 @@
 mod buffer;
 mod device;
 pub mod kernels;
+mod metal;
 mod pipeline;
 mod step;
 
 pub use buffer::{BufferPool, PooledBuffer};
 pub use device::{Backend, Gpu, GpuError, GpuInfo};
+pub use metal::MPS_VAR;
 pub use pipeline::{PipelineCache, Shader};
 pub use step::{
     MAX_WORKGROUPS_PER_DIMENSION, Step, StepEncoder, StepOutput, StepSizes, Timed, TimedKind,

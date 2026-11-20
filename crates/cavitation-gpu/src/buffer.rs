@@ -7,6 +7,7 @@ use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Gpu;
+use crate::metal::RawBuffer;
 
 /// The smallest size class, in bytes. Smaller requests get a buffer of this size.
 const SMALLEST_CLASS: u64 = 256;
@@ -14,6 +15,10 @@ const SMALLEST_CLASS: u64 = 256;
 /// Up to this size, classes are powers of two; above it, quarter steps between powers of
 /// two, so a large buffer is at most a quarter larger than asked for.
 const FINE_CLASSES_FROM: u64 = 4 << 20;
+
+/// A buffer handed back to a pool, with its `MTLBuffer` when the pool made it on Metal's
+/// device.
+type FreeBuffer = (wgpu::Buffer, Option<RawBuffer>);
 
 /// The id the next [`BufferPool`] gets, so a buffer can be matched to its pool.
 static NEXT_POOL: AtomicU64 = AtomicU64::new(0);
@@ -42,6 +47,8 @@ pub struct PooledBuffer {
     len: u64,
     /// The id of the pool it came from.
     pool: u64,
+    /// The `MTLBuffer` under `buffer`, when the pool made it on Metal's device.
+    raw: Option<RawBuffer>,
 }
 
 impl PooledBuffer {
@@ -95,6 +102,16 @@ impl PooledBuffer {
     /// ```
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// The `MTLBuffer` under [`buffer`](Self::buffer), when the pool made it on Metal's
+    /// device (on a Metal adapter, unless `CAVITATION_MPS=0`, for a usage that does not map).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "read only where there is Metal")
+    )]
+    pub(crate) fn raw(&self) -> Option<&RawBuffer> {
+        self.raw.as_ref()
     }
 
     /// A binding of the first [`len`](PooledBuffer::len) bytes, for a bind group entry.
@@ -155,7 +172,7 @@ pub struct BufferPool {
     /// This pool's id, carried by its buffers.
     id: u64,
     /// The buffers handed back, by usage and size class.
-    free: HashMap<(wgpu::BufferUsages, u64), Vec<wgpu::Buffer>>,
+    free: HashMap<(wgpu::BufferUsages, u64), Vec<FreeBuffer>>,
     /// The number of buffers created so far.
     created: usize,
     /// The bytes in the buffers created so far.
@@ -239,21 +256,33 @@ impl BufferPool {
             len
         };
         let reused = self.free.get_mut(&(usage, class)).and_then(Vec::pop);
-        let buffer = reused.unwrap_or_else(|| {
+        let (buffer, raw) = reused.unwrap_or_else(|| {
             self.created += 1;
             self.created_bytes += class;
-            self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
-                label: Some("cavitation pooled buffer"),
-                size: class,
-                usage,
-                mapped_at_creation: false,
-            })
+            let device = self.gpu.device();
+            match self
+                .gpu
+                .metal()
+                .and_then(|m| m.create_buffer(device, class, usage))
+            {
+                Some((buffer, raw)) => (buffer, Some(raw)),
+                None => (
+                    device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("cavitation pooled buffer"),
+                        size: class,
+                        usage,
+                        mapped_at_creation: false,
+                    }),
+                    None,
+                ),
+            }
         });
         self.outstanding += 1;
         PooledBuffer {
             buffer,
             len,
             pool: self.id,
+            raw,
         }
     }
 
@@ -289,7 +318,7 @@ impl BufferPool {
         self.free
             .entry((buffer.buffer.usage(), buffer.buffer.size()))
             .or_default()
-            .push(buffer.buffer);
+            .push((buffer.buffer, buffer.raw));
     }
 
     /// The number of buffers this pool has created.

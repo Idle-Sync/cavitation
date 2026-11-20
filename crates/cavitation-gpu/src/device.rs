@@ -3,6 +3,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::Arc;
 
 /// The environment variable that restricts every [`Gpu`] to one backend.
 const BACKEND_VAR: &str = "CAVITATION_GPU_BACKEND";
@@ -364,6 +365,8 @@ pub struct Gpu {
     queue: wgpu::Queue,
     /// What was chosen, for [`Gpu::info`].
     info: GpuInfo,
+    /// wgpu's own `MTLDevice` and queue, on a Metal adapter unless `CAVITATION_MPS=0`.
+    metal: Option<Arc<crate::metal::Metal>>,
 }
 
 impl fmt::Debug for Gpu {
@@ -579,6 +582,33 @@ impl Gpu {
         &self.queue
     }
 
+    /// Whether Apple's Metal Performance Shaders run where they apply (the convolutions, from
+    /// macOS 26): a Metal adapter on macOS, unless `CAVITATION_MPS=0`. They run as Metal work
+    /// in a step's spans, which a profiled step's [`StepSizes::timed_passes`] counts.
+    ///
+    /// [`StepSizes::timed_passes`]: crate::StepSizes::timed_passes
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_gpu::{Backend, Gpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     if gpu.info().backend != Backend::Metal {
+    ///         assert!(!gpu.uses_mps());
+    ///     }
+    /// }
+    /// ```
+    pub fn uses_mps(&self) -> bool {
+        self.metal.is_some()
+    }
+
+    /// wgpu's own `MTLDevice` and command queue, on a Metal adapter unless
+    /// `CAVITATION_MPS=0`.
+    pub(crate) fn metal(&self) -> Option<&crate::metal::Metal> {
+        self.metal.as_deref()
+    }
+
     /// Turns [`Gpu::open`]'s result into `Some` or `None`. It panics on an unknown backend
     /// name, and on any other error when a GPU is `expected` there and `required`
     /// (`CAVITATION_GPU_REQUIRED` is `1`).
@@ -630,11 +660,13 @@ fn open_device(adapter: &wgpu::Adapter, dx12_compiler: &str) -> Result<Gpu, Stri
         dx12_compiler: (backend == Backend::Dx12).then(|| dx12_compiler.to_string()),
         limits,
     };
+    let metal = crate::metal::Metal::open(&device, &queue).map(Arc::new);
     Ok(Gpu {
         adapter: adapter.clone(),
         device,
         queue,
         info,
+        metal,
     })
 }
 

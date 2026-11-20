@@ -442,12 +442,15 @@ const RUNNING: &str = "running statistics";
 /// See [`FORWARD`].
 const READBACK: &str = "readback";
 
-/// The timed passes a profiled step of `layers` layers, `norms` of them batch norms and
-/// `splits` of them with an input gradient timed apart, needs (see `GpuTrainer::new`), or 0
-/// if that many passes' timestamps do not fit wgpu's queries on `gpu`: two per pass, and with
-/// encoder timestamps as many again for the copy runs.
-fn profiled_passes(layers: usize, norms: usize, splits: usize, gpu: &Gpu) -> u32 {
-    let passes = (2 * layers + 6 + norms + splits).max(64);
+/// The timed passes a profiled step of `layers` layers, `norms` of them batch norms, `splits`
+/// of them with an input gradient timed apart and `convs` of them convolutions, needs (see
+/// `GpuTrainer::new`), or 0 if that many passes' timestamps do not fit wgpu's queries on
+/// `gpu`: two per pass, and with encoder timestamps as many again for the copy runs. Where
+/// the GPU uses MPS, a convolution's three passes are Metal work, after which the span's
+/// next commands open a timed pass of their own: one more pass each.
+fn profiled_passes(layers: usize, norms: usize, splits: usize, convs: usize, gpu: &Gpu) -> u32 {
+    let metal = if gpu.uses_mps() { 3 * convs } else { 0 };
+    let passes = (2 * layers + 6 + norms + splits + metal).max(64);
     let per_pass = if gpu.info().encoder_timestamps { 4 } else { 2 };
     if passes * per_pass <= wgpu::QUERY_SET_MAX_QUERIES as usize {
         passes as u32
@@ -664,6 +667,11 @@ impl<'s> GpuTrainer<'s> {
             .skip(1)
             .filter(|l| matches!(l.kind, Kind::Linear { .. } | Kind::Conv2d { .. }))
             .count();
+        let convs = m
+            .layers
+            .iter()
+            .filter(|l| matches!(l.kind, Kind::Conv2d { .. }))
+            .count();
         let sizes = StepSizes {
             upload_bytes: round(4 * batch * m.input_width)
                 + round(target_bytes)
@@ -677,7 +685,7 @@ impl<'s> GpuTrainer<'s> {
             // more (its upload ends the pass before it). A model too deep for wgpu's timestamp
             // queries is not timed.
             spans: (u32_of(2 * m.layers.len() + splits) + 5).max(16),
-            timed_passes: profiled_passes(m.layers.len(), norms, splits, gpu),
+            timed_passes: profiled_passes(m.layers.len(), norms, splits, convs, gpu),
             // The loss, the flag and the health values each step, or one flat buffer.
             readback_bytes: round(4 * elements)
                 .max(16 + 2 * round(4 * lens.len()) + round(4 * relu_words)),

@@ -4,6 +4,8 @@
 mod batch_norm;
 mod bindings;
 mod conv;
+#[cfg(target_os = "macos")]
+mod conv_mps;
 mod elementwise;
 mod gemm;
 mod glu;
