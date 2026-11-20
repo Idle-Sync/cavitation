@@ -133,8 +133,8 @@ pub struct Options {
     /// `--device`: where our side trains. `gpu` is the GPU through wgpu (`GpuTrainer`),
     /// which needs the `gpu` feature; `cuda` an NVIDIA card through CUDA (`CudaTrainer`),
     /// which needs the `cuda` feature; `cpu`, the default, trains with `Trainer`; `auto` is
-    /// the device `cavitation_nn::devices` marks as chosen (the CPU with `--profile`, which
-    /// times the CPU and GPU trainers, not CUDA's).
+    /// the device `cavitation_nn::devices` marks as chosen (the CPU with `--profile`;
+    /// `--profile` takes `--device cpu` or `gpu`, not `cuda`).
     pub device: DeviceKind,
     /// `--backend vulkan|dx12|metal`: the GPU backend, or the platform's default.
     pub backend: Option<String>,
@@ -242,9 +242,9 @@ impl Options {
             return Err("--backend needs --device gpu".into());
         }
         if auto {
-            // `--profile` with `auto` times the CPU trainer, whatever `auto` would pick.
             o.device = auto_device()?;
             if o.profile.is_some() {
+                println!("--profile with --device auto profiles the CPU trainer");
                 o.device = DeviceKind::Cpu;
             }
         }
@@ -354,7 +354,7 @@ fn train_ours(
     Ok(epochs)
 }
 
-/// The GPU `--backend` names, or the platform's default.
+/// Opens the GPU on the `--backend` named, or on the platform's default.
 ///
 /// # Errors
 ///
@@ -626,8 +626,10 @@ fn profile(
 /// gradient apart from its parameter gradients; then the loss, health values, update,
 /// running statistics, copies and readback where the device times them; then the timed parts'
 /// sum against the whole step on the host's clock, whose difference is the time no pass
-/// covers (the host's work, its waits and the untimed copies). A part the device does not time
-/// prints `-`. Nothing is written.
+/// covers (the host's work, its waits and the untimed copies). Each median is over the steps
+/// that timed the part (a span whose timestamps read backwards has no time); a part no step
+/// timed prints `-`, and so do the sum and the uncovered time when the device times nothing.
+/// Nothing is written.
 ///
 /// # Errors
 ///
@@ -641,6 +643,7 @@ fn profile_gpu(
     o: &Options,
     steps: usize,
 ) -> Result<(), String> {
+    use cavitation_gpu::Timing;
     use cavitation_nn::{GpuStepProfile, GpuTrainer, OptimizerConfig};
     let gpu = open_gpu(o)?;
     println!("{}", gpu.info());
@@ -672,15 +675,22 @@ fn profile_gpu(
     })?;
     let timing = profiles[0].timing;
     println!(
-        "{} profile on the GPU: batch {}, medians of {steps} steps after 3 warm-up steps; {timing:?}",
+        "{} profile on the GPU: batch {}, medians of {steps} steps after 3 warm-up steps",
         net.name, net.batch
     );
+    match timing {
+        Timing::Untimed { why } => println!("nothing is timed: {why}"),
+        Timing::Passes { copies_untimed } => {
+            println!("compute passes are timed; copies are not: {copies_untimed}");
+        }
+        Timing::PassesAndCopies => println!("compute passes and copies are timed"),
+    }
     let ms = |pick: &dyn Fn(&GpuStepProfile) -> Option<Duration>| -> Option<f64> {
-        let times: Option<Vec<f64>> = profiles
+        let times: Vec<f64> = profiles
             .iter()
-            .map(|p| pick(p).map(|d| d.as_secs_f64() * 1e3))
+            .filter_map(|p| pick(p).map(|d| d.as_secs_f64() * 1e3))
             .collect();
-        times.map(|t| median(&t))
+        (!times.is_empty()).then(|| median(&times))
     };
     let cell = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{v:.2}"));
     println!(
@@ -732,9 +742,10 @@ fn profile_gpu(
             .flatten()
             .sum()
     };
-    let timed = ms(&|p| Some(timed_sum(p)));
+    let untimed_device = matches!(timing, Timing::Untimed { .. });
+    let timed = ms(&|p| (!untimed_device).then(|| timed_sum(p)));
     let total = ms(&|p| Some(p.total));
-    let untimed = ms(&|p| Some(p.total.saturating_sub(timed_sum(p))));
+    let untimed = ms(&|p| (!untimed_device).then(|| p.total.saturating_sub(timed_sum(p))));
     println!(
         "timed parts {} ms, whole step {} ms on the host's clock, not covered by a timed part {} ms",
         cell(timed),

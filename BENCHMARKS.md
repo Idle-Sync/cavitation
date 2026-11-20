@@ -71,6 +71,7 @@ cargo run --release -p cavitation-bench -- mnist-cnn --seed 0 --python <python w
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --python <python with torch>
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --cav-only    # Cavitation's half only
 cargo run --release -p cavitation-bench -- cifar-cnn --profile 15            # time per layer, no training run
+cargo run --release -p cavitation-bench --features gpu -- cifar-cnn --profile 15 --device gpu   # the same on the GPU
 ```
 
 The PyTorch side is `scripts/bench/torch_cnn.py`; `scripts/fixtures/requirements.txt` lists what its Python needs. Each run writes its results to `target/bench/cnn/<benchmark>-seed<N>/result.json`.
