@@ -9,8 +9,9 @@
 //!   within its stated bound of the tape's backward formula evaluated in `f64` on the same
 //!   `f32` values; the softmax's backward pass bit for bit on small integers, whose sums and
 //!   products are exact in any order.
-//! - **Bad rows:** a NaN or infinite value gives a NaN row, and the other rows keep the bits
-//!   of a run without it.
+//! - **Bad rows:** as on the CPU, a NaN or +∞, or −∞ everywhere, gives a NaN row, and a −∞
+//!   elsewhere the `f32` tape's bits for it, forward and backward; the other rows keep the
+//!   bits of a run without it.
 //!
 //! Every output starts as NaN, so a value left unwritten fails, and a second run gives the
 //! same bits. The tests skip without a GPU, unless `CAVITATION_GPU_REQUIRED=1`.
@@ -315,36 +316,101 @@ fn softmax_backward_exact() {
     });
 }
 
-/// A row with a NaN, +∞ or −∞ gives a NaN row in both forward passes; the other rows keep
-/// the bits of a run without it.
+/// What the tape records for `x` (`rows × width`) through the softmax, or the log-softmax if
+/// `log`, on an `f32` store, and the input's gradient for a gradient `g` of the output.
+fn tape_backward(log: bool, width: usize, x: &[f32], g: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let rows = x.len() / width;
+    let mut store = ParamStore::new();
+    let id = store.add(Tensor::from_vec(x.to_vec(), &[rows, width]).unwrap());
+    let mut graph = Graph::new();
+    let mut tape = graph.tape(&store.values);
+    let v = tape.param(id);
+    let y = if log {
+        tape.log_softmax(v)
+    } else {
+        tape.softmax(v)
+    };
+    let out = tape.value(y).data().to_vec();
+    // Σ y · g has the gradient g for y, exactly.
+    let g = tape.input(Tensor::from_vec(g.to_vec(), &[rows, width]).unwrap().view());
+    let product = tape.mul(y, g);
+    let loss = tape.sum(product);
+    tape.backward(loss, &mut store.grads);
+    drop(tape);
+    (out, store.grad(id).data().to_vec())
+}
+
+/// The rows of a 4 × 5 batch other than row 1.
+fn other_rows(v: &[f32]) -> Vec<f32> {
+    v[..5].iter().chain(&v[10..]).copied().collect()
+}
+
+/// Bad rows as the CPU has them, in both forward passes:
+/// - a NaN or +∞, or −∞ everywhere, gives a NaN row;
+/// - a −∞ elsewhere gives the `f32` tape's bits for it (a softmax of +0, a log-softmax of
+///   −∞), the row's other values the bits of the same row without it, and through both
+///   backward passes from the tape's output the tape's bits for it (`0 · (g − Σ y·g)` and
+///   `g − 0 · Σ g`).
+///
+/// The other rows keep the bits of a run without the bad row.
 #[test]
-fn bad_rows_are_nan() {
+fn bad_rows_match_the_cpu() {
     for_each_gpu(|gpu| {
-        let (rows, width) = (4u32, 5u32);
+        let shape = (4u32, 5u32);
         let mut kit = kit(gpu, 20);
         let kernels = RowSoftmaxKernels::new(gpu, &mut kit.cache).unwrap();
         let x = seeded_values(7, 20, -3.0, 3.0);
-        for op in [RowSoftmax::Softmax, RowSoftmax::LogSoftmax] {
-            let clean = gpu_run(&mut kit, &kernels, op, (rows, width), &x, None);
-            for (name, value) in [
-                ("NaN", f32::NAN),
-                ("+inf", f32::INFINITY),
-                ("-inf", f32::NEG_INFINITY),
+        let g = seeded_values(8, 20, -1.0, 1.0);
+        for log in [false, true] {
+            let (op, back) = if log {
+                (RowSoftmax::LogSoftmax, RowSoftmax::LogSoftmaxBackward)
+            } else {
+                (RowSoftmax::Softmax, RowSoftmax::SoftmaxBackward)
+            };
+            let clean = gpu_run(&mut kit, &kernels, op, shape, &x, None);
+            let mut all_neg = x.clone();
+            all_neg[5..10].fill(f32::NEG_INFINITY);
+            for (name, bad) in [
+                ("NaN", with(&x, 7, f32::NAN)),
+                ("+inf", with(&x, 7, f32::INFINITY)),
+                ("-inf everywhere", all_neg),
             ] {
-                let mut bad = x.clone();
-                bad[7] = value;
-                let got = gpu_run(&mut kit, &kernels, op, (rows, width), &bad, None);
+                let got = gpu_run(&mut kit, &kernels, op, shape, &bad, None);
+                let cpu = tape_forward::<f32>(log, 5, &bad);
+                assert!(
+                    cpu[5..10].iter().all(|v| v.is_nan()),
+                    "{op:?} with {name}: CPU"
+                );
                 assert!(
                     got[5..10].iter().all(|v| v.is_nan()),
                     "{op:?} with {name}: the bad row is {:?}",
                     &got[5..10]
                 );
-                let rest: Vec<f32> = got[..5].iter().chain(&got[10..]).copied().collect();
-                let want: Vec<f32> = clean[..5].iter().chain(&clean[10..]).copied().collect();
-                assert_exact(&rest, &want, &format!("{op:?} with {name}: the other rows"));
+                let what = format!("{op:?} with {name}: the other rows");
+                assert_exact(&other_rows(&got), &other_rows(&clean), &what);
             }
+            let bad = with(&x, 7, f32::NEG_INFINITY);
+            let got = gpu_run(&mut kit, &kernels, op, shape, &bad, None);
+            let (cpu, cpu_dx) = tape_backward(log, 5, &bad, &g);
+            assert_exact(&got[7..8], &cpu[7..8], &format!("{op:?} of -inf"));
+            let short: Vec<f32> = [5, 6, 8, 9].iter().map(|&i| bad[i]).collect();
+            let alone = gpu_run(&mut kit, &kernels, op, (1, 4), &short, None);
+            let rest = [got[5], got[6], got[8], got[9]];
+            assert_exact(&rest, &alone, &format!("{op:?} beside -inf"));
+            let what = format!("{op:?} with -inf: the other rows");
+            assert_exact(&other_rows(&got), &other_rows(&clean), &what);
+            let dx = gpu_run(&mut kit, &kernels, back, shape, &cpu, Some(&g));
+            assert_exact(&dx[7..8], &cpu_dx[7..8], &format!("{back:?} at -inf"));
+            assert!(dx.iter().all(|v| v.is_finite()), "{back:?}: {dx:?}");
         }
     });
+}
+
+/// `x` with value `at` set to `v`.
+fn with(x: &[f32], at: usize, v: f32) -> Vec<f32> {
+    let mut x = x.to_vec();
+    x[at] = v;
+    x
 }
 
 /// A call refuses an output that is one of its inputs, and a backward pass without its

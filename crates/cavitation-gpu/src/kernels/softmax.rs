@@ -23,8 +23,10 @@ pub const MAX_SOFTMAX_ROWS: u32 = crate::MAX_WORKGROUPS_PER_DIMENSION * WORKGROU
 /// uniform, `a` (the forward input, or the forward output for a backward pass) and `b` (the
 /// gradient flowing back; bound to `a` and unused forward).
 ///
-/// A forward row with a value whose exponent bits are all set (NaN or ±∞) is written as NaN
-/// bits, since WGSL may fold NaN arithmetic away. The logarithm of the log-softmax is
+/// A forward row with a NaN or `+∞`, or with `−∞` everywhere, is written as NaN bits, since
+/// WGSL may fold NaN arithmetic away; a `−∞` elsewhere is tested by its bits and takes the
+/// CPU's values without infinite arithmetic: a term of 0, a softmax of 0, a log-softmax of
+/// `−∞`, and `e^y = 0` in the log-softmax's backward pass. The logarithm of the log-softmax is
 /// `ln(1 + e)` with `e` the sum without the first maximum's term: for `e ≤ 1` it is
 /// `2·atanh(e / (2 + e))` from its series to `y¹⁵`, as the cross-entropy's kernel takes it,
 /// which keeps `e`'s low bits and avoids WGSL's `log` near 1.
@@ -41,25 +43,47 @@ const ROWS: Shader = Shader {
         @group(0) @binding(3) var<storage, read> b: array<f32>;
 
         const NAN_BITS: u32 = 0x7fc00000u;
+        const NEG_INF_BITS: u32 = 0xff800000u;
 
-        // Writes NaN over the row at base and returns true if a value in it is NaN or
-        // infinite.
+        // Whether x is -inf, from its bits.
+        fn is_neg_inf(x: f32) -> bool {
+            return bitcast<u32>(x) == NEG_INF_BITS;
+        }
+
+        // Writes NaN over the row at base and returns true where the CPU gives a NaN row: a
+        // value in it is NaN or +inf, or every value is -inf.
         fn bad_row(base: u32) -> bool {
             var bad = false;
+            var finite = false;
             for (var j = 0u; j < r.width; j = j + 1u) {
-                bad = bad || (bitcast<u32>(a[base + j]) & 0x7f800000u) == 0x7f800000u;
+                let z = a[base + j];
+                if (is_neg_inf(z)) { continue; }
+                bad = bad || (bitcast<u32>(z) & 0x7f800000u) == 0x7f800000u;
+                finite = true;
             }
+            bad = bad || !finite;
             if (bad) {
                 for (var j = 0u; j < r.width; j = j + 1u) { out[base + j] = NAN_BITS; }
             }
             return bad;
         }
 
-        // The row's maximum.
+        // The row's maximum over its values other than -inf (a row bad_row passed has one).
         fn row_max(base: u32) -> f32 {
-            var m = a[base];
-            for (var j = 1u; j < r.width; j = j + 1u) { m = max(m, a[base + j]); }
+            var m = 0.0;
+            var seen = false;
+            for (var j = 0u; j < r.width; j = j + 1u) {
+                let z = a[base + j];
+                if (is_neg_inf(z)) { continue; }
+                if (seen) { m = max(m, z); } else { m = z; seen = true; }
+            }
             return m;
+        }
+
+        // e^(z - m), and 0 for a z of -inf, as the CPU's exp(-inf) gives.
+        fn exp_from(z: f32, m: f32) -> f32 {
+            if (is_neg_inf(z)) { return 0.0; }
+            return exp(z - m);
         }
 
         // ln(1 + e) for e >= 0.
@@ -87,7 +111,7 @@ const ROWS: Shader = Shader {
             let m = row_max(base);
             var s = 0.0;
             for (var j = 0u; j < r.width; j = j + 1u) {
-                let e = exp(a[base + j] - m);
+                let e = exp_from(a[base + j], m);
                 out[base + j] = bitcast<u32>(e);
                 s = s + e;
             }
@@ -109,11 +133,13 @@ const ROWS: Shader = Shader {
             }
             var e = 0.0;
             for (var j = 0u; j < r.width; j = j + 1u) {
-                if (j != k) { e = e + exp(a[base + j] - m); }
+                if (j != k) { e = e + exp_from(a[base + j], m); }
             }
             let lse = ln_1p(e);
             for (var j = 0u; j < r.width; j = j + 1u) {
-                out[base + j] = bitcast<u32>(a[base + j] - m - lse);
+                let z = a[base + j];
+                // -inf - max - lse is -inf, written as bits.
+                out[base + j] = select(bitcast<u32>(z - m - lse), NEG_INF_BITS, is_neg_inf(z));
             }
         }
 
@@ -129,7 +155,8 @@ const ROWS: Shader = Shader {
             }
         }
 
-        // g - e^y * sum of g, with y the forward output in a and g in b.
+        // g - e^y * sum of g, with y the forward output in a and g in b; e^y is 0 for a y
+        // of -inf.
         @compute @workgroup_size(WORKGROUP)
         fn log_softmax_backward(@builtin(global_invocation_id) id: vec3<u32>) {
             if (id.x >= r.rows) { return; }
@@ -137,7 +164,8 @@ const ROWS: Shader = Shader {
             var total = 0.0;
             for (var j = 0u; j < r.width; j = j + 1u) { total = total + b[base + j]; }
             for (var j = 0u; j < r.width; j = j + 1u) {
-                out[base + j] = bitcast<u32>(b[base + j] - exp(a[base + j]) * total);
+                let p = exp_from(a[base + j], 0.0);
+                out[base + j] = bitcast<u32>(b[base + j] - p * total);
             }
         }
     ",
@@ -219,11 +247,11 @@ impl RowSoftmax {
 /// runs give the same bits. The forward passes are `Tape::softmax` and `Tape::log_softmax`
 /// ported operation for operation: the row's maximum subtracted first, the softmax's terms
 /// summed in order, and the log-softmax's `ln Σ e^(z − max)` taken as `ln(1 + e)` with `e`
-/// the sum without the first maximum's term. A row with a NaN or infinite value gives a NaN
-/// row. The CPU gives the same for a NaN or `+∞`, but a finite row for a `−∞` off the
-/// maximum; only a model whose values have already overflowed meets that case. The backward
-/// passes are the tape's: `y · (g − Σ y·g)` for the softmax, and `g − e^y · Σ g` for the
-/// log-softmax, from the forward output `y` and the gradient `g`.
+/// the sum without the first maximum's term. A row with a NaN or `+∞`, or with `−∞`
+/// everywhere, gives a NaN row, and a `−∞` elsewhere a softmax of 0 and a log-softmax of
+/// `−∞`, as on the CPU. The backward passes are the tape's: `y · (g − Σ y·g)` for the
+/// softmax, and `g − e^y · Σ g` for the log-softmax, from the forward output `y` and the
+/// gradient `g`.
 ///
 /// The bounds are against the exact result of the same `f32` inputs. WGSL gives `exp`
 /// within `3 + 2|x|` ulp, `log` within 3 ulp off `[0.5, 2]` and division within 2.5 ulp, and

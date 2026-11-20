@@ -9,8 +9,9 @@
 //!   backward pass the bits of the `f32` tape's gradient (the same operations in the same
 //!   order, without fused multiply-add); the log-softmax's within its stated bound of the
 //!   tape's formula evaluated in `f64` on the same `f32` values.
-//! - **Bad rows:** a NaN or infinite value gives a NaN row, and the other rows keep the bits
-//!   of a run without it.
+//! - **Bad rows:** as on the CPU, a NaN or +∞, or −∞ everywhere, gives a NaN row, and a −∞
+//!   elsewhere the `f32` tape's bits for it, forward and backward; the other rows keep the
+//!   bits of a run without it.
 //!
 //! Every output starts as NaN, so a value left unwritten fails, and two runs give the same
 //! bits. Each test skips without CUDA, unless `CAVITATION_CUDA_REQUIRED=1` makes that a
@@ -35,6 +36,10 @@ const SHAPES: [(usize, usize); 8] = [
     (70_000, 4),
     (3, 5000),
 ];
+
+// `sum_bound`, `second`, `forward_bounds` and `log_backward_reference` copy the bounds of
+// `crates/cavitation-gpu/tests/softmax.rs` (`sum_bound` from its `common`), which state the
+// WGSL kernels' bounds; a change to one must be made to the other.
 
 /// The error bound of a sum of `k` terms in any order: `2(k + 2) · u · Σ|terms|`.
 fn sum_bound(k: usize, abs_sum: f64) -> f64 {
@@ -225,32 +230,74 @@ fn backward_twin() {
     }
 }
 
-/// A row with a NaN, +∞ or −∞ gives a NaN row in both forward passes; the other rows keep
-/// the bits of a run without it.
+/// The rows of a 4 × 5 batch other than row 1.
+fn other_rows(v: &[f32]) -> Vec<f32> {
+    v[..5].iter().chain(&v[10..]).copied().collect()
+}
+
+/// `x` with value `at` set to `v`.
+fn with(x: &[f32], at: usize, v: f32) -> Vec<f32> {
+    let mut x = x.to_vec();
+    x[at] = v;
+    x
+}
+
+/// Bad rows as the CPU has them, in both forward passes:
+/// - a NaN or +∞, or −∞ everywhere, gives a NaN row;
+/// - a −∞ elsewhere gives the `f32` tape's bits for it (a softmax of +0, a log-softmax of
+///   −∞), the row's other values the bits of the same row without it, and through both
+///   backward passes from the tape's output the tape's bits for it (`0 · (g − Σ y·g)` and
+///   `g − 0 · Σ g`).
+///
+/// The other rows keep the bits of a run without the bad row.
 #[test]
-fn bad_rows_are_nan() {
+fn bad_rows_match_the_cpu() {
     let Some(cuda) = Cuda::new() else { return };
     let kernels = RowSoftmax::new(&cuda).unwrap();
+    let shape = (4, 5);
     let x = seeded_values(7, 20, -3.0, 3.0);
-    for op in [RowSoftmaxOp::Softmax, RowSoftmaxOp::LogSoftmax] {
-        let clean = cuda_run(&cuda, &kernels, op, (4, 5), &x, None);
-        for (name, value) in [
-            ("NaN", f32::NAN),
-            ("+inf", f32::INFINITY),
-            ("-inf", f32::NEG_INFINITY),
+    let g = seeded_values(8, 20, -1.0, 1.0);
+    for log in [false, true] {
+        let (op, back) = if log {
+            (RowSoftmaxOp::LogSoftmax, RowSoftmaxOp::LogSoftmaxBackward)
+        } else {
+            (RowSoftmaxOp::Softmax, RowSoftmaxOp::SoftmaxBackward)
+        };
+        let clean = cuda_run(&cuda, &kernels, op, shape, &x, None);
+        let mut all_neg = x.clone();
+        all_neg[5..10].fill(f32::NEG_INFINITY);
+        for (name, bad) in [
+            ("NaN", with(&x, 7, f32::NAN)),
+            ("+inf", with(&x, 7, f32::INFINITY)),
+            ("-inf everywhere", all_neg),
         ] {
-            let mut bad = x.clone();
-            bad[7] = value;
-            let got = cuda_run(&cuda, &kernels, op, (4, 5), &bad, None);
+            let got = cuda_run(&cuda, &kernels, op, shape, &bad, None);
+            let (cpu, _) = tape::<f32>(log, 5, &bad, None);
+            assert!(
+                cpu[5..10].iter().all(|v| v.is_nan()),
+                "{op:?} with {name}: CPU"
+            );
             assert!(
                 got[5..10].iter().all(|v| v.is_nan()),
                 "{op:?} with {name}: the bad row is {:?}",
                 &got[5..10]
             );
-            let rest: Vec<f32> = got[..5].iter().chain(&got[10..]).copied().collect();
-            let want: Vec<f32> = clean[..5].iter().chain(&clean[10..]).copied().collect();
-            assert_exact(&rest, &want, &format!("{op:?} with {name}: the other rows"));
+            let what = format!("{op:?} with {name}: the other rows");
+            assert_exact(&other_rows(&got), &other_rows(&clean), &what);
         }
+        let bad = with(&x, 7, f32::NEG_INFINITY);
+        let got = cuda_run(&cuda, &kernels, op, shape, &bad, None);
+        let (cpu, cpu_dx) = tape::<f32>(log, 5, &bad, Some(&g));
+        assert_exact(&got[7..8], &cpu[7..8], &format!("{op:?} of -inf"));
+        let short: Vec<f32> = [5, 6, 8, 9].iter().map(|&i| bad[i]).collect();
+        let alone = cuda_run(&cuda, &kernels, op, (1, 4), &short, None);
+        let rest = [got[5], got[6], got[8], got[9]];
+        assert_exact(&rest, &alone, &format!("{op:?} beside -inf"));
+        let what = format!("{op:?} with -inf: the other rows");
+        assert_exact(&other_rows(&got), &other_rows(&clean), &what);
+        let dx = cuda_run(&cuda, &kernels, back, shape, &cpu, Some(&g));
+        assert_exact(&dx[7..8], &cpu_dx[7..8], &format!("{back:?} at -inf"));
+        assert!(dx.iter().all(|v| v.is_finite()), "{back:?}: {dx:?}");
     }
 }
 

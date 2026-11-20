@@ -343,7 +343,8 @@ fn every_activation_tracks_the_cpu_fit() {
 /// Softmax and log-softmax after each `Linear` of an MLP: a run on the GPU tracks the CPU run of
 /// the same `FitConfig`, each epoch's mean loss and validation loss (through the trainer's
 /// model) within 2⁻¹⁰ of the CPU's and the final parameters within 2⁻¹⁰ of each tensor's
-/// largest value plus 2⁻¹⁶, over 3 epochs of 50 rows at batch 16 (a last batch of 2) with Adam.
+/// largest value plus 2⁻¹⁶, over 3 epochs of 50 rows at batch 16 (a last batch of 2) with
+/// Adam.
 #[test]
 fn softmax_layers_track_the_cpu_fit() {
     let train = classes(72, 50, 12, 4);

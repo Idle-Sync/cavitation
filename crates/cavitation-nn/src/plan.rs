@@ -669,3 +669,15 @@ pub(crate) fn pack_rows(on: &[bool], rows: usize) -> Vec<u32> {
     }
     words
 }
+
+#[cfg(all(test, feature = "gpu"))]
+mod tests {
+    /// The plan's row limit for a softmax is the one the wgpu kernels state.
+    #[test]
+    fn softmax_rows_match_the_kernels() {
+        assert_eq!(
+            super::MAX_SOFTMAX_ROWS as u64,
+            u64::from(cavitation_gpu::kernels::MAX_SOFTMAX_ROWS)
+        );
+    }
+}

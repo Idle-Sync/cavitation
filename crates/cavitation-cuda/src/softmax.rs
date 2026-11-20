@@ -90,10 +90,10 @@ impl RowSoftmaxOp {
 /// `RowSoftmaxKernels`), ported operation for operation with CUDA's `expf` and `logf`: the
 /// row's maximum subtracted first, the softmax's terms summed in order, and the
 /// log-softmax's `ln Σ e^(z − max)` as `ln(1 + e)` with `e` the sum without the first
-/// maximum's term, from its series for `e ≤ 1`. A row with a NaN or infinite value gives a
-/// NaN row; the CPU gives the same for NaN and `+∞`, but a finite row for a `−∞` off the
-/// maximum. The backward passes are the tape's, `y · (g − Σ y·g)` and `g − e^y · Σ g`, from
-/// the forward output `y` and the gradient `g`.
+/// maximum's term, from its series for `e ≤ 1`. A row with a NaN or `+∞`, or with `−∞`
+/// everywhere, gives a NaN row, and a `−∞` elsewhere a softmax of 0 and a log-softmax of
+/// `−∞`, as on the CPU. The backward passes are the tape's, `y · (g − Σ y·g)` and
+/// `g − e^y · Σ g`, from the forward output `y` and the gradient `g`.
 ///
 /// Compiled without fused multiply-add, the softmax's backward pass gives the CPU's bits;
 /// the others take an exponential or a logarithm the CPU takes with std's and are within

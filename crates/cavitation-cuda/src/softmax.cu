@@ -7,16 +7,29 @@
 
 typedef unsigned int u32;
 
-// The bits of the NaN a bad row gets.
+// The bits of the NaN a bad row gets, and of -inf.
 #define NAN_BITS 0x7fc00000u
+#define NEG_INF_BITS 0xff800000u
 
-// Writes NaN over the row of a at base into out and returns true if a value in it is NaN or
-// infinite.
+// Whether x is -inf, from its bits.
+__device__ __forceinline__ bool is_neg_inf(float x) {
+    return __float_as_uint(x) == NEG_INF_BITS;
+}
+
+// Writes NaN over the row of a at base into out and returns true where the CPU gives a NaN
+// row: a value in it is NaN or +inf, or every value is -inf.
 __device__ bool bad_row(const float *a, float *out, u32 base, u32 width) {
     bool bad = false;
+    bool finite = false;
     for (u32 j = 0u; j < width; j = j + 1u) {
-        bad = bad || (__float_as_uint(a[base + j]) & 0x7f800000u) == 0x7f800000u;
+        float z = a[base + j];
+        if (is_neg_inf(z)) {
+            continue;
+        }
+        bad = bad || (__float_as_uint(z) & 0x7f800000u) == 0x7f800000u;
+        finite = true;
     }
+    bad = bad || !finite;
     if (bad) {
         float nan = __uint_as_float(NAN_BITS);
         for (u32 j = 0u; j < width; j = j + 1u) {
@@ -26,13 +39,24 @@ __device__ bool bad_row(const float *a, float *out, u32 base, u32 width) {
     return bad;
 }
 
-// The row's maximum.
+// The row's maximum over its values other than -inf (a row bad_row passed has one).
 __device__ float row_max(const float *a, u32 base, u32 width) {
-    float m = a[base];
-    for (u32 j = 1u; j < width; j = j + 1u) {
-        m = fmaxf(m, a[base + j]);
+    float m = 0.0f;
+    bool seen = false;
+    for (u32 j = 0u; j < width; j = j + 1u) {
+        float z = a[base + j];
+        if (is_neg_inf(z)) {
+            continue;
+        }
+        m = seen ? fmaxf(m, z) : z;
+        seen = true;
     }
     return m;
+}
+
+// e^(z - m), and 0 for a z of -inf, as the CPU's exp(-inf) gives.
+__device__ __forceinline__ float exp_from(float z, float m) {
+    return is_neg_inf(z) ? 0.0f : expf(z - m);
 }
 
 // ln(1 + e) for e >= 0: 2 atanh(e / (2 + e)) from its series to y^15 for e <= 1, logf(1 + e)
@@ -68,7 +92,7 @@ extern "C" __global__ void softmax(const float *a, const float *, float *out, u3
     float m = row_max(a, base, width);
     float s = 0.0f;
     for (u32 j = 0u; j < width; j = j + 1u) {
-        float e = expf(a[base + j] - m);
+        float e = exp_from(a[base + j], m);
         out[base + j] = e;
         s = s + e;
     }
@@ -99,12 +123,14 @@ extern "C" __global__ void log_softmax(const float *a, const float *, float *out
     float e = 0.0f;
     for (u32 j = 0u; j < width; j = j + 1u) {
         if (j != k) {
-            e = e + expf(a[base + j] - m);
+            e = e + exp_from(a[base + j], m);
         }
     }
     float lse = ln_1p_series(e);
     for (u32 j = 0u; j < width; j = j + 1u) {
-        out[base + j] = a[base + j] - m - lse;
+        float z = a[base + j];
+        // -inf - max - lse is -inf.
+        out[base + j] = is_neg_inf(z) ? __uint_as_float(NEG_INF_BITS) : z - m - lse;
     }
 }
 
@@ -125,7 +151,7 @@ extern "C" __global__ void softmax_backward(const float *a, const float *b, floa
     }
 }
 
-// g - e^y * sum of g, with y the forward output in a and g in b.
+// g - e^y * sum of g, with y the forward output in a and g in b; e^y is 0 for a y of -inf.
 extern "C" __global__ void log_softmax_backward(const float *a, const float *b, float *out,
                                                 u32 rows, u32 width) {
     u32 i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -138,6 +164,7 @@ extern "C" __global__ void log_softmax_backward(const float *a, const float *b, 
         total = total + b[base + j];
     }
     for (u32 j = 0u; j < width; j = j + 1u) {
-        out[base + j] = b[base + j] - expf(a[base + j]) * total;
+        float p = exp_from(a[base + j], 0.0f);
+        out[base + j] = b[base + j] - p * total;
     }
 }
