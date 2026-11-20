@@ -22,6 +22,10 @@ pub const MPS_VAR: &str = "CAVITATION_MPS";
 /// # Errors
 ///
 /// Returns a message for a value other than `0` or `1`.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "read only where there is Metal")
+)]
 pub(crate) fn mps_allowed(value: Option<&str>) -> Result<bool, String> {
     match value {
         None | Some("1") => Ok(true),
@@ -35,6 +39,10 @@ pub(crate) fn mps_allowed(value: Option<&str>) -> Result<bool, String> {
 /// # Panics
 ///
 /// If it has a value other than `0` or `1`.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(dead_code, reason = "read only where there is Metal")
+)]
 fn mps_on() -> bool {
     let value = std::env::var(MPS_VAR).ok();
     mps_allowed(value.as_deref()).unwrap_or_else(|e| panic!("{e}"))
@@ -58,13 +66,8 @@ mod elsewhere {
     pub(crate) enum RawBuffer {}
 
     impl Metal {
-        /// No Metal here; an invalid `CAVITATION_MPS` is still refused.
-        ///
-        /// # Panics
-        ///
-        /// If `CAVITATION_MPS` has a value other than `0` or `1`.
+        /// No Metal here, whatever `CAVITATION_MPS` says.
         pub(crate) fn open(_: &wgpu::Device, _: &wgpu::Queue) -> Option<Metal> {
-            super::mps_on();
             None
         }
 
@@ -391,6 +394,7 @@ mod tests {
         }
     }
 
+    /// Metal work in steps, on the pooled buffers, on a Metal adapter.
     #[cfg(target_os = "macos")]
     mod on_metal {
         use std::sync::Arc;
@@ -603,6 +607,54 @@ mod tests {
                 metal > 1e4 && span == metal,
                 "{metal} ns of a span of {span} ns"
             );
+            pool.give(a);
+            pool.give(b);
+        }
+
+        /// Metal work recorded after other commands in a span gets an entry of its own, and
+        /// work that takes over a later span's pass times that span, not an earlier entry.
+        #[test]
+        fn later_metal_work_times_its_own_span() {
+            let Some(gpu) = metal_gpu() else { return };
+            if !gpu.info().timestamps {
+                return;
+            }
+            let mut pool = BufferPool::new(&gpu);
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST;
+            let len = 64 << 20;
+            let (a, b) = (pool.take(len, usage), pool.take(len, usage));
+            let small = Arc::new(Copy {
+                from: raw(&a),
+                to: raw(&b),
+                len: 256,
+                split: false,
+            });
+            let big = Arc::new(Copy {
+                from: raw(&a),
+                to: raw(&b),
+                len: len as usize,
+                split: false,
+            });
+            let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+            steps.set_profiling(true);
+            let mut step = steps.begin();
+            step.span("first");
+            step.clear(a.buffer(), 0, 256);
+            step.metal(small);
+            step.span("second");
+            step.metal(big);
+            let out = step.finish();
+            let timed = out.timed();
+            let per_span = |s| timed.iter().filter(|t| t.span == s).count();
+            assert_eq!((per_span(0), per_span(1)), (2, 1), "{timed:?}");
+            let second = out.spans()[1].1.expect("the second span is timed");
+            let own = timed.iter().find(|t| t.span == 1).unwrap().nanoseconds;
+            // Copying 64 MiB takes more than 10 µs on any Apple GPU.
+            assert!(second > 1e4 && own == Some(second), "{timed:?}");
+            let first = out.spans()[0].1.expect("the first span is timed");
+            assert!(first < second, "{first} ns against {second} ns");
             pool.give(a);
             pool.give(b);
         }

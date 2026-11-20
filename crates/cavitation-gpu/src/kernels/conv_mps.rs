@@ -8,10 +8,11 @@
 //! freeing an executable whose compilation is still running on MPSGraph's own queue crashes.
 
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use objc2::AnyThread;
 use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::NSObjectProtocol;
+use objc2::{AnyThread, sel};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber};
 use objc2_metal_performance_shaders::{MPSCommandBuffer, MPSDataType, MPSShape};
 use objc2_metal_performance_shaders_graph::{
@@ -37,12 +38,14 @@ pub(crate) struct ConvGraph {
     inputs: Retained<NSArray<MPSGraphTensorData>>,
     /// The output, written in place.
     results: Retained<NSArray<MPSGraphTensorData>>,
+    /// Held while encoding, so two steps never encode the executable at once.
+    encoding: Mutex<()>,
 }
 
-// SAFETY: the executable and tensor data are only encoded from, one step at a time (a step
-// holds its encoder by `&mut`); MPSGraph executables may be used from any thread.
+// SAFETY: the Objective-C objects are only encoded from, under `encoding`; Metal and MPSGraph
+// objects may be used from any thread one at a time.
 unsafe impl Send for ConvGraph {}
-// SAFETY: as for `Send`: shared references only ever encode, never concurrently.
+// SAFETY: as for `Send`: shared references only encode, and `encoding` serialises that.
 unsafe impl Sync for ConvGraph {}
 
 impl fmt::Debug for ConvGraph {
@@ -56,9 +59,12 @@ impl fmt::Debug for ConvGraph {
 
 impl MetalOp for ConvGraph {
     fn encode(&self, cb: &MPSCommandBuffer) {
-        // SAFETY: the inputs and the result are bound to buffers that live as long as the
-        // call that holds this graph, which a step records only while it is alive, in the
-        // executable's feed order and shapes.
+        let _one_at_a_time = self
+            .encoding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: the inputs and the result are in the executable's feed order and shapes,
+        // and their tensor data retain their `MTLBuffer`s, so the buffers outlive the work.
         unsafe {
             self.exe
                 .encodeToCommandBuffer_inputsArray_resultsArray_executionDescriptor(
@@ -91,9 +97,9 @@ fn placeholder(graph: &MPSGraph, dims: &[u32]) -> Retained<MPSGraphTensor> {
 /// `buffer`'s first elements as a tensor of `dims` in `f32`.
 fn tensor_data(buffer: &PooledBuffer, dims: &[u32]) -> Option<Retained<MPSGraphTensorData>> {
     let raw = buffer.raw()?;
-    // SAFETY: the buffer holds at least the tensor's `f32`s (the call checked its length);
-    // the tensor data retains it, and the call that holds the tensor data keeps it from
-    // being given back to the pool.
+    // SAFETY: the buffer holds at least the tensor's `f32`s (the call checked its length),
+    // and the tensor data retains the `MTLBuffer`. A pooled buffer given back and reused
+    // while a call that reads it is still recorded is a logic error, as for a bind group.
     Some(unsafe {
         MPSGraphTensorData::initWithMTLBuffer_shape_dataType(
             MPSGraphTensorData::alloc(),
@@ -129,8 +135,8 @@ fn descriptor(dims: &ConvDims) -> Retained<MPSGraphConvolution2DOpDescriptor> {
 }
 
 /// Compiles `out` of `graph` for `feeds` (placeholder, shape and buffer each) on `gpu`'s
-/// device and binds it to the buffers; `None` without Metal or when a buffer has no
-/// `MTLBuffer`.
+/// device and binds it to the buffers; `None` without Metal, when a buffer has no
+/// `MTLBuffer`, or before macOS 26, whose MPSGraph cannot be held to full precision.
 fn compile(
     gpu: &Gpu,
     graph: &MPSGraph,
@@ -163,7 +169,10 @@ fn compile(
     let feed_types = NSDictionary::from_slices(&keys, &values);
     // SAFETY: a fresh descriptor, set before it is used.
     let options = unsafe { MPSGraphCompilationDescriptor::new() };
-    // SAFETY: as above.
+    if !options.respondsToSelector(sel!(setReducedPrecisionFastMath:)) {
+        return None;
+    }
+    // SAFETY: as above; both setters exist, the first having been asked.
     unsafe {
         options.setReducedPrecisionFastMath(MPSGraphReducedPrecisionFastMath::None);
         options.setWaitForCompilationCompletion(true);
@@ -196,6 +205,7 @@ fn compile(
         exe,
         inputs: NSArray::from_slice(&inputs),
         results: NSArray::from_slice(&[&*result]),
+        encoding: Mutex::new(()),
     }))
 }
 

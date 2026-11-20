@@ -582,6 +582,27 @@ impl Gpu {
         &self.queue
     }
 
+    /// Whether Apple's Metal Performance Shaders run where they apply (the convolutions, from
+    /// macOS 26): a Metal adapter on macOS, unless `CAVITATION_MPS=0`. They run as Metal work
+    /// in a step's spans, which a profiled step's [`StepSizes::timed_passes`] counts.
+    ///
+    /// [`StepSizes::timed_passes`]: crate::StepSizes::timed_passes
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_gpu::{Backend, Gpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     if gpu.info().backend != Backend::Metal {
+    ///         assert!(!gpu.uses_mps());
+    ///     }
+    /// }
+    /// ```
+    pub fn uses_mps(&self) -> bool {
+        self.metal.is_some()
+    }
+
     /// wgpu's own `MTLDevice` and command queue, on a Metal adapter unless
     /// `CAVITATION_MPS=0`.
     pub(crate) fn metal(&self) -> Option<&crate::metal::Metal> {

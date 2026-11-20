@@ -16,7 +16,9 @@
 //! overwriting its output. They are held to the WGSL kernels' bounds below, and exact on
 //! small integers; on an Apple M4 the worst output of the kernel tests is at 0.131 of the
 //! forward bound, 0.132 of the input gradient's and 0.019 of the weight gradient's (0.131,
-//! 0.125 and 0.018 for WGSL), and a second run gives the same bits.
+//! 0.125 and 0.018 for WGSL), and a second run gives the same bits. This needs macOS 26 or
+//! later (MPSGraph's full-precision setting); on an older macOS the WGSL kernels run. On a
+//! Metal adapter the wide-tile WGSL kernels run, and are tested, only with `CAVITATION_MPS=0`.
 
 use super::bindings::{Kind, layout};
 use super::gemm::{DIMS_BYTES, GemmDims, grid, square_grid, wide_allowed};
@@ -559,13 +561,15 @@ fn bind(
 /// [`call`](ConvForward::call) prepares one convolution on given buffers, made once when a
 /// model is compiled, and [`record`](ConvForward::record) adds it to a step.
 ///
-/// Each output adds its `in · kh · kw` products in the CPU reference's order (channel, then
+/// With the WGSL kernel, each output adds its `in · kh · kw` products in the CPU reference's order (channel, then
 /// kernel row, then column) with `fma`, a tap in the padding adding 0, then adds the bias
 /// with one rounding. So it is within `2(k + 3) · u · (Σ|w·x| + |bias|)` of the exact
 /// convolution, `u` = 2^-24, to first order in `u`, and exact on inputs whose products and
 /// partial sums are integers below 2^24. The same inputs give the same bits on every run on
 /// one GPU and backend. One difference from the CPU reference, which skips the taps in the
-/// padding: a NaN or infinite weight meets the padding's 0 there, so its outputs are NaN.
+/// padding: a NaN or infinite weight meets the padding's 0 there, so its outputs are NaN. Through MPSGraph on Metal the bound and the exactness are measured, not
+/// derived (see the module documentation), and how a non-finite value meets the padding is
+/// MPSGraph's own.
 ///
 /// # Examples
 ///
@@ -639,7 +643,8 @@ impl ConvForward {
     /// `call`'s product is one the wide tile computes ([`Gemm::ensure_wide`](super::Gemm::ensure_wide)
     /// gives the rule) and it is not built yet. Returns whether `call` runs on the wide tile
     /// from now on. `record` uses the wide tile only for a call this has been called for;
-    /// without it the call runs on the square tile, with the same bits.
+    /// without it the call runs on the square tile, with the same bits. A call that runs
+    /// through MPSGraph builds nothing and returns `false`.
     ///
     /// # Errors
     ///
@@ -654,7 +659,7 @@ impl ConvForward {
         call: &ConvCall,
     ) -> Result<bool, GpuError> {
         let d = call.gemm;
-        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
+        if call.on_metal() || !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
             return Ok(false);
         }
         if self.wide.is_none() {
@@ -754,9 +759,11 @@ impl ConvForward {
     }
 }
 
-/// One prepared convolution pass: its shape, its two uniforms and its bind group, from
-/// [`ConvForward::call`] or [`ConvInputGrad::call`]. It records only through the kernel that
-/// made it: the two kernels' bind group layouts differ.
+/// One prepared convolution pass: its shape and, with the WGSL kernel, its two uniforms and
+/// its bind group, or, through MPSGraph, its compiled pass; from [`ConvForward::call`] or
+/// [`ConvInputGrad::call`]. It records only through the kernel that made it: the two
+/// kernels' bind group layouts differ, and a pass compiled through MPSGraph is the one pass
+/// it was made for whichever kernel records it.
 ///
 /// # Examples
 ///
@@ -813,6 +820,15 @@ impl ConvCall {
         }
     }
 
+    /// Whether the pass runs through MPSGraph, so no WGSL pipeline is needed for it.
+    fn on_metal(&self) -> bool {
+        match self.run {
+            ConvRun::Wgsl { .. } => false,
+            #[cfg(target_os = "macos")]
+            ConvRun::Metal(_) => true,
+        }
+    }
+
     /// Records the pass into `step`: through `pipeline`, or `wide` where the GEMM's wide tile
     /// fits, or as Metal work.
     fn record(
@@ -839,7 +855,7 @@ impl ConvCall {
 /// [`call`](ConvInputGrad::call) prepares one gradient on given buffers, made once when a
 /// model is compiled, and [`record`](ConvInputGrad::record) adds it to a step.
 ///
-/// The input gradient `dx = Σ w · dy` is gathered: each input value sums, over the output
+/// With the WGSL kernel, the input gradient `dx = Σ w · dy` is gathered: each input value sums, over the output
 /// channels and the kernel's taps in the CPU reference's order (`o`, then the kernel row,
 /// then the column), the output gradient of the one window whose tap lands on it, or 0 where
 /// none does. It uses `fma` and writes every input gradient, overwriting it, with no
@@ -847,7 +863,9 @@ impl ConvCall {
 /// and `u` = 2^-24, to first order in `u`, and exact on inputs whose products and partial sums
 /// are integers below 2^24. The same inputs give the same bits on every run on one GPU and
 /// backend. As in the forward pass, a NaN or infinite weight meets 0 at a tap no window
-/// covers, where the CPU reference skips the tap, so its input gradients are NaN.
+/// covers, where the CPU reference skips the tap, so its input gradients are NaN. Through MPSGraph on Metal the bound and the exactness are measured, not
+/// derived (see the module documentation), and how a non-finite value meets the padding is
+/// MPSGraph's own.
 ///
 /// # Examples
 ///
@@ -915,7 +933,8 @@ impl ConvInputGrad {
     /// `call`'s product is one the wide tile computes ([`Gemm::ensure_wide`](super::Gemm::ensure_wide)
     /// gives the rule) and it is not built yet. Returns whether `call` runs on the wide tile
     /// from now on. `record` uses the wide tile only for a call this has been called for;
-    /// without it the call runs on the square tile, with the same bits.
+    /// without it the call runs on the square tile, with the same bits. A call that runs
+    /// through MPSGraph builds nothing and returns `false`.
     ///
     /// # Errors
     ///
@@ -930,7 +949,7 @@ impl ConvInputGrad {
         call: &ConvCall,
     ) -> Result<bool, GpuError> {
         let d = call.gemm;
-        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
+        if call.on_metal() || !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
             return Ok(false);
         }
         if self.wide.is_none() {
@@ -1024,7 +1043,7 @@ impl ConvInputGrad {
 /// [`call`](ConvWeightGrad::call) prepares one gradient on given buffers, made once when a
 /// model is compiled, and [`record`](ConvWeightGrad::record) adds it to a step.
 ///
-/// The weight gradient `dw = Σ dy · x` sums over every image's output positions, `batch ·
+/// With the WGSL kernel, the weight gradient `dw = Σ dy · x` sums over every image's output positions, `batch ·
 /// oh · ow` of them, in the CPU reference's order (image, then output row, then column), cut
 /// into fixed blocks of [`WEIGHT_GRAD_BLOCK`] consecutive positions. One pass sums each
 /// block with `fma` into a partial gradient of its own, a tap in the padding adding 0; a
@@ -1034,7 +1053,9 @@ impl ConvInputGrad {
 /// weight's gradient is within `2(L + B + 2) · u · Σ|dy·x|` of the exact gradient, `u` =
 /// 2^-24, to first order in `u`, and exact on inputs whose products and partial sums are
 /// integers below 2^24. A NaN or infinite output gradient meets 0 at a tap in the padding,
-/// where the CPU reference skips the tap, so its weight gradients are NaN.
+/// where the CPU reference skips the tap, so its weight gradients are NaN. Through MPSGraph on Metal the bound and the exactness are measured, not
+/// derived (see the module documentation), and how a non-finite value meets the padding is
+/// MPSGraph's own.
 ///
 /// # Examples
 ///
@@ -1140,7 +1161,8 @@ impl ConvWeightGrad {
     /// if `call`'s product is one the wide tile computes ([`Gemm::ensure_wide`](super::Gemm::ensure_wide)
     /// gives the rule) and it is not built yet. Returns whether `call` runs on the wide tile
     /// from now on. `record` uses the wide tile only for a call this has been called for;
-    /// without it the call runs on the square tile, with the same bits.
+    /// without it the call runs on the square tile, with the same bits. A call that runs
+    /// through MPSGraph builds nothing and returns `false`.
     ///
     /// # Errors
     ///
@@ -1155,7 +1177,7 @@ impl ConvWeightGrad {
         call: &ConvWeightGradCall,
     ) -> Result<bool, GpuError> {
         let d = call.gemm;
-        if !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
+        if call.on_metal() || !wide_allowed(cache) || !grid(d.m, d.n, d.batch).0 {
             return Ok(false);
         }
         if self.wide.is_none() {
@@ -1326,6 +1348,15 @@ enum WeightGradRun {
 }
 
 impl ConvWeightGradCall {
+    /// Whether the gradient runs through MPSGraph, so no WGSL pipeline is needed for it.
+    fn on_metal(&self) -> bool {
+        match self.run {
+            WeightGradRun::Wgsl { .. } => false,
+            #[cfg(target_os = "macos")]
+            WeightGradRun::Metal(_) => true,
+        }
+    }
+
     /// The shape this gradient was prepared for.
     ///
     /// # Examples

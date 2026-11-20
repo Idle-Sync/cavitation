@@ -43,9 +43,9 @@ pub struct StepSizes {
     /// The most timed compute passes one profiled step has: one per span, and one more
     /// for each span's dispatches that follow an upload, clear or readback recorded inside
     /// that span (a copy ends the pass it interrupts), or follow Metal work recorded inside
-    /// that span (on Metal, a convolution's pass). Metal work itself takes none: it is timed
-    /// by its command buffers, or takes over its span's pass when nothing was dispatched in
-    /// it yet. With encoder timestamps, each run of
+    /// that span (on Metal, a convolution's pass, [`Gpu::uses_mps`](crate::Gpu::uses_mps)).
+    /// Metal work itself takes none: it is timed by its command buffers, or takes over its
+    /// span's pass when nothing was dispatched in it yet. With encoder timestamps, each run of
     /// copies in a span is timed too; a span begins with a pass, so a step never has more
     /// copy runs than passes, and room is kept for as many. The timestamps must fit wgpu's
     /// 4,096 queries: at most 2,048 timed passes, or 1,024 with encoder timestamps.
@@ -174,7 +174,7 @@ impl Timeline {
     }
 
     /// Begins a timed pass of `span`, with at most `max` timed passes a step, and returns
-    /// its entry. An open run of copies must be closed first.
+    /// its pair of queries. An open run of copies must be closed first.
     ///
     /// # Panics
     ///
@@ -669,6 +669,10 @@ pub struct Step<'a> {
     pass: Option<wgpu::ComputePass<'static>>,
     /// The profile entry of the timed pass being recorded while it has no dispatch yet:
     /// Metal work recorded then takes the entry over instead of adding one.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "read only when recording Metal work")
+    )]
     empty_entry: Option<usize>,
     /// The index of the span being recorded, if any.
     span: Option<usize>,
@@ -1185,13 +1189,10 @@ impl<'a> Step<'a> {
                     .expect("the readback buffer is mapped");
                 steps.host.extend_from_slice(&view[..user_bytes as usize]);
                 if let Some(t) = steps.timestamps.as_ref().filter(|_| timed) {
-                    let ticks = if entries > 0 {
-                        view[timestamp_at as usize..map_end as usize]
-                            .as_chunks::<8>()
-                            .0
-                    } else {
-                        &[]
-                    };
+                    // A timed span always opens a pass with queries, so there are ticks.
+                    let ticks = view[timestamp_at as usize..map_end as usize]
+                        .as_chunks::<8>()
+                        .0;
                     add_span_times(
                         &mut steps.spans,
                         &mut steps.timeline,
@@ -1202,14 +1203,6 @@ impl<'a> Step<'a> {
                 }
             }
             steps.readback.unmap();
-        } else if let Some(t) = steps.timestamps.as_ref().filter(|_| timed) {
-            add_span_times(
-                &mut steps.spans,
-                &mut steps.timeline,
-                &[],
-                t.period,
-                &steps.metal_times,
-            );
         }
         StepOutput {
             bytes: &steps.host,
@@ -1260,6 +1253,11 @@ impl<'a> Step<'a> {
             .expect("the step is being recorded");
         self.steps.pieces.push(Piece::Wgpu(done.finish()));
         self.steps.pieces.push(Piece::Metal(op, entry));
+        // Where copies are timed, a run of copies follows a pass of its span: give the
+        // commands after the work one.
+        if entry.is_some() && self.steps.timestamps.as_ref().is_some_and(|t| t.encoder) {
+            self.begin_pass();
+        }
     }
 
     /// Begins a compute pass, timed when profiling with timestamps inside a span.
@@ -1280,7 +1278,7 @@ impl<'a> Step<'a> {
         let mut entry = None;
         let writes = timed.map(|(t, span)| {
             let index = timeline.pass(span, max);
-            entry = Some(index as usize);
+            entry = Some(timeline.entries.len() - 1);
             wgpu::ComputePassTimestampWrites {
                 query_set: &t.queries,
                 beginning_of_pass_write_index: Some(2 * index),
@@ -1341,8 +1339,8 @@ impl<'a> Step<'a> {
     }
 }
 
-/// Sets each timed entry's GPU time from the resolved timestamp `ticks` (two per entry, in
-/// entry order) and the nanoseconds per tick, from the entry's beginning to its end, and each
+/// Sets each timed entry's GPU time from the resolved timestamp `ticks` (two per pair of
+/// queries, in the order of `timeline`'s query slots) and the nanoseconds per tick, from the entry's beginning to its end, and each
 /// span's time, the sum of its entries' times. Only the two timestamps of one entry are
 /// compared: on Metal, timestamps of passes separated by a copy are not on one timeline (a
 /// later pass can end before an earlier one begins). An entry whose end reads before its

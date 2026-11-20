@@ -443,11 +443,12 @@ const READBACK: &str = "readback";
 /// The timed passes a profiled step of `layers` layers, `norms` of them batch norms, `splits`
 /// of them with an input gradient timed apart and `convs` of them convolutions, needs (see
 /// `GpuTrainer::new`), or 0 if that many passes' timestamps do not fit wgpu's queries on
-/// `gpu`: two per pass, and with encoder timestamps as many again for the copy runs. On
-/// Metal a convolution's three passes are Metal work, after which a dispatch in the same span
-/// opens a timed pass of its own: one more pass each.
+/// `gpu`: two per pass, and with encoder timestamps as many again for the copy runs. Where
+/// the GPU uses MPS, a convolution's three passes are Metal work, after which the span's
+/// next commands open a timed pass of their own: one more pass each.
 fn profiled_passes(layers: usize, norms: usize, splits: usize, convs: usize, gpu: &Gpu) -> u32 {
-    let passes = (2 * layers + 6 + norms + splits + 3 * convs).max(64);
+    let metal = if gpu.uses_mps() { 3 * convs } else { 0 };
+    let passes = (2 * layers + 6 + norms + splits + metal).max(64);
     let per_pass = if gpu.info().encoder_timestamps { 4 } else { 2 };
     if passes * per_pass <= wgpu::QUERY_SET_MAX_QUERIES as usize {
         passes as u32
