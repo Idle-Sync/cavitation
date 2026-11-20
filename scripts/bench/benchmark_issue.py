@@ -26,9 +26,11 @@
 # shape (a row whose machine, device, network and mode already have one becomes current only if
 # its date is not older; the other goes to the earlier rows). A row may carry a `mode` (a
 # variant such as `CAVITATION_CUDNN_BENCHMARK=1`, shown after the device), a `source` (where it
-# was measured, such as a PR) and a `note`; the measuring fields a back-filled row lacks may be
-# null. The script refuses to rewrite an issue that has text but no data comment, since that text
-# would be lost; `--replace-body` overrides that. `--render-only` rewrites the issue from what it
+# was measured, such as a PR) and a `note`; a back-filled row needs `machine`, `device`, `net`
+# and `cav_s`, and its other fields may be null. Importing a row the issue already holds changes
+# nothing. The script refuses to rewrite an issue that has text but no data comment, since that
+# text would be lost; `--replace-body` overrides that. Before each rewrite it reads the issue
+# again and applies its own changes to what it finds, so an edit made during a run is kept. `--render-only` rewrites the issue from what it
 # holds; `--dry-run` prints the new body instead of editing the issue. CUDA runs in its default
 # mode (`CAVITATION_CUDNN_BENCHMARK` unset), the repeatable one.
 
@@ -124,8 +126,19 @@ def normalise(data):
     for key in ["rows", "history", "notes", "todo"]:
         data.setdefault(key, [])
     for row in data["rows"] + data["history"]:
-        row.setdefault("mode", "")
+        row["mode"] = row.get("mode") or ""
     return data
+
+
+def check_row(row):
+    row["mode"] = row.get("mode") or ""
+    for field in ["machine", "device", "net"]:
+        if not isinstance(row.get(field), str):
+            sys.exit(f"a row has no {field}: {row}")
+    if row["device"] not in DEVICES or row["net"] not in NETS:
+        sys.exit(f"row {key(row)}: unknown device or network")
+    if not isinstance(row.get("cav_s"), (int, float)):
+        sys.exit(f"row {key(row)}: cav_s, Cavitation's epoch in seconds, is required")
 
 
 def read_issue(issue, replace_body):
@@ -150,42 +163,52 @@ def key(row):
 
 def add_row(data, row):
     """Makes `row` current unless the current row for its key is newer; keeps the other as
-    an earlier row. Dates are ISO strings, so they compare as text."""
-    row.setdefault("mode", "")
-    if row["device"] not in DEVICES or row["net"] not in NETS:
-        sys.exit(f"row {key(row)}: unknown device or network")
+    an earlier row. Dates are ISO strings, so they compare as text; a row without one counts
+    as the oldest, and of two rows with the same date the one added last is current. Adding a
+    row the data already holds changes nothing."""
+    check_row(row)
+    if row in data["rows"] or row in data["history"]:
+        return
     old = next((r for r in data["rows"] if key(r) == key(row)), None)
     if old is None:
         data["rows"].append(row)
-    elif (old.get("date") or "") > (row.get("date") or ""):
-        data["history"].append(row)
+        return
+    if (old.get("date") or "") > (row.get("date") or ""):
+        earlier = row
     else:
         data["rows"] = [r for r in data["rows"] if key(r) != key(row)]
         data["rows"].append(row)
-        data["history"].append(old)
+        earlier = old
+    if earlier not in data["history"]:
+        data["history"].append(earlier)
 
 
 def import_file(data, path):
     with open(path, encoding="utf-8") as f:
         new = normalise(json.load(f))
     for name, m in new["machines"].items():
+        unknown = [d for d in m.get("devices", []) if d not in DEVICES]
+        if unknown:
+            sys.exit(f"machine {name}: unknown devices {', '.join(unknown)}")
         have = data["machines"].setdefault(name, {"hardware": "", "os": "", "devices": []})
         have["hardware"] = m.get("hardware") or have["hardware"]
         have["os"] = m.get("os") or have["os"]
         have["devices"] = [d for d in DEVICES if d in have["devices"] or d in m.get("devices", [])]
+    for row in new["rows"] + new["history"]:
+        check_row(row)
+        if row["machine"] not in data["machines"]:
+            sys.exit(f"row {key(row)}: machine {row['machine']} is not listed")
     for row in new["rows"]:
         add_row(data, row)
     for row in new["history"]:
-        if row not in data["history"]:
+        if row not in data["history"] and row not in data["rows"]:
             data["history"].append(row)
     for kind in ["notes", "todo"]:
         for text in new[kind]:
             if text not in data[kind]:
                 data[kind].append(text)
     for row in data["rows"]:
-        machine = data["machines"].get(row["machine"])
-        if machine is None:
-            sys.exit(f"row {key(row)}: machine {row['machine']} is not listed")
+        machine = data["machines"][row["machine"]]
         if row["device"] not in machine["devices"]:
             machine["devices"] = [d for d in DEVICES if d in machine["devices"] or d == row["device"]]
 
@@ -200,11 +223,16 @@ def speed(row):
         return f"🟢 {1 / r:.2f}× faster"
     if r > 1.03:
         return f"🔴 {r:.2f}× slower"
-    if r < 1:
+    if f"{1 / r:.2f}" != "1.00" and r < 1:
         return f"🟡 same ({1 / r:.2f}× faster)"
-    if r > 1:
+    if f"{r:.2f}" != "1.00" and r > 1:
         return f"🟡 same ({r:.2f}× slower)"
     return "🟡 same"
+
+
+def table_text(text):
+    """Text for a table cell: a `|` would end the cell and a newline the row."""
+    return str(text).replace("|", "\\|").replace("\r", " ").replace("\n", " ")
 
 
 def render(data):
@@ -238,7 +266,7 @@ def render(data):
     for name in sorted(data["machines"]):
         m = data["machines"][name]
         devs = ", ".join(DEVICE_NAMES[d] for d in m["devices"])
-        out.append(f"| {name} | {m['hardware']} | {m['os']} | {devs} |")
+        out.append(f"| {name} | {table_text(m['hardware'])} | {table_text(m['os'])} | {devs} |")
     out.append("")
     out.append("## Speed")
     out.append("")
@@ -314,7 +342,7 @@ def render(data):
 
 
 def device_label(device, mode):
-    return f"{DEVICE_NAMES[device]}, {mode}" if mode else DEVICE_NAMES[device]
+    return f"{DEVICE_NAMES[device]}, {table_text(mode)}" if mode else DEVICE_NAMES[device]
 
 
 def measurement_table(out, rows):
@@ -337,11 +365,11 @@ def measurement_table(out, rows):
         if row.get("epochs") is not None and row.get("rows") is not None:
             size = f"{row['epochs']} × {row['rows']:,}"
         threads = ", ".join(shown(row.get(k)) for k in ["threads", "kernel"])
-        source = "; ".join(t for t in [row.get("source"), row.get("note")] if t) or "–"
+        source = table_text("; ".join(t for t in [row.get("source"), row.get("note")] if t) or "–")
         out.append(
             f"| {row['machine']} | {device_label(row['device'], row['mode'])} | {row['net']} "
-            f"| {row['cav_s']:.2f} s | {torch} | {size} | {threads} | {shown(row.get('commit'))} "
-            f"| {shown(row.get('date'))} | {row.get('torch_about') or '–'} | {source} |"
+            f"| {row['cav_s']:.2f} s | {torch} | {size} | {threads} | {table_text(shown(row.get('commit')))} "
+            f"| {shown(row.get('date'))} | {table_text(row.get('torch_about') or '–')} | {source} |"
         )
     out.append("")
 
@@ -368,82 +396,95 @@ def main():
     args = p.parse_args()
 
     root = repo_root()
+    # Every change is kept as a step and applied to a fresh read of the issue before each
+    # publish, so an edit made to the issue during an hour-long run is not overwritten. The
+    # steps run once here first, so a bad file or note stops the script before it measures.
+    changes = edits(args)
     data = read_issue(args.issue, args.replace_body)
-    edits = edit(data, args)
+    for change in changes:
+        change(data, True)
 
-    if not args.render_only and not (edits and not args.machine):
-        if not args.machine:
-            sys.exit("--machine is needed to measure")
-        devices = [d for d in args.devices.split(",") if d]
-        nets = [n for n in args.nets.split(",") if n]
-        for d in devices:
-            if d not in DEVICES:
-                sys.exit(f"unknown device {d}; choose from {', '.join(DEVICES)}")
-        for n in nets:
-            if n not in NETS:
-                sys.exit(f"unknown network {n}; choose from {', '.join(NETS)}")
-        if any(DEVICES[d]["torch"] for d in devices) and not args.python:
-            sys.exit("--python is needed for cpu, cuda and metal")
-        watched = ["crates", "scripts/bench", "Cargo.toml", "Cargo.lock"]
-        if run(["git", "status", "--porcelain", "--"] + watched, cwd=root).strip():
-            sys.exit("uncommitted changes in " + ", ".join(watched) + "; measure a commit")
-        machine = data["machines"].get(args.machine, {"hardware": "", "os": "", "devices": []})
-        if args.hardware:
-            machine["hardware"] = args.hardware
-        if args.os:
-            machine["os"] = args.os
-        if not machine["hardware"] or not machine["os"]:
-            sys.exit(f"machine {args.machine} is new: give --hardware and --os")
-        machine["devices"] = [d for d in DEVICES if d in machine["devices"] or d in devices]
-        data["machines"][args.machine] = machine
-
-        features = sorted({DEVICES[d]["feature"] for d in devices if DEVICES[d]["feature"]})
-        build = ["cargo", "build", "--release", "-p", "cavitation-bench"]
-        if features:
-            build += ["--features", ",".join(features)]
-        subprocess.run(build, cwd=root, check=True)
-        tdir = target_dir(root)
-        binary = os.path.join(tdir, "release", "cavitation-bench" + (".exe" if os.name == "nt" else ""))
-        if not shutil.which(binary) and not os.path.exists(binary):
-            sys.exit(f"no binary at {binary}")
-        commit = run(["git", "rev-parse", "--short", "HEAD"], cwd=root).strip()
-        date = datetime.date.today().isoformat()
-        failed = None
-        for device in devices:
-            for net in nets:
-                try:
-                    row = measure(root, binary, tdir, device, net, args)
-                except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as e:
-                    failed = f"{net} on {device}: {e}"
-                    break
-                row.update(machine=args.machine, device=device, net=net, mode="", commit=commit, date=date)
-                add_row(data, row)
-                publish(data, args, root)
-            if failed:
-                break
-        if failed:
-            sys.exit(f"stopped: {failed}; the rows measured before it are in the issue")
+    if args.render_only or (changes and not args.machine):
+        publish(changes, args, root)
         return
+    if not args.machine:
+        sys.exit("--machine is needed to measure")
+    devices = [d for d in args.devices.split(",") if d]
+    nets = [n for n in args.nets.split(",") if n]
+    for d in devices:
+        if d not in DEVICES:
+            sys.exit(f"unknown device {d}; choose from {', '.join(DEVICES)}")
+    for n in nets:
+        if n not in NETS:
+            sys.exit(f"unknown network {n}; choose from {', '.join(NETS)}")
+    if any(DEVICES[d]["torch"] for d in devices) and not args.python:
+        sys.exit("--python is needed for cpu, cuda and metal")
+    watched = ["crates", "scripts/bench", "Cargo.toml", "Cargo.lock"]
+    if run(["git", "status", "--porcelain", "--"] + watched, cwd=root).strip():
+        sys.exit("uncommitted changes in " + ", ".join(watched) + "; measure a commit")
+    machine = data["machines"].get(args.machine, {"hardware": "", "os": "", "devices": []})
+    if not (args.hardware or machine["hardware"]) or not (args.os or machine["os"]):
+        sys.exit(f"machine {args.machine} is new: give --hardware and --os")
 
-    publish(data, args, root)
+    def add_machine(d, first):
+        m = d["machines"].setdefault(args.machine, {"hardware": "", "os": "", "devices": []})
+        m["hardware"] = args.hardware or m["hardware"]
+        m["os"] = args.os or m["os"]
+        m["devices"] = [x for x in DEVICES if x in m["devices"] or x in devices]
+
+    changes.append(add_machine)
+    if len(changes) > 1:
+        publish(changes, args, root)
+
+    features = sorted({DEVICES[d]["feature"] for d in devices if DEVICES[d]["feature"]})
+    build = ["cargo", "build", "--release", "-p", "cavitation-bench"]
+    if features:
+        build += ["--features", ",".join(features)]
+    subprocess.run(build, cwd=root, check=True)
+    tdir = target_dir(root)
+    binary = os.path.join(tdir, "release", "cavitation-bench" + (".exe" if os.name == "nt" else ""))
+    if not shutil.which(binary) and not os.path.exists(binary):
+        sys.exit(f"no binary at {binary}")
+    commit = run(["git", "rev-parse", "--short", "HEAD"], cwd=root).strip()
+    date = datetime.date.today().isoformat()
+    for device in devices:
+        for net in nets:
+            try:
+                row = measure(root, binary, tdir, device, net, args)
+            except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as e:
+                sys.exit(f"stopped: {net} on {device}: {e}; the rows measured before it are in the issue")
+            row.update(machine=args.machine, device=device, net=net, mode="", commit=commit, date=date)
+            changes.append(lambda d, first, row=row: add_row(d, dict(row)))
+            publish(changes, args, root)
 
 
-def edit(data, args):
-    """Applies --import, --note, --todo and their removals; says whether there were any."""
+def edits(args):
+    """The steps for --import, --note, --todo and their removals. Each takes the issue's data
+    and whether it is the first time it runs: a removal of text that is not there stops the
+    script the first time, and is skipped on a later read where someone already removed it."""
+    steps = []
     if args.import_path:
-        import_file(data, args.import_path)
+        steps.append(lambda d, first: import_file(d, args.import_path))
     for kind, added, removed in [("notes", args.note, args.remove_note), ("todo", args.todo, args.remove_todo)]:
         for text in removed:
-            if text not in data[kind]:
-                sys.exit(f"no {kind} entry reads exactly: {text}")
-            data[kind].remove(text)
+            def remove(d, first, kind=kind, text=text):
+                if text in d[kind]:
+                    d[kind].remove(text)
+                elif first:
+                    sys.exit(f"no {kind} entry reads exactly: {text}")
+            steps.append(remove)
         for text in added:
-            if text not in data[kind]:
-                data[kind].append(text)
-    return bool(args.import_path or args.note or args.todo or args.remove_note or args.remove_todo)
+            def add(d, first, kind=kind, text=text):
+                if text not in d[kind]:
+                    d[kind].append(text)
+            steps.append(add)
+    return steps
 
 
-def publish(data, args, root):
+def publish(changes, args, root):
+    data = read_issue(args.issue, args.replace_body)
+    for change in changes:
+        change(data, False)
     body = render(data)
     if args.dry_run:
         sys.stdout.reconfigure(encoding="utf-8")
