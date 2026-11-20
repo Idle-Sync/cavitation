@@ -71,6 +71,7 @@ cargo run --release -p cavitation-bench -- mnist-cnn --seed 0 --python <python w
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --python <python with torch>
 cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --cav-only    # Cavitation's half only
 cargo run --release -p cavitation-bench -- cifar-cnn --profile 15            # time per layer, no training run
+cargo run --release -p cavitation-bench --features gpu -- cifar-cnn --profile 15 --device gpu   # the same on the GPU
 ```
 
 Issue #361 keeps the latest ratio for each machine, device and network. After work on a device's speed, `scripts/bench/benchmark_issue.py --machine <letter> --python <python with torch> --devices <list>` reruns that device's two benchmarks and rewrites the issue; the script's header lists its options.

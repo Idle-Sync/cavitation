@@ -38,7 +38,11 @@
 //!   them. `--rows` trains on the first N training images only, for a quick run.
 //!   `--profile N` runs only N training steps, after 3 warm-up steps, with
 //!   `Trainer::profile_next_step`, and prints each layer's median forward and backward time,
-//!   then the loss's, the optimiser's and the whole step's, and writes no files.
+//!   then the loss's, the optimiser's and the whole step's, and writes no files. With
+//!   `--device gpu` it profiles `GpuTrainer` instead: each layer's passes on the GPU's clock,
+//!   a `Linear`'s or a `Conv2d`'s input gradient apart, the loss, health values, update,
+//!   running statistics, copies and readback where the device times them, and the timed
+//!   parts' sum against the whole step on the host's clock.
 //! - `subnormal [--steps N]` (default 2,000) times the optimiser update of one parameter of
 //!   1,068,810 elements whose gradient is 1e-3 on the first step and 0 after, for SGD,
 //!   SGD with momentum 0.9 and Adam (lr 1e-3), so their state decays through the subnormal
