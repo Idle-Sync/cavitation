@@ -142,9 +142,11 @@ impl GpuModel {
     ///   layer's output, a batch count does not hold one value,
     ///   a PReLU's weight does not hold one value per slope, a batch norm that keeps no
     ///   running statistics would see one value per channel, or a layer's inference form is
-    ///   an average pooling that is dilated or divides by 0, or an adaptive average pooling
-    ///   with a size of 0 (the CPU's layers refuse these); the message names the layer (and
-    ///   both widths, where two differ).
+    ///   an average pooling that is dilated or divides by 0 (`AvgPool2d::with_options`
+    ///   refuses both with `InvalidData`, `AvgPool2d::new` panics on a dilated geometry, and
+    ///   `InferenceModel::compile` panics on such a form), or an adaptive average pooling with
+    ///   a size of 0 (as `AdaptiveAvgPool2d::new` refuses it); the message names the layer
+    ///   (and both widths, where two differ).
     ///
     /// # Panics
     ///
@@ -779,10 +781,11 @@ mod tests {
         }
     }
 
-    /// Adaptive average pooling is planned with its sizes and widths; the pooling forms the
-    /// CPU's layers refuse (a dilated average pooling, a divisor of 0, an adaptive pooling with
-    /// a size of 0) are invalid data, and an adaptive pooling beyond the kernels' 32-bit
-    /// arithmetic or 2³¹ values per batch is unsupported, each naming the layer.
+    /// Adaptive average pooling is planned with its sizes and widths; the pooling forms the CPU
+    /// refuses (a dilated average pooling or a divisor of 0, which `AvgPool2d::with_options`
+    /// refuses with `InvalidData`, and an adaptive pooling with a size of 0, which
+    /// `AdaptiveAvgPool2d::new` refuses) are invalid data, and an adaptive pooling beyond the
+    /// kernels' 32-bit arithmetic or 2³¹ values per batch is unsupported, each naming the layer.
     #[test]
     fn pooling_forms_are_checked() {
         let mut params = ParamStore::new();

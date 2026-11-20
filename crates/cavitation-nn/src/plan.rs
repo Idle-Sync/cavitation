@@ -380,9 +380,11 @@ impl Plan {
     ///   GLU's input width is odd, a mask is not as wide as its layer's output, a batch count
     ///   does not hold one value, a PReLU's weight does not hold one value per slope, a batch
     ///   norm that keeps no running statistics would see one value per channel, an average
-    ///   pooling is dilated or divides by 0, or an adaptive average pooling has a count or
-    ///   size of 0 or more values per image than `usize` holds (the CPU's layers refuse the
-    ///   same as invalid data).
+    ///   pooling is dilated or divides by 0 (`AvgPool2d::with_options` refuses both with
+    ///   `InvalidData`, `AvgPool2d::new` panics on a dilated geometry, and
+    ///   `InferenceModel::compile` panics on such a form), or an
+    ///   adaptive average pooling has a count or size of 0 or more values per image than
+    ///   `usize` holds (as `AdaptiveAvgPool2d::new` refuses it).
     pub(crate) fn build_for(
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
@@ -781,7 +783,8 @@ fn kind(
             count_include_pad,
             divisor_override,
         }) => {
-            // The CPU's `AvgPool2d` refuses both as invalid data, and its kernels panic on them.
+            // `AvgPool2d::with_options` refuses both as invalid data, and the CPU kernels panic
+            // on them.
             if geom.dilation() != (1, 1) {
                 return invalid(&format!(
                     "is an average pooling with dilation {:?}; average pooling takes none",

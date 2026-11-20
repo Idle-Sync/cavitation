@@ -1022,8 +1022,9 @@ impl AvgPool2d {
 /// gradient that at most `m` outputs cover within
 /// `(2(m + 3) + 10) · 2⁻²⁴ · (|dx| + Σ|dy / (dh · dw)|) + 2⁻¹²⁶`: the average pooling's
 /// bounds with a second division, the absolute term covering a result the GPU flushes to
-/// zero. NaN and ±∞ follow IEEE arithmetic as on the CPU; subnormal inputs are outside the
-/// bound, since the GPU may read them as zero.
+/// zero. NaN and ±∞ propagate as on the CPU on the backends measured (Vulkan, DX12); WGSL
+/// does not guarantee it, since it lets an implementation assume no NaN or infinity.
+/// Subnormal inputs are outside the bound, since the GPU may read them as zero.
 ///
 /// # Examples
 ///

@@ -12,7 +12,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cavitation_core::{Conv2dGeom, Error, Gate, ParamStore, Rng, Tensor};
+use cavitation_core::{Conv2dGeom, Error, Gate, ParamStore, Pool2dGeom, Rng, Tensor};
 use cavitation_cuda::Cuda;
 
 use super::CudaTrainer;
@@ -991,6 +991,81 @@ fn auto_trains_on_cuda_when_it_opens() {
     }
 }
 
+/// A layer of your own with no parameters that passes its input on and declares a dilated
+/// average pooling as its inference form, which the CPU's `AvgPool2d` never builds.
+struct DilatedAvg;
+
+impl<T: cavitation_core::Real> crate::Layer<T> for DilatedAvg {
+    fn name(&self) -> &str {
+        "dilated_avg"
+    }
+    fn output_width(&self, input_width: usize) -> usize {
+        input_width
+    }
+    fn forward(
+        &self,
+        _: &mut cavitation_core::Tape<'_, T>,
+        x: cavitation_core::Var,
+    ) -> cavitation_core::Var {
+        x
+    }
+    fn parameters(&self) -> Vec<(&'static str, cavitation_core::ParamId)> {
+        Vec::new()
+    }
+    fn inference(&self, _: &cavitation_core::ParamValues<f32>) -> Option<crate::InferenceLayer> {
+        let geom = Pool2dGeom::with_options(1, (6, 6), (2, 2), (2, 2), (0, 0), (2, 2), false);
+        Some(crate::InferenceLayer::AvgPool2d {
+            geom: geom.unwrap(),
+            count_include_pad: true,
+            divisor_override: None,
+        })
+    }
+}
+
+/// `Device::Auto` with a layer whose inference form is a dilated average pooling, which the
+/// card refuses as invalid data: the run leaves CUDA (and, on a build with the `gpu` feature,
+/// the wgpu GPU, which refuses it too) and trains on the CPU, to the bits of `Device::Cpu`;
+/// when CUDA opened, its history says why a device was left.
+#[test]
+fn auto_leaves_a_dilated_average_pooling_to_the_cpu() {
+    if !auto_is_unrestricted() {
+        return;
+    }
+    let mut start = ParamStore::new();
+    let net =
+        Sequential::new()
+            .push(DilatedAvg)
+            .push(Linear::new(&mut start, 36, 4, &mut Rng::seed(73)));
+    let train = classes(74, 16, 36, 4);
+    let cuda_opens = Cuda::open().is_ok();
+    let mut outcomes = Vec::new();
+    for device in [Device::Auto, Device::Cpu] {
+        let mut params = start.clone();
+        let config = FitConfig {
+            epochs: 2,
+            batch: 8,
+            health: Health::quiet(),
+            device,
+            ..FitConfig::default()
+        };
+        let history = fit(&net, &mut params, &train, config).unwrap();
+        assert_eq!(history.device, DeviceKind::Cpu);
+        let left = matches!(device, Device::Auto) && cuda_opens;
+        assert_eq!(history.device_note.is_some(), left);
+        if let Some(note) = &history.device_note {
+            println!("left CUDA: {note}");
+            assert!(
+                note.contains("layer 0 (dilated_avg) is an average pooling with dilation (2, 2)"),
+                "{note}"
+            );
+        }
+        let losses: Vec<u64> = (history.epochs.iter())
+            .map(|e| e.mean_loss.to_bits())
+            .collect();
+        outcomes.push((bits(&net, &params), losses));
+    }
+    assert_eq!(outcomes[0], outcomes[1]);
+}
 /// `Device::Auto` leaves what CUDA refuses (an optimiser without a CUDA kernel,
 /// `OnNonFinite::Warn`) to the next device, and its history says why CUDA was left; on a
 /// build without the `gpu` feature the next device is the CPU, to the bits of

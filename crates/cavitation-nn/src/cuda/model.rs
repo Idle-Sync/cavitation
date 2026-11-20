@@ -147,9 +147,11 @@ impl<'c> CudaModel<'c> {
     ///   layer's output, a batch count does not hold one value,
     ///   a PReLU's weight does not hold one value per slope, a batch norm that keeps no
     ///   running statistics would see one value per channel, or a layer's inference form is
-    ///   an average pooling that is dilated or divides by 0, or an adaptive average pooling
-    ///   with a size of 0 (the CPU's layers refuse these); the message names the layer (and
-    ///   both widths, where two differ).
+    ///   an average pooling that is dilated or divides by 0 (`AvgPool2d::with_options`
+    ///   refuses both with `InvalidData`, `AvgPool2d::new` panics on a dilated geometry, and
+    ///   `InferenceModel::compile` panics on such a form), or an adaptive average pooling with
+    ///   a size of 0 (as `AdaptiveAvgPool2d::new` refuses it); the message names the layer
+    ///   (and both widths, where two differ).
     ///
     /// # Panics
     ///
