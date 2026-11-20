@@ -19,7 +19,8 @@
 //! - [`CudaInfo`]: the card, each library's version and the files they were loaded from,
 //!   for printing.
 //! - [`DeviceBuffer`]: memory on the card, zeroed, written from and read into slices of a
-//!   [`Scalar`] (`f32`, `u32` or `i32`).
+//!   [`Scalar`] (`f32`, `u32` or `i32`), copied from another buffer on the card, and zeroed
+//!   again.
 //! - [`Module`], [`Kernel`] and [`Arg`]: kernels written in CUDA C++, compiled at run time
 //!   by NVRTC and launched on the card. The sources are compiled without fused
 //!   multiply-add, so their arithmetic is the CPU's for the same expressions.

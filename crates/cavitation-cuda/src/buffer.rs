@@ -179,6 +179,100 @@ impl DeviceBuffer<'_> {
         };
         self.cuda.check("cuMemcpyDtoH_v2", code)
     }
+
+    /// Copies `bytes` bytes of `from`, starting `from_at` bytes into it, into this buffer
+    /// starting `at` bytes in, after the work already given to the card. The copy is queued
+    /// on the card and returns without waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the driver reports an error.
+    ///
+    /// # Panics
+    ///
+    /// If either range runs past its buffer's end, or the two buffers were allocated in two
+    /// different [`Cuda`]s.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::Cuda;
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let mut from = cuda.buffer(12).unwrap();
+    ///     from.write(&[1.0f32, 2.0, 3.0]).unwrap();
+    ///     let mut to = cuda.buffer(12).unwrap();
+    ///     to.copy_from(4, &from, 0, 8).unwrap();
+    ///     let mut back = [0.0f32; 3];
+    ///     to.read(&mut back).unwrap();
+    ///     assert_eq!(back, [0.0, 1.0, 2.0]);
+    /// }
+    /// ```
+    pub fn copy_from(
+        &mut self,
+        at: usize,
+        from: &DeviceBuffer<'_>,
+        from_at: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        assert!(
+            std::ptr::eq(self.cuda, from.cuda),
+            "a copy between buffers of two different Cuda handles"
+        );
+        let fits = |start: usize, len: usize| start.checked_add(bytes).is_some_and(|e| e <= len);
+        assert!(
+            fits(at, self.bytes) && fits(from_at, from.bytes),
+            "a copy of {bytes} bytes from byte {from_at} of a buffer of {} to byte {at} of one \
+             of {}",
+            from.bytes,
+            self.bytes
+        );
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.cuda.bind()?;
+        // SAFETY: both ranges lie in live allocations of this context (checked above), and
+        // they do not overlap: `self`, borrowed mutably, is not `from`.
+        let code = unsafe {
+            (self.cuda.driver.cuMemcpyDtoD_v2)(
+                self.pointer + at as u64,
+                from.pointer + from_at as u64,
+                bytes,
+            )
+        };
+        self.cuda.check("cuMemcpyDtoD_v2", code)
+    }
+
+    /// Sets every byte of the buffer to zero, after the work already given to the card. The
+    /// write is queued on the card and returns without waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the driver reports an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::Cuda;
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let mut buffer = cuda.buffer(8).unwrap();
+    ///     buffer.write(&[1.5f32, -2.0]).unwrap();
+    ///     buffer.zero().unwrap();
+    ///     let mut back = [1.0f32; 2];
+    ///     buffer.read(&mut back).unwrap();
+    ///     assert_eq!(back.map(f32::to_bits), [0, 0]);
+    /// }
+    /// ```
+    pub fn zero(&mut self) -> Result<(), CudaError> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        self.cuda.bind()?;
+        // SAFETY: the address was allocated with at least `bytes` bytes in this context.
+        let code = unsafe { (self.cuda.driver.cuMemsetD8_v2)(self.pointer, 0, self.bytes) };
+        self.cuda.check("cuMemsetD8_v2", code)
+    }
 }
 
 impl Drop for DeviceBuffer<'_> {
