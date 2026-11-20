@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::Gpu;
+use crate::metal::{self, Committed, Piece};
 
 /// Upload, copy and readback offsets are kept to this alignment, wgpu's `MAP_ALIGNMENT`
 /// (copies need only 4).
@@ -279,6 +280,13 @@ pub struct StepEncoder {
     bind_groups: usize,
     /// The number of steps submitted.
     submitted: u64,
+    /// The step's parts so far, in order, when it holds Metal work: the wgpu command
+    /// buffers before each piece of Metal work, and the work.
+    pieces: Vec<Piece>,
+    /// The Metal work committed by the last step, waited on after it.
+    committed: Vec<Committed>,
+    /// The last step's timed Metal work: profile entry and nanoseconds.
+    metal_times: Vec<(usize, Option<f64>)>,
 }
 
 impl StepEncoder {
@@ -372,6 +380,9 @@ impl StepEncoder {
             buffers,
             bind_groups: 0,
             submitted: 0,
+            pieces: Vec::new(),
+            committed: Vec::new(),
+            metal_times: Vec::new(),
         }
     }
 
@@ -1072,7 +1083,13 @@ impl<'a> Step<'a> {
         });
         steps.staging_mapped.store(false, Ordering::Release);
         steps.staging.unmap();
-        steps.gpu.queue().submit([encoder.finish()]);
+        steps.pieces.push(Piece::Wgpu(encoder.finish()));
+        metal::submit(
+            steps.gpu.metal(),
+            steps.gpu.queue(),
+            &mut steps.pieces,
+            &mut steps.committed,
+        );
         if let Some(resolve) = resolve {
             steps
                 .gpu
@@ -1106,6 +1123,8 @@ impl<'a> Step<'a> {
             .device()
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("wait for the step");
+        steps.metal_times.clear();
+        metal::wait(&mut steps.committed, &mut steps.metal_times);
         steps.host.clear();
         if map_end > 0 {
             {
@@ -1121,6 +1140,7 @@ impl<'a> Step<'a> {
                         &mut steps.timeline.entries,
                         ticks,
                         t.period,
+                        &steps.metal_times,
                     );
                 }
             }
@@ -1135,6 +1155,48 @@ impl<'a> Step<'a> {
 
     /// Begins a compute pass, timed when profiling with timestamps inside a span.
     ///
+    /// Records Metal work (Metal Performance Shaders) into the step: it runs after
+    /// everything recorded before it and before everything recorded after it, on the same
+    /// queue and buffers. The step's wgpu commands so far are closed into a command buffer
+    /// of their own, and the work is encoded and committed in its place when the step is
+    /// finished. A profiled step times the work as a pass of the current span, from the
+    /// start of its first command buffer to the end of its last.
+    ///
+    /// # Panics
+    ///
+    /// If the GPU is not Metal's with `CAVITATION_MPS` allowing it ([`Gpu::metal`]), or the
+    /// step has more timed passes than [`StepSizes::timed_passes`].
+    #[cfg(target_os = "macos")]
+    #[allow(dead_code, reason = "used by the Metal kernels and the tests")]
+    pub(crate) fn metal(&mut self, op: Arc<dyn metal::MetalOp>) {
+        assert!(
+            self.steps.gpu.metal().is_some(),
+            "Metal work needs a Metal adapter with {} allowing it",
+            metal::MPS_VAR
+        );
+        self.end_pass();
+        self.close_copies();
+        let timed = self.steps.timestamps.is_some() && self.steps.profiling;
+        let max = self.steps.sizes.timed_passes;
+        let entry = self
+            .span
+            .filter(|_| timed)
+            .map(|span| self.steps.timeline.pass(span, max) as usize);
+        let next =
+            self.steps
+                .gpu
+                .device()
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("cavitation step"),
+                });
+        let done = self
+            .encoder
+            .replace(next)
+            .expect("the step is being recorded");
+        self.steps.pieces.push(Piece::Wgpu(done.finish()));
+        self.steps.pieces.push(Piece::Metal(op, entry));
+    }
+
     /// # Panics
     ///
     /// If the step has more timed passes than [`StepSizes::timed_passes`].
@@ -1214,17 +1276,22 @@ impl<'a> Step<'a> {
 /// compared: on Metal, timestamps of passes separated by a copy are not on one timeline (a
 /// later pass can end before an earlier one begins). An entry whose end reads before its
 /// beginning has no time, and neither has its span: no time is made up as 0. A span with
-/// no timed entry keeps `None`.
+/// no timed entry keeps `None`. The entries of Metal work take their times from `metal`
+/// (entry, nanoseconds) instead, timed by their command buffers.
 fn add_span_times(
     spans: &mut [(&'static str, Option<f64>)],
     entries: &mut [Timed],
     ticks: &[[u8; 8]],
     period: f64,
+    metal: &[(usize, Option<f64>)],
 ) {
     for (e, entry) in entries.iter_mut().enumerate() {
         let begin = u64::from_le_bytes(ticks[2 * e]);
         let end = u64::from_le_bytes(ticks[2 * e + 1]);
         entry.nanoseconds = (end >= begin).then(|| (end - begin) as f64 * period);
+    }
+    for &(e, nanoseconds) in metal {
+        entries[e].nanoseconds = nanoseconds;
     }
     for (s, span) in spans.iter_mut().enumerate() {
         let mut mine = entries.iter().filter(|e| e.span == s).peekable();
@@ -1434,7 +1501,7 @@ mod tests {
         // report across a copy. b: one pass. d: one pass of no measurable time.
         let mut timed = entries(&[(0, Pass), (0, Copies), (0, Pass), (1, Pass), (3, Pass)]);
         let raw = ticks(&[(500, 510), (510, 520), (100, 130), (300, 301), (700, 700)]);
-        add_span_times(&mut spans, &mut timed, &raw, 2.0);
+        add_span_times(&mut spans, &mut timed, &raw, 2.0, &[]);
         let times: Vec<Option<f64>> = timed.iter().map(|t| t.nanoseconds).collect();
         assert_eq!(
             times,
@@ -1463,7 +1530,7 @@ mod tests {
         ] {
             let mut spans = vec![("a", None)];
             let mut timed = entries(&[(0, Pass), (0, Copies)]);
-            add_span_times(&mut spans, &mut timed, &raw, 1.0);
+            add_span_times(&mut spans, &mut timed, &raw, 1.0, &[]);
             assert_eq!(spans, [("a", None)], "{timed:?}");
             assert_eq!(timed.iter().filter(|t| t.nanoseconds.is_none()).count(), 1);
             assert!(timed.iter().all(|t| t.nanoseconds != Some(0.0)));
