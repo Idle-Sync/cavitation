@@ -2,7 +2,8 @@
 //! batches, rates, masks and short last batch, bit for bit against a loop written by hand);
 //! the parameters reach the host before `on_epoch`, when early stopping keeps a best epoch,
 //! before an error of a step or of an epoch's end, and at the end; the run tracks the CPU's
-//! `fit` within 2⁻¹⁰; and what CUDA does not run is refused before any training.
+//! `fit` within 2⁻¹⁰, with every loss CUDA trains; and what CUDA does not run, or the CPU's
+//! tape would panic on, is refused before any training.
 //! [`Device::Auto`] trains on CUDA when it opens, to the bits of `Device::Cuda`, and leaves
 //! what CUDA refuses to the next device; `CAVITATION_DEVICE=cuda` keeps it on CUDA.
 //!
@@ -12,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cavitation_core::{Conv2dGeom, Error, Gate, ParamStore, Pool2dGeom, Rng, Tensor};
+use cavitation_core::{Conv2dGeom, Error, Gate, Graph, ParamStore, Pool2dGeom, Rng, Tensor};
 use cavitation_cuda::Cuda;
 
 use super::CudaTrainer;
@@ -22,10 +23,10 @@ use super::test_util::{
 };
 use crate::train::{Choice, fit_choosing};
 use crate::{
-    Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Device, DeviceKind, EarlyStopping, Evaluation,
-    FitConfig, Flatten, Health, Hooks, Linear, Loss, LrSchedule, Monitor, OnNonFinite,
-    OptimizerConfig, Sequential, StepControl, Targets, devices, fit, fit_controlled,
-    fit_with_hooks,
+    Batch, BatchNorm2d, Batcher, Conv2d, CudaModel, Dataset, Device, DeviceKind, EarlyStopping,
+    Evaluation, FitConfig, Flatten, Health, Hooks, Linear, Loss, LrSchedule, Monitor, OnNonFinite,
+    OptimizerConfig, Sequential, StepControl, Targets, TargetsView, devices, evaluate, fit,
+    fit_controlled, fit_with_hooks,
 };
 
 /// `config` on `cuda`.
@@ -529,6 +530,228 @@ fn glu_layers_track_the_cpu_fit() {
     }
 }
 
+/// `rows` rows of `width` values in `[-1, 1)` from `seed`, with `outputs` target values per
+/// row in `[-1, 1)`.
+fn values(seed: u64, rows: usize, width: usize, outputs: usize) -> Dataset {
+    let mut rng = Rng::seed(seed);
+    let mut draw = |n: usize| -> Vec<f32> { (0..n).map(|_| rng.range(-1.0, 1.0) as f32).collect() };
+    let x = draw(rows * width);
+    let t = draw(rows * outputs);
+    Dataset {
+        x: Tensor::from_vec(x, &[rows, width]).unwrap(),
+        targets: Targets::Values(Tensor::from_vec(t, &[rows, outputs]).unwrap()),
+    }
+}
+
+/// The losses besides cross-entropy, each with whether it trains on labels: the negative
+/// log-likelihood after an MLP whose every `Linear` ends in a log-softmax, on labels; MSE, L1,
+/// Huber (`delta` 0.5) and smooth L1 (`beta` 0.5 and 0) after the test MLP, on targets in
+/// `[−1, 1)`.
+fn other_losses() -> Vec<(Loss, bool)> {
+    vec![
+        (Loss::Nll, true),
+        (Loss::Mse, false),
+        (Loss::L1, false),
+        (Loss::Huber { delta: 0.5 }, false),
+        (Loss::SmoothL1 { beta: 0.5 }, false),
+        (Loss::SmoothL1 { beta: 0.0 }, false),
+    ]
+}
+
+/// Each loss of `other_losses`: a run on CUDA tracks the CPU run of the same `FitConfig`,
+/// each epoch's mean loss and validation loss (through the trainer's model) within 2⁻¹⁰ of
+/// the CPU's and the final parameters within 2⁻¹⁰ of each tensor's largest value plus 2⁻¹⁶,
+/// over 3 epochs of 50 rows at batch 16 (a last batch of 2) with Adam; and
+/// `CudaModel::evaluate` on the trained parameters measures the held-out loss within 2⁻¹⁰ of
+/// the CPU's `evaluate`.
+#[test]
+fn every_loss_tracks_the_cpu_fit() {
+    for (k, (loss, classes_in)) in other_losses().into_iter().enumerate() {
+        let seed = 180 + 3 * k as u64;
+        let (train, held_out) = if classes_in {
+            (classes(seed, 50, 12, 4), classes(seed + 1, 20, 12, 4))
+        } else {
+            (values(seed, 50, 12, 4), values(seed + 1, 20, 12, 4))
+        };
+        let config = || FitConfig {
+            epochs: 3,
+            batch: 16,
+            optimizer: OptimizerConfig::Adam {
+                lr: 0.01,
+                weight_decay: 0.0,
+            },
+            loss,
+            shuffle_seed: Some(3),
+            health: Health::quiet(),
+            validation: Some(held_out.clone()),
+            ..FitConfig::default()
+        };
+        let what = format!("{loss:?}");
+        let mut start = ParamStore::new();
+        let net = if classes_in {
+            softmax_mlp::<f32>(&mut start, seed + 2, true)
+        } else {
+            mlp::<f32>(&mut start, seed + 2)
+        };
+        let mut cpu = start.clone();
+        let on_cpu = fit(&net, &mut cpu, &train, config()).unwrap();
+        with_cuda(|cuda| {
+            let mut params = start.clone();
+            let on_device = fit(&net, &mut params, &train, on(cuda, config())).unwrap();
+            let mut worst = 0.0f64;
+            for (g, c) in on_device.epochs.iter().zip(&on_cpu.epochs) {
+                let (gv, cv) = (
+                    g.validation.as_ref().unwrap(),
+                    c.validation.as_ref().unwrap(),
+                );
+                for (got, want, which) in [
+                    (g.mean_loss, c.mean_loss, "mean loss"),
+                    (gv.loss, cv.loss, "validation loss"),
+                ] {
+                    let off = (got - want).abs() / want.abs();
+                    assert!(
+                        off <= 1.0 / 1024.0,
+                        "{what}: epoch {}: {which} {got}, the CPU's {want}",
+                        g.epoch
+                    );
+                    worst = worst.max(off);
+                }
+            }
+            let mut worst_param = 0.0f32;
+            for (name, id) in net.state_names() {
+                let (a, b) = (params.value(id).data(), cpu.value(id).data());
+                let scale = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let off = (a.iter().zip(b))
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                let tolerance = scale / 1024.0 + 1.0 / 65536.0;
+                assert!(
+                    off <= tolerance,
+                    "{what}: {name} off by {off:e} of {scale:e}"
+                );
+                worst_param = worst_param.max(off / tolerance);
+            }
+            let mut model = CudaModel::compile(&net, &params, 16, cuda).unwrap();
+            let got = model.evaluate(&net, &held_out, loss).unwrap();
+            let want = evaluate(&net, &params, &held_out, loss, 16).unwrap();
+            let evaluated = (got.loss - want.loss).abs() / want.loss.abs();
+            assert!(
+                evaluated <= 1.0 / 1024.0,
+                "{what}: evaluate {got:?} against the CPU's {want:?}"
+            );
+            println!(
+                "{what}: worst loss off by {worst:.3e} of the CPU's; parameters {worst_param:.4} \
+                 of the tolerance; evaluate's loss off by {evaluated:.3e}"
+            );
+        });
+    }
+}
+
+/// The thresholds the CPU's tape panics on, each with the start of the message it panics
+/// with: a Huber `delta` not above 0 and a smooth L1 `beta` below 0, NaN either way and as
+/// the `f32` the tape takes (`1e-50` rounds to 0).
+fn bad_thresholds() -> [(Loss, &'static str); 6] {
+    let huber = "huber: delta must be positive, but it is";
+    let smooth = "smooth_l1: beta must not be negative, but it is";
+    [
+        (Loss::Huber { delta: 0.0 }, huber),
+        (Loss::Huber { delta: -1.0 }, huber),
+        (Loss::Huber { delta: f64::NAN }, huber),
+        (Loss::Huber { delta: 1e-50 }, huber),
+        (Loss::SmoothL1 { beta: -0.5 }, smooth),
+        (Loss::SmoothL1 { beta: f64::NAN }, smooth),
+    ]
+}
+
+/// The message of the panic the CPU's tape raises when `loss` is recorded on 8 × 4 outputs.
+fn tape_panic(loss: Loss) -> String {
+    let panic = std::panic::catch_unwind(|| {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let zeros = Tensor::zeros(&[8, 4]);
+        let out = tape.input(zeros.view());
+        loss.record(&mut tape, out, TargetsView::Values(zeros.view()));
+    })
+    .expect_err("the tape panics");
+    (panic.downcast_ref::<String>().cloned())
+        .or_else(|| panic.downcast_ref::<&str>().map(|m| m.to_string()))
+        .unwrap_or_default()
+}
+
+/// A threshold of `bad_thresholds`, on which the CPU's tape panics, is `Error::InvalidData`
+/// with the tape's message (the value as the `f32` the tape takes) before any training on
+/// every device: `fit` on the CPU, on CUDA and with `Device::Auto` (which returns the
+/// error itself rather than leaving CUDA for the CPU) gives the same error, and
+/// `CudaTrainer::new` names itself; the parameters are untouched. A smooth L1 `beta` of 0 or
+/// −0 trains.
+#[test]
+fn a_bad_threshold_is_refused_on_every_device() {
+    let mut start = ParamStore::new();
+    let net = mlp::<f32>(&mut start, 195);
+    let data = values(196, 16, 12, 4);
+    let config = |loss| FitConfig {
+        epochs: 1,
+        batch: 8,
+        loss,
+        health: Health::quiet(),
+        ..FitConfig::default()
+    };
+    let sgd = OptimizerConfig::Sgd {
+        lr: 0.01,
+        momentum: 0.0,
+        weight_decay: 0.0,
+    };
+    for (loss, text) in bad_thresholds() {
+        let problem = tape_panic(loss);
+        assert!(
+            problem.starts_with(text),
+            "{loss:?}: the tape's panic {problem}"
+        );
+        let mut cpu = start.clone();
+        let cpu_error = fit(&net, &mut cpu, &data, config(loss)).unwrap_err();
+        assert!(
+            matches!(cpu_error, Error::InvalidData(_)),
+            "{loss:?}: {cpu_error}"
+        );
+        let message = format!("invalid data: Loss: {problem}");
+        assert_eq!(cpu_error.to_string(), message);
+        assert_eq!(bits(&net, &cpu), bits(&net, &start), "{loss:?} on the CPU");
+        let mut auto = start.clone();
+        let auto_config = FitConfig {
+            device: Device::Auto,
+            ..config(loss)
+        };
+        let auto_error = fit_choosing(&net, &mut auto, &data, auto_config, Choice::Best);
+        assert_eq!(
+            auto_error.unwrap_err().to_string(),
+            message,
+            "{loss:?} on Auto"
+        );
+        assert_eq!(bits(&net, &auto), bits(&net, &start), "{loss:?} on Auto");
+        with_cuda(|cuda| {
+            let mut params = start.clone();
+            let error = fit(&net, &mut params, &data, on(cuda, config(loss))).unwrap_err();
+            assert_eq!(error.to_string(), message, "{loss:?}");
+            assert_eq!(bits(&net, &params), bits(&net, &start), "{loss:?}");
+            let made = CudaTrainer::new(&net, &start, &sgd, loss, 8, cuda).unwrap_err();
+            assert!(matches!(made, Error::InvalidData(_)), "{loss:?}: {made}");
+            assert_eq!(
+                made.to_string(),
+                format!("invalid data: CudaTrainer: {problem}")
+            );
+        });
+    }
+    for beta in [0.0, -0.0] {
+        with_cuda(|cuda| {
+            let mut params = start.clone();
+            let loss = Loss::SmoothL1 { beta };
+            let run = fit(&net, &mut params, &data, on(cuda, config(loss))).unwrap();
+            assert!(run.epochs[0].mean_loss.is_finite(), "beta {beta}");
+        });
+    }
+}
+
 /// A CNN through average pooling and adaptive average pooling to each of `ADAPTIVE_OUTPUTS`:
 /// a run on CUDA tracks the CPU run of the same `FitConfig`, each epoch's mean loss and
 /// validation loss (through the trainer's model) within 2⁻¹⁰ of the CPU's and the final
@@ -885,11 +1108,11 @@ fn what_cuda_does_not_run_is_refused() {
             &mut params,
             &values,
             FitConfig {
-                loss: Loss::L1,
+                loss: Loss::BinaryCrossEntropy,
                 ..config()
             },
         );
-        refused(r, "Loss::L1", &params);
+        refused(r, "Loss::BinaryCrossEntropy", &params);
         let r = fit_with_hooks(&net, &mut params, &train, config(), &mut Hooks::new());
         assert_eq!(r.unwrap().epochs.len(), 1);
         let before = bits(&net, &start);

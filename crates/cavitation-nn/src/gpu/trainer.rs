@@ -12,8 +12,9 @@ use cavitation_gpu::kernels::{
     ChannelDims, ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
     ConvWeightGradCall, CrossEntropyCall, DeadRelu, DeadReluCall, Elementwise, ElementwiseCall,
     FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, Glu, GluCall, MaxPool2d, MeanSquaredError,
-    MseCall, OptimizerKernel, OptimizerRule, Prelu, PreluCall, RowSoftmax, RowSoftmaxCall,
-    RunningUpdate, SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
+    MseCall, NegativeLogLikelihood, NllCall, OptimizerKernel, OptimizerRule, Prelu, PreluCall,
+    Regression, RegressionCall, RegressionLoss, RowSoftmax, RowSoftmaxCall, RunningUpdate,
+    SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepOutput,
@@ -52,6 +53,10 @@ struct TrainKernels {
     cross_entropy: SoftmaxCrossEntropy,
     /// Mean squared error and its gradient.
     mse: MeanSquaredError,
+    /// The negative log-likelihood and its gradient.
+    nll: NegativeLogLikelihood,
+    /// The L1, Huber and smooth L1 losses and their gradients.
+    regression: RegressionLoss,
     /// The finite flag over the loss and every gradient.
     finite: FiniteFlag,
     /// Each parameter gradient's sum of squares, for the gradient-norm checks.
@@ -114,6 +119,23 @@ enum LossCall {
     CrossEntropy(CrossEntropyCall),
     /// Mean squared error on target values.
     Mse(MseCall),
+    /// The negative log-likelihood on class labels.
+    Nll(NllCall),
+    /// L1, Huber or smooth L1 on target values.
+    Regression(RegressionCall),
+}
+
+/// The regression kernel's form of `loss`, with its threshold as the `f32` the tape takes,
+/// or `None` for a loss that is not L1, Huber or smooth L1.
+fn regression(loss: Loss) -> Option<Regression> {
+    match loss {
+        Loss::L1 => Some(Regression::L1),
+        Loss::Huber { delta } => Some(Regression::Huber {
+            delta: delta as f32,
+        }),
+        Loss::SmoothL1 { beta } => Some(Regression::SmoothL1 { beta: beta as f32 }),
+        _ => None,
+    }
 }
 
 /// A dropout layer's mask for a step: the layer's stream, drop probability and the packed
@@ -246,8 +268,9 @@ pub struct GpuOptimizerState {
 /// A step does what [`Trainer::step`](crate::Trainer::step) does on the CPU, with the same
 /// dropout masks (from [`dropout_mask`] with the trainer's seed and the step's number) and
 /// the same order of work. The model's layers must be ones [`GpuModel::compile`] takes; the
-/// losses are [`Loss::CrossEntropy`] and [`Loss::Mse`], and the optimisers SGD (with or
-/// without momentum), Adam and AdamW. A parameter used by two layers is refused.
+/// losses are [`Loss::CrossEntropy`], [`Loss::Nll`], [`Loss::Mse`], [`Loss::L1`],
+/// [`Loss::Huber`] and [`Loss::SmoothL1`], and the optimisers SGD (with or without momentum),
+/// Adam and AdamW. A parameter used by two layers is refused.
 ///
 /// While a full step runs on the GPU, the next full step's dropout masks are drawn on the host;
 /// a batch of fewer rows draws its own before it runs.
@@ -541,11 +564,13 @@ impl<'s> GpuTrainer<'s> {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for a loss other than
-    /// cross-entropy and MSE, for a parameter used by two layers, and as
-    /// [`GpuModel::compile`] returns; [`Error::InvalidData`] as `compile` returns, if the
-    /// model has no parameters or one that holds no values, and if a batch norm would
-    /// normalise a training batch over one value per channel.
+    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for binary cross-entropy (with
+    /// or without logits) and KL divergence, for a parameter used by two layers, and as
+    /// [`GpuModel::compile`] returns; [`Error::InvalidData`] as `compile` returns, for a
+    /// Huber `delta` not above 0 or a smooth L1 `beta` below 0 (NaN either way, as `f32`s;
+    /// the CPU's tape panics on them), if the model has no parameters or one that holds no
+    /// values, and if a batch norm would normalise a training batch over one value per
+    /// channel.
     ///
     /// # Examples
     ///
@@ -561,6 +586,10 @@ impl<'s> GpuTrainer<'s> {
     ///     assert!(GpuTrainer::new(&net, &params, &adam, Loss::Mse, 16, &gpu).is_ok());
     ///     let rms = OptimizerConfig::RmsProp { lr: 1e-3, alpha: 0.99, momentum: 0.0, weight_decay: 0.0, centered: false };
     ///     assert!(GpuTrainer::new(&net, &params, &rms, Loss::Mse, 16, &gpu).is_err());
+    ///     let huber = Loss::Huber { delta: 0.5 };
+    ///     assert!(GpuTrainer::new(&net, &params, &adam, huber, 16, &gpu).is_ok());
+    ///     let flat = Loss::Huber { delta: 0.0 };
+    ///     assert!(GpuTrainer::new(&net, &params, &adam, flat, 16, &gpu).is_err());
     /// }
     /// ```
     pub fn new(
@@ -589,11 +618,14 @@ impl<'s> GpuTrainer<'s> {
                 )));
             }
         };
-        if !matches!(loss, Loss::CrossEntropy | Loss::Mse) {
+        if !matches!(loss, Loss::CrossEntropy | Loss::Nll | Loss::Mse) && regression(loss).is_none()
+        {
             return Err(Error::Unsupported(format!(
-                "GpuTrainer: the GPU has no Loss::{loss:?}; it runs CrossEntropy and Mse"
+                "GpuTrainer: the GPU has no Loss::{loss:?}; it runs CrossEntropy, Nll, Mse, L1, \
+                 Huber and SmoothL1"
             )));
         }
+        loss.check_threshold("GpuTrainer")?;
         let mut gpu_model = GpuModel::compile(model, params, batch_size, gpu)?;
         if gpu_model.params.is_empty() {
             return Err(Error::InvalidData(
@@ -628,6 +660,8 @@ impl<'s> GpuTrainer<'s> {
             sums: ChannelSums::new(gpu, &mut m.cache).map_err(shader)?,
             cross_entropy: SoftmaxCrossEntropy::new(gpu, &mut m.cache).map_err(shader)?,
             mse: MeanSquaredError::new(gpu, &mut m.cache).map_err(shader)?,
+            nll: NegativeLogLikelihood::new(gpu, &mut m.cache).map_err(shader)?,
+            regression: RegressionLoss::new(gpu, &mut m.cache).map_err(shader)?,
             finite: FiniteFlag::new(gpu, &mut m.cache).map_err(shader)?,
             squares: SumSquares::new(gpu, &mut m.cache).map_err(shader)?,
             dead_relu: DeadRelu::new(gpu, &mut m.cache).map_err(shader)?,
@@ -848,7 +882,7 @@ impl<'s> GpuTrainer<'s> {
             .extend(batch.x.data().iter().flat_map(|v| v.to_le_bytes()));
         let x_bytes = self.upload.len();
         match (self.loss, batch.targets) {
-            (Loss::CrossEntropy, TargetsView::Classes(labels)) if labels.len() == b => {
+            (loss, TargetsView::Classes(labels)) if loss.needs_classes() && labels.len() == b => {
                 if let Some((row, &label)) = labels.iter().enumerate().find(|(_, l)| **l >= output)
                 {
                     return Err(Error::InvalidData(format!(
@@ -859,7 +893,9 @@ impl<'s> GpuTrainer<'s> {
                 self.upload
                     .extend(labels.iter().flat_map(|&l| (l as u32).to_le_bytes()));
             }
-            (Loss::Mse, TargetsView::Values(t)) if t.shape().dims() == [b, output] => {
+            (loss, TargetsView::Values(t))
+                if !loss.needs_classes() && t.shape().dims() == [b, output] =>
+            {
                 self.upload
                     .extend(t.data().iter().flat_map(|v| v.to_le_bytes()));
             }
@@ -939,6 +975,8 @@ impl<'s> GpuTrainer<'s> {
         match &pass.loss {
             LossCall::CrossEntropy(call) => self.kernels.cross_entropy.record(&mut step, call),
             LossCall::Mse(call) => self.kernels.mse.record(&mut step, call),
+            LossCall::Nll(call) => self.kernels.nll.record(&mut step, call),
+            LossCall::Regression(call) => self.kernels.regression.record(&mut step, call),
         }
         if profiling {
             let mut start = 0;
@@ -2058,15 +2096,36 @@ impl TrainPass {
                 &grads[g],
                 (&loss_value, 0),
             )),
-            _ => LossCall::Mse(train.mse.call(
+            Loss::Nll => LossCall::Nll(train.nll.call(
                 steps,
                 pool,
-                u32_of(batch * out_width),
+                (u32_of(batch), u32_of(out_width)),
                 &values[x],
                 &targets,
                 &grads[g],
                 (&loss_value, 0),
             )),
+            _ => match regression(loss) {
+                Some(kind) => LossCall::Regression(train.regression.call(
+                    steps,
+                    pool,
+                    kind,
+                    u32_of(batch * out_width),
+                    &values[x],
+                    &targets,
+                    &grads[g],
+                    (&loss_value, 0),
+                )),
+                None => LossCall::Mse(train.mse.call(
+                    steps,
+                    pool,
+                    u32_of(batch * out_width),
+                    &values[x],
+                    &targets,
+                    &grads[g],
+                    (&loss_value, 0),
+                )),
+            },
         };
 
         // The backward pass, last layer first. A parameter's gradient is written once, by

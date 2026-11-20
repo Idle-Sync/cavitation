@@ -108,3 +108,119 @@ extern "C" __global__ void mean_merge(const float *partials, float *out, u32 off
     }
     out[offset] = acc / divisor;
 }
+
+// The bits of +infinity and of the sign.
+#define INF_BITS 0x7f800000u
+#define SIGN_BIT 0x80000000u
+
+// The negative log-likelihood, one thread per row: the row's loss -lp[label] (its sign bit
+// flipped) and its gradient, -w at the label and +0 elsewhere, as the CPU's bits. A row with a
+// NaN gets NaN for its loss and keeps its finite gradient; a row whose label is not below the
+// classes gets NaN for its loss and its whole gradient row.
+extern "C" __global__ void nll_rows(const u32 *log_probs, const u32 *labels, u32 *grad,
+                                    u32 *row_loss, u32 batch, u32 classes, float w) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch) {
+        return;
+    }
+    u32 base = i * classes;
+    u32 label = labels[i];
+    if (label >= classes) {
+        row_loss[i] = NAN_BITS;
+        for (u32 j = 0u; j < classes; j = j + 1u) {
+            grad[base + j] = NAN_BITS;
+        }
+        return;
+    }
+    bool nan = false;
+    for (u32 j = 0u; j < classes; j = j + 1u) {
+        nan = nan || (log_probs[base + j] & 0x7fffffffu) > INF_BITS;
+    }
+    row_loss[i] = nan ? NAN_BITS : log_probs[base + label] ^ SIGN_BIT;
+    u32 minus_w = __float_as_uint(w) ^ SIGN_BIT;
+    for (u32 j = 0u; j < classes; j = j + 1u) {
+        grad[base + j] = j == label ? minus_w : 0u;
+    }
+}
+
+// The bits of pred[i] - target[i], its NaN and infinite cases decided from the inputs' bits.
+__device__ u32 difference_bits(const float *pred, const float *target, u32 i) {
+    u32 pb = __float_as_uint(pred[i]);
+    u32 tb = __float_as_uint(target[i]);
+    u32 pm = pb & 0x7fffffffu;
+    u32 tm = tb & 0x7fffffffu;
+    if (pm > INF_BITS || tm > INF_BITS) {
+        return NAN_BITS;
+    }
+    if (pm == INF_BITS && tm == INF_BITS) {
+        return pb != tb ? pb : NAN_BITS;
+    }
+    if (pm == INF_BITS) {
+        return pb;
+    }
+    if (tm == INF_BITS) {
+        return tb ^ SIGN_BIT;
+    }
+    return __float_as_uint(pred[i] - target[i]);
+}
+
+// The L1 (kind 0), Huber (kind 1) and smooth L1 (kind 2) losses with threshold param, one
+// thread per value: each value's loss into terms and the prediction's gradient into grad. NaN
+// gives NaN for both; an infinite difference takes the linear branch, a loss of +inf (NaN with
+// an infinite threshold, for Huber and smooth L1) and the gradient sign(d) * w (Huber's
+// sign(d) * (param * w)). A finite difference runs the CPU's expressions in its order.
+extern "C" __global__ void regression_terms(const float *pred, const float *target, u32 *grad,
+                                            u32 *terms, u32 n, float w, u32 kind,
+                                            float param) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    u32 db = difference_bits(pred, target, i);
+    u32 magnitude = db & 0x7fffffffu;
+    if (magnitude > INF_BITS) {
+        terms[i] = NAN_BITS;
+        grad[i] = NAN_BITS;
+        return;
+    }
+    u32 sign = db & SIGN_BIT;
+    u32 wb = __float_as_uint(w);
+    if (magnitude == INF_BITS) {
+        bool infinite_param = (__float_as_uint(param) & 0x7fffffffu) == INF_BITS;
+        if (kind == 0u) {
+            terms[i] = INF_BITS;
+            grad[i] = wb ^ sign;
+        } else if (kind == 1u) {
+            terms[i] = infinite_param ? NAN_BITS : INF_BITS;
+            grad[i] = (infinite_param ? INF_BITS : __float_as_uint(param * w)) ^ sign;
+        } else {
+            terms[i] = infinite_param ? NAN_BITS : INF_BITS;
+            grad[i] = wb ^ sign;
+        }
+        return;
+    }
+    float d = __uint_as_float(db);
+    float a = fabsf(d);
+    // sign(d) * w, with sign(+-0) = 0 giving +0, as the CPU's sign.
+    u32 unit = d > 0.0f ? wb : (d < 0.0f ? wb ^ SIGN_BIT : 0u);
+    if (kind == 0u) {
+        terms[i] = __float_as_uint(a);
+        grad[i] = unit;
+    } else if (kind == 1u) {
+        if (a < param) {
+            terms[i] = __float_as_uint(0.5f * d * d);
+            grad[i] = __float_as_uint(d * w);
+        } else {
+            terms[i] = __float_as_uint(param * (a - 0.5f * param));
+            grad[i] = __float_as_uint((d > 0.0f ? param : -param) * w);
+        }
+    } else {
+        if (a < param) {
+            terms[i] = __float_as_uint(0.5f * d * d / param);
+            grad[i] = __float_as_uint(d / param * w);
+        } else {
+            terms[i] = __float_as_uint(a - 0.5f * param);
+            grad[i] = unit;
+        }
+    }
+}

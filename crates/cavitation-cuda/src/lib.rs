@@ -69,6 +69,11 @@
 //!   squared error's gradient the CPU's bits and its loss the fixed tree's, the
 //!   cross-entropy within the WGSL kernel's stated bounds (`tests/loss.rs`).
 //!
+//! - [`NegativeLogLikelihood`], and [`RegressionLoss`] with a [`Regression`] (L1, Huber and
+//!   smooth L1): the other training losses with `Reduction::Mean`, ported from the WGSL
+//!   kernels: each row's or value's loss and gradient the CPU's bits, NaN and ±∞ included,
+//!   and the mean the fixed tree's (`tests/loss.rs`).
+//!
 //! - [`OptimizerKernel`] and [`OptimizerRule`]: SGD (with momentum and weight decay), Adam
 //!   and AdamW over a model's parameters in flat buffers, one launch per step, skipped when
 //!   the step's finite flag is set, as this crate's own kernels: the bits of the kernels'
@@ -149,7 +154,9 @@ pub use error::CudaError;
 pub use glu::{Glu, GluGate, GluOp};
 pub use health::{DeadRelu, FiniteFlag, SumSquares};
 pub use linear::{Linear, LinearShape};
-pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
+pub use loss::{
+    MeanSquaredError, NegativeLogLikelihood, Regression, RegressionLoss, SoftmaxCrossEntropy,
+};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d, PoolShape};

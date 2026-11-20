@@ -53,8 +53,10 @@
 //! - [`kernels::BatchNorm2d`]: 2-D batch normalisation as `Tape::batch_norm2d` computes it,
 //!   forward and backward, from the batch's statistics or running ones, and the running
 //!   statistics' update, skipped when the step's finite flag is set.
-//! - [`kernels::SoftmaxCrossEntropy`] and [`kernels::MeanSquaredError`]: the training losses
-//!   as the tape's `Reduction::Mean` computes them, with their gradients.
+//! - [`kernels::SoftmaxCrossEntropy`], [`kernels::MeanSquaredError`],
+//!   [`kernels::NegativeLogLikelihood`] and [`kernels::RegressionLoss`] (L1, Huber and smooth
+//!   L1): the training losses as the tape's `Reduction::Mean` computes them, with their
+//!   gradients.
 //! - [`kernels::SumSquares`], [`kernels::FiniteFlag`] and [`kernels::DeadRelu`]: the health
 //!   values a step reads back: each gradient's sum of squares, the finite flag (tested by
 //!   bits) and the dead-ReLU bits.

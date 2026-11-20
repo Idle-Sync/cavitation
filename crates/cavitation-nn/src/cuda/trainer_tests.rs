@@ -1,10 +1,11 @@
 //! `CudaTrainer` against the CPU: each parameter's gradient after one step against the `f64`
 //! training tape's from the same weights, batch and dropout masks, on the test MLP (with a
 //! neuron mask), a small CNN (convolution, batch norm, max pooling, dropout), a CNN through
-//! average and adaptive average pooling, `mnist-cnn` and `cifar-cnn`; the parameters after one
-//! SGD step within the update's bound; two runs giving the same bits; a step on non-finite
-//! inputs leaving the parameters and the optimiser's state as they were; five steps tracking
-//! the CPU `Trainer`; and a profiled step.
+//! average and adaptive average pooling, `mnist-cnn` and `cifar-cnn`, and every loss besides
+//! cross-entropy on an MLP; the parameters after one SGD step within the update's bound; two
+//! runs giving the same bits; a step on non-finite inputs leaving the parameters and the
+//! optimiser's state as they were; five steps tracking the CPU `Trainer`; and a profiled
+//! step.
 //!
 //! The `f64` reference takes the card's discrete decisions: each ReLU keeps the values whose
 //! input was above 0 on the card, and each max pooling takes the card's winners (as a sum over
@@ -25,12 +26,12 @@
 
 use std::time::Duration;
 
-use cavitation_core::{Gate, Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
+use cavitation_core::{Gate, Graph, ParamStore, Pool2dGeom, Tensor, TensorView};
 
 use super::CudaTrainer;
 use super::test_util::{
     ADAPTIVE_OUTPUTS, Data, GLU_GATES, Twin, activation_mlp, cifar_cnn, glu_mlp, mlp, mnist_cnn,
-    more_activations, off, pool_cnn, prelu_mlp, small_cnn, softmax_mlp, twin, with_cuda,
+    more_activations, off, pool_cnn, prelu_mlp, small_cnn, softmax_mlp, twin, uniform, with_cuda,
 };
 use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
@@ -50,7 +51,7 @@ struct Decisions {
 /// Each parameter's gradient on the `f64` training tape (seed 0, step 1, as a trainer's
 /// first step), with cross-entropy, in the `f64` store's parameter order, with each ReLU and
 /// max pooling taking the card's `decisions`.
-fn tape_gradients(t: &mut Twin, data: &Data, decisions: &Decisions) -> Vec<Vec<f64>> {
+fn tape_gradients(t: &mut Twin, data: &Data, loss: Loss, decisions: &Decisions) -> Vec<Vec<f64>> {
     let width = data.x.len() / data.rows;
     let x64: Vec<f64> = data.x.iter().map(|&v| f64::from(v)).collect();
     let input = Tensor::from_vec(x64, &[data.rows, width]).unwrap();
@@ -81,7 +82,11 @@ fn tape_gradients(t: &mut Twin, data: &Data, decisions: &Decisions) -> Vec<Vec<f
             }
             v = y;
         }
-        let loss = tape.softmax_cross_entropy(v, &data.labels, Reduction::Mean);
+        let wide: Option<Vec<f64>> =
+            (data.values.as_ref()).map(|values| values.iter().map(|&x| f64::from(x)).collect());
+        let values = (wide.as_ref())
+            .map(|w| TensorView::from_slice(w, &[data.rows, w.len() / data.rows]).unwrap());
+        let loss = loss.record_f64(&mut tape, v, &data.labels, values);
         tape.backward(loss, &mut t.params64.grads);
     }
     (t.net64.parameter_names().into_iter())
@@ -139,8 +144,14 @@ fn card_decisions(t: &Twin, trainer: &CudaTrainer<'_, '_>, rows: usize, what: &s
 
 /// One trainer step with a learning rate of 0, and each parameter's gradient on the card
 /// against the `f64` tape's with the card's ReLU and max-pooling decisions, every layer
-/// asserted.
-fn check_gradients(mut t: Twin, data: &Data, what: &str) {
+/// asserted, with cross-entropy.
+fn check_gradients(t: Twin, data: &Data, what: &str) {
+    check_loss_gradients(t, data, Loss::CrossEntropy, what);
+}
+
+/// [`check_gradients`] with `loss`, on `data`'s labels for a class loss and its values for
+/// the others.
+fn check_loss_gradients(mut t: Twin, data: &Data, loss: Loss, what: &str) {
     let names: Vec<String> = (t.net.parameter_names().into_iter())
         .map(|(n, _)| n)
         .collect();
@@ -150,20 +161,13 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
             momentum: 0.0,
             weight_decay: 0.0,
         };
-        let mut trainer = CudaTrainer::new(
-            &t.net,
-            &t.params,
-            &still,
-            Loss::CrossEntropy,
-            data.rows,
-            cuda,
-        )
-        .unwrap();
+        let mut trainer =
+            CudaTrainer::new(&t.net, &t.params, &still, loss, data.rows, cuda).unwrap();
         trainer.step(&t.net, data.view()).unwrap();
         let got = trainer.last_gradients();
         let decisions = card_decisions(&t, &trainer, data.rows, what);
         drop(trainer);
-        let want = tape_gradients(&mut t, data, &decisions);
+        let want = tape_gradients(&mut t, data, loss, &decisions);
         assert_eq!(
             (names.len(), want.len()),
             (got.len(), got.len()),
@@ -293,6 +297,41 @@ fn pool_layers_match_the_tape() {
         let t = twin(|p, s| pool_cnn(p, s, to), |p, s| pool_cnn(p, s, to), seed);
         let what = format!("adaptive pooling to {to:?}");
         check_gradients(t, &Data::new(seed, 6, 98, 5), &what);
+    }
+}
+
+/// The losses on value targets the card trains, with thresholds that put the test MLP's
+/// outputs against targets in `[−1, 1)` on both branches, and smooth L1's `beta` of 0.
+const VALUE_LOSSES: [Loss; 7] = [
+    Loss::Mse,
+    Loss::L1,
+    Loss::Huber { delta: 0.5 },
+    Loss::Huber { delta: 1.0 },
+    Loss::SmoothL1 { beta: 0.5 },
+    Loss::SmoothL1 { beta: 1.0 },
+    Loss::SmoothL1 { beta: 0.0 },
+];
+
+/// Each loss besides cross-entropy: the negative log-likelihood after an MLP whose every
+/// `Linear` ends in a log-softmax, and each of `VALUE_LOSSES` after the test MLP on targets
+/// in `[−1, 1)`: the card's gradients against the `f64` tape's, within the tolerance above.
+#[test]
+fn every_loss_matches_the_tape() {
+    let t = twin(
+        |p, s| softmax_mlp(p, s, true),
+        |p, s| softmax_mlp(p, s, true),
+        170,
+    );
+    let data = Data::within(170, 24, 12, 4, (-2.0, 2.0));
+    check_loss_gradients(t, &data, Loss::Nll, "Nll");
+    for (k, loss) in VALUE_LOSSES.into_iter().enumerate() {
+        let seed = 171 + k as u64;
+        let t = twin(mlp::<f64>, mlp::<f32>, seed);
+        let data = Data {
+            values: Some(uniform(seed + 100, 24 * 4, -1.0, 1.0)),
+            ..Data::within(seed, 24, 12, 4, (-2.0, 2.0))
+        };
+        check_loss_gradients(t, &data, loss, &format!("{loss:?}"));
     }
 }
 
@@ -616,5 +655,45 @@ fn cifar_step_time() {
             median(&|p| p.readback),
             median(&|p| p.total)
         );
+    });
+}
+
+/// A step with `Loss::Nll` whose labels hold one equal to the output width is
+/// `Error::InvalidData` naming the row, before anything runs: the parameters stay as they
+/// were, and the trainer has taken no step.
+#[test]
+fn an_nll_label_past_the_outputs_is_refused() {
+    let t = twin(
+        |p, s| softmax_mlp(p, s, true),
+        |p, s| softmax_mlp(p, s, true),
+        190,
+    );
+    let mut data = Data::within(190, 8, 12, 4, (-2.0, 2.0));
+    data.labels[5] = 4;
+    with_cuda(|cuda| {
+        let sgd = OptimizerConfig::Sgd {
+            lr: 0.1,
+            momentum: 0.0,
+            weight_decay: 0.0,
+        };
+        let mut trainer = CudaTrainer::new(&t.net, &t.params, &sgd, Loss::Nll, 8, cuda).unwrap();
+        let error = trainer.step(&t.net, data.view()).unwrap_err();
+        assert!(
+            matches!(error, cavitation_core::Error::InvalidData(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("the label of row 5 is 4"),
+            "{error}"
+        );
+        assert_eq!(trainer.steps(), 0);
+        let mut after = t.params.clone();
+        trainer.sync_to(&mut after);
+        for (name, id) in t.net.state_names() {
+            let bits = |p: &ParamStore| -> Vec<u32> {
+                p.value(id).data().iter().map(|v| v.to_bits()).collect()
+            };
+            assert_eq!(bits(&after), bits(&t.params), "{name}");
+        }
     });
 }

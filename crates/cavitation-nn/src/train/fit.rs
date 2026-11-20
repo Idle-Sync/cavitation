@@ -86,8 +86,34 @@ impl Loss {
     }
 
     /// Whether the loss takes class labels rather than target values.
-    fn needs_classes(self) -> bool {
+    pub(crate) fn needs_classes(self) -> bool {
         matches!(self, Loss::CrossEntropy | Loss::Nll)
+    }
+
+    /// Checks the threshold of [`Huber`](Loss::Huber) and [`SmoothL1`](Loss::SmoothL1) as
+    /// the tape checks the `f32` [`record`](Loss::record) gives it, where the tape panics:
+    /// [`Error::InvalidData`] naming `who`, with the tape's message, for a `delta` that is not
+    /// above 0 or a `beta` below 0 as an `f32`, NaN either way. [`fit`], [`evaluate`] and
+    /// the GPU trainers refuse such a loss before any work, on every device.
+    ///
+    /// [`evaluate`]: crate::evaluate
+    pub(crate) fn check_threshold(self, who: &str) -> Result<(), Error> {
+        let problem = match self {
+            Loss::Huber { delta } if (delta as f32).is_nan() || delta as f32 <= 0.0 => {
+                format!(
+                    "huber: delta must be positive, but it is {:?}",
+                    delta as f32
+                )
+            }
+            Loss::SmoothL1 { beta } if (beta as f32).is_nan() || (beta as f32) < 0.0 => {
+                format!(
+                    "smooth_l1: beta must not be negative, but it is {:?}",
+                    beta as f32
+                )
+            }
+            _ => return Ok(()),
+        };
+        Err(Error::InvalidData(format!("{who}: {problem}")))
     }
 
     /// Panics, naming the loss and the kind of targets, if `targets` do not suit the loss.
@@ -152,6 +178,37 @@ impl Loss {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, any(feature = "gpu", feature = "cuda")))]
+impl Loss {
+    /// [`record`](Loss::record) on an `f64` tape, for the GPU engines' tests: class `labels`
+    /// for a class loss, else the target `values` (recorded as an input first), with the
+    /// threshold the `f32` tape takes, widened.
+    pub(crate) fn record_f64(
+        self,
+        tape: &mut Tape<'_, f64>,
+        out: Var,
+        labels: &[usize],
+        values: Option<TensorView<'_, f64>>,
+    ) -> Var {
+        let mean = Reduction::Mean;
+        match (self, values) {
+            (Loss::CrossEntropy, _) => tape.softmax_cross_entropy(out, labels, mean),
+            (Loss::Nll, _) => tape.nll(out, labels, mean),
+            (loss, Some(values)) => {
+                let t = tape.input(values);
+                match loss {
+                    Loss::Mse => tape.mse(out, t, mean),
+                    Loss::L1 => tape.l1(out, t, mean),
+                    Loss::Huber { delta } => tape.huber(out, t, f64::from(delta as f32), mean),
+                    Loss::SmoothL1 { beta } => tape.smooth_l1(out, t, f64::from(beta as f32), mean),
+                    other => unimplemented!("Loss::{other:?} on an f64 tape"),
+                }
+            }
+            (loss, None) => panic!("Loss::{loss:?} needs target values"),
         }
     }
 }
@@ -2102,11 +2159,12 @@ pub(crate) fn check_dataset(data: &Dataset) -> Result<(), Error> {
 }
 
 /// Checks, before any training, that `model` and `loss` suit `data` (already passed by
-/// [`check_dataset`]): the kind of targets is the kind `loss` needs, binary cross-entropy
-/// targets are in `[0, 1]` (neither needs the output width, so both run even for a model
-/// whose layers disagree), the inputs are as wide as each layer that names an input width
-/// expects, every class label is below the
-/// model's output width, and value targets are as wide as the model's output.
+/// [`check_dataset`]): the kind of targets is the kind `loss` needs, a Huber or smooth L1
+/// threshold is one the tape takes ([`Loss::check_threshold`], named `Loss`), binary
+/// cross-entropy targets are in `[0, 1]` (none of these needs the output width, so they run
+/// even for a model whose layers disagree), the inputs are as wide as each layer that names
+/// an input width expects, every class label is below the model's output width, and value
+/// targets are as wide as the model's output.
 pub(super) fn check_model_and_loss(
     model: &Sequential,
     loss: Loss,
@@ -2121,6 +2179,7 @@ pub(super) fn check_model_and_loss(
             kind(has_classes)
         )));
     }
+    loss.check_threshold("Loss")?;
     if matches!(
         loss,
         Loss::BinaryCrossEntropy | Loss::BinaryCrossEntropyWithLogits
@@ -2227,7 +2286,8 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 ///
 /// Returns, before training, [`Error::InvalidData`] if `train.x` is not a matrix or has no rows, if
 /// value targets are not a matrix, if the kind of targets is not the kind `config.loss` needs (see
-/// [`Loss`]), if a class label is not below the model's output width, or, for
+/// [`Loss`]), if a [`Loss::Huber`] `delta` is not above 0 or a [`Loss::SmoothL1`] `beta` is below
+/// 0 (NaN either way, as the `f32` the tape takes, where the tape panics), if a class label is not below the model's output width, or, for
 /// [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`], if a target is NaN,
 /// infinite or outside `[0, 1]` (the message names its row and column), if the targets do not have
 /// one entry per row, if value targets are not as wide as the model's output, if the inputs are not
@@ -5762,6 +5822,80 @@ mod tests {
         let auto = run(Device::Auto, false);
         if auto.0 == DeviceKind::Cpu {
             assert_eq!(auto, cpu);
+        }
+    }
+
+    /// A Huber `delta` not above 0 or a smooth L1 `beta` below 0, NaN either way and as the
+    /// `f32` the tape takes, is `Error::InvalidData` with the tape's message from `fit` on the
+    /// CPU, before any step (the tape itself panics), and from `evaluate`; the parameters are
+    /// untouched. A `beta` of 0 and a tiny positive `delta` train.
+    #[test]
+    fn a_bad_threshold_is_invalid_data() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new().push(Linear::new(&mut params, 3, 2, &mut Rng::seed(4)));
+        let data = Dataset {
+            x: Tensor::full(&[6, 3], 0.5),
+            targets: Targets::Values(Tensor::full(&[6, 2], 1.0)),
+        };
+        let config = |loss| FitConfig {
+            epochs: 1,
+            batch: 4,
+            loss,
+            health: Health::quiet(),
+            ..FitConfig::default()
+        };
+        let bits = |p: &ParamStore| -> Vec<u32> {
+            (net.state_names().iter())
+                .flat_map(|(_, id)| p.value(*id).data().iter().map(|v| v.to_bits()))
+                .collect()
+        };
+        for (loss, message) in [
+            (
+                Loss::Huber { delta: 0.0 },
+                "huber: delta must be positive, but it is 0.0",
+            ),
+            (
+                Loss::Huber { delta: -2.0 },
+                "huber: delta must be positive, but it is -2.0",
+            ),
+            (
+                Loss::Huber { delta: 1e-50 },
+                "huber: delta must be positive, but it is 0.0",
+            ),
+            (
+                Loss::Huber { delta: f64::NAN },
+                "huber: delta must be positive, but it is NaN",
+            ),
+            (
+                Loss::SmoothL1 { beta: -0.5 },
+                "smooth_l1: beta must not be negative, but it is -0.5",
+            ),
+            (
+                Loss::SmoothL1 { beta: f64::NAN },
+                "smooth_l1: beta must not be negative, but it is NaN",
+            ),
+        ] {
+            let mut trained = params.clone();
+            let error = fit(&net, &mut trained, &data, config(loss)).unwrap_err();
+            assert!(matches!(error, Error::InvalidData(_)), "{loss:?}: {error}");
+            assert_eq!(error.to_string(), format!("invalid data: Loss: {message}"));
+            assert_eq!(bits(&trained), bits(&params), "{loss:?}");
+            let measured = crate::evaluate(&net, &params, &data, loss, 4).unwrap_err();
+            assert_eq!(
+                measured.to_string(),
+                format!("invalid data: Loss: {message}")
+            );
+        }
+        for loss in [
+            Loss::SmoothL1 { beta: 0.0 },
+            Loss::SmoothL1 { beta: -0.0 },
+            Loss::Huber { delta: 1e-30 },
+        ] {
+            let mut trained = params.clone();
+            assert!(
+                fit(&net, &mut trained, &data, config(loss)).is_ok(),
+                "{loss:?}"
+            );
         }
     }
 }

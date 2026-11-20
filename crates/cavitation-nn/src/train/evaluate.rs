@@ -598,7 +598,8 @@ impl Evaluator {
     ///
     /// Returns [`Error::InvalidData`], as [`fit`](crate::fit) does before training, if
     /// `data.x` is not a matrix or has no rows, if the targets are not one per row, if the
-    /// kind of targets is not the kind the loss needs, if binary cross-entropy targets are
+    /// kind of targets is not the kind the loss needs, if a Huber `delta` is not above 0 or
+    /// a smooth L1 `beta` is below 0 (NaN either way), if binary cross-entropy targets are
     /// outside `[0, 1]`, if the inputs are not as wide as the model expects, if value
     /// targets are not as wide as the model's output, or if a class label is not below the
     /// model's output width (the message names the row, the label and the width).
