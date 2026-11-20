@@ -2,19 +2,20 @@
 //! `cavitation-gpu`'s tests check its WGSL ones. Max pooling forward is compared bit for bit,
 //! payloads and subnormals included, with its winners, on windows built to hold the ties and
 //! NaNs that decide a winner. Max pooling backward is compared bit for bit on sums that round
-//! and on subnormal, infinite and NaN gradients: nothing is flushed. Average pooling, forward
-//! and backward, is compared bit for bit with the CPU's `f32` kernels on small integers, on
-//! seeded values whose sums round and on special values, and within the WGSL kernels' rounding
-//! bound of an `f64` reference. Each test skips without CUDA, unless
-//! `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
+//! and on subnormal, infinite and NaN gradients: nothing is flushed. Average and adaptive
+//! average pooling, forward and backward, are compared bit for bit with the CPU's `f32`
+//! kernels on small integers, on seeded values whose sums round and on special values, and
+//! within the WGSL kernels' rounding bounds of an `f64` reference. Each test skips without
+//! CUDA, unless `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
 
 mod common;
 
 use cavitation_core::Pool2dGeom;
 use cavitation_core::kernels::pooling::{
-    avg_pool2d, avg_pool2d_backward, max_pool2d_backward, max_pool2d_reference,
+    adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
+    max_pool2d_backward, max_pool2d_reference,
 };
-use cavitation_cuda::{AvgPool2d, Cuda, CudaError, MaxPool2d, PoolShape};
+use cavitation_cuda::{AdaptiveAvgPool2d, AvgPool2d, Cuda, CudaError, MaxPool2d, PoolShape};
 use common::{
     Seeded, U, assert_exact, assert_within, exact_values, nans, panic_message, read, read_u32,
     seeded_values, upload,
@@ -569,6 +570,224 @@ fn misuse_is_refused() {
     });
     assert!(
         text.contains("the input gradient buffer holds 12 bytes"),
+        "{text}"
+    );
+}
+
+/// One adaptive-pooling case: channels, input size, output size and batch.
+type Adaptive = (usize, (usize, usize), (usize, usize), usize);
+
+/// The shapes the adaptive-pooling twins run, as `cavitation-gpu`'s tests: global pooling of
+/// the CNN heads, uneven windows that overlap (7 → 3) beside even ones (5 → 2 across), an
+/// output larger than its input (4 → 6, pixels shared by two outputs), overlapping windows of
+/// 3 (9 → 4), an output equal to its input, and windows of powers of two (6 → 4, 8 → 1).
+fn adaptive_cases() -> Vec<Adaptive> {
+    vec![
+        (8, (32, 32), (1, 1), 2),
+        (3, (7, 5), (3, 2), 2),
+        (2, (4, 6), (6, 4), 3),
+        (4, (9, 9), (4, 4), 1),
+        (2, (5, 5), (5, 5), 2),
+        (2, (6, 8), (4, 1), 2),
+    ]
+}
+
+/// The CPU's window along an axis: `floor(o · size / out) .. ceil((o + 1) · size / out)`.
+fn adaptive_window(o: usize, out: usize, size: usize) -> std::ops::Range<usize> {
+    o * size / out..((o + 1) * size).div_ceil(out)
+}
+
+/// Along one axis of `size` pooled to `out`: the longest window, and the most outputs whose
+/// windows hold one pixel.
+fn adaptive_axis(size: usize, out: usize) -> (usize, usize) {
+    let longest = (0..out)
+        .map(|o| adaptive_window(o, out, size).len())
+        .max()
+        .unwrap();
+    let covers = (0..size)
+        .map(|p| {
+            (0..out)
+                .filter(|&o| adaptive_window(o, out, size).contains(&p))
+                .count()
+        })
+        .max()
+        .unwrap();
+    (longest, covers)
+}
+
+/// The card's kernels for an adaptive case.
+fn adaptive_pool(cuda: &Cuda, (c, input, output, batch): Adaptive) -> AdaptiveAvgPool2d<'_> {
+    let pair = |(a, b): (usize, usize)| (a as u32, b as u32);
+    AdaptiveAvgPool2d::new(cuda, batch as u32, c as u32, pair(input), pair(output))
+        .expect("adaptive pool")
+}
+
+/// The input and output lengths of an adaptive case.
+fn adaptive_lens((c, (h, w), (oh, ow), batch): Adaptive) -> (usize, usize) {
+    (batch * c * h * w, batch * c * oh * ow)
+}
+
+/// The card's adaptive-pooling outputs for `x`, written over NaNs.
+fn cuda_adaptive(cuda: &Cuda, case: Adaptive, x: &[f32]) -> Vec<f32> {
+    let pool = adaptive_pool(cuda, case);
+    let (_, outs) = adaptive_lens(case);
+    let (xb, mut out) = (upload(cuda, x), nans(cuda, outs));
+    pool.forward(&xb, &mut out).expect("forward");
+    read(&out, outs)
+}
+
+/// The card's adaptive-pooling input gradient: `dx` plus each output gradient's share.
+fn cuda_adaptive_backward(cuda: &Cuda, case: Adaptive, dy: &[f32], dx: &[f32]) -> Vec<f32> {
+    let pool = adaptive_pool(cuda, case);
+    let (dyb, mut dxb) = (upload(cuda, dy), upload(cuda, dx));
+    pool.backward(&dyb, &mut dxb).expect("backward");
+    read(&dxb, dx.len())
+}
+
+/// Adaptive average pooling, forward and backward, on small integers, on seeded values whose
+/// sums round, and on values with NaNs, infinities, signed zeros and subnormals among them:
+/// the CPU's `f32` bits on every shape, since the card sums in the CPU's order and divides
+/// correctly rounded, by the window's height and then its width.
+#[test]
+fn adaptive_pool_gives_the_cpus_bits() {
+    let Some(cuda) = Cuda::new() else { return };
+    for (s, case) in adaptive_cases().into_iter().enumerate() {
+        let (c, input, output, batch) = case;
+        let s = s as u64;
+        let (ins, outs) = adaptive_lens(case);
+        let inputs = [
+            (exact_values(1600 + s, ins), exact_values(1700 + s, outs)),
+            (mixed_values(1800 + s, ins), mixed_values(1900 + s, outs)),
+            (
+                with_specials(mixed_values(2000 + s, ins)),
+                with_specials(mixed_values(2100 + s, outs)),
+            ),
+        ];
+        for (k, (x, dy)) in inputs.into_iter().enumerate() {
+            let mut want = vec![0.0; outs];
+            adaptive_avg_pool2d(batch, c, input, output, &x, &mut want);
+            let what = format!("adaptive_avg_pool2d input {k} {case:?}");
+            assert_exact(&cuda_adaptive(&cuda, case, &x), &want, &what);
+            let dx = x;
+            let mut want = dx.clone();
+            adaptive_avg_pool2d_backward(batch, c, input, output, &dy, &mut want);
+            let got = cuda_adaptive_backward(&cuda, case, &dy, &dx);
+            assert_exact(&got, &want, &format!("{what} backward"));
+        }
+    }
+}
+
+/// Adaptive average pooling on seeded values, forward and backward, within the WGSL kernels'
+/// bound of an f64 reference of the same f32 inputs (derived in `cavitation-gpu`'s
+/// `tests/pooling.rs`): an output summing at most `n` pixels of a window of `dh · dw` within
+/// `(2(n + 2) + 11) · u · Σ|x| / (dh · dw)`, and an input gradient that at most `m` outputs
+/// cover within `(2(m + 3) + 10) · u · (|dx| + Σ|dy / (dh · dw)|)`.
+#[test]
+fn adaptive_pool_rounding_twin() {
+    let Some(cuda) = Cuda::new() else { return };
+    let (mut worst_forward, mut worst_backward) = (0.0f64, 0.0f64);
+    for (s, case) in adaptive_cases().into_iter().enumerate() {
+        let (c, input, output, batch) = case;
+        let s = s as u64;
+        let (ins, outs) = adaptive_lens(case);
+        let (rows, rows_cover) = adaptive_axis(input.0, output.0);
+        let (cols, cols_cover) = adaptive_axis(input.1, output.1);
+        let (n, m) = ((rows * cols) as f64, (rows_cover * cols_cover) as f64);
+        let wide = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>();
+        let abs = |v: &[f64]| v.iter().map(|x| x.abs()).collect::<Vec<f64>>();
+        let what = format!("adaptive_avg_pool2d {case:?}");
+
+        let x = seeded_values(2200 + s, ins, -1.0, 1.0);
+        let (mut reference, mut scale) = (vec![0.0; outs], vec![0.0; outs]);
+        adaptive_avg_pool2d(batch, c, input, output, &wide(&x), &mut reference);
+        adaptive_avg_pool2d(batch, c, input, output, &abs(&wide(&x)), &mut scale);
+        let worst = assert_within(
+            &cuda_adaptive(&cuda, case, &x),
+            &reference,
+            |i| (2.0 * (n + 2.0) + 11.0) * U * scale[i],
+            &what,
+        );
+        worst_forward = worst_forward.max(worst.ratio());
+
+        let dy = seeded_values(2300 + s, outs, -1.0, 1.0);
+        let dx = seeded_values(2400 + s, ins, -1.0, 1.0);
+        let (mut reference, mut scale) = (wide(&dx), abs(&wide(&dx)));
+        adaptive_avg_pool2d_backward(batch, c, input, output, &wide(&dy), &mut reference);
+        adaptive_avg_pool2d_backward(batch, c, input, output, &abs(&wide(&dy)), &mut scale);
+        let worst = assert_within(
+            &cuda_adaptive_backward(&cuda, case, &dy, &dx),
+            &reference,
+            |i| (2.0 * (m + 3.0) + 10.0) * U * scale[i],
+            &format!("{what} backward"),
+        );
+        worst_backward = worst_backward.max(worst.ratio());
+    }
+    println!(
+        "adaptive_avg_pool2d: worst {worst_forward:.3} of its bound forward, {worst_backward:.3} \
+         backward"
+    );
+}
+
+/// A 4100 × 4100 image pooled to its own size (16.8M values) copies it forward and adds `dy`
+/// to `dx` backward, every value exactly once; two runs of both passes give the same bits.
+#[test]
+fn adaptive_pool_covers_a_large_grid_the_same_every_run() {
+    let Some(cuda) = Cuda::new() else { return };
+    let case = (1, (4100, 4100), (4100, 4100), 1);
+    let n = 4100 * 4100;
+    let x = exact_values(2500, n);
+    assert_exact(&cuda_adaptive(&cuda, case, &x), &x, "adaptive 4100");
+    let dy = exact_values(2501, n);
+    let dx = exact_values(2502, n);
+    let want: Vec<f32> = dx.iter().zip(&dy).map(|(a, b)| a + b).collect();
+    let got = cuda_adaptive_backward(&cuda, case, &dy, &dx);
+    assert_exact(&got, &want, "adaptive 4100 backward");
+
+    let case = (3, (7, 5), (3, 2), 2);
+    let x = mixed_values(2503, 2 * 3 * 35);
+    let dy = mixed_values(2504, 2 * 3 * 6);
+    let dx = mixed_values(2505, 2 * 3 * 35);
+    assert_bits(
+        &cuda_adaptive(&cuda, case, &x),
+        &cuda_adaptive(&cuda, case, &x),
+        "adaptive again",
+    );
+    assert_bits(
+        &cuda_adaptive_backward(&cuda, case, &dy, &dx),
+        &cuda_adaptive_backward(&cuda, case, &dy, &dx),
+        "adaptive backward again",
+    );
+}
+
+/// A count or size of 0, as the CPU refuses a size of 0, and sizes whose window arithmetic
+/// or lengths overflow a `u32` are refused with `CudaError::Invalid`; a short buffer panics
+/// before the launch, naming it.
+#[test]
+fn adaptive_misuse_is_refused() {
+    let Some(cuda) = Cuda::new() else { return };
+    for (batch, channels, input, output) in [
+        (0, 1, (4, 4), (2, 2)),
+        (1, 0, (4, 4), (2, 2)),
+        (1, 1, (4, 4), (0, 2)),
+        (1, 1, (0, 4), (2, 2)),
+        (1, 1, (70_000, 1), (70_000, 1)),
+        (1 << 16, 1 << 16, (1, 1), (1, 1)),
+    ] {
+        assert!(
+            matches!(
+                AdaptiveAvgPool2d::new(&cuda, batch, channels, input, output),
+                Err(CudaError::Invalid(_))
+            ),
+            "{batch} {channels} {input:?} {output:?}"
+        );
+    }
+    let pool = AdaptiveAvgPool2d::new(&cuda, 1, 1, (4, 4), (2, 2)).expect("adaptive pool");
+    let (x, mut short) = (upload(&cuda, &[0.0f32; 16]), nans(&cuda, 3));
+    let text = panic_message(|| {
+        let _ = pool.forward(&x, &mut short);
+    });
+    assert!(
+        text.contains("the output buffer holds 12 bytes, and 4 values need 16"),
         "{text}"
     );
 }

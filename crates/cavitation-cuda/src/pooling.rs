@@ -1,6 +1,7 @@
-//! 2-D max and average pooling, forward and backward, as this crate's own CUDA kernels, the
-//! twins of the CPU's `max_pool2d_reference`, `max_pool2d_backward`, `avg_pool2d` and
-//! `avg_pool2d_backward` in `cavitation_core::kernels::pooling`.
+//! 2-D max, average and adaptive average pooling, forward and backward, as this crate's own
+//! CUDA kernels, the twins of the CPU's `max_pool2d_reference`, `max_pool2d_backward`,
+//! `avg_pool2d`, `avg_pool2d_backward`, `adaptive_avg_pool2d` and
+//! `adaptive_avg_pool2d_backward` in `cavitation_core::kernels::pooling`.
 
 use std::fmt;
 
@@ -241,14 +242,15 @@ struct Compiled<'c> {
 }
 
 impl<'c> Compiled<'c> {
-    /// Compiles the source as `name` with `defines` in front, for `shape` (checked); the
-    /// forward kernel is `prefix` + `_forward`, the backward one `prefix` + `_backward`.
+    /// Compiles the source as `name` with `defines` in front, for `(outputs, inputs)` values
+    /// per batch, which the caller has checked fit a `u32`; the forward kernel is `prefix` +
+    /// `_forward`, the backward one `prefix` + `_backward`.
     fn new(
         cuda: &'c Cuda,
         name: &str,
         prefix: &str,
         defines: String,
-        shape: &PoolShape,
+        (outputs, inputs): (usize, usize),
     ) -> Result<Compiled<'c>, CudaError> {
         let module = cuda.compile(name, &(defines + SOURCE))?;
         let forward = module.function(&format!("{prefix}_forward"))?;
@@ -257,8 +259,8 @@ impl<'c> Compiled<'c> {
             module,
             forward,
             backward,
-            outputs: shape.y_len(),
-            inputs: shape.x_len(),
+            outputs,
+            inputs,
         })
     }
 
@@ -345,7 +347,13 @@ impl<'c> MaxPool2d<'c> {
             shape.dilation.0,
             shape.dilation.1
         );
-        let kernels = Compiled::new(cuda, "pooling.cu (max)", "max", defines, &shape)?;
+        let kernels = Compiled::new(
+            cuda,
+            "pooling.cu (max)",
+            "max",
+            defines,
+            (shape.y_len(), shape.x_len()),
+        )?;
         Ok(MaxPool2d { shape, kernels })
     }
 
@@ -512,7 +520,13 @@ impl<'c> AvgPool2d<'c> {
             u8::from(count_include_pad),
             divisor_override.unwrap_or(0)
         );
-        let kernels = Compiled::new(cuda, "pooling.cu (avg)", "avg", defines, &shape)?;
+        let kernels = Compiled::new(
+            cuda,
+            "pooling.cu (avg)",
+            "avg",
+            defines,
+            (shape.y_len(), shape.x_len()),
+        )?;
         Ok(AvgPool2d { shape, kernels })
     }
 
@@ -562,6 +576,211 @@ impl<'c> AvgPool2d<'c> {
         let k = &self.kernels;
         check_buffers(
             "avg_pool2d backward",
+            &[
+                (dy, "output gradient", k.outputs),
+                (dx, "input gradient", k.inputs),
+            ],
+        );
+        // SAFETY: the backward kernel takes (const float *grad_out, float *grad_in), reads
+        // outputs below `outputs` and touches input pixels below `inputs`, which the buffers
+        // hold (checked above); dx, borrowed mutably, is not dy.
+        unsafe { k.launch(k.backward, k.inputs, &[Arg::Buffer(dy), Arg::Buffer(dx)]) }
+    }
+}
+
+/// Adaptive average pooling on the card for one shape, as the CPU's `adaptive_avg_pool2d`
+/// and `adaptive_avg_pool2d_backward` compute it, bit for bit: `channels` planes of `input`
+/// (height, width) pooled to `output`, output `(i, j)` the sum of rows
+/// `floor(i · h / oh) .. ceil((i + 1) · h / oh)` and the same columns for `j`, in row-major
+/// order, divided by the window's height and then by its width; the backward pass adds each
+/// output gradient, divided the same way, to every pixel of its window, one thread per pixel
+/// adding its outputs in the CPU's order. The divisions are correctly rounded and nothing is
+/// flushed, so subnormals and ±∞ go where the CPU's do, and NaN appears wherever the CPU has
+/// NaN (with CUDA's own NaN bits).
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_cuda::{AdaptiveAvgPool2d, Cuda};
+///
+/// if let Some(cuda) = Cuda::new() {
+///     // One 1 x 4 image pooled to 1 x 3: windows [0, 2), [1, 3) and [2, 4).
+///     let pool = AdaptiveAvgPool2d::new(&cuda, 1, 1, (1, 4), (1, 3)).unwrap();
+///     let (mut x, mut y) = (cuda.buffer(16).unwrap(), cuda.buffer(12).unwrap());
+///     x.write(&[1.0f32, 3.0, 5.0, 7.0]).unwrap();
+///     pool.forward(&x, &mut y).unwrap();
+///     let mut out = [0.0f32; 3];
+///     y.read(&mut out).unwrap();
+///     assert_eq!(out, [2.0, 4.0, 6.0]);
+/// }
+/// ```
+pub struct AdaptiveAvgPool2d<'c> {
+    /// Images, channels, input size and output size.
+    sizes: (u32, u32, (u32, u32), (u32, u32)),
+    /// The kernels, compiled for the sizes.
+    kernels: Compiled<'c>,
+}
+
+impl fmt::Debug for AdaptiveAvgPool2d<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdaptiveAvgPool2d")
+            .field("sizes", &self.sizes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'c> AdaptiveAvgPool2d<'c> {
+    /// Compiles the forward and backward kernels for `batch` images of `channels` planes of
+    /// `input` (height, width) pooled to `output`, on `cuda`'s card.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Invalid`] if a count or size is 0 (the CPU's `adaptive_avg_pool2d`
+    /// refuses a size of 0), the input or output holds more than 2³² − 1 values, or along an
+    /// axis `(size + 1) · (out + 1)` does not fit a `u32` (it bounds the window arithmetic);
+    /// [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the driver refuses the
+    /// kernels.
+    ///
+    /// ```
+    /// use cavitation_cuda::{AdaptiveAvgPool2d, Cuda};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     assert!(AdaptiveAvgPool2d::new(&cuda, 32, 64, (7, 7), (1, 1)).is_ok());
+    ///     assert!(AdaptiveAvgPool2d::new(&cuda, 32, 64, (7, 7), (0, 1)).is_err());
+    /// }
+    /// ```
+    pub fn new(
+        cuda: &'c Cuda,
+        batch: u32,
+        channels: u32,
+        input: (u32, u32),
+        output: (u32, u32),
+    ) -> Result<AdaptiveAvgPool2d<'c>, CudaError> {
+        let sizes = (batch, channels, input, output);
+        let refuse = |why: &str| {
+            Err(CudaError::Invalid(format!(
+                "adaptive_avg_pool2d: {why}: {batch} images of {channels} channels of \
+                 {input:?} pooled to {output:?}"
+            )))
+        };
+        if [batch, channels, input.0, input.1, output.0, output.1].contains(&0) {
+            return refuse("the batch, channels and sizes must be at least 1");
+        }
+        let fits = |size: u32, out: u32| {
+            (u64::from(size) + 1) * (u64::from(out) + 1) <= u64::from(u32::MAX)
+        };
+        if !fits(input.0, output.0) || !fits(input.1, output.1) {
+            return refuse("the window arithmetic does not fit a u32");
+        }
+        let values = |(h, w): (u32, u32)| {
+            PoolShape::product([batch, channels, h, w]).filter(|&n| n <= u32::MAX as usize)
+        };
+        let (Some(outputs), Some(inputs)) = (values(output), values(input)) else {
+            return refuse("the input or output holds more than 2³² − 1 values");
+        };
+        let mut defines = String::from("#define ADAPTIVE 1\n");
+        for (name, value) in [
+            ("FORWARD_TOTAL", outputs as u64),
+            ("BACKWARD_TOTAL", inputs as u64),
+            ("H", u64::from(input.0)),
+            ("W", u64::from(input.1)),
+            ("OH", u64::from(output.0)),
+            ("OW", u64::from(output.1)),
+        ] {
+            defines.push_str(&format!("#define {name} {value}u\n"));
+        }
+        let kernels = Compiled::new(
+            cuda,
+            "pooling.cu (adaptive)",
+            "adaptive",
+            defines,
+            (outputs, inputs),
+        )?;
+        Ok(AdaptiveAvgPool2d { sizes, kernels })
+    }
+
+    /// Images, channels, input size and output size.
+    ///
+    /// ```
+    /// use cavitation_cuda::{AdaptiveAvgPool2d, Cuda};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let pool = AdaptiveAvgPool2d::new(&cuda, 2, 3, (7, 5), (3, 2)).unwrap();
+    ///     assert_eq!(pool.sizes(), (2, 3, (7, 5), (3, 2)));
+    /// }
+    /// ```
+    pub fn sizes(&self) -> (u32, u32, (u32, u32), (u32, u32)) {
+        self.sizes
+    }
+
+    /// Writes each output of the batch `x` to `y`, every one of them.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the launch is refused.
+    ///
+    /// # Panics
+    ///
+    /// If `x` holds fewer floats than the batch's input or `y` fewer than its output.
+    ///
+    /// ```
+    /// use cavitation_cuda::{AdaptiveAvgPool2d, Cuda};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let pool = AdaptiveAvgPool2d::new(&cuda, 1, 1, (2, 2), (1, 1)).unwrap();
+    ///     let (mut x, mut y) = (cuda.buffer(16).unwrap(), cuda.buffer(4).unwrap());
+    ///     x.write(&[1.0f32, 2.0, 3.0, 6.0]).unwrap();
+    ///     pool.forward(&x, &mut y).unwrap();
+    ///     let mut out = [0.0f32];
+    ///     y.read(&mut out).unwrap();
+    ///     assert_eq!(out, [3.0]);
+    /// }
+    /// ```
+    pub fn forward(&self, x: &DeviceBuffer<'_>, y: &mut DeviceBuffer<'_>) -> Result<(), CudaError> {
+        let k = &self.kernels;
+        check_buffers(
+            "adaptive_avg_pool2d forward",
+            &[(x, "input", k.inputs), (y, "output", k.outputs)],
+        );
+        // SAFETY: the forward kernel takes (const float *x, float *out), reads inputs below
+        // `inputs` and writes outputs below `outputs`, which the buffers hold (checked
+        // above); y, borrowed mutably, is not x.
+        unsafe { k.launch(k.forward, k.outputs, &[Arg::Buffer(x), Arg::Buffer(y)]) }
+    }
+
+    /// Adds each output gradient `dy`, divided by its window's height and then its width, to
+    /// the input gradient `dx` at every pixel of its window.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the launch is refused.
+    ///
+    /// # Panics
+    ///
+    /// If `dy` holds fewer floats than the batch's output or `dx` fewer than its input.
+    ///
+    /// ```
+    /// use cavitation_cuda::{AdaptiveAvgPool2d, Cuda};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let pool = AdaptiveAvgPool2d::new(&cuda, 1, 1, (2, 2), (1, 1)).unwrap();
+    ///     let (mut dy, mut dx) = (cuda.buffer(4).unwrap(), cuda.buffer(16).unwrap());
+    ///     dy.write(&[4.0f32]).unwrap();
+    ///     dx.write(&[0.0f32; 4]).unwrap();
+    ///     pool.backward(&dy, &mut dx).unwrap();
+    ///     let mut grad = [0.0f32; 4];
+    ///     dx.read(&mut grad).unwrap();
+    ///     assert_eq!(grad, [1.0; 4]);
+    /// }
+    /// ```
+    pub fn backward(
+        &self,
+        dy: &DeviceBuffer<'_>,
+        dx: &mut DeviceBuffer<'_>,
+    ) -> Result<(), CudaError> {
+        let k = &self.kernels;
+        check_buffers(
+            "adaptive_avg_pool2d backward",
             &[
                 (dy, "output gradient", k.outputs),
                 (dx, "input gradient", k.inputs),

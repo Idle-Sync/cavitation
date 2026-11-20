@@ -55,8 +55,9 @@
 //!   SiLU gate, forward and backward, as this crate's own kernels: the ReLU gate the CPU's
 //!   bits, the others within the WGSL kernels' stated bounds (`tests/glu.rs`).
 //!
-//! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
-//!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
+//! - [`MaxPool2d`], [`AvgPool2d`], [`AdaptiveAvgPool2d`] and [`PoolShape`]: 2-D max, average
+//!   and adaptive average pooling, forward and backward, as this crate's own kernels, each the
+//!   CPU's bits (`tests/pooling.rs`).
 //!
 //! - [`BatchNorm2d`], [`BatchStats`], [`RunningUpdate`] and [`ChannelDims`]: 2-D batch
 //!   normalisation, forward from the batch's or the running statistics, backward and the
@@ -151,7 +152,7 @@ pub use linear::{Linear, LinearShape};
 pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
-pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
+pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d, PoolShape};
 pub use prelu::{Prelu, PreluOp};
 pub use reduce::ChannelDims;
 pub use softmax::{RowSoftmax, RowSoftmaxOp};
