@@ -2581,23 +2581,20 @@ fn run_fit_as(
         Device::Cuda(cuda) => Some(cuda),
         _ => opened_cuda.as_ref(),
     };
+    // The GPU a run names, or that `CAVITATION_DEVICE=gpu` asks for. Under `Choice::Best` the
+    // GPU is opened later, only once CUDA was not used.
     #[cfg(feature = "gpu")]
-    let opened = {
-        use cavitation_gpu::{Backend, Gpu};
-        match choice {
-            Choice::Only(DeviceKind::Gpu) if auto => {
-                let gpu = Gpu::open(Backend::on_this_platform())
-                    .map_err(|e| Error::Unsupported(format!("CAVITATION_DEVICE=gpu: {e}")))?;
-                Some(gpu)
-            }
-            Choice::Best if auto && !cpu_only => Gpu::open(Backend::on_this_platform()).ok(),
-            _ => None,
-        }
+    let asked = match choice {
+        Choice::Only(DeviceKind::Gpu) if auto => Some(
+            cavitation_gpu::Gpu::open(cavitation_gpu::Backend::on_this_platform())
+                .map_err(|e| Error::Unsupported(format!("CAVITATION_DEVICE=gpu: {e}")))?,
+        ),
+        _ => None,
     };
     #[cfg(feature = "gpu")]
-    let gpu = match config.device {
+    let named = match config.device {
         Device::Gpu(gpu) => Some(gpu),
-        _ => opened.as_ref(),
+        _ => asked.as_ref(),
     };
     #[cfg(any(feature = "gpu", feature = "cuda"))]
     {
@@ -2605,7 +2602,7 @@ fn run_fit_as(
         let mut card = false;
         #[cfg(feature = "gpu")]
         {
-            card |= gpu.is_some();
+            card |= named.is_some();
         }
         #[cfg(feature = "cuda")]
         {
@@ -2679,8 +2676,14 @@ fn run_fit_as(
             Err(e) => device_note = Some(e.to_string()),
         }
     }
+    // `Device::Auto` opens the GPU only now that CUDA, tried first, was not used, so a CUDA
+    // run holds no wgpu device.
     #[cfg(feature = "gpu")]
-    if let Some(gpu) = gpu {
+    let opened = (named.is_none() && fall_back && !cpu_only)
+        .then(|| cavitation_gpu::Gpu::open(cavitation_gpu::Backend::on_this_platform()).ok())
+        .flatten();
+    #[cfg(feature = "gpu")]
+    if let Some(gpu) = named.or(opened.as_ref()) {
         // A run that can fall back looks at the health settings first: building the trainer
         // compiles the model's shaders, which is wasted on a run those settings refuse.
         let refused = match crate::gpu::GpuTrainer::check_health(&config.health) {
