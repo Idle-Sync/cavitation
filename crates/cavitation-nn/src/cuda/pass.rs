@@ -4,11 +4,11 @@
 
 use std::cell::{Ref, RefCell, RefMut};
 
-use cavitation_core::{Conv2dGeom, Pool2dGeom};
+use cavitation_core::{Conv2dGeom, Gate, GeluApprox, Pool2dGeom};
 use cavitation_cuda::{
     AvgPool2d, BatchNorm2d, BatchStats, ChannelDims, Conv2d, ConvShape, Cuda, CudaError,
-    DeviceBuffer, Dropout, Elementwise, ElementwiseOp, Linear, LinearShape, MaxPool2d, PoolShape,
-    Prelu, PreluOp, RowSoftmax, RowSoftmaxOp,
+    DeviceBuffer, Dropout, Elementwise, ElementwiseOp, Glu, GluGate, GluOp, Linear, LinearShape,
+    MaxPool2d, PoolShape, Prelu, PreluOp, RowSoftmax, RowSoftmaxOp,
 };
 
 use crate::plan::{Act, CompiledLayer, Kind};
@@ -103,6 +103,8 @@ pub(crate) struct Shared<'c> {
     pub(crate) softmax: RowSoftmax<'c>,
     /// PReLU: forward, the input's gradient and the slopes' gradient.
     pub(crate) prelu: Prelu<'c>,
+    /// Gated linear units, forward and backward.
+    pub(crate) glu: Glu<'c>,
 }
 
 /// The kernels of one pass that are set up for its shapes, which its [`Op`]s name by index.
@@ -214,6 +216,17 @@ pub(crate) enum Op {
         dy: usize,
         partials: usize,
         ds: usize,
+    },
+    /// A GLU's `op` with `gate` over `rows` rows of `width` values of `x` (and the gradient
+    /// `dy`): the forward pass, or the input's gradient, both halves.
+    Glu {
+        op: GluOp,
+        gate: GluGate,
+        rows: usize,
+        width: usize,
+        x: usize,
+        dy: Option<usize>,
+        y: usize,
     },
     /// Dropout of `n` values with the bits `mask` and the scale `scale`, forward or backward.
     Dropout {
@@ -354,6 +367,26 @@ fn run_op(
                 &mut s.get_mut(y),
                 rows,
                 channels,
+            )
+        }
+        Op::Glu {
+            op,
+            gate,
+            rows,
+            width,
+            x,
+            dy,
+            y,
+        } => {
+            let g = dy.map(|g| s.get(g));
+            (shared.glu).run(
+                op,
+                gate,
+                &s.get(x),
+                g.as_deref(),
+                &mut s.get_mut(y),
+                rows,
+                width,
             )
         }
         Op::PreluSlopeGrad {
@@ -595,6 +628,17 @@ pub(crate) fn prelu_shape(rows: usize, width: usize, channels: usize) -> (usize,
     }
 }
 
+/// The card's kernels for a GLU's `gate`.
+pub(crate) fn glu_gate(gate: Gate) -> GluGate {
+    match gate {
+        Gate::Sigmoid => GluGate::Sigmoid,
+        Gate::Gelu(GeluApprox::Tanh) => GluGate::GeluTanh,
+        Gate::Gelu(GeluApprox::Exact) => GluGate::GeluErf,
+        Gate::Relu => GluGate::Relu,
+        Gate::Silu => GluGate::Silu,
+    }
+}
+
 /// An activation's forward operation.
 pub(crate) fn forward_op(act: Act) -> ElementwiseOp {
     match act {
@@ -745,6 +789,19 @@ impl<'c> Forward<'c> {
                         channels,
                         x,
                         slope: parts.params[weight],
+                        dy: None,
+                        y,
+                    });
+                    y
+                }
+                Kind::Glu(gate) => {
+                    let y = store.values(n)?;
+                    ops.push(Op::Glu {
+                        op: GluOp::Forward,
+                        gate: glu_gate(gate),
+                        rows,
+                        width: layer.inputs,
+                        x,
                         dy: None,
                         y,
                     });

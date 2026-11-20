@@ -52,10 +52,10 @@ pub(crate) struct GpuMask {
 /// (with `min <= max`), [`Relu6`](crate::Relu6), [`Hardsigmoid`](crate::Hardsigmoid),
 /// [`Hardswish`](crate::Hardswish) and [`LogSigmoid`](crate::LogSigmoid), each as an
 /// [`ActivationLayer`](crate::ActivationLayer) too, [`Softmax`](crate::Softmax) and
-/// [`LogSoftmax`](crate::LogSoftmax) over each row, and [`Prelu`](crate::Prelu) with one slope
-/// per column or one shared slope (at most 65,535), its slopes trained as parameters. Neuron
-/// masks set on the model when it is compiled are compiled in; a mask set later needs a new
-/// compile.
+/// [`LogSoftmax`](crate::LogSoftmax) over each row, [`Prelu`](crate::Prelu) with one slope per
+/// column or one shared slope (at most 65,535), its slopes trained as parameters, and
+/// [`Glu`](crate::Glu) with every gate, over an even width. Neuron masks set on the model when
+/// it is compiled are compiled in; a mask set later needs a new compile.
 ///
 /// A batch-norm layer's `num_batches_tracked` stays on the host, since only the host
 /// decides whether a step's running-statistics update ran.
@@ -129,12 +129,14 @@ impl GpuModel {
     ///   the model has a convolution and `batch` is above 65,535 or a softmax and `batch` is
     ///   above 16,776,960, a PReLU has more than 65,535 slopes, takes more than 2³¹ values
     ///   per batch or its slope gradient would sum more than 268,431,360 values per slope, a
-    ///   `Linear`'s batch, inputs or outputs or a convolution's output pixels or channels are
-    ///   above 4,194,240, a batch norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the
-    ///   parameters, running statistics and masks together are larger than one GPU buffer.
+    ///   GLU takes more than 4,294,967,295 values per batch, a `Linear`'s batch, inputs or
+    ///   outputs or a convolution's output pixels or channels are above 4,194,240, a batch
+    ///   norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the parameters, running
+    ///   statistics and masks together are larger than one GPU buffer.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
-    ///   a mask is not as wide as its layer's output, a batch count does not hold one value,
+    ///   a GLU's input width is odd (the CPU's GLU panics on it), a mask is not as wide as its
+    ///   layer's output, a batch count does not hold one value,
     ///   a PReLU's weight does not hold one value per slope, or a batch norm that keeps no
     ///   running statistics would see one value per channel; the message names the layer (and
     ///   both widths, where two differ).
@@ -148,17 +150,17 @@ impl GpuModel {
     /// A layer the GPU does not run is refused by index and name:
     ///
     /// ```
-    /// use cavitation_core::{Gate, ParamStore, Rng};
+    /// use cavitation_core::{ParamStore, Rng};
     /// use cavitation_gpu::Gpu;
-    /// use cavitation_nn::{GpuModel, Glu, Linear, Sequential};
+    /// use cavitation_nn::{AdaptiveAvgPool2d, GpuModel, Linear, Sequential};
     ///
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new()
     ///     .push(Linear::new(&mut params, 4, 4, &mut Rng::seed(0)))
-    ///     .push(Glu { gate: Gate::Sigmoid });
+    ///     .push(AdaptiveAvgPool2d::new(1, (2, 2), (1, 1)).unwrap());
     /// if let Some(gpu) = Gpu::new() {
     ///     let err = GpuModel::compile(&net, &params, 8, &gpu).unwrap_err();
-    ///     assert!(err.to_string().contains("layer 1 (glu)"), "{err}");
+    ///     assert!(err.to_string().contains("layer 1 (adaptive_avg_pool2d)"), "{err}");
     /// }
     /// ```
     pub fn compile(
@@ -419,9 +421,9 @@ mod tests {
 
     use super::{Act, GpuModel, Kind, Plan, pack_rows};
     use crate::{
-        AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh, Init, Layer,
-        LeakyRelu, Linear, LogSoftmax, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax,
-        Tanh,
+        AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu,
+        Hardtanh, Init, Layer, LeakyRelu, Linear, LogSoftmax, MaxPool2d, NeuronMask, Relu,
+        Sequential, Sigmoid, Softmax, Tanh,
     };
 
     /// A layer with no inference form.
@@ -439,6 +441,33 @@ mod tests {
         }
         fn parameters(&self) -> Vec<(&'static str, ParamId)> {
             Vec::new()
+        }
+    }
+
+    /// A layer that passes its input on and fixes an input width more than half of `usize`.
+    struct Huge;
+
+    impl<T: Real> Layer<T> for Huge {
+        fn name(&self) -> &str {
+            "huge"
+        }
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        fn input_width(&self) -> Option<usize> {
+            Some(usize::MAX / 2 + 1)
+        }
+        fn forward(&self, _: &mut Tape<'_, T>, x: Var) -> Var {
+            x
+        }
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+        fn inference(
+            &self,
+            _: &cavitation_core::ParamValues<f32>,
+        ) -> Option<crate::InferenceLayer> {
+            Some(crate::InferenceLayer::Identity)
         }
     }
 
@@ -574,10 +603,18 @@ mod tests {
             (
                 Sequential::new()
                     .push(linear(&mut params, &mut rng))
+                    .push(AdaptiveAvgPool2d::new(3, (1, 1), (1, 1)).unwrap()),
+                "unsupported: GpuModel::compile: layer 1 (adaptive_avg_pool2d) is not a layer the \
+                 GPU runs",
+            ),
+            (
+                Sequential::new()
+                    .push(linear(&mut params, &mut rng))
                     .push(Glu {
                         gate: Gate::Sigmoid,
                     }),
-                "unsupported: GpuModel::compile: layer 1 (glu) is not a layer the GPU runs",
+                "invalid data: GpuModel::compile: layer 1 (glu) is a GLU over width 3, which must \
+                 be even",
             ),
             (
                 Sequential::new()
@@ -856,5 +893,117 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// A GLU is planned with every gate, halving the width: a GLU before the first layer that
+    /// fixes a width doubles the model's input width for each GLU, an odd width is invalid on
+    /// both engines, as the CPU's GLU panics on it, and both refuse more than 4,294,967,295
+    /// values per batch, which the kernels' 32-bit indices do not hold.
+    #[test]
+    fn glu_is_planned_with_its_widths() {
+        use crate::plan::Engine;
+
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(5);
+        for gate in [
+            Gate::Sigmoid,
+            Gate::Gelu(GeluApprox::Tanh),
+            Gate::Gelu(GeluApprox::Exact),
+            Gate::Relu,
+            Gate::Silu,
+        ] {
+            let net = Sequential::new()
+                .push(Linear::new(&mut params, 4, 6, &mut rng))
+                .push(Glu { gate })
+                .push(Linear::new(&mut params, 3, 2, &mut rng));
+            let plan = Plan::build(&net, &params, 8).unwrap();
+            assert_eq!(plan.layers[1].kind, Kind::Glu(gate));
+            assert_eq!((plan.layers[1].inputs, plan.layers[1].outputs), (6, 3));
+        }
+
+        let net = Sequential::new()
+            .push(Glu { gate: Gate::Silu })
+            .push(Glu {
+                gate: Gate::Sigmoid,
+            })
+            .push(Linear::new(&mut params, 3, 2, &mut rng));
+        let plan = Plan::build(&net, &params, 8).unwrap();
+        assert_eq!(plan.input_width, 12);
+        let widths: Vec<(usize, usize)> =
+            plan.layers.iter().map(|l| (l.inputs, l.outputs)).collect();
+        assert_eq!(widths, [(12, 6), (6, 3), (3, 2)]);
+        let alone = Sequential::new().push(Glu { gate: Gate::Relu });
+        let err = Plan::build(&alone, &params, 8).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unsupported: GpuModel::compile: no layer of the model fixes its input width"
+        );
+        let doubled = Sequential::new().push(Glu { gate: Gate::Relu }).push(Huge);
+        let err = Plan::build(&doubled, &params, 8).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported: GpuModel::compile: layer 1 (huge) takes input width {}, which the \
+                 GLUs before it double past what memory can index",
+                usize::MAX / 2 + 1
+            )
+        );
+
+        let odd = Sequential::new()
+            .push(Linear::new(&mut params, 4, 5, &mut rng))
+            .push(Glu { gate: Gate::Relu });
+        for engine in [Engine::WGPU, Engine::CUDA] {
+            let err = Plan::build_for(&odd, &params, 8, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "invalid data: {}: layer 1 (glu) is a GLU over width 5, which must be even",
+                    engine.name
+                )
+            );
+        }
+
+        let wide = Sequential::new()
+            .push(Linear::new(&mut params, 2, 4096, &mut rng))
+            .push(Glu { gate: Gate::Relu });
+        for engine in [Engine::WGPU, Engine::CUDA] {
+            assert!(Plan::build_for(&wide, &params, 1_048_575, engine).is_ok());
+            let err = Plan::build_for(&wide, &params, 1_048_576, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: {}: layer 1 (glu) is a GLU over 1048576 rows of 4096 values, \
+                     more than the 4294967295 per batch the GPU takes",
+                    engine.name
+                )
+            );
+        }
+    }
+
+    /// A GLU's buffers are held to the largest buffer the GPU binds, as every layer's are: a
+    /// leading GLU over 4,096 values a row, at the first batch whose input is larger, is
+    /// refused when the model compiles, before anything is allocated.
+    #[test]
+    fn glu_buffers_are_held_to_the_gpus_binding_limit() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Glu { gate: Gate::Relu })
+            .push(Linear::new(&mut params, 2048, 1, &mut Rng::seed(8)));
+        for_each_gpu(|gpu| {
+            let limits = &gpu.info().limits;
+            let largest = limits
+                .max_buffer_size
+                .min(limits.max_storage_buffer_binding_size);
+            let batch = (largest / (4 * 4096) + 1) as usize;
+            let err = GpuModel::compile(&net, &params, batch, gpu).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: GpuModel::compile: layer 0 (glu) reads or writes {} bytes per \
+                     batch of {batch}, more than the {largest} this GPU binds",
+                    4 * 4096 * batch
+                )
+            );
+        });
     }
 }

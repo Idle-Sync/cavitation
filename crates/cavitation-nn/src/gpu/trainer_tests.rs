@@ -16,13 +16,13 @@
 //! that a failure.
 
 use cavitation_core::{
-    Conv2dGeom, Graph, ParamStore, Pool2dGeom, Real, Reduction, Rng, Tensor, TensorView,
+    Conv2dGeom, Gate, Graph, ParamStore, Pool2dGeom, Real, Reduction, Rng, Tensor, TensorView,
 };
 use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuTrainer;
 use super::forward_tests::{
-    Twin, activation_mlp, mlp, more_activations, prelu_mlp, softmax_mlp, twin,
+    GLU_GATES, Twin, activation_mlp, glu_mlp, mlp, more_activations, prelu_mlp, softmax_mlp, twin,
 };
 use crate::{
     BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, Loss,
@@ -376,6 +376,26 @@ fn prelu_layers_match_the_tape() {
         );
         let what = if shared { "shared PReLU" } else { "PReLU" };
         check_gradients(t, &Data::new(seed, 24, 12, 4, (-2.0, 2.0)), what);
+    }
+}
+
+/// A GLU of each gate after the first two `Linear`s of an MLP, and with the ReLU and SiLU
+/// gates a GLU as the first layer too (the input 24 wide): the GPU's gradients against the
+/// `f64` tape's, within the tolerance above.
+#[test]
+fn glu_layers_match_the_tape() {
+    let leading = [(Gate::Relu, true), (Gate::Silu, true)];
+    let cases = GLU_GATES.into_iter().map(|g| (g, false)).chain(leading);
+    for (k, (gate, lead)) in cases.enumerate() {
+        let seed = 120 + k as u64;
+        let t = twin(
+            |p, s| glu_mlp(p, s, gate, lead),
+            |p, s| glu_mlp(p, s, gate, lead),
+            seed,
+        );
+        let width = if lead { 24 } else { 12 };
+        let what = format!("GLU with {gate:?}{}", if lead { ", leading" } else { "" });
+        check_gradients(t, &Data::new(seed, 24, width, 4, (-2.0, 2.0)), &what);
     }
 }
 

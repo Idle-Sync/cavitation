@@ -11,8 +11,13 @@ use crate::error::CudaError;
 use crate::module::{Arg, Module};
 use crate::sys::CuFunction;
 
-/// The kernels' source, a port of `cavitation-gpu`'s `elementwise.wgsl`.
+/// The kernels' source, a port of `cavitation-gpu`'s `elementwise.wgsl`, compiled after
+/// [`ACTIVATION`].
 const SOURCE: &str = include_str!("elementwise.cu");
+
+/// The scalar functions the element-wise and the GLU kernels share, a port of
+/// `cavitation-gpu`'s `activation.wgsl`: each module compiles its own text after this one.
+pub(crate) const ACTIVATION: &str = include_str!("activation.cu");
 
 /// Threads per block.
 const BLOCK: u32 = 256;
@@ -258,7 +263,7 @@ impl<'c> Elementwise<'c> {
     ///
     /// [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the driver refuses them.
     pub fn new(cuda: &'c Cuda) -> Result<Elementwise<'c>, CudaError> {
-        let module = cuda.compile("elementwise.cu", SOURCE)?;
+        let module = cuda.compile("elementwise.cu", &format!("{ACTIVATION}{SOURCE}"))?;
         let mut functions = [std::ptr::null_mut(); ElementwiseOp::ALL.len()];
         for (function, &op) in functions.iter_mut().zip(ElementwiseOp::ALL) {
             *function = module.function(op.kernel())?;
