@@ -1828,9 +1828,6 @@ pub struct History {
 /// variants. Without the `gpu` feature a hidden variant that can never be built holds the
 /// lifetime `'g`, which only `Gpu` and `Cuda` use.
 ///
-/// A `Cuda` handle stays on the thread that opened it, so with the `cuda` feature a `Device`,
-/// and the `FitConfig` that holds one, is not `Send`.
-///
 /// # Examples
 ///
 /// ```
@@ -4289,13 +4286,11 @@ mod tests {
         }
     }
 
-    /// A configuration, a trainer and their health checks can move to another thread; with
-    /// the `cuda` feature a configuration cannot, as `Device::Cuda` holds a `Cuda` handle,
-    /// which stays on its thread.
+    /// A configuration, a trainer and their health checks can move to another thread, with
+    /// or without the `cuda` feature.
     const _: () = {
         /// Requires `T: Send`.
         const fn send<T: Send>() {}
-        #[cfg(not(feature = "cuda"))]
         send::<FitConfig<'static>>();
         send::<Trainer<'static>>();
         send::<Health<'static>>();
@@ -4305,10 +4300,8 @@ mod tests {
     /// thread, moved into `std::thread::spawn` with the data, model and parameters, and
     /// trains there: both callbacks ran on the worker, not on this thread (the epoch
     /// callback once per epoch, the sink on the steps, with a bound every gradient passes),
-    /// and the run gives the parameters of the same run on this thread, bit for bit. With the
-    /// `cuda` feature a `FitConfig` is not `Send`, and the test is not built.
+    /// and the run gives the parameters of the same run on this thread, bit for bit.
     #[test]
-    #[cfg(not(feature = "cuda"))]
     fn a_fit_config_moves_to_another_thread() {
         type Seen = Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>;
         let make = |epochs: Seen, warnings: Seen| FitConfig {

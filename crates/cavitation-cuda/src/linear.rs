@@ -149,6 +149,7 @@ impl<'c> Linear<'c> {
     ///
     /// The buffers must hold the matrices the sizes and leading dimensions describe, and
     /// `c` must not be `a` or `b`.
+    /// The caller holds the lock, from [`Cuda::bind`].
     #[allow(clippy::too_many_arguments)]
     unsafe fn gemm(
         &self,
@@ -212,7 +213,7 @@ impl<'c> Linear<'c> {
         if let Some(b) = bias {
             Self::fits(b, s.outputs as usize, "bias");
         }
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let [batch, inputs, outputs] = self.sizes;
         // Row-major `y` is the column-major `outputs × batch` matrix `yᵀ = W · xᵀ`, where
         // row-major `W` is column-major `Wᵀ` (inputs × outputs) and row-major `x` is
@@ -271,7 +272,7 @@ impl<'c> Linear<'c> {
         Self::fits(w, s.w_len(), "weight");
         Self::fits(dy, s.y_len(), "output gradient");
         Self::fits(dx, s.x_len(), "input gradient");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let [batch, inputs, outputs] = self.sizes;
         // Column-major `dxᵀ` (inputs × batch) = `Wᵀ` (inputs × outputs) · `dyᵀ`.
         // SAFETY: `w` holds `inputs × outputs` floats, `dy` `outputs × batch` and `dx`
@@ -310,7 +311,7 @@ impl<'c> Linear<'c> {
         Self::fits(x, s.x_len(), "input");
         Self::fits(dy, s.y_len(), "output gradient");
         Self::fits(dw, s.w_len(), "weight gradient");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let [batch, inputs, outputs] = self.sizes;
         // Column-major `dWᵀ` (inputs × outputs) = `xᵀ` (inputs × batch) · `dy` (batch ×
         // outputs), the transpose of column-major `dyᵀ`.
@@ -347,7 +348,7 @@ impl<'c> Linear<'c> {
         let s = &self.shape;
         Self::fits(dy, s.y_len(), "output gradient");
         Self::fits(db, s.outputs as usize, "bias gradient");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let [batch, _, outputs] = self.sizes;
         // `db = dyᵀ · ones`, with column-major `dyᵀ` (outputs × batch).
         // SAFETY: the handle is live, `dy` holds `outputs × batch` floats, the ones

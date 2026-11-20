@@ -61,7 +61,7 @@ pub struct Kernel<'m> {
 #[derive(Clone, Copy, Debug)]
 pub enum Arg<'a> {
     /// A pointer parameter: the buffer's address on the card. The buffer may come from any
-    /// [`Cuda`] on this thread, since they share the card's primary context.
+    /// [`Cuda`], since they share the card's primary context.
     Buffer(&'a DeviceBuffer<'a>),
     /// An `unsigned int` parameter.
     U32(u32),
@@ -71,7 +71,8 @@ pub enum Arg<'a> {
     F32(f32),
 }
 
-/// An NVRTC program, destroyed when dropped.
+/// An NVRTC program, destroyed when dropped. It lives within one [`Cuda::compile`] call and
+/// is dropped there before the lock is given back.
 struct Program<'a> {
     /// NVRTC's functions.
     nvrtc: &'a Nvrtc,
@@ -146,10 +147,13 @@ impl Cuda {
         let c_name =
             CString::new(name).map_err(|_| failed("the name holds a NUL character".into()))?;
         let nvrtc = &self.nvrtc;
+        // Held across NVRTC's calls as well as the driver's, and declared before the
+        // program, which is destroyed before it is given back.
+        let _bound = self.bind()?;
 
         let mut raw = std::ptr::null_mut();
         // SAFETY: the pointer is to a live handle, both strings are NUL-terminated and
-        // live across the call, and no headers are passed.
+        // live across the call, and no headers are passed; the lock is held.
         let code = unsafe {
             (nvrtc.nvrtcCreateProgram)(
                 &mut raw,
@@ -190,9 +194,9 @@ impl Cuda {
             .text(nvrtc.nvrtcGetPTXSize, nvrtc.nvrtcGetPTX)
             .ok_or_else(|| failed("the compiler returned no PTX".into()))?;
 
-        self.bind()?;
         let mut module: CuModule = std::ptr::null_mut();
-        // SAFETY: the pointer is to a live handle, and `ptx` is a NUL-terminated PTX text.
+        // SAFETY: the pointer is to a live handle, `ptx` is a NUL-terminated PTX text, and
+        // the context is current on this thread with the lock held.
         let code =
             unsafe { (self.driver.cuModuleLoadData)(&mut module, ptx.as_ptr().cast::<c_void>()) };
         self.check("cuModuleLoadData", code)?;
@@ -229,7 +233,7 @@ impl<'c> Module<'c> {
     /// If `name` holds a NUL character.
     pub(crate) fn function(&self, name: &str) -> Result<CuFunction, CudaError> {
         let c_name = CString::new(name).expect("a kernel name holds no NUL character");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let mut function: CuFunction = std::ptr::null_mut();
         // SAFETY: the pointer is to a live handle, the module is loaded, and the name is
         // NUL-terminated and lives across the call.
@@ -260,11 +264,11 @@ impl Drop for Module<'_> {
     /// Waits for the card's work, which may still run the module's kernels, and unloads
     /// it. Errors are not reported: there is no one to report them to.
     fn drop(&mut self) {
-        // Made current first; if that fails, the calls below fail too, and nothing else
-        // can be done.
-        let _ = self.cuda.bind();
+        // The lock is taken and the context made current first; if that fails, the calls
+        // below fail too, and nothing else can be done.
+        let _bound = self.cuda.bind_anyway();
         // SAFETY: the module came from `cuModuleLoadData` in the card's context, now
-        // current on this thread, and is unloaded once.
+        // current on this thread with the lock held, and is unloaded once.
         unsafe {
             (self.cuda.driver.cuCtxSynchronize)();
             (self.cuda.driver.cuModuleUnload)(self.module);
@@ -346,7 +350,7 @@ impl Kernel<'_> {
                 Arg::F32(value) => u64::from(value.to_bits()),
             };
         }
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let mut pointers = [std::ptr::null_mut::<c_void>(); MAX_KERNEL_ARGS];
         for (pointer, value) in pointers.iter_mut().zip(values.iter_mut()) {
             *pointer = std::ptr::from_mut(value).cast::<c_void>();

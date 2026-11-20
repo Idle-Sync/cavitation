@@ -191,7 +191,7 @@ Device::Auto and --device auto train on the cuda.
 Choose with --device auto|cuda|gpu|cpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cuda|gpu|cpu.
 ```
 
-The convolution runs through cuDNN, with deterministic algorithms only, and `Linear` through cuBLAS; NVIDIA publishes no error bounds for either, so a CUDA run agrees with the CPU run within measured tolerances, and two CUDA runs give the same bits. An epoch of `cifar-cnn --cav-only --rows 12800 --epochs 3` takes 1.48 s with `--device cuda` on the machine above. A `Cuda` handle stays on the thread that opened it, so with the `cuda` feature a `FitConfig` is not `Send`.
+The convolution runs through cuDNN, with deterministic algorithms only, and `Linear` through cuBLAS; NVIDIA publishes no error bounds for either, so a CUDA run agrees with the CPU run within measured tolerances, and two CUDA runs give the same bits. An epoch of `cifar-cnn --cav-only --rows 12800 --epochs 3` takes 1.48 s with `--device cuda` on the machine above.
 
 ## The inspector
 

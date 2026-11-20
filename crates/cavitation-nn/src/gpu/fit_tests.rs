@@ -670,16 +670,13 @@ fn what_the_gpu_does_not_run_is_refused() {
 }
 
 /// The default device is the CPU, and a `FitConfig` that names a GPU still moves to another
-/// thread (without the `cuda` feature, whose `Device::Cuda` keeps it on its thread).
+/// thread.
 #[test]
 fn the_default_device_is_the_cpu() {
     assert!(matches!(FitConfig::default().device, Device::Cpu));
     assert!(matches!(Device::default(), Device::Cpu));
-    #[cfg(not(feature = "cuda"))]
-    {
-        fn is_send<T: Send>(_: &T) {}
-        is_send(&FitConfig::default());
-    }
+    fn is_send<T: Send>(_: &T) {}
+    is_send(&FitConfig::default());
     for_each_gpu(|gpu| {
         let config = FitConfig {
             device: Device::Gpu(gpu),

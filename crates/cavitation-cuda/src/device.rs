@@ -4,6 +4,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use crate::error::CudaError;
 use crate::find::{
@@ -111,21 +112,21 @@ impl fmt::Display for CudaInfo {
 /// The card is the driver's first; the context is the card's primary context, which other
 /// CUDA code in the process shares.
 ///
-/// A `Cuda` belongs to the thread that opened it, so the type is neither `Send` nor `Sync`.
-/// Buffers and modules borrow it and are dropped before it. Each call makes the card's
-/// context current on the thread first, so other CUDA code on the same thread may change
-/// the current context between calls; when the `Cuda` is dropped, the thread is left with
-/// no current context. Two `Cuda`s on one thread share the card's primary context, so a
-/// buffer of one may be passed to a kernel of the other.
+/// A `Cuda` is `Send` and `Sync`: it may be moved to another thread, or shared between
+/// threads behind a reference or an [`Arc`](std::sync::Arc). Calls from several threads are
+/// serialised: each call into the driver, cuDNN, cuBLAS or NVRTC (a buffer's copy, a
+/// kernel's launch, a convolution, a compile) takes a lock the `Cuda` holds and makes the
+/// card's context current on the calling thread, and gives the lock back when it returns,
+/// so the card is given one thread's work at a time, in the order the lock was taken.
+/// Buffers and modules borrow it and are dropped before it. Since each call makes the
+/// context current first, other CUDA code on the same thread may change the current
+/// context between calls; when the `Cuda` is dropped, the dropping thread is left with no
+/// current context. Two `Cuda`s share the card's primary context, so a buffer of one may be
+/// passed to a kernel of the other.
 ///
-/// ```compile_fail
-/// fn send<T: Send>(_: T) {}
-/// send(cavitation_cuda::Cuda::open().unwrap());
 /// ```
-///
-/// ```compile_fail
-/// fn share<T: Sync>(_: &T) {}
-/// share(&cavitation_cuda::Cuda::open().unwrap());
+/// fn send_and_sync<T: Send + Sync>() {}
+/// send_and_sync::<cavitation_cuda::Cuda>();
 /// ```
 ///
 /// # Examples
@@ -149,8 +150,8 @@ pub struct Cuda {
     pub(crate) nvrtc: Nvrtc,
     /// The card.
     device: CuDevice,
-    /// The card's primary context, retained once and current on the opening thread; null
-    /// until it is retained.
+    /// The card's primary context, retained once and made current on each thread that
+    /// calls in, while it holds `lock`; null until it is retained.
     context: CuContext,
     /// The cuDNN handle, or null until it is created.
     pub(crate) cudnn_handle: *mut c_void,
@@ -158,6 +159,50 @@ pub struct Cuda {
     pub(crate) cublas_handle: *mut c_void,
     /// What was opened.
     info: CudaInfo,
+    /// Held across every call into the driver and the libraries, so that one thread at a
+    /// time uses the context and the handles.
+    lock: Mutex<()>,
+}
+
+// SAFETY: `Cuda`'s raw pointers are the primary context and the cuDNN and cuBLAS handles,
+// and nothing about them ties them to the thread that made them:
+// - Every use of the context and the handles, here and in the types that borrow a `Cuda`,
+//   happens while `lock` is held (through `Cuda::bind`), so no two threads use them at
+//   once.
+// - With the lock held, the context is made current on the calling thread before the call
+//   (`cuCtxSetCurrent` "binds the specified CUDA context to the calling CPU thread"). The
+//   driver lets one context be current to several threads: `cuCtxDestroy` speaks of a
+//   context "current to other threads", and the primary context is "shared with the CUDA
+//   runtime API", which uses it from every thread of a process
+//   (https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__CTX.html,
+//   https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__PRIMARY__CTX.html).
+// - cuDNN: "The cuDNN library is thread-safe. Its functions can be called from multiple
+//   host threads, so long as the threads do not share the same cuDNN handle
+//   simultaneously", and the handle's device must stay the same, which it does: there is
+//   one card (https://docs.nvidia.com/deeplearning/cudnn/developer/misc.html).
+// - cuBLAS: "The library is thread safe and its functions can be called from multiple host
+//   threads, even with the same handle"; the handle is tied to the context current at
+//   `cublasCreate`, which is the one made current before each call, and its configuration
+//   is set once, in `start` (https://docs.nvidia.com/cuda/cublas/index.html).
+// - NVRTC: "Multiple threads can invoke NVRTC API functions concurrently, as long as there
+//   is no race condition", a race being two threads on one program; each program lives
+//   within one `Cuda::compile` call (https://docs.nvidia.com/cuda/nvrtc/index.html).
+// - Nothing is kept in thread-local state between calls: the only per-thread state the
+//   driver has is the current context, which each call sets again under the lock.
+// The function tables are plain function pointers, and the other fields are data.
+unsafe impl Send for Cuda {}
+// SAFETY: as for `Send`: every method taking `&Cuda` that reaches the driver or a library
+// does so with `lock` held and the context made current on the calling thread.
+unsafe impl Sync for Cuda {}
+
+/// The proof that a thread holds a [`Cuda`]'s lock, with the card's context current on it:
+/// what [`Cuda::bind`] returns. The lock is given back when it is dropped. The lock is not
+/// reentrant, so a value whose own `Drop` takes it (a buffer, a module) is declared before
+/// the guard in a scope that may drop it, and so is dropped after it.
+#[must_use = "the lock is held only while the guard lives"]
+pub(crate) struct Bound<'c> {
+    /// The lock.
+    _lock: MutexGuard<'c, ()>,
 }
 
 impl fmt::Debug for Cuda {
@@ -360,6 +405,7 @@ impl Cuda {
             context: std::ptr::null_mut(),
             cudnn_handle: std::ptr::null_mut(),
             cublas_handle: std::ptr::null_mut(),
+            lock: Mutex::new(()),
             info: CudaInfo {
                 name,
                 memory: memory as u64,
@@ -379,8 +425,9 @@ impl Cuda {
     }
 
     /// Retains the card's primary context, makes it current on this thread, and creates
-    /// the cuDNN and cuBLAS handles in it.
+    /// the cuDNN and cuBLAS handles in it, with the lock held.
     fn start(&mut self) -> Result<(), CudaError> {
+        let _lock = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: the pointer is to this struct's context field, written once, and the
         // device came from `cuDeviceGet`.
         let code =
@@ -456,7 +503,7 @@ impl Cuda {
     /// }
     /// ```
     pub fn free_memory(&self) -> Result<u64, CudaError> {
-        self.bind()?;
+        let _bound = self.bind()?;
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: both pointers are to live `usize`s, each written once, and this
         // thread's current context is the one opened.
@@ -483,20 +530,38 @@ impl Cuda {
     /// }
     /// ```
     pub fn synchronize(&self) -> Result<(), CudaError> {
-        self.bind()?;
+        let _bound = self.bind()?;
         // SAFETY: the function takes no arguments and works on this thread's current
         // context, the one opened.
         let code = unsafe { (self.driver.cuCtxSynchronize)() };
         self.check("cuCtxSynchronize", code)
     }
 
-    /// Makes the card's context current on the calling thread, which is the thread that
-    /// opened it (the type is not `Send`), so that the driver call after it works on this
-    /// card whatever other code made current in between.
-    pub(crate) fn bind(&self) -> Result<(), CudaError> {
-        // SAFETY: the context is retained until `self` drops.
+    /// Takes the lock and makes the card's context current on the calling thread, so that
+    /// the calls made while the guard lives are this thread's alone and work on this card,
+    /// whatever other code made current in between. Every call into the driver, cuDNN,
+    /// cuBLAS or NVRTC is made while a guard lives. The lock is not reentrant: a thread
+    /// holding the guard neither calls a function that binds again nor drops a value whose
+    /// `Drop` does.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the context cannot be made current; the lock is given back.
+    pub(crate) fn bind(&self) -> Result<Bound<'_>, CudaError> {
+        let (bound, code) = self.bind_anyway();
+        self.check("cuCtxSetCurrent", code)?;
+        Ok(bound)
+    }
+
+    /// Takes the lock and tries to make the card's context current, returning the guard
+    /// with the driver's status whether that worked or not: for a `Drop`, which goes on
+    /// either way. A lock poisoned by a panic on another thread is taken all the same: it
+    /// guards no data, only the order of calls.
+    pub(crate) fn bind_anyway(&self) -> (Bound<'_>, c_int) {
+        let lock = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: the context is retained until `self` drops, and the lock is held.
         let code = unsafe { (self.driver.cuCtxSetCurrent)(self.context) };
-        self.check("cuCtxSetCurrent", code)
+        (Bound { _lock: lock }, code)
     }
 
     /// The compute architecture kernels are compiled for, as `10 * major + minor`: the
@@ -540,17 +605,18 @@ impl Cuda {
 
 impl Drop for Cuda {
     /// Waits for the card's work, destroys the handles, gives the context back and leaves
-    /// the thread with no current context. Errors are not reported: there is no one to
-    /// report them to.
+    /// the dropping thread with no current context. Errors are not reported: there is no
+    /// one to report them to.
     fn drop(&mut self) {
         if self.context.is_null() {
             return;
         }
-        // SAFETY: the context is retained and is made current on this thread first, each
-        // handle is destroyed once and only if it was created, the context's reference is
-        // the one `start` took, and a null context is a valid argument to `cuCtxSetCurrent`.
+        let _bound = self.bind_anyway();
+        // SAFETY: the context is retained and made current on this thread just above, with
+        // the lock held; each handle is destroyed once and only if it was created, the
+        // context's reference is the one `start` took, and a null context is a valid
+        // argument to `cuCtxSetCurrent`.
         unsafe {
-            (self.driver.cuCtxSetCurrent)(self.context);
             (self.driver.cuCtxSynchronize)();
             if !self.cudnn_handle.is_null() {
                 (self.cudnn.cudnnDestroy)(self.cudnn_handle);
