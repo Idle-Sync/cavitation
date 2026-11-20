@@ -9,7 +9,7 @@ use cavitation_cuda::Cuda;
 
 use crate::{
     ActivationKind, ActivationLayer, BatchNorm2d, BatchView, Conv2d, Dataset, Dropout, Flatten,
-    Init, Linear, MaxPool2d, Relu, Sequential, Tanh, Targets, TargetsView,
+    Init, Linear, LogSoftmax, MaxPool2d, Relu, Sequential, Softmax, Tanh, Targets, TargetsView,
 };
 
 /// Runs `body` on CUDA if it opens, and returns whether it ran.
@@ -42,6 +42,26 @@ pub(super) fn mlp<T: Real>(params: &mut ParamStore<T>, seed: u64) -> Sequential<
         .push(Linear::new(params, 16, 9, &mut rng))
         .push(Relu)
         .push(Linear::new(params, 9, 4, &mut rng))
+}
+
+/// An MLP 12 → 16 → 9 → 4 with a softmax, or a log-softmax if `log`, after each `Linear`, in
+/// either precision.
+pub(super) fn softmax_mlp<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    log: bool,
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let rows = |net: Sequential<T>| {
+        if log {
+            net.push(LogSoftmax)
+        } else {
+            net.push(Softmax)
+        }
+    };
+    let net = rows(Sequential::new_generic().push(Linear::new(params, 12, 16, &mut rng)));
+    let net = rows(net.push(Linear::new(params, 16, 9, &mut rng)));
+    rows(net.push(Linear::new(params, 9, 4, &mut rng)))
 }
 
 /// The activations the GPU engines run besides ReLU, leaky ReLU, tanh, the sigmoid and GELU,

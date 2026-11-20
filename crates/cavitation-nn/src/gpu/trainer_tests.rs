@@ -21,7 +21,7 @@ use cavitation_core::{
 use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuTrainer;
-use super::forward_tests::{Twin, activation_mlp, mlp, more_activations, twin};
+use super::forward_tests::{Twin, activation_mlp, mlp, more_activations, softmax_mlp, twin};
 use crate::{
     BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, Loss,
     MaxPool2d, NeuronMask, OptimizerConfig, Relu, Sequential, TargetsView, Trace,
@@ -343,6 +343,21 @@ fn every_activation_matches_the_tape() {
             &Data::new(seed, 24, 12, 4, (-2.0, 2.0)),
             &format!("{kind:?}"),
         );
+    }
+}
+
+/// Softmax and log-softmax after each `Linear` of an MLP: the GPU's gradients against the
+/// `f64` tape's, within the tolerance above.
+#[test]
+fn softmax_layers_match_the_tape() {
+    for (seed, log) in [(90, false), (91, true)] {
+        let t = twin(
+            |p, s| softmax_mlp(p, s, log),
+            |p, s| softmax_mlp(p, s, log),
+            seed,
+        );
+        let what = if log { "log-softmax" } else { "softmax" };
+        check_gradients(t, &Data::new(seed, 24, 12, 4, (-2.0, 2.0)), what);
     }
 }
 

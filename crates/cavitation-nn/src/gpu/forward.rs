@@ -6,7 +6,7 @@ use cavitation_core::{Error, TensorView};
 use cavitation_gpu::kernels::{
     AvgPool2d, BatchNorm2d, BatchNormForward, BatchStats, BiasAdd, BiasAddCall, ChannelDims,
     ConvCall, ConvDims, ConvForward, Elementwise, ElementwiseCall, ElementwiseKernels, Gemm,
-    GemmCall, GemmDims, MaxPool2d,
+    GemmCall, GemmDims, MaxPool2d, RowSoftmax, RowSoftmaxCall, RowSoftmaxKernels,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, wgpu,
@@ -28,6 +28,8 @@ pub(crate) struct Kernels {
     pub(crate) conv: ConvForward,
     /// The element-wise operations: the activations and the masks.
     pub(crate) elementwise: ElementwiseKernels,
+    /// Softmax and log-softmax over each row.
+    pub(crate) softmax: RowSoftmaxKernels,
     /// Batch normalisation.
     pub(crate) batch_norm: BatchNorm2d,
 }
@@ -40,6 +42,7 @@ impl Kernels {
             bias: BiasAdd::new(gpu, cache)?,
             conv: ConvForward::new(gpu, cache)?,
             elementwise: ElementwiseKernels::new(gpu, cache)?,
+            softmax: RowSoftmaxKernels::new(gpu, cache)?,
             batch_norm: BatchNorm2d::new(gpu, cache)?,
         })
     }
@@ -56,6 +59,8 @@ enum Op {
     Conv(ConvCall),
     /// An activation or a mask.
     Elementwise(ElementwiseCall),
+    /// A softmax or log-softmax over each row.
+    Softmax(RowSoftmaxCall),
     /// Max pooling with its kernel and bind group.
     MaxPool(MaxPool2d, wgpu::BindGroup),
     /// Average pooling with its kernel and bind group.
@@ -216,6 +221,26 @@ impl Forward {
                     ops.push(Op::Elementwise(call));
                     out
                 }
+                Kind::Softmax { log } => {
+                    let out = new(&mut values, pool);
+                    let op = if log {
+                        RowSoftmax::LogSoftmax
+                    } else {
+                        RowSoftmax::Softmax
+                    };
+                    let shape = (u32_of(batch), u32_of(layer.outputs));
+                    let call = (kernels.softmax).call(
+                        steps,
+                        pool,
+                        op,
+                        shape,
+                        &values[x],
+                        None,
+                        &values[out],
+                    );
+                    ops.push(Op::Softmax(call));
+                    out
+                }
                 Kind::MaxPool2d(geom) => {
                     let out = new(&mut values, pool);
                     let kernel = MaxPool2d::new(cache, &geom, batch)?;
@@ -327,6 +352,7 @@ impl Forward {
                 Op::Bias(call) => kernels.bias.record(step, call),
                 Op::Conv(call) => kernels.conv.record(step, call),
                 Op::Elementwise(call) => kernels.elementwise.record(step, call),
+                Op::Softmax(call) => kernels.softmax.record(step, call),
                 Op::MaxPool(kernel, group) => kernel.forward(step, group),
                 Op::AvgPool(kernel, group) => kernel.forward(step, group),
                 Op::BatchNorm(call) => kernels.batch_norm.record_forward(step, call),

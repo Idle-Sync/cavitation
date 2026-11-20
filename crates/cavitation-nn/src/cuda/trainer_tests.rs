@@ -28,8 +28,8 @@ use cavitation_core::{Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
 
 use super::CudaTrainer;
 use super::test_util::{
-    Data, Twin, activation_mlp, cifar_cnn, mlp, mnist_cnn, more_activations, off, small_cnn, twin,
-    with_cuda,
+    Data, Twin, activation_mlp, cifar_cnn, mlp, mnist_cnn, more_activations, off, small_cnn,
+    softmax_mlp, twin, with_cuda,
 };
 use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
@@ -228,6 +228,21 @@ fn every_activation_matches_the_tape() {
             &Data::within(seed, 24, 12, 4, (-2.0, 2.0)),
             &format!("{kind:?}"),
         );
+    }
+}
+
+/// Softmax and log-softmax after each `Linear` of an MLP: the card's gradients against the
+/// `f64` tape's, within the tolerance above.
+#[test]
+fn softmax_layers_match_the_tape() {
+    for (seed, log) in [(90, false), (91, true)] {
+        let t = twin(
+            |p, s| softmax_mlp(p, s, log),
+            |p, s| softmax_mlp(p, s, log),
+            seed,
+        );
+        let what = if log { "log-softmax" } else { "softmax" };
+        check_gradients(t, &Data::within(seed, 24, 12, 4, (-2.0, 2.0)), what);
     }
 }
 

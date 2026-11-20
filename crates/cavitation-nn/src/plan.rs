@@ -20,14 +20,19 @@ const MAX_CONV_BATCH: usize = 65_535;
 /// one workgroup each along a dispatch dimension.
 const MAX_GEMM_SIDE: usize = 65_535 * 64;
 
+/// The most rows a batch through a softmax or log-softmax may hold on the wgpu engine: its
+/// kernels run one thread per row, in one dispatch dimension of 65,535 workgroups of 256.
+const MAX_SOFTMAX_ROWS: usize = 65_535 * 256;
+
 /// The engine a plan is built for: the name its messages start with, and whether the wgpu
 /// engine's own limits apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Engine {
     /// What the messages name, such as `GpuModel::compile`.
     pub(crate) name: &'static str,
-    /// Whether the wgpu kernels' limits are checked: a convolution's batch, a GEMM's sides,
-    /// and a batch norm's eps that `f32` arithmetic flushing subnormals would lose.
+    /// Whether the wgpu kernels' limits are checked: a convolution's and a softmax's batch,
+    /// a GEMM's sides, and a batch norm's eps that `f32` arithmetic flushing subnormals
+    /// would lose.
     pub(crate) wgpu_limits: bool,
 }
 
@@ -171,6 +176,11 @@ pub(crate) enum Kind {
     },
     /// An element-wise activation.
     Activation(Act),
+    /// Softmax over each row, or log-softmax if `log`.
+    Softmax {
+        /// Whether it is the log-softmax.
+        log: bool,
+    },
     /// A 2-D convolution.
     Conv2d {
         /// Its shape.
@@ -207,7 +217,7 @@ impl Kind {
             Kind::Conv2d { geom, .. } => Some(geom.in_width()),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => Some(geom.in_width()),
             Kind::BatchNorm2d(norm) => Some(norm.channels * norm.spatial),
-            Kind::Activation(_) | Kind::Dropout(_) | Kind::Identity => None,
+            Kind::Activation(_) | Kind::Softmax { .. } | Kind::Dropout(_) | Kind::Identity => None,
         }
     }
 
@@ -217,7 +227,11 @@ impl Kind {
             Kind::Linear { outputs, .. } => *outputs,
             Kind::Conv2d { geom, .. } => geom.out_width(),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => geom.out_width(),
-            Kind::Activation(_) | Kind::BatchNorm2d(_) | Kind::Dropout(_) | Kind::Identity => width,
+            Kind::Activation(_)
+            | Kind::Softmax { .. }
+            | Kind::BatchNorm2d(_)
+            | Kind::Dropout(_)
+            | Kind::Identity => width,
         }
     }
 }
@@ -271,8 +285,8 @@ impl Plan {
     /// - [`Error::Unsupported`] if the model has no layers, a layer is not one a GPU runs or
     ///   has parameters its GPU form does not use (by index and name), an id is used in two
     ///   roles, no layer fixes the input width, or (on the wgpu engine) a convolution's batch
-    ///   is above 65,535, a GEMM's side above 4,194,240, or a batch norm's eps below 2⁻¹²⁶ in
-    ///   `f32` and not 0.
+    ///   is above 65,535, a softmax's above 16,776,960, a GEMM's side above 4,194,240, or a
+    ///   batch norm's eps below 2⁻¹²⁶ in `f32` and not 0.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports, a
     ///   mask is not as wide as its layer's output, a batch count does not hold one value, or
@@ -381,8 +395,8 @@ impl Plan {
 }
 
 /// Refuses what the wgpu kernels cannot run: a convolution over more than 65,535 images, a
-/// GEMM side above 4,194,240, and a batch norm's eps that `f32` arithmetic flushing
-/// subnormals may turn into 0.
+/// softmax over more than 16,776,960 rows, a GEMM side above 4,194,240, and a batch norm's
+/// eps that `f32` arithmetic flushing subnormals may turn into 0.
 fn check_wgpu_limits(
     kind: &Kind,
     batch: usize,
@@ -390,6 +404,12 @@ fn check_wgpu_limits(
     name: &str,
     who: &str,
 ) -> Result<(), Error> {
+    if matches!(kind, Kind::Softmax { .. }) && batch > MAX_SOFTMAX_ROWS {
+        return Err(Error::Unsupported(format!(
+            "{who}: layer {i} ({name}) is a softmax, which takes at most {MAX_SOFTMAX_ROWS} \
+             rows per batch on the GPU, not {batch}"
+        )));
+    }
     if matches!(kind, Kind::Conv2d { .. }) && batch > MAX_CONV_BATCH {
         return Err(Error::Unsupported(format!(
             "{who}: layer {i} ({name}) is a convolution, which takes at most {MAX_CONV_BATCH} \
@@ -593,6 +613,8 @@ fn kind(
             });
         }
         Some(InferenceLayer::Activation(kind)) => kind,
+        Some(InferenceLayer::Softmax) => return Ok(Kind::Softmax { log: false }),
+        Some(InferenceLayer::LogSoftmax) => return Ok(Kind::Softmax { log: true }),
         Some(_) => return refuse("is not a layer the GPU runs"),
         None => return refuse("has no inference form, so the GPU cannot run it"),
     };

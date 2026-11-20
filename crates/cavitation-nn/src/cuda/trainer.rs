@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_cuda::{
     ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, MeanSquaredError, OptimizerKernel,
-    OptimizerRule, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
+    OptimizerRule, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
 };
 
 use super::model::{CudaModel, ran, refused};
@@ -1614,6 +1614,22 @@ impl<'c> TrainPass<'c> {
                         settings: act.settings(),
                         n: n_in,
                         a: if from_output { saved.pre } else { x },
+                        b: Some(g),
+                        y: dx,
+                    });
+                    dx
+                }
+                Kind::Softmax { log } => {
+                    let dx = s.values(n_in)?;
+                    backward.push(Op::Softmax {
+                        op: if log {
+                            RowSoftmaxOp::LogSoftmaxBackward
+                        } else {
+                            RowSoftmaxOp::SoftmaxBackward
+                        },
+                        rows,
+                        width: layer.outputs,
+                        a: saved.pre,
                         b: Some(g),
                         y: dx,
                     });

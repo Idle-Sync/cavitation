@@ -8,20 +8,20 @@
 //! Without CUDA the tests that need it say so and check nothing;
 //! `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
 
-use cavitation_core::{Conv2dGeom, GeluApprox, ParamId, ParamStore, Pool2dGeom, Rng, Tensor};
+use cavitation_core::{Conv2dGeom, Gate, GeluApprox, ParamId, ParamStore, Pool2dGeom, Rng, Tensor};
 
 use super::CudaModel;
 use super::test_util::{cifar_cnn, classes, mlp, mnist_cnn, off, twin, uniform, with_cuda};
 use crate::plan::{Engine, Plan, pack_rows};
 use crate::{
-    AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Hardtanh, InferenceModel, Init,
-    LeakyRelu, Linear, Loss, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh,
-    accuracy, evaluate,
+    AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh, InferenceModel,
+    Init, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid,
+    Softmax, Tanh, accuracy, evaluate,
 };
 
 /// A small CNN with every kind of layer the card runs, two of them masked: 1 × 6 × 6 images
 /// through a convolution, batch norm, ReLU, max pooling, average pooling with padding,
-/// dropout, flatten, two `Linear`s and each activation.
+/// dropout, flatten, two `Linear`s, each activation, and a softmax and a log-softmax.
 fn every_kind(params: &mut ParamStore) -> Sequential {
     let mut rng = Rng::seed(7);
     let conv = Conv2dGeom::with_options(1, 3, (6, 6), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
@@ -43,6 +43,8 @@ fn every_kind(params: &mut ParamStore) -> Sequential {
         .push(Gelu {
             approx: GeluApprox::Tanh,
         })
+        .push(Softmax)
+        .push(LogSoftmax)
         .push(Linear::without_bias(
             params,
             5,
@@ -56,18 +58,21 @@ fn every_kind(params: &mut ParamStore) -> Sequential {
 }
 
 /// The plan names `CudaModel::compile` in its refusals, and the wgpu engine's limits (a
-/// convolution's batch above 65,535, a batch norm's eps below 2⁻¹²⁶) do not apply.
+/// convolution's batch above 65,535, a softmax's above 16,776,960, a batch norm's eps below
+/// 2⁻¹²⁶) do not apply.
 #[test]
 fn the_plan_refuses_under_cudas_name() {
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(0);
     let net = Sequential::new()
         .push(Linear::new(&mut params, 4, 3, &mut rng))
-        .push(Softmax);
+        .push(Glu {
+            gate: Gate::Sigmoid,
+        });
     let err = Plan::build_for(&net, &params, 8, Engine::CUDA).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "unsupported: CudaModel::compile: layer 1 (softmax) is not a layer the GPU runs"
+        "unsupported: CudaModel::compile: layer 1 (glu) is not a layer the GPU runs"
     );
     let err = Plan::build_for(&Sequential::new(), &params, 8, Engine::CUDA).unwrap_err();
     assert_eq!(
@@ -84,6 +89,15 @@ fn the_plan_refuses_under_cudas_name() {
     let net = Sequential::new().push(tiny_eps);
     assert!(Plan::build_for(&net, &store, 4, Engine::CUDA).is_ok());
     assert!(Plan::build_for(&net, &store, 4, Engine::WGPU).is_err());
+    let norm =
+        BatchNorm2d::with_options(&mut store, 2, (2, 2), 1e-5, Some(0.1), true, true).unwrap();
+    for net in [
+        Sequential::new().push(norm.clone()).push(Softmax),
+        Sequential::new().push(norm).push(LogSoftmax),
+    ] {
+        assert!(Plan::build_for(&net, &store, 16_776_961, Engine::CUDA).is_ok());
+        assert!(Plan::build_for(&net, &store, 16_776_961, Engine::WGPU).is_err());
+    }
 }
 
 /// Every parameter, running statistic and mask comes back from the card bit for bit, odd

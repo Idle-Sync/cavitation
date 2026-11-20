@@ -8,6 +8,7 @@ use cavitation_core::{Conv2dGeom, Pool2dGeom};
 use cavitation_cuda::{
     AvgPool2d, BatchNorm2d, BatchStats, ChannelDims, Conv2d, ConvShape, Cuda, CudaError,
     DeviceBuffer, Dropout, Elementwise, ElementwiseOp, Linear, LinearShape, MaxPool2d, PoolShape,
+    RowSoftmax, RowSoftmaxOp,
 };
 
 use crate::plan::{Act, CompiledLayer, Kind};
@@ -98,6 +99,8 @@ pub(crate) struct Shared<'c> {
     pub(crate) elementwise: Elementwise<'c>,
     /// Dropout and the neuron masks.
     pub(crate) dropout: Dropout<'c>,
+    /// Softmax and log-softmax over each row, forward and backward.
+    pub(crate) softmax: RowSoftmax<'c>,
 }
 
 /// The kernels of one pass that are set up for its shapes, which its [`Op`]s name by index.
@@ -176,6 +179,16 @@ pub(crate) enum Op {
         op: ElementwiseOp,
         settings: (f32, f32),
         n: usize,
+        a: usize,
+        b: Option<usize>,
+        y: usize,
+    },
+    /// The row operation `op` over `rows` rows of `width` values of `a` (and `b`): a softmax
+    /// or log-softmax, or its backward pass.
+    Softmax {
+        op: RowSoftmaxOp,
+        rows: usize,
+        width: usize,
         a: usize,
         b: Option<usize>,
         y: usize,
@@ -299,6 +312,24 @@ fn run_op(
                 n,
                 alpha,
                 scale,
+            )
+        }
+        Op::Softmax {
+            op,
+            rows,
+            width,
+            a,
+            b,
+            y,
+        } => {
+            let second = b.map(|b| s.get(b));
+            (shared.softmax).run(
+                op,
+                &s.get(a),
+                second.as_deref(),
+                &mut s.get_mut(y),
+                rows,
+                width,
             )
         }
         Op::Dropout {
@@ -616,6 +647,22 @@ impl<'c> Forward<'c> {
                         op: forward_op(act),
                         settings: act.settings(),
                         n,
+                        a: x,
+                        b: None,
+                        y,
+                    });
+                    y
+                }
+                Kind::Softmax { log } => {
+                    let y = store.values(n)?;
+                    ops.push(Op::Softmax {
+                        op: if log {
+                            RowSoftmaxOp::LogSoftmax
+                        } else {
+                            RowSoftmaxOp::Softmax
+                        },
+                        rows,
+                        width: layer.outputs,
                         a: x,
                         b: None,
                         y,
