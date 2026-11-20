@@ -50,7 +50,8 @@ DATA_END = "-->"
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, check=True, text=True, capture_output=True, **kw).stdout
+    out = subprocess.run(cmd, check=True, capture_output=True, **kw).stdout
+    return out.decode("utf-8", errors="replace")
 
 
 def repo_root():
@@ -81,27 +82,29 @@ def measure(root, binary, tdir, device, net, args):
         cmd += ["--epochs", str(args.epochs)]
     if args.rows:
         cmd += ["--rows", str(args.rows)]
-    env = dict(os.environ, CAVITATION_THREADS="4")
-    env.pop("CAVITATION_CUDNN_BENCHMARK", None)
-    if device == "dx12":
-        env.setdefault("WGPU_DX12_COMPILER", "dxc")
+    env = dict(os.environ, CAVITATION_THREADS="4", CARGO_TARGET_DIR=tdir)
+    for name in ["CAVITATION_CUDNN_BENCHMARK", "CAVITATION_GPU_BACKEND", "CAVITATION_DEVICE", "CAVITATION_KERNEL"]:
+        env.pop(name, None)
     print("running:", " ".join(cmd[1:]), flush=True)
     subprocess.run(cmd, check=True, cwd=root, env=env)
     with open(result, encoding="utf-8") as f:
         r = json.load(f)
+    shown = " ".join(cmd[1:])
+    if args.python:
+        shown = shown.replace(args.python, "<python with torch>")
     cav = epoch_seconds(r["cav"])
     torch = epoch_seconds(r["torch"]) if spec["torch"] else None
     if cav is None or (spec["torch"] and torch is None):
         sys.exit(f"{net} on {device}: the run wrote no epoch times")
     return {
-        "cav_s": round(cav, 3),
-        "torch_s": round(torch, 3) if torch is not None else None,
+        "cav_s": cav,
+        "torch_s": torch,
         "epochs": r["epochs"],
         "rows": r["rows"],
         "kernel": r["kernel"],
         "threads": r["threads"],
         "torch_about": r["torch_about"][0] if r["torch_about"] else None,
-        "command": "cavitation-bench " + " ".join(cmd[1:]).replace(args.python, "<python with torch>"),
+        "command": "cavitation-bench " + shown,
     }
 
 
@@ -111,19 +114,22 @@ def read_issue(issue):
     if start < 0:
         return {"machines": {}, "rows": []}
     end = body.find(DATA_END, start)
+    if end < 0:
+        sys.exit(f"issue #{issue}: the benchmark data comment has no end")
     return json.loads(body[start + len(DATA_START) : end])
 
 
 def speed(row):
     if row["torch_s"] is None:
         return "❌"
+    if row["cav_s"] <= 0 or row["torch_s"] <= 0:
+        return "n/a (an epoch took no measurable time)"
     r = row["cav_s"] / row["torch_s"]
-    words = f"{1 / r:.2f}× faster" if r < 1 else f"{r:.2f}× slower"
     if r < 0.97:
-        return f"🟢 {words}"
+        return f"🟢 {1 / r:.2f}× faster"
     if r > 1.03:
-        return f"🔴 {words}"
-    return f"🟡 same ({words})"
+        return f"🔴 {r:.2f}× slower"
+    return "🟡 same (within 3%)"
 
 
 def render(data):
@@ -140,7 +146,7 @@ def render(data):
         "Each cell says how much faster or slower Cavitation is than PyTorch for an epoch on the "
         "same machine: \"1.27× faster\" means PyTorch takes 1.27 times as long as Cavitation, "
         "\"2.46× slower\" means Cavitation takes 2.46 times as long as PyTorch. "
-        "🟢 faster by more than 3%, 🟡 within 3% either way, 🔴 slower by more than 3%, "
+        "🟢 Cavitation's epoch more than 3% shorter than PyTorch's, 🟡 within 3% either way, 🔴 more than 3% longer, "
         "⬜ not measured, ❌ nothing to compare with."
     )
     out.append("")
@@ -193,7 +199,7 @@ def render(data):
             f"| {row['date']} | {about} |"
         )
     out.append("")
-    out.append("Commands, as each row ran them (from `target/release/`, with `CAVITATION_THREADS=4`):")
+    out.append("Commands, as each row ran them (the release build of `cavitation-bench`, with `CAVITATION_THREADS=4`):")
     out.append("")
     out.append("```")
     seen = []
@@ -211,7 +217,7 @@ def render(data):
         out.append("Every machine, device and network listed above has a row.")
     out.append("")
     out.append(DATA_START)
-    out.append(json.dumps({"machines": data["machines"], "rows": rows}, ensure_ascii=False, indent=1))
+    out.append(json.dumps({"machines": data["machines"], "rows": rows}, ensure_ascii=False, indent=1).replace(">", "\\u003e"))
     out.append(DATA_END)
     return "\n".join(out) + "\n"
 
@@ -247,8 +253,9 @@ def main():
                 sys.exit(f"unknown network {n}; choose from {', '.join(NETS)}")
         if any(DEVICES[d]["torch"] for d in devices) and not args.python:
             sys.exit("--python is needed for cpu, cuda and metal")
-        if run(["git", "status", "--porcelain", "--", "crates"], cwd=root).strip():
-            sys.exit("crates/ has uncommitted changes; measure a commit")
+        watched = ["crates", "scripts/bench", "Cargo.toml", "Cargo.lock"]
+        if run(["git", "status", "--porcelain", "--"] + watched, cwd=root).strip():
+            sys.exit("uncommitted changes in " + ", ".join(watched) + "; measure a commit")
         machine = data["machines"].get(args.machine, {"hardware": "", "os": "", "devices": []})
         if args.hardware:
             machine["hardware"] = args.hardware
@@ -270,15 +277,30 @@ def main():
             sys.exit(f"no binary at {binary}")
         commit = run(["git", "rev-parse", "--short", "HEAD"], cwd=root).strip()
         date = datetime.date.today().isoformat()
+        failed = None
         for device in devices:
             for net in nets:
-                row = measure(root, binary, tdir, device, net, args)
+                try:
+                    row = measure(root, binary, tdir, device, net, args)
+                except (subprocess.CalledProcessError, OSError, KeyError, ValueError) as e:
+                    failed = f"{net} on {device}: {e}"
+                    break
                 row.update(machine=args.machine, device=device, net=net, commit=commit, date=date)
                 data["rows"] = [
                     r for r in data["rows"] if (r["machine"], r["device"], r["net"]) != (args.machine, device, net)
                 ]
                 data["rows"].append(row)
+                publish(data, args, root)
+            if failed:
+                break
+        if failed:
+            sys.exit(f"stopped: {failed}; the rows measured before it are in the issue")
+        return
 
+    publish(data, args, root)
+
+
+def publish(data, args, root):
     body = render(data)
     if args.dry_run:
         sys.stdout.reconfigure(encoding="utf-8")
