@@ -11,6 +11,16 @@
 //!   `f32` tape's bits on squares whose sums are exact, and within its bound of the `f64`
 //!   tape. Both are checked up to 2²⁴ + 1,000 values, and an overflowed square and a NaN
 //!   reach the loss.
+//! - **Negative log-likelihood:** the gradient bit for bit against `Tape::nll` on an `f32`
+//!   store; the loss the bits of the fixed tree evaluated on the host and within its bound of
+//!   the `f64` tape, on the cross-entropy's shapes; NaN and ±∞ as on the CPU, and a bad label
+//!   giving a NaN row.
+//! - **L1, Huber and smooth L1:** the gradient bit for bit against `Tape::l1`, `Tape::huber`
+//!   and `Tape::smooth_l1` on an `f32` store, every branch included; the loss the bits of the
+//!   fixed tree evaluated on the host over the tape's terms and within the WGSL kernel's bound
+//!   of the `f64` tape, up to 2²⁴ + 1,000 values; each value at the edges (±0, the threshold
+//!   and one ulp either side, a threshold of 0 or +∞, NaN, ±∞, overflow and subnormals) the
+//!   `f32` tape's bits; the tape's refusal of a bad threshold.
 //!
 //! Every output starts as NaN, every loss is written at word 1 between two sentinels, and two
 //! runs give the same bits. Each test skips without CUDA, unless `CAVITATION_CUDA_REQUIRED=1`
@@ -18,8 +28,11 @@
 
 mod common;
 
-use cavitation_core::{Graph, ParamStore, Reduction, Tensor};
-use cavitation_cuda::{Cuda, CudaError, DeviceBuffer, MeanSquaredError, SoftmaxCrossEntropy};
+use cavitation_core::{Graph, ParamStore, Real, Reduction, Tensor};
+use cavitation_cuda::{
+    Cuda, CudaError, DeviceBuffer, MeanSquaredError, NegativeLogLikelihood, Regression,
+    RegressionLoss, SoftmaxCrossEntropy,
+};
 use common::{
     FLOOR, U, assert_exact, assert_within, exact_values, nans, panic_message, read, seeded_values,
     upload,
@@ -636,4 +649,417 @@ fn refusals() {
         let _ = mse.run(&z, &l, &mut short_grad, (&mut loss, 0));
     });
     assert!(m.contains("the gradient buffer holds 60 bytes"), "{m}");
+}
+
+/// The card's negative log-likelihood of `log_probs` against `labels`: the loss and the
+/// gradient.
+fn cuda_nll(
+    cuda: &Cuda,
+    nll: &NegativeLogLikelihood<'_>,
+    log_probs: &[f32],
+    labels: &[u32],
+) -> (f32, Vec<f32>) {
+    let (lp, l) = (upload(cuda, log_probs), upload(cuda, labels));
+    let mut grad = nans(cuda, log_probs.len());
+    let mut out = loss_buffer(cuda);
+    nll.run(&lp, &l, &mut grad, (&mut out, 1)).expect("run");
+    (read_loss(&out), read(&grad, log_probs.len()))
+}
+
+/// What `Tape::nll` with `Reduction::Mean` gives on a store of `T` from the same `f32`
+/// log-probabilities: the loss and the gradient.
+fn tape_nll<T: Real>(classes: usize, log_probs: &[f32], labels: &[u32]) -> (T, Vec<T>) {
+    let batch = labels.len();
+    let mut store = ParamStore::<T>::new_generic();
+    let wide: Vec<T> = log_probs
+        .iter()
+        .map(|&v| T::from_f64(f64::from(v)))
+        .collect();
+    let id = store.add(Tensor::from_vec(wide, &[batch, classes]).unwrap());
+    let labels: Vec<usize> = labels.iter().map(|&l| l as usize).collect();
+    let mut graph = Graph::<T>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let lp = tape.param(id);
+    let loss = tape.nll(lp, &labels, Reduction::Mean);
+    let value = tape.value(loss).data()[0];
+    tape.backward(loss, &mut store.grads);
+    drop(tape);
+    (value, store.grad(id).data().to_vec())
+}
+
+/// The negative log-likelihood against the tape, on the cross-entropy's shapes with
+/// log-probabilities in `[−12, 0)`: the gradient bit for bit against an `f32` store's; the
+/// loss the bits of the fixed tree evaluated on the host over the row losses (each its
+/// label's value negated) divided by the batch, and within `(22 + chunks)·u·Σ|ℓ| / B +
+/// 5u·loss` of an `f64` store's. A second run gives the same bits.
+#[test]
+fn nll_twin() {
+    let Some(cuda) = Cuda::new() else { return };
+    for (s, (batch, classes)) in [
+        (1u32, 10u32),
+        (128, 10),
+        (1000, 3),
+        (7, 1000),
+        (65, 1),
+        (70_000, 4),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = (batch * classes) as usize;
+        let nll = NegativeLogLikelihood::new(&cuda, (batch, classes)).expect("nll");
+        assert_eq!(nll.shape(), (batch, classes));
+        let what = format!("{batch} × {classes}");
+        let lp = seeded_values(40 + s as u64, n, -12.0, 0.0);
+        let y = labels(50 + s as u64, batch as usize, classes);
+        let (loss, grad) = cuda_nll(&cuda, &nll, &lp, &y);
+        let (_, want_grad) = tape_nll::<f32>(classes as usize, &lp, &y);
+        assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+        let rows: Vec<f32> = (y.iter().enumerate())
+            .map(|(i, &l)| -lp[i * classes as usize + l as usize])
+            .collect();
+        let host = tree(&rows) / batch as f32;
+        assert_eq!(
+            loss.to_bits(),
+            host.to_bits(),
+            "the loss against the host's tree, {what}"
+        );
+        let (want, _) = tape_nll::<f64>(classes as usize, &lp, &y);
+        let total: f64 = rows.iter().map(|&v| f64::from(v).abs()).sum();
+        let b = f64::from(batch);
+        let bound = second(depth(batch as usize) * U * total / b + 5.0 * U * want.abs());
+        let worst = assert_within(&[loss], &[want], |_| bound, &format!("the loss, {what}"));
+        println!("nll loss {what}: worst {:.3} of its bound", worst.ratio());
+        let (again, again_grad) = cuda_nll(&cuda, &nll, &lp, &y);
+        assert_eq!(
+            again.to_bits(),
+            loss.to_bits(),
+            "a second run's loss, {what}"
+        );
+        assert_exact(
+            &again_grad,
+            &grad,
+            &format!("a second run's gradient, {what}"),
+        );
+    }
+}
+
+/// NaN and ±∞ as on the CPU: a NaN anywhere in a row gives a NaN loss and the CPU's finite
+/// gradient; −∞ at the label gives a +∞ loss; ±∞ off the label leaves the loss finite (the
+/// CPU's, bit for bit, here where every partial sum is exact). A label not below the classes,
+/// which the CPU panics on, gives a NaN loss and a NaN gradient row, the other rows' gradients
+/// unchanged.
+#[test]
+fn nll_non_finite_rows() {
+    let Some(cuda) = Cuda::new() else { return };
+    let nll = NegativeLogLikelihood::new(&cuda, (4, 5)).expect("nll");
+    // Quarters, so the CPU's sum and the card's tree are exact.
+    let lp: Vec<f32> = (0..20).map(|i| -0.25 * (i % 7) as f32).collect();
+    let y = vec![0u32, 4, 2, 1];
+    let (clean, clean_grad) = cuda_nll(&cuda, &nll, &lp, &y);
+    assert_exact(&[clean], &[tape_nll::<f32>(5, &lp, &y).0], "the clean loss");
+    for (name, at, value) in [
+        ("a NaN off the label", 7, f32::NAN),
+        ("a NaN at the label", 9, f32::NAN),
+        ("-inf at the label", 9, f32::NEG_INFINITY),
+        ("+inf off the label", 5, f32::INFINITY),
+        ("-inf off the label", 8, f32::NEG_INFINITY),
+    ] {
+        let mut bad = lp.clone();
+        bad[at] = value;
+        let (loss, grad) = cuda_nll(&cuda, &nll, &bad, &y);
+        let (want, want_grad) = tape_nll::<f32>(5, &bad, &y);
+        assert_exact(&[loss], &[want], &format!("{name}: the loss"));
+        assert_exact(&grad, &want_grad, &format!("{name}: the gradient"));
+    }
+    let mut bad_label = y.clone();
+    bad_label[1] = 5;
+    let (loss, grad) = cuda_nll(&cuda, &nll, &lp, &bad_label);
+    assert!(loss.is_nan(), "label 5 of 5 classes: the loss is {loss}");
+    assert!(
+        grad[5..10].iter().all(|g| g.is_nan()),
+        "the bad row's gradient"
+    );
+    let rest: Vec<f32> = grad[..5].iter().chain(&grad[10..]).copied().collect();
+    let want: Vec<f32> = (clean_grad[..5].iter().chain(&clean_grad[10..]))
+        .copied()
+        .collect();
+    assert_exact(&rest, &want, "label 5 of 5 classes: the other rows");
+}
+
+/// Each regression loss the tests run, with its term error `c` in units of `u` against the
+/// exact loss of the same `f32` values, as `cavitation-gpu`'s `tests/loss.rs` derives it: 1
+/// for L1, 4 for Huber and 8 for smooth L1 (the WGSL division's 2.5 ulp; NVRTC's is
+/// correctly rounded, so 4 would do here).
+const REGRESSIONS: [(Regression, f64); 7] = [
+    (Regression::L1, 1.0),
+    (Regression::Huber { delta: 1.0 }, 4.0),
+    (Regression::Huber { delta: 0.25 }, 4.0),
+    (Regression::SmoothL1 { beta: 1.0 }, 8.0),
+    (Regression::SmoothL1 { beta: 0.75 }, 8.0),
+    (Regression::SmoothL1 { beta: 0.0 }, 8.0),
+    (
+        Regression::Huber {
+            delta: f32::INFINITY,
+        },
+        4.0,
+    ),
+];
+
+/// The card's regression loss: the loss and the gradient.
+fn cuda_regression(
+    cuda: &Cuda,
+    loss: &RegressionLoss<'_>,
+    pred: &[f32],
+    target: &[f32],
+) -> (f32, Vec<f32>) {
+    let (p, t) = (upload(cuda, pred), upload(cuda, target));
+    let mut grad = nans(cuda, pred.len());
+    let mut out = loss_buffer(cuda);
+    loss.run(&p, &t, &mut grad, (&mut out, 1)).expect("run");
+    (read_loss(&out), read(&grad, pred.len()))
+}
+
+/// What the tape gives for `kind` with `Reduction::Mean` on a store of `T` from the same
+/// `f32` values: the loss and the prediction's gradient.
+fn tape_regression<T: Real>(kind: Regression, pred: &[f32], target: &[f32]) -> (T, Vec<T>) {
+    let n = pred.len();
+    let wide = |v: &[f32]| {
+        v.iter()
+            .map(|&x| T::from_f64(f64::from(x)))
+            .collect::<Vec<T>>()
+    };
+    let mut store = ParamStore::<T>::new_generic();
+    let id = store.add(Tensor::from_vec(wide(pred), &[n]).unwrap());
+    let mut graph = Graph::<T>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let p = tape.param(id);
+    let t = tape.input(Tensor::from_vec(wide(target), &[n]).unwrap().view());
+    let l = match kind {
+        Regression::L1 => tape.l1(p, t, Reduction::Mean),
+        Regression::Huber { delta } => {
+            tape.huber(p, t, T::from_f64(f64::from(delta)), Reduction::Mean)
+        }
+        Regression::SmoothL1 { beta } => {
+            tape.smooth_l1(p, t, T::from_f64(f64::from(beta)), Reduction::Mean)
+        }
+    };
+    let value = tape.value(l).data()[0];
+    tape.backward(l, &mut store.grads);
+    drop(tape);
+    (value, store.grad(id).data().to_vec())
+}
+
+/// Each value's loss as the CPU's tape computes it in `f32`.
+fn regression_terms(kind: Regression, pred: &[f32], target: &[f32]) -> Vec<f32> {
+    let term = |p: f32, t: f32| {
+        let d = p - t;
+        let a = d.abs();
+        match kind {
+            Regression::L1 => a,
+            Regression::Huber { delta } if a < delta => 0.5 * d * d,
+            Regression::Huber { delta } => delta * (a - 0.5 * delta),
+            Regression::SmoothL1 { beta } if a < beta => 0.5 * d * d / beta,
+            Regression::SmoothL1 { beta } => a - 0.5 * beta,
+        }
+    };
+    pred.iter().zip(target).map(|(&p, &t)| term(p, t)).collect()
+}
+
+/// Each loss of `REGRESSIONS` against the tape, for 1, 37, 4,097 and 100,000 values with
+/// predictions and targets in `[−2, 2)` (every branch taken), and 2²⁴ + 1,000 values with L1
+/// and smooth L1: the gradient bit for bit against an `f32` store's, smooth L1's quadratic
+/// branch included; the loss the bits of the fixed tree evaluated on the host over the
+/// `f32` tape's terms divided by `n`, and within `(22 + chunks + c)·u·Σ ℓ / n + 5u·loss` of an
+/// `f64` store's. A second run gives the same bits.
+#[test]
+fn regression_twin() {
+    let Some(cuda) = Cuda::new() else { return };
+    for (k, (kind, c)) in REGRESSIONS.into_iter().enumerate() {
+        let sizes: &[usize] = if k == 0 || k == 3 {
+            &[1, 37, 4097, 100_000, (1 << 24) + 1000]
+        } else {
+            &[1, 37, 4097, 100_000]
+        };
+        for (s, &n) in sizes.iter().enumerate() {
+            let loss = RegressionLoss::new(&cuda, n as u32, kind).expect("regression loss");
+            assert_eq!((loss.len() as usize, loss.kind()), (n, kind));
+            let what = format!("{kind:?} of {n} values");
+            let seed = 100 * k as u64 + s as u64;
+            let pred = seeded_values(seed + 1000, n, -2.0, 2.0);
+            let target = seeded_values(seed + 2000, n, -2.0, 2.0);
+            let (value, grad) = cuda_regression(&cuda, &loss, &pred, &target);
+            let (_, want_grad) = tape_regression::<f32>(kind, &pred, &target);
+            assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+            let host = tree(&regression_terms(kind, &pred, &target)) / n as f32;
+            assert_eq!(
+                value.to_bits(),
+                host.to_bits(),
+                "the loss against the host's tree, {what}"
+            );
+            let (want, _) = tape_regression::<f64>(kind, &pred, &target);
+            let total = want * n as f64;
+            let bound = second((depth(n) + c) * U * total / n as f64 + 5.0 * U * want);
+            let worst = assert_within(&[value], &[want], |_| bound, &format!("the loss, {what}"));
+            println!("{what}: loss worst {:.3} of its bound", worst.ratio());
+            let (again, again_grad) = cuda_regression(&cuda, &loss, &pred, &target);
+            assert_eq!(
+                again.to_bits(),
+                value.to_bits(),
+                "a second run's loss, {what}"
+            );
+            assert_exact(
+                &again_grad,
+                &grad,
+                &format!("a second run's gradient, {what}"),
+            );
+        }
+    }
+}
+
+/// Each value's loss and gradient on its own (`n = 1`, so the loss is the value's term) at
+/// the edges, the `f32` tape's bits, NaN where it is NaN: `d` of ±0; `|d|` exactly at the
+/// threshold (the linear branch) and one ulp either side; smooth L1 with `beta` 0 and +∞;
+/// Huber with `delta` +∞; NaN in either input, two infinities of one sign and of opposite
+/// signs, one infinite input, a finite difference that overflows; and differences near the
+/// smallest normal, whose differences and gradients are subnormal (nothing is flushed).
+#[test]
+fn regression_edges_match_the_tape() {
+    let Some(cuda) = Cuda::new() else { return };
+    let below = |x: f32| f32::from_bits(x.to_bits() - 1);
+    let above = |x: f32| f32::from_bits(x.to_bits() + 1);
+    let inf = f32::INFINITY;
+    let tiny = f32::MIN_POSITIVE;
+    let pairs: Vec<(f32, f32)> = vec![
+        (1.5, 1.5),
+        (-0.0, 0.0),
+        (0.0, -0.0),
+        (0.5, 0.0),
+        (-0.25, 0.25),
+        (below(0.5), 0.0),
+        (above(0.5), 0.0),
+        (0.0, below(0.5)),
+        (0.25, 0.0),
+        (-3.0, 1.0),
+        (1e-3, 0.0),
+        (f32::NAN, 0.0),
+        (0.0, f32::NAN),
+        (inf, inf),
+        (-inf, -inf),
+        (inf, -inf),
+        (-inf, inf),
+        (inf, 1.0),
+        (1.0, inf),
+        (-inf, 0.0),
+        (3e38, -3e38),
+        (-3e38, 3e38),
+        (1e20, 0.0),
+        (1.5 * tiny, tiny),
+        (-0.75 * tiny, 0.0),
+    ];
+    let kinds = [
+        Regression::L1,
+        Regression::Huber { delta: 0.5 },
+        Regression::Huber { delta: inf },
+        Regression::SmoothL1 { beta: 0.5 },
+        Regression::SmoothL1 { beta: 0.0 },
+        Regression::SmoothL1 { beta: inf },
+    ];
+    for kind in kinds {
+        let loss = RegressionLoss::new(&cuda, 1, kind).expect("regression loss");
+        for &(p, t) in &pairs {
+            let what = format!("{kind:?} at p = {p:e}, t = {t:e}");
+            let (value, grad) = cuda_regression(&cuda, &loss, &[p], &[t]);
+            let (want, want_grad) = tape_regression::<f32>(kind, &[p], &[t]);
+            assert_exact(&[value], &[want], &format!("the loss, {what}"));
+            assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+        }
+    }
+}
+
+/// The refusals of the negative log-likelihood and the regression losses: the CPU tape's
+/// thresholds (Huber's `delta` not above 0 or NaN, smooth L1's `beta` below 0 or NaN, with the
+/// tape's message) and shapes with a dimension of 0 are `CudaError::Invalid`; a buffer too
+/// short panics before any launch, naming it.
+#[test]
+fn nll_and_regression_refusals() {
+    let Some(cuda) = Cuda::new() else { return };
+    let invalid = |r: Result<(), CudaError>, why: &str| match r {
+        Err(CudaError::Invalid(text)) => assert!(text.contains(why), "{text}"),
+        other => panic!("accepted: {other:?}"),
+    };
+    let nll = |shape| NegativeLogLikelihood::new(&cuda, shape).map(|_| ());
+    invalid(nll((0, 4)), "above 0");
+    invalid(nll((4, 0)), "above 0");
+    invalid(nll((1 << 20, 1 << 12)), "more than the 2147483648");
+    let regression = |n, kind| RegressionLoss::new(&cuda, n, kind).map(|_| ());
+    invalid(regression(0, Regression::L1), "above 0");
+    for (kind, text) in [
+        (
+            Regression::Huber { delta: 0.0 },
+            "huber: delta must be positive, but it is 0.0",
+        ),
+        (
+            Regression::Huber { delta: -1.0 },
+            "huber: delta must be positive, but it is -1.0",
+        ),
+        (
+            Regression::Huber { delta: f32::NAN },
+            "huber: delta must be positive, but it is NaN",
+        ),
+        (
+            Regression::SmoothL1 { beta: -0.5 },
+            "smooth_l1: beta must not be negative, but it is -0.5",
+        ),
+        (
+            Regression::SmoothL1 { beta: f32::NAN },
+            "smooth_l1: beta must not be negative, but it is NaN",
+        ),
+    ] {
+        invalid(regression(4, kind), text);
+    }
+
+    let nll = NegativeLogLikelihood::new(&cuda, (4, 4)).expect("nll");
+    let (z, l) = (nans(&cuda, 16), upload(&cuda, &[0u32; 16]));
+    let one = nans(&cuda, 1);
+    let mut short_grad = nans(&cuda, 15);
+    let mut grad = nans(&cuda, 16);
+    let mut loss = nans(&cuda, 16);
+    let m = panic_message(|| {
+        let _ = nll.run(&one, &l, &mut grad, (&mut loss, 0));
+    });
+    assert!(
+        m.contains("the log-probabilities buffer holds 4 bytes, and 16 values need 64"),
+        "{m}"
+    );
+    let m = panic_message(|| {
+        let _ = nll.run(&z, &one, &mut grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the labels buffer holds 4 bytes"), "{m}");
+    let m = panic_message(|| {
+        let _ = nll.run(&z, &l, &mut short_grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the gradient buffer holds 60 bytes"), "{m}");
+    let m = panic_message(|| {
+        let _ = nll.run(&z, &l, &mut grad, (&mut loss, 16));
+    });
+    assert!(m.contains("the loss output buffer holds 64 bytes"), "{m}");
+
+    let huber = RegressionLoss::new(&cuda, 16, Regression::Huber { delta: 1.0 }).expect("huber");
+    let m = panic_message(|| {
+        let _ = huber.run(&one, &z, &mut grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the prediction buffer holds 4 bytes"), "{m}");
+    let m = panic_message(|| {
+        let _ = huber.run(&z, &one, &mut grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the target buffer holds 4 bytes"), "{m}");
+    let m = panic_message(|| {
+        let _ = huber.run(&z, &z, &mut short_grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the gradient buffer holds 60 bytes"), "{m}");
+    assert!(
+        read(&grad, 16).iter().all(|v| v.is_nan()),
+        "a refused call wrote the gradient"
+    );
 }
