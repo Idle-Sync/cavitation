@@ -13,10 +13,14 @@ use std::num::NonZeroU64;
 
 use crate::{BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Shader, Step, StepEncoder};
 
-/// The element-wise shader, one entry point per operation.
+/// The element-wise shader, one entry point per operation, with the scalar functions it
+/// shares with the GLU kernels (`activation.wgsl`) appended.
 const ELEMENTWISE: Shader = Shader {
     name: "elementwise",
-    source: include_str!("elementwise.wgsl"),
+    source: concat!(
+        include_str!("elementwise.wgsl"),
+        include_str!("activation.wgsl")
+    ),
 };
 
 /// The dropout shader, whose mask binding holds `u32` words.
