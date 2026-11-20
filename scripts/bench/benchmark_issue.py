@@ -187,28 +187,32 @@ def render(data):
     out.append("")
     out.append("## Measurements")
     out.append("")
-    out.append("| Machine | Device | Network | Cavitation epoch | PyTorch epoch | Epochs × rows | Threads, kernel | Commit | Date | PyTorch |")
-    out.append("|---|---|---|---|---|---|---|---|---|---|")
-    order = {d: i for i, d in enumerate(DEVICES)}
-    for row in sorted(rows, key=lambda r: (r["machine"], order[r["device"]], NETS.index(r["net"]))):
-        torch = f"{row['torch_s']:.2f} s" if row["torch_s"] is not None else "❌"
-        about = row["torch_about"] or "–"
-        out.append(
-            f"| {row['machine']} | {DEVICE_NAMES[row['device']]} | {row['net']} | {row['cav_s']:.2f} s | {torch} "
-            f"| {row['epochs']} × {row['rows']:,} | {row['threads']}, {row['kernel']} | {row['commit']} "
-            f"| {row['date']} | {about} |"
-        )
-    out.append("")
-    out.append("Commands, as each row ran them (the release build of `cavitation-bench`, with `CAVITATION_THREADS=4`):")
-    out.append("")
-    out.append("```")
-    seen = []
-    for row in rows:
-        if row["command"] not in seen:
-            seen.append(row["command"])
-    out.extend(seen)
-    out.append("```")
-    out.append("")
+    if not rows:
+        out.append("None yet.")
+        out.append("")
+    else:
+        out.append("| Machine | Device | Network | Cavitation epoch | PyTorch epoch | Epochs × rows | Threads, kernel | Commit | Date | PyTorch |")
+        out.append("|---|---|---|---|---|---|---|---|---|---|")
+        order = {d: i for i, d in enumerate(DEVICES)}
+        for row in sorted(rows, key=lambda r: (r["machine"], order[r["device"]], NETS.index(r["net"]))):
+            torch = f"{row['torch_s']:.2f} s" if row["torch_s"] is not None else "❌"
+            about = row["torch_about"] or "–"
+            out.append(
+                f"| {row['machine']} | {DEVICE_NAMES[row['device']]} | {row['net']} | {row['cav_s']:.2f} s | {torch} "
+                f"| {row['epochs']} × {row['rows']:,} | {row['threads']}, {row['kernel']} | {row['commit']} "
+                f"| {row['date']} | {about} |"
+            )
+        out.append("")
+        out.append("Commands, as each row ran them (the release build of `cavitation-bench`, with `CAVITATION_THREADS=4`):")
+        out.append("")
+        out.append("```")
+        seen = []
+        for row in rows:
+            if row["command"] not in seen:
+                seen.append(row["command"])
+        out.extend(seen)
+        out.append("```")
+        out.append("")
     out.append("## Not measured yet")
     out.append("")
     for m in missing:
