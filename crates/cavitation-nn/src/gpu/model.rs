@@ -979,4 +979,31 @@ mod tests {
             );
         }
     }
+
+    /// A GLU's buffers are held to the largest buffer the GPU binds, as every layer's are: a
+    /// leading GLU over 4,096 values a row, at the first batch whose input is larger, is
+    /// refused when the model compiles, before anything is allocated.
+    #[test]
+    fn glu_buffers_are_held_to_the_gpus_binding_limit() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(Glu { gate: Gate::Relu })
+            .push(Linear::new(&mut params, 2048, 1, &mut Rng::seed(8)));
+        for_each_gpu(|gpu| {
+            let limits = &gpu.info().limits;
+            let largest = limits
+                .max_buffer_size
+                .min(limits.max_storage_buffer_binding_size);
+            let batch = (largest / (4 * 4096) + 1) as usize;
+            let err = GpuModel::compile(&net, &params, batch, gpu).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: GpuModel::compile: layer 0 (glu) reads or writes {} bytes per \
+                     batch of {batch}, more than the {largest} this GPU binds",
+                    4 * 4096 * batch
+                )
+            );
+        });
+    }
 }

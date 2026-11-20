@@ -799,3 +799,135 @@ mod tests {
         );
     }
 }
+
+/// The plan's GLU widths and refusals, on both engines; nothing here touches a device.
+#[cfg(all(test, any(feature = "gpu", feature = "cuda")))]
+mod glu_tests {
+    use cavitation_core::{Gate, ParamId, ParamStore, ParamValues, Real, Rng, Tape, Var};
+
+    use super::{Engine, Plan};
+    use crate::{Glu, InferenceLayer, Layer, Linear, Prelu, Sequential};
+
+    /// Both engines.
+    const ENGINES: [Engine; 2] = [Engine::WGPU, Engine::CUDA];
+
+    /// A layer that passes its input on and fixes the input width it holds.
+    struct Fixed(usize);
+
+    impl<T: Real> Layer<T> for Fixed {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        fn input_width(&self) -> Option<usize> {
+            Some(self.0)
+        }
+        fn forward(&self, _: &mut Tape<'_, T>, x: Var) -> Var {
+            x
+        }
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+        fn inference(&self, _: &ParamValues<f32>) -> Option<InferenceLayer> {
+            Some(InferenceLayer::Identity)
+        }
+    }
+
+    /// A GLU.
+    fn glu() -> Glu {
+        Glu {
+            gate: Gate::Sigmoid,
+        }
+    }
+
+    /// Each GLU before the first layer that fixes a width doubles the model's input width, a
+    /// `Linear`'s or a per-column PReLU's; without the GLUs the width is that layer's own.
+    #[test]
+    fn leading_glus_double_the_input_width() {
+        let mut params = ParamStore::new();
+        let mut rng = Rng::seed(6);
+        let cases: Vec<(Sequential, usize)> = vec![
+            (
+                Sequential::new().push(Linear::new(&mut params, 4, 3, &mut rng)),
+                4,
+            ),
+            (
+                Sequential::new()
+                    .push(glu())
+                    .push(Linear::new(&mut params, 4, 3, &mut rng)),
+                8,
+            ),
+            (
+                Sequential::new().push(glu()).push(glu()).push(Linear::new(
+                    &mut params,
+                    4,
+                    3,
+                    &mut rng,
+                )),
+                16,
+            ),
+            (Sequential::new().push(Prelu::new(&mut params, 3)), 3),
+            (
+                Sequential::new()
+                    .push(glu())
+                    .push(Prelu::new(&mut params, 3)),
+                6,
+            ),
+        ];
+        for engine in ENGINES {
+            for (net, width) in &cases {
+                let plan = Plan::build_for(net, &params, 8, engine).unwrap();
+                assert_eq!(plan.input_width, *width, "{} layers", net.len());
+                assert_eq!(plan.layers[0].inputs, *width, "{} layers", net.len());
+            }
+        }
+    }
+
+    /// 64 GLUs before a `Linear` of 4 inputs would double its width past `usize`: refused,
+    /// naming the layer that fixes the width.
+    #[test]
+    fn leading_glus_past_usize_are_refused() {
+        let mut params = ParamStore::new();
+        let mut net = Sequential::new();
+        for _ in 0..64 {
+            net = net.push(glu());
+        }
+        let net = net.push(Linear::new(&mut params, 4, 3, &mut Rng::seed(7)));
+        for engine in ENGINES {
+            let err = Plan::build_for(&net, &params, 8, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: {}: layer 64 (linear) takes input width 4, which the GLUs \
+                     before it double past what memory can index",
+                    engine.name
+                )
+            );
+        }
+    }
+
+    /// A GLU over 4,294,967,296 values per batch (2³⁰ rows of 4) is refused on both engines,
+    /// whose kernels index with 32-bit integers, and one row fewer is planned. The width is
+    /// fixed by a layer that passes its input on, so no other layer's limit comes first (a
+    /// `Linear` over 2³¹ rows is above the wgpu GEMM's side).
+    #[test]
+    fn glu_over_more_than_u32_values_is_refused() {
+        let params = ParamStore::new();
+        let net = Sequential::new().push(glu()).push(Fixed(2));
+        let rows = (u32::MAX / 4) as usize + 1;
+        for engine in ENGINES {
+            assert!(Plan::build_for(&net, &params, rows - 1, engine).is_ok());
+            let err = Plan::build_for(&net, &params, rows, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: {}: layer 0 (glu) is a GLU over 1073741824 rows of 4 values, \
+                     more than the 4294967295 per batch the GPU takes",
+                    engine.name
+                )
+            );
+        }
+    }
+}
