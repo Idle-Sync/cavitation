@@ -8,7 +8,7 @@ use cavitation_core::{Conv2dGeom, Pool2dGeom};
 use cavitation_cuda::{
     AvgPool2d, BatchNorm2d, BatchStats, ChannelDims, Conv2d, ConvShape, Cuda, CudaError,
     DeviceBuffer, Dropout, Elementwise, ElementwiseOp, Linear, LinearShape, MaxPool2d, PoolShape,
-    RowSoftmax, RowSoftmaxOp,
+    Prelu, PreluOp, RowSoftmax, RowSoftmaxOp,
 };
 
 use crate::plan::{Act, CompiledLayer, Kind};
@@ -101,6 +101,8 @@ pub(crate) struct Shared<'c> {
     pub(crate) dropout: Dropout<'c>,
     /// Softmax and log-softmax over each row, forward and backward.
     pub(crate) softmax: RowSoftmax<'c>,
+    /// PReLU: forward, the input's gradient and the slopes' gradient.
+    pub(crate) prelu: Prelu<'c>,
 }
 
 /// The kernels of one pass that are set up for its shapes, which its [`Op`]s name by index.
@@ -192,6 +194,26 @@ pub(crate) enum Op {
         a: usize,
         b: Option<usize>,
         y: usize,
+    },
+    /// PReLU's `op` over `rows` rows of `channels` values of `x` with the slopes `slope`
+    /// (and the gradient `dy`): the forward pass or the input's gradient.
+    Prelu {
+        op: PreluOp,
+        rows: usize,
+        channels: usize,
+        x: usize,
+        slope: usize,
+        dy: Option<usize>,
+        y: usize,
+    },
+    /// PReLU's slopes' gradient `ds` from `x` and `dy`, with `partials` as scratch memory.
+    PreluSlopeGrad {
+        rows: usize,
+        channels: usize,
+        x: usize,
+        dy: usize,
+        partials: usize,
+        ds: usize,
     },
     /// Dropout of `n` values with the bits `mask` and the scale `scale`, forward or backward.
     Dropout {
@@ -314,6 +336,41 @@ fn run_op(
                 scale,
             )
         }
+        Op::Prelu {
+            op,
+            rows,
+            channels,
+            x,
+            slope,
+            dy,
+            y,
+        } => {
+            let g = dy.map(|g| s.get(g));
+            (shared.prelu).run(
+                op,
+                &s.get(x),
+                &s.get(slope),
+                g.as_deref(),
+                &mut s.get_mut(y),
+                rows,
+                channels,
+            )
+        }
+        Op::PreluSlopeGrad {
+            rows,
+            channels,
+            x,
+            dy,
+            partials,
+            ds,
+        } => (shared.prelu).slope_grad(
+            &s.get(x),
+            &s.get(dy),
+            &mut s.get_mut(partials),
+            &mut s.get_mut(ds),
+            rows,
+            channels,
+        ),
         Op::Softmax {
             op,
             rows,
@@ -528,6 +585,16 @@ pub(crate) fn norm_dims(
     ))
 }
 
+/// The `(rows, channels)` the PReLU kernels take for `rows` rows of `width` values with
+/// `channels` slopes: each column a channel, or every value a row of one shared slope.
+pub(crate) fn prelu_shape(rows: usize, width: usize, channels: usize) -> (usize, usize) {
+    if channels == 1 {
+        (rows * width, 1)
+    } else {
+        (rows, channels)
+    }
+}
+
 /// An activation's forward operation.
 pub(crate) fn forward_op(act: Act) -> ElementwiseOp {
     match act {
@@ -665,6 +732,20 @@ impl<'c> Forward<'c> {
                         width: layer.outputs,
                         a: x,
                         b: None,
+                        y,
+                    });
+                    y
+                }
+                Kind::Prelu { channels, weight } => {
+                    let y = store.values(n)?;
+                    let (rows, channels) = prelu_shape(rows, layer.inputs, channels);
+                    ops.push(Op::Prelu {
+                        op: PreluOp::Forward,
+                        rows,
+                        channels,
+                        x,
+                        slope: parts.params[weight],
+                        dy: None,
                         y,
                     });
                     y

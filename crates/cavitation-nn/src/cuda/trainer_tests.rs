@@ -28,8 +28,8 @@ use cavitation_core::{Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
 
 use super::CudaTrainer;
 use super::test_util::{
-    Data, Twin, activation_mlp, cifar_cnn, mlp, mnist_cnn, more_activations, off, small_cnn,
-    softmax_mlp, twin, with_cuda,
+    Data, Twin, activation_mlp, cifar_cnn, mlp, mnist_cnn, more_activations, off, prelu_mlp,
+    small_cnn, softmax_mlp, twin, with_cuda,
 };
 use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
@@ -242,6 +242,22 @@ fn softmax_layers_match_the_tape() {
             seed,
         );
         let what = if log { "log-softmax" } else { "softmax" };
+        check_gradients(t, &Data::within(seed, 24, 12, 4, (-2.0, 2.0)), what);
+    }
+}
+
+/// A PReLU before each `Linear` of an MLP, the first layer among them, with one slope per
+/// column and with one shared slope: the card's gradients, the slopes' among them, against
+/// the `f64` tape's, within the tolerance above.
+#[test]
+fn prelu_layers_match_the_tape() {
+    for (seed, shared) in [(94, false), (95, true)] {
+        let t = twin(
+            |p, s| prelu_mlp(p, s, shared),
+            |p, s| prelu_mlp(p, s, shared),
+            seed,
+        );
+        let what = if shared { "shared PReLU" } else { "PReLU" };
         check_gradients(t, &Data::within(seed, 24, 12, 4, (-2.0, 2.0)), what);
     }
 }

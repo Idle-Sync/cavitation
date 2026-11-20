@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_cuda::{
     ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, MeanSquaredError, OptimizerKernel,
-    OptimizerRule, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
+    OptimizerRule, PreluOp, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
 };
 
 use super::model::{CudaModel, ran, refused};
-use super::pass::{DropoutMask, Forward, Op, Parts, Store, backward_op, run};
+use super::pass::{DropoutMask, Forward, Op, Parts, Store, backward_op, prelu_shape, run};
 use crate::health::channel_size;
 use crate::plan::{Act, Kind, Running};
 use crate::{
@@ -1469,6 +1469,7 @@ fn check_untied(m: &CudaModel<'_>, model: &Sequential) -> Result<(), Error> {
                 std::iter::once(weight).chain(bias).collect()
             }
             Kind::BatchNorm2d(n) => n.weight.into_iter().chain(n.bias).collect(),
+            Kind::Prelu { weight, .. } => vec![weight],
             _ => Vec::new(),
         };
         for k in ids {
@@ -1631,6 +1632,30 @@ impl<'c> TrainPass<'c> {
                         width: layer.outputs,
                         a: saved.pre,
                         b: Some(g),
+                        y: dx,
+                    });
+                    dx
+                }
+                Kind::Prelu { channels, weight } => {
+                    let (rows, channels) = prelu_shape(rows, layer.inputs, channels);
+                    let partials =
+                        s.values(cavitation_cuda::Prelu::partials_len(rows, channels))?;
+                    backward.push(Op::PreluSlopeGrad {
+                        rows,
+                        channels,
+                        x,
+                        dy: g,
+                        partials,
+                        ds: param_grads[weight],
+                    });
+                    let dx = s.values(n_in)?;
+                    backward.push(Op::Prelu {
+                        op: PreluOp::InputGrad,
+                        rows,
+                        channels,
+                        x,
+                        slope: params[weight],
+                        dy: Some(g),
                         y: dx,
                     });
                     dx

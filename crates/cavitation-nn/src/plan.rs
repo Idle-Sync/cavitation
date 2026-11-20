@@ -24,6 +24,14 @@ const MAX_GEMM_SIDE: usize = 65_535 * 64;
 /// kernels run one thread per row, in one dispatch dimension of 65,535 workgroups of 256.
 const MAX_SOFTMAX_ROWS: usize = 65_535 * 256;
 
+/// The most slopes a PReLU may have on either engine: the slopes' gradient sums each channel
+/// in one row of a grid, and a grid dimension holds at most 65,535.
+const MAX_PRELU_CHANNELS: usize = 65_535;
+
+/// The most values of one channel a PReLU's slope gradient sums on the wgpu engine: 65,535
+/// chunks of 4,096, one workgroup each along a dispatch dimension.
+const MAX_PRELU_ROWS: usize = 65_535 * 4096;
+
 /// The engine a plan is built for: the name its messages start with, and whether the wgpu
 /// engine's own limits apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +184,14 @@ pub(crate) enum Kind {
     },
     /// An element-wise activation.
     Activation(Act),
+    /// PReLU, `x` above 0 and `slope · x` elsewhere, value `i` of a row taking slope
+    /// `i % channels`: one slope per column, or one shared slope (`channels = 1`).
+    Prelu {
+        /// The slopes.
+        channels: usize,
+        /// The slopes' index.
+        weight: usize,
+    },
     /// Softmax over each row, or log-softmax if `log`.
     Softmax {
         /// Whether it is the log-softmax.
@@ -217,6 +233,7 @@ impl Kind {
             Kind::Conv2d { geom, .. } => Some(geom.in_width()),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => Some(geom.in_width()),
             Kind::BatchNorm2d(norm) => Some(norm.channels * norm.spatial),
+            Kind::Prelu { channels, .. } => (*channels > 1).then_some(*channels),
             Kind::Activation(_) | Kind::Softmax { .. } | Kind::Dropout(_) | Kind::Identity => None,
         }
     }
@@ -228,6 +245,7 @@ impl Kind {
             Kind::Conv2d { geom, .. } => geom.out_width(),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => geom.out_width(),
             Kind::Activation(_)
+            | Kind::Prelu { .. }
             | Kind::Softmax { .. }
             | Kind::BatchNorm2d(_)
             | Kind::Dropout(_)
@@ -284,13 +302,15 @@ impl Plan {
     ///
     /// - [`Error::Unsupported`] if the model has no layers, a layer is not one a GPU runs or
     ///   has parameters its GPU form does not use (by index and name), an id is used in two
-    ///   roles, no layer fixes the input width, or (on the wgpu engine) a convolution's batch
-    ///   is above 65,535, a softmax's above 16,776,960, a GEMM's side above 4,194,240, or a
-    ///   batch norm's eps below 2⁻¹²⁶ in `f32` and not 0.
+    ///   roles, no layer fixes the input width, a PReLU has more than 65,535 slopes, or (on
+    ///   the wgpu engine) a convolution's batch is above 65,535, a softmax's above 16,776,960,
+    ///   a PReLU's slope gradient would sum more than 268,431,360 values per slope, a GEMM's
+    ///   side is above 4,194,240, or a batch norm's eps is below 2⁻¹²⁶ in `f32` and not 0.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports, a
-    ///   mask is not as wide as its layer's output, a batch count does not hold one value, or
-    ///   a batch norm that keeps no running statistics would see one value per channel.
+    ///   mask is not as wide as its layer's output, a batch count does not hold one value, a
+    ///   PReLU's weight does not hold one value per slope, or a batch norm that keeps no
+    ///   running statistics would see one value per channel.
     pub(crate) fn build_for(
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
@@ -345,7 +365,7 @@ impl Plan {
                 )));
             }
             if engine.wgpu_limits {
-                check_wgpu_limits(&kind, batch, i, name, who)?;
+                check_wgpu_limits(&kind, batch, width, i, name, who)?;
             }
             let outputs = kind.output_width(width);
             if outputs == 0 {
@@ -395,15 +415,26 @@ impl Plan {
 }
 
 /// Refuses what the wgpu kernels cannot run: a convolution over more than 65,535 images, a
-/// softmax over more than 16,776,960 rows, a GEMM side above 4,194,240, and a batch norm's
-/// eps that `f32` arithmetic flushing subnormals may turn into 0.
+/// softmax over more than 16,776,960 rows, a PReLU whose slope gradient sums more than
+/// 268,431,360 values per slope (`width` the layer's input width), a GEMM side above
+/// 4,194,240, and a batch norm's eps that `f32` arithmetic flushing subnormals may turn into 0.
 fn check_wgpu_limits(
     kind: &Kind,
     batch: usize,
+    width: usize,
     i: usize,
     name: &str,
     who: &str,
 ) -> Result<(), Error> {
+    if let Kind::Prelu { channels, .. } = *kind {
+        let rows = if channels == 1 { batch * width } else { batch };
+        if rows > MAX_PRELU_ROWS {
+            return Err(Error::Unsupported(format!(
+                "{who}: layer {i} ({name}) is a PReLU whose slope gradient sums {rows} values \
+                 per slope, more than the {MAX_PRELU_ROWS} the GPU takes"
+            )));
+        }
+    }
     if matches!(kind, Kind::Softmax { .. }) && batch > MAX_SOFTMAX_ROWS {
         return Err(Error::Unsupported(format!(
             "{who}: layer {i} ({name}) is a softmax, which takes at most {MAX_SOFTMAX_ROWS} \
@@ -582,6 +613,25 @@ fn kind(
             bias,
             running,
         }));
+    }
+    if let Some(prelu) = layer.as_prelu() {
+        let channels = layer.input_width().unwrap_or(1);
+        if channels > MAX_PRELU_CHANNELS {
+            return refuse(&format!(
+                "is a PReLU with {channels} slopes; the GPU takes at most {MAX_PRELU_CHANNELS}"
+            ));
+        }
+        let held = params.values.get(prelu.weight()).data().len();
+        if held != channels {
+            return Err(Error::InvalidData(format!(
+                "{who}: layer {i} ({name}) is a PReLU with {channels} slopes, but its weight \
+                 holds {held} values"
+            )));
+        }
+        return Ok(Kind::Prelu {
+            channels,
+            weight: slots.slot(prelu.weight(), Role::Param, i, name, who)?,
+        });
     }
     if !layer.parameters().is_empty() || !layer.buffers().is_empty() {
         return refuse("has parameters, and the GPU runs no layer of its kind");

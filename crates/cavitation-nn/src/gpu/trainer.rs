@@ -12,15 +12,15 @@ use cavitation_gpu::kernels::{
     ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
     ConvWeightGradCall, CrossEntropyCall, DeadRelu, DeadReluCall, Elementwise, ElementwiseCall,
     FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, MaxPool2d, MeanSquaredError, MseCall,
-    OptimizerKernel, OptimizerRule, RowSoftmax, RowSoftmaxCall, RunningUpdate, SoftmaxCrossEntropy,
-    SumSquares, SumSquaresCall,
+    OptimizerKernel, OptimizerRule, Prelu, PreluCall, RowSoftmax, RowSoftmaxCall, RunningUpdate,
+    SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepOutput,
     StepSizes, TimedKind, Timing, wgpu,
 };
 
-use super::forward::Kernels;
+use super::forward::{Kernels, prelu_shape};
 use super::model::{Act, GpuModel, Kind};
 use crate::health::channel_size;
 use crate::{
@@ -89,6 +89,10 @@ enum Op {
     Elementwise(ElementwiseCall),
     /// A softmax or log-softmax over each row, forward or backward.
     Softmax(RowSoftmaxCall),
+    /// PReLU forward, or its input gradient.
+    Prelu(PreluCall),
+    /// A PReLU's slope gradient.
+    PreluSlope(ChannelSumsCall),
     /// Pooling forward: the kernel's index in [`TrainPass::pools`] and the bind group.
     PoolForward(usize, wgpu::BindGroup),
     /// Pooling backward: the kernel's index and the bind group.
@@ -1687,6 +1691,7 @@ fn check_untied(gpu: &GpuModel, model: &Sequential) -> Result<(), Error> {
                 std::iter::once(weight).chain(bias).collect()
             }
             Kind::BatchNorm2d(n) => n.weight.into_iter().chain(n.bias).collect(),
+            Kind::Prelu { weight, .. } => vec![weight],
             _ => Vec::new(),
         };
         for k in ids {
@@ -1717,6 +1722,8 @@ fn record(ops: &[Op], model: &Kernels, train: &TrainKernels, pools: &[Pool], ste
             Op::Sums(call) => train.sums.record(step, call),
             Op::Elementwise(call) => model.elementwise.record(step, call),
             Op::Softmax(call) => model.softmax.record(step, call),
+            Op::Prelu(call) => model.prelu.record(step, call),
+            Op::PreluSlope(call) => model.prelu.record_slope_grad(step, call),
             Op::PoolForward(k, group) => match &pools[*k] {
                 Pool::Max(p) => p.forward(step, group),
                 Pool::Avg(p) => p.forward(step, group),
@@ -1864,6 +1871,20 @@ impl TrainPass {
                         op,
                         shape,
                         &values[x],
+                        None,
+                        &values[out],
+                    )));
+                    out
+                }
+                Kind::Prelu { channels, weight } => {
+                    let out = take(&mut values, pool);
+                    forward.push(Op::Prelu(k.prelu.call(
+                        steps,
+                        pool,
+                        Prelu::Forward,
+                        prelu_shape(batch, layer.inputs, channels),
+                        &values[x],
+                        &m.params[weight].buffer,
                         None,
                         &values[out],
                     )));
@@ -2158,6 +2179,29 @@ impl TrainPass {
                         op,
                         shape,
                         &values[s.pre],
+                        Some(&grads[g]),
+                        &grads[dx],
+                    )));
+                    dx
+                }
+                Kind::Prelu { channels, weight } => {
+                    let shape = prelu_shape(batch, layer.inputs, channels);
+                    backward.push(Op::PreluSlope(k.prelu.slope_grad_call(
+                        steps,
+                        pool,
+                        shape,
+                        x,
+                        &grads[g],
+                        &param_grads[weight],
+                    )));
+                    let dx = new_grad(&mut grads, pool, n_in);
+                    backward.push(Op::Prelu(k.prelu.call(
+                        steps,
+                        pool,
+                        Prelu::InputGrad,
+                        shape,
+                        x,
+                        &m.params[weight].buffer,
                         Some(&grads[g]),
                         &grads[dx],
                     )));

@@ -11,12 +11,14 @@
 use cavitation_core::{Conv2dGeom, Gate, GeluApprox, ParamId, ParamStore, Pool2dGeom, Rng, Tensor};
 
 use super::CudaModel;
-use super::test_util::{cifar_cnn, classes, mlp, mnist_cnn, off, twin, uniform, with_cuda};
+use super::test_util::{
+    cifar_cnn, classes, mlp, mnist_cnn, off, prelu_mlp, twin, uniform, with_cuda,
+};
 use crate::plan::{Engine, Plan, pack_rows};
 use crate::{
     AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh, InferenceModel,
-    Init, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid,
-    Softmax, Tanh, accuracy, evaluate,
+    Init, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d, NeuronMask, Prelu, Relu, Sequential,
+    Sigmoid, Softmax, Tanh, accuracy, evaluate,
 };
 
 /// A small CNN with every kind of layer the card runs, two of them masked: 1 × 6 × 6 images
@@ -58,8 +60,9 @@ fn every_kind(params: &mut ParamStore) -> Sequential {
 }
 
 /// The plan names `CudaModel::compile` in its refusals, and the wgpu engine's limits (a
-/// convolution's batch above 65,535, a softmax's above 16,776,960, a batch norm's eps below
-/// 2⁻¹²⁶) do not apply.
+/// convolution's batch above 65,535, a softmax's above 16,776,960, a PReLU's slope gradient
+/// over more than 268,431,360 values per slope, a batch norm's eps below 2⁻¹²⁶) do not apply;
+/// a PReLU of more than 65,535 slopes is refused on both.
 #[test]
 fn the_plan_refuses_under_cudas_name() {
     let mut params = ParamStore::new();
@@ -98,6 +101,16 @@ fn the_plan_refuses_under_cudas_name() {
         assert!(Plan::build_for(&net, &store, 16_776_961, Engine::CUDA).is_ok());
         assert!(Plan::build_for(&net, &store, 16_776_961, Engine::WGPU).is_err());
     }
+    let net = Sequential::new().push(Prelu::new(&mut store, 2));
+    assert!(Plan::build_for(&net, &store, 268_431_361, Engine::CUDA).is_ok());
+    assert!(Plan::build_for(&net, &store, 268_431_361, Engine::WGPU).is_err());
+    let wide = Sequential::new().push(Prelu::new(&mut store, 65_536));
+    let err = Plan::build_for(&wide, &store, 2, Engine::CUDA).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported: CudaModel::compile: layer 0 (prelu) is a PReLU with 65536 slopes; the GPU \
+         takes at most 65535"
+    );
 }
 
 /// Every parameter, running statistic and mask comes back from the card bit for bit, odd
@@ -290,4 +303,32 @@ fn compile_refuses_activation_settings_the_kernels_do_not_take() {
             );
         }
     });
+}
+
+/// A PReLU before each `Linear` of an MLP, with one slope per column and with one shared
+/// slope: the evaluation-mode outputs against the CPU's `InferenceModel`, and the slopes
+/// back from the card bit for bit.
+#[test]
+fn prelu_layers_match_the_cpu() {
+    for (seed, shared) in [(96, false), (97, true)] {
+        let what = if shared { "shared PReLU" } else { "PReLU" };
+        let mut params = ParamStore::new();
+        let net = prelu_mlp::<f32>(&mut params, seed, shared);
+        check_outputs(&net, &params, 23, &uniform(seed, 23 * 12, -2.0, 2.0), what);
+        let slopes: Vec<ParamId> = (0..net.len())
+            .filter_map(|i| net.layer(i).as_prelu().map(|p| p.weight()))
+            .collect();
+        assert_eq!(slopes.len(), 3);
+        with_cuda(|cuda| {
+            let mut model = CudaModel::compile(&net, &params, 4, cuda).unwrap();
+            let mut back = params.clone();
+            for &id in &slopes {
+                back.value_mut(id).data_mut().fill(9.0);
+            }
+            model.download_to(&mut back);
+            for &id in &slopes {
+                assert_eq!(back.value(id).data(), params.value(id).data(), "{what}");
+            }
+        });
+    }
 }
