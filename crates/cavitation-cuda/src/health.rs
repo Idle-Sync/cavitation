@@ -46,10 +46,41 @@ fn check_buffers(what: &str, buffers: &[(&DeviceBuffer<'_>, &str, u64)]) {
 /// Each tensor's `(start, len)` in a flat buffer that holds tensors of `lens` values one
 /// after another; refuses, naming `what`, a tensor of no values and more than 2³¹ values
 /// together.
+#[cfg(test)]
 fn flat(what: &str, lens: &[usize]) -> Result<Vec<(u32, u32)>, CudaError> {
+    placed(what, lens, None)
+}
+
+/// Each tensor's `(start, len)` in a flat buffer that holds tensors of `lens` values at
+/// `starts` (one after another without them), in order and without overlapping; refuses,
+/// naming `what`, a tensor of no values, starts that are not one per tensor or that overlap
+/// the tensor before, and an end past 2³¹ values.
+fn placed(
+    what: &str,
+    lens: &[usize],
+    starts: Option<&[usize]>,
+) -> Result<Vec<(u32, u32)>, CudaError> {
+    if let Some(starts) = starts
+        && starts.len() != lens.len()
+    {
+        return Err(CudaError::Invalid(format!(
+            "{what}: {} starts for {} tensors",
+            starts.len(),
+            lens.len()
+        )));
+    }
     let mut start = 0u64;
     let mut tensors = Vec::with_capacity(lens.len());
     for (k, &len) in lens.iter().enumerate() {
+        if let Some(starts) = starts {
+            let at = starts[k] as u64;
+            if at < start {
+                return Err(CudaError::Invalid(format!(
+                    "{what}: tensor {k} starts at {at}, inside the tensor before it, which                      ends at {start}"
+                )));
+            }
+            start = at;
+        }
         if len == 0 {
             return Err(CudaError::Invalid(format!(
                 "{what}: tensor {k} holds no values; every tensor must hold at least one"
@@ -292,13 +323,54 @@ impl<'c> SumSquares<'c> {
     /// 2³¹ values together; [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the
     /// driver refuses the kernels or the memory.
     pub fn new(cuda: &'c Cuda, lens: &[usize]) -> Result<SumSquares<'c>, CudaError> {
+        Self::make(cuda, lens, None)
+    }
+
+    /// [`new`](Self::new) for gradients of `lens` values at `starts` in the flat buffer
+    /// (in order, not overlapping), with the values between them not read.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), and [`CudaError::Invalid`] if `starts` does not hold one start
+    /// per gradient or a gradient starts inside the one before it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, SumSquares};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     // [3, 4] at 0 and [1, 2, 2] at 4; the 9s between are not read.
+    ///     let sums = SumSquares::with_starts(&cuda, &[2, 3], &[0, 4]).unwrap();
+    ///     let (mut grads, mut out) = (cuda.buffer(28).unwrap(), cuda.buffer(8).unwrap());
+    ///     grads.write(&[3.0f32, 4.0, 9.0, 9.0, 1.0, 2.0, 2.0]).unwrap();
+    ///     sums.run(&grads, (&mut out, 0)).unwrap();
+    ///     let mut got = [0.0f32; 2];
+    ///     out.read(&mut got).unwrap();
+    ///     assert_eq!(got, [25.0, 9.0]);
+    /// }
+    /// ```
+    pub fn with_starts(
+        cuda: &'c Cuda,
+        lens: &[usize],
+        starts: &[usize],
+    ) -> Result<SumSquares<'c>, CudaError> {
+        Self::make(cuda, lens, Some(starts))
+    }
+
+    /// [`new`](Self::new) or [`with_starts`](Self::with_starts).
+    fn make(
+        cuda: &'c Cuda,
+        lens: &[usize],
+        starts: Option<&[usize]>,
+    ) -> Result<SumSquares<'c>, CudaError> {
         const WHAT: &str = "sum of squares";
         if lens.is_empty() {
             return Err(CudaError::Invalid(format!(
                 "{WHAT}: there must be at least one gradient"
             )));
         }
-        let tensors = flat(WHAT, lens)?;
+        let tensors = placed(WHAT, lens, starts)?;
         let kernels = Kernels::new(cuda)?;
         let table = FlatTable::new(cuda, &tensors)?;
         Ok(SumSquares {
@@ -420,7 +492,50 @@ impl<'c> FiniteFlag<'c> {
     /// together; [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the driver
     /// refuses the kernels or the memory.
     pub fn new(cuda: &'c Cuda, lens: &[usize]) -> Result<FiniteFlag<'c>, CudaError> {
-        let tensors = flat("finite flag", lens)?;
+        Self::make(cuda, lens, None)
+    }
+
+    /// [`new`](Self::new) for gradients of `lens` values at `starts` in the flat buffer
+    /// (in order, not overlapping), with the values between them not read.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), and [`CudaError::Invalid`] if `starts` does not hold one start
+    /// per gradient or a gradient starts inside the one before it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, FiniteFlag};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     // A NaN between the gradients is not read.
+    ///     let check = FiniteFlag::with_starts(&cuda, &[1, 1], &[0, 2]).unwrap();
+    ///     let (mut loss, mut grads) = (cuda.buffer(4).unwrap(), cuda.buffer(12).unwrap());
+    ///     let mut flag = cuda.buffer(4).unwrap();
+    ///     loss.write(&[0.5f32]).unwrap();
+    ///     grads.write(&[1.0f32, f32::NAN, 2.0]).unwrap();
+    ///     check.run((&loss, 0), &grads, &mut flag).unwrap();
+    ///     let mut bad = [1u32];
+    ///     flag.read(&mut bad).unwrap();
+    ///     assert_eq!(bad, [0]);
+    /// }
+    /// ```
+    pub fn with_starts(
+        cuda: &'c Cuda,
+        lens: &[usize],
+        starts: &[usize],
+    ) -> Result<FiniteFlag<'c>, CudaError> {
+        Self::make(cuda, lens, Some(starts))
+    }
+
+    /// [`new`](Self::new) or [`with_starts`](Self::with_starts).
+    fn make(
+        cuda: &'c Cuda,
+        lens: &[usize],
+        starts: Option<&[usize]>,
+    ) -> Result<FiniteFlag<'c>, CudaError> {
+        let tensors = placed("finite flag", lens, starts)?;
         let kernels = Kernels::new(cuda)?;
         let table = FlatTable::new(cuda, &tensors)?;
         Ok(FiniteFlag {
@@ -693,6 +808,23 @@ mod tests {
         );
         assert_eq!(table_words(&[]), (vec![], 0));
         assert!(flat("t", &[1 << 30, 1 << 30]).is_ok());
+        assert_eq!(
+            placed("t", &[2, 3], Some(&[1, 8])).unwrap(),
+            vec![(1, 2), (8, 3)]
+        );
+        for (starts, why) in [
+            (vec![0], "1 starts for 2 tensors"),
+            (
+                vec![0, 1],
+                "tensor 1 starts at 1, inside the tensor before it",
+            ),
+            (vec![0, (1 << 31) - 2], "more than the 2147483648"),
+        ] {
+            let Err(CudaError::Invalid(text)) = placed("t", &[2, 3], Some(&starts)) else {
+                panic!("{starts:?} accepted");
+            };
+            assert!(text.contains(why), "{text}");
+        }
         for (lens, why) in [
             (vec![2, 0], "tensor 1 holds no values"),
             (vec![1 << 30, 1 << 30, 1], "more than the 2147483648"),

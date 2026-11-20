@@ -321,8 +321,10 @@ pub struct OptimizerKernel<'c> {
     rule: OptimizerRule,
     /// Each parameter's length.
     lens: Vec<usize>,
-    /// The elements of all parameters together.
+    /// The end of the last parameter in the flat buffers: the elements every buffer holds.
     elements: usize,
+    /// Each parameter's first element in the flat buffers.
+    starts: Vec<usize>,
     /// The compiled kernels.
     module: Module<'c>,
     /// The rule's kernel.
@@ -396,22 +398,81 @@ impl<'c> OptimizerKernel<'c> {
         rule: OptimizerRule,
         lens: &[usize],
     ) -> Result<OptimizerKernel<'c>, CudaError> {
+        let mut starts = Vec::with_capacity(lens.len());
+        let mut at = 0usize;
+        for &n in lens {
+            starts.push(at);
+            at = at.saturating_add(n);
+        }
+        Self::with_starts(cuda, rule, lens, &starts)
+    }
+
+    /// [`new`](Self::new) for parameters of `lens` elements at `starts` in the flat buffers
+    /// (in order, not overlapping); the elements between them are never read or written.
+    ///
+    /// # Errors
+    ///
+    /// As [`new`](Self::new), and [`CudaError::Invalid`] if `starts` does not hold one start
+    /// per parameter or a parameter starts inside the one before it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, OptimizerKernel, OptimizerRule};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let sgd = OptimizerRule::Sgd { lr: 0.5, momentum: 0.0, weight_decay: 0.0 };
+    ///     // Two one-element parameters at 0 and 2; element 1 is left alone.
+    ///     let mut opt = OptimizerKernel::with_starts(&cuda, sgd, &[1, 1], &[0, 2]).unwrap();
+    ///     let mut values = cuda.buffer(12).unwrap();
+    ///     let mut grads = cuda.buffer(12).unwrap();
+    ///     let finite = cuda.buffer(4).unwrap();
+    ///     values.write(&[1.0f32, 7.0, 2.0]).unwrap();
+    ///     grads.write(&[2.0f32, 9.0, 2.0]).unwrap();
+    ///     opt.update(&mut values, &grads, &mut [], &finite, &[true, true]).unwrap();
+    ///     assert!(opt.commit().unwrap());
+    ///     let mut out = [0.0f32; 3];
+    ///     values.read(&mut out).unwrap();
+    ///     assert_eq!(out, [0.0, 7.0, 1.0]);
+    /// }
+    /// ```
+    pub fn with_starts(
+        cuda: &'c Cuda,
+        rule: OptimizerRule,
+        lens: &[usize],
+        starts: &[usize],
+    ) -> Result<OptimizerKernel<'c>, CudaError> {
         rule.check()?;
         if lens.is_empty() || lens.contains(&0) {
             return Err(CudaError::Invalid(format!(
                 "optimizer: every parameter must hold at least one element, got lengths {lens:?}"
             )));
         }
-        let elements = lens.iter().try_fold(0usize, |a, &n| a.checked_add(n));
-        let elements = match elements {
-            Some(n) if n <= MAX_ELEMENTS => n,
-            _ => {
+        if starts.len() != lens.len() {
+            return Err(CudaError::Invalid(format!(
+                "optimizer: {} starts for {} parameters",
+                starts.len(),
+                lens.len()
+            )));
+        }
+        let mut elements = 0usize;
+        for (k, (&at, &n)) in starts.iter().zip(lens).enumerate() {
+            if at < elements {
                 return Err(CudaError::Invalid(format!(
-                    "optimizer: the parameters hold more than the {MAX_ELEMENTS} elements the \
-                     kernel takes"
+                    "optimizer: parameter {k} starts at {at}, inside the parameter before it, \
+                     which ends at {elements}"
                 )));
             }
-        };
+            elements = match at.checked_add(n) {
+                Some(end) if end <= MAX_ELEMENTS => end,
+                _ => {
+                    return Err(CudaError::Invalid(format!(
+                        "optimizer: the parameters hold more than the {MAX_ELEMENTS} elements \
+                         the kernel takes"
+                    )));
+                }
+            };
+        }
         let block = BLOCK as usize;
         let blocks: usize = lens.iter().map(|n| n.div_ceil(block)).sum();
         if blocks > MAX_BLOCKS {
@@ -420,12 +481,10 @@ impl<'c> OptimizerKernel<'c> {
             )));
         }
         let mut table = Vec::with_capacity(2 * blocks);
-        let mut start = 0;
-        for (k, &n) in lens.iter().enumerate() {
+        for (k, (&start, &n)) in starts.iter().zip(lens).enumerate() {
             for first in (start..start + n).step_by(block) {
                 table.extend([k as u32, first as u32]);
             }
-            start += n;
         }
         let module = cuda.compile("optimizer.cu", SOURCE)?;
         let function = module.function(match rule {
@@ -440,6 +499,7 @@ impl<'c> OptimizerKernel<'c> {
             rule,
             lens: lens.to_vec(),
             elements,
+            starts: starts.to_vec(),
             module,
             function,
             table: table_buffer,
@@ -618,10 +678,10 @@ impl<'c> OptimizerKernel<'c> {
         for (word, value) in self.words.iter_mut().zip(shared) {
             *word = value.to_bits();
         }
-        let mut end = 0;
         let (infos, _) = self.words[SHARED_WORDS..].as_chunks_mut::<INFO_WORDS>();
         for (k, info) in infos.iter_mut().enumerate() {
-            end += self.lens[k] as u32;
+            // Below 2³¹: checked when the kernel was made.
+            let end = (self.starts[k] + self.lens[k]) as u32;
             let t = self.steps[k].checked_add(1).ok_or_else(|| {
                 CudaError::Invalid(format!(
                     "optimizer: parameter {k} has {} updates, the most a count holds",

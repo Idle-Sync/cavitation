@@ -1,6 +1,7 @@
 //! Memory on the card: allocated, written from the host and read back.
 
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use crate::device::Cuda;
 use crate::error::CudaError;
@@ -22,7 +23,8 @@ impl Scalar for f32 {}
 impl Scalar for u32 {}
 impl Scalar for i32 {}
 
-/// A block of the card's memory, freed when dropped.
+/// A block of the card's memory, freed when dropped (when it and every [`part`](Self::part)
+/// of it are dropped).
 ///
 /// It starts as zeros. It holds bytes, not a type: what is written as `f32` is read as
 /// `f32`, in the host's byte order, which is the card's.
@@ -48,6 +50,18 @@ pub struct DeviceBuffer<'c> {
     pub(crate) pointer: DevicePtr,
     /// Its size as asked for.
     bytes: usize,
+    /// The allocation it lies in, shared with the parts made of it, freed when the last of
+    /// them is dropped.
+    memory: Arc<Allocation<'c>>,
+}
+
+/// One allocation of the card's memory, freed when dropped.
+#[derive(Debug)]
+struct Allocation<'c> {
+    /// The CUDA it was allocated in.
+    cuda: &'c Cuda,
+    /// Its address on the card.
+    pointer: DevicePtr,
 }
 
 impl Cuda {
@@ -90,6 +104,10 @@ impl Cuda {
             cuda: self,
             pointer,
             bytes,
+            memory: Arc::new(Allocation {
+                cuda: self,
+                pointer,
+            }),
         })
     }
 }
@@ -316,8 +334,55 @@ impl DeviceBuffer<'_> {
     }
 }
 
-impl Drop for DeviceBuffer<'_> {
-    /// Waits for the card's work, which may still use the buffer, and frees it. Errors are
+impl<'c> DeviceBuffer<'c> {
+    /// A buffer of the `bytes` bytes that start `at` bytes into this one: the same memory, not
+    /// a copy, so a write through either is seen through the other. The memory is freed once
+    /// this buffer and all its parts are dropped.
+    ///
+    /// # Safety
+    ///
+    /// The kernels and library calls of this crate take each output borrowed mutably and
+    /// rely on it being none of their inputs; a part and the buffer it lies in (or two parts
+    /// that overlap) are two values for one memory, which the borrow checker does not
+    /// connect. The caller must never pass a part and a buffer it overlaps to one call that
+    /// writes either of them.
+    ///
+    /// # Panics
+    ///
+    /// If the part runs past the buffer's end, or `at` is not a multiple of 4.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::Cuda;
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let mut whole = cuda.buffer(16).unwrap();
+    ///     // SAFETY: the part and the buffer are never given to one call together.
+    ///     let mut back = unsafe { whole.part(8, 8) };
+    ///     back.write(&[3.0f32, 4.0]).unwrap();
+    ///     let mut all = [0.0f32; 4];
+    ///     whole.read(&mut all).unwrap();
+    ///     assert_eq!(all, [0.0, 0.0, 3.0, 4.0]);
+    /// }
+    /// ```
+    pub unsafe fn part(&self, at: usize, bytes: usize) -> DeviceBuffer<'c> {
+        assert!(
+            at.is_multiple_of(4) && at.checked_add(bytes).is_some_and(|end| end <= self.bytes),
+            "a part of {bytes} bytes at {at} does not lie in a buffer of {} bytes, four-byte              aligned",
+            self.bytes
+        );
+        DeviceBuffer {
+            cuda: self.cuda,
+            pointer: self.pointer + at as DevicePtr,
+            bytes,
+            memory: Arc::clone(&self.memory),
+        }
+    }
+}
+
+impl Drop for Allocation<'_> {
+    /// Waits for the card's work, which may still use the memory, and frees it. Errors are
     /// not reported: there is no one to report them to.
     fn drop(&mut self) {
         // The lock is taken and the context made current first; if that fails, the calls

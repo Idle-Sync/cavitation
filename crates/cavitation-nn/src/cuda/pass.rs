@@ -42,6 +42,32 @@ impl<'c> Store<'c> {
         Ok(self.buffers.len() - 1)
     }
 
+    /// A new entry for the `n` values of buffer `of` from value `at` on, and its index: the
+    /// same memory, not a copy.
+    ///
+    /// # Safety
+    ///
+    /// As for [`DeviceBuffer::part`]: the caller never passes the new entry and an entry it
+    /// overlaps to one call that writes either.
+    pub(crate) unsafe fn part(&mut self, (of, at): (usize, usize), n: usize) -> usize {
+        // SAFETY: the caller's promise.
+        let part = unsafe { self.get(of).part(4 * at, 4 * n) };
+        self.buffers.push(RefCell::new(part));
+        self.buffers.len() - 1
+    }
+
+    /// Makes entry `i` the `n` values of buffer `of` from value `at` on, the same memory, in
+    /// place of its own buffer, which is freed.
+    ///
+    /// # Safety
+    ///
+    /// As for [`part`](Self::part).
+    pub(crate) unsafe fn make_part(&mut self, i: usize, (of, at): (usize, usize), n: usize) {
+        // SAFETY: the caller's promise.
+        let part = unsafe { self.get(of).part(4 * at, 4 * n) };
+        *self.buffers[i].get_mut() = part;
+    }
+
     /// Buffer `i`, to read.
     pub(crate) fn get(&self, i: usize) -> Ref<'_, DeviceBuffer<'c>> {
         self.buffers[i].borrow()
