@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_cuda::{
-    ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, GluOp, MeanSquaredError, OptimizerKernel,
-    OptimizerRule, PreluOp, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
+    ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, GluOp, MeanSquaredError,
+    NegativeLogLikelihood, OptimizerKernel, OptimizerRule, PreluOp, Regression, RegressionLoss,
+    RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
 };
 
 use super::model::{CudaModel, ran, refused};
@@ -36,6 +37,23 @@ enum LossKernel<'c> {
     CrossEntropy(SoftmaxCrossEntropy<'c>),
     /// Mean squared error on target values.
     Mse(MeanSquaredError<'c>),
+    /// The negative log-likelihood on class labels.
+    Nll(NegativeLogLikelihood<'c>),
+    /// L1, Huber or smooth L1 on target values.
+    Regression(RegressionLoss<'c>),
+}
+
+/// The regression kernel's form of `loss`, with its threshold as the `f32` the tape takes,
+/// or `None` for a loss that is not L1, Huber or smooth L1.
+fn regression(loss: Loss) -> Option<Regression> {
+    match loss {
+        Loss::L1 => Some(Regression::L1),
+        Loss::Huber { delta } => Some(Regression::Huber {
+            delta: delta as f32,
+        }),
+        Loss::SmoothL1 { beta } => Some(Regression::SmoothL1 { beta: beta as f32 }),
+        _ => None,
+    }
 }
 
 /// One ReLU layer's dead-neuron bits in a pass: one per channel of `spatial` values, or one
@@ -184,9 +202,10 @@ pub struct CudaStepProfile {
 /// [`GpuTrainer`](crate::GpuTrainer) does on wgpu: the same dropout masks (from
 /// [`dropout_mask`] with the trainer's seed and the step's number), the same order of work,
 /// and an epoch's shorter last batch through a step set up for its rows. The model's layers
-/// must be ones [`CudaModel::compile`] takes; the losses are [`Loss::CrossEntropy`] and
-/// [`Loss::Mse`], and the optimisers SGD (with or without momentum), Adam and AdamW. A
-/// parameter used by two layers is refused.
+/// must be ones [`CudaModel::compile`] takes; the losses are [`Loss::CrossEntropy`],
+/// [`Loss::Nll`], [`Loss::Mse`], [`Loss::L1`], [`Loss::Huber`] and [`Loss::SmoothL1`], and the
+/// optimisers SGD (with or without momentum), Adam and AdamW. A parameter used by two layers
+/// is refused.
 ///
 /// The convolution's passes run through cuDNN and `Linear`'s through cuBLAS, which publish no
 /// error bounds; their distance from the CPU is measured in `cavitation-cuda`'s tests and in
@@ -347,12 +366,13 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for a loss other than
-    /// cross-entropy and MSE, for a parameter used by two layers, for an optimiser setting
-    /// that is not finite as an `f32`, and as [`CudaModel::compile`] returns;
-    /// [`Error::InvalidData`] as `compile` returns, if the model has no parameters or one
-    /// that holds no values, and if a batch norm would normalise a training batch over one
-    /// value per channel.
+    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for binary cross-entropy (with
+    /// or without logits) and KL divergence, for a parameter used by two layers, for an
+    /// optimiser setting that is not finite as an `f32`, and as [`CudaModel::compile`]
+    /// returns; [`Error::InvalidData`] as `compile` returns, for a Huber `delta` not above 0
+    /// or a smooth L1 `beta` below 0 (NaN either way, as `f32`s; the CPU's tape panics on
+    /// them), if the model has no parameters or one that holds no values, and if a batch
+    /// norm would normalise a training batch over one value per channel.
     ///
     /// # Examples
     ///
@@ -368,6 +388,10 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     ///     assert!(CudaTrainer::new(&net, &params, &adam, Loss::Mse, 16, &cuda).is_ok());
     ///     let rms = OptimizerConfig::RmsProp { lr: 1e-3, alpha: 0.99, momentum: 0.0, weight_decay: 0.0, centered: false };
     ///     assert!(CudaTrainer::new(&net, &params, &rms, Loss::Mse, 16, &cuda).is_err());
+    ///     let huber = Loss::Huber { delta: 0.5 };
+    ///     assert!(CudaTrainer::new(&net, &params, &adam, huber, 16, &cuda).is_ok());
+    ///     let flat = Loss::Huber { delta: 0.0 };
+    ///     assert!(CudaTrainer::new(&net, &params, &adam, flat, 16, &cuda).is_err());
     /// }
     /// ```
     pub fn new(
@@ -397,11 +421,14 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                 )));
             }
         };
-        if !matches!(loss, Loss::CrossEntropy | Loss::Mse) {
+        if !matches!(loss, Loss::CrossEntropy | Loss::Nll | Loss::Mse) && regression(loss).is_none()
+        {
             return Err(Error::Unsupported(format!(
-                "{WHO}: CUDA has no Loss::{loss:?}; it runs CrossEntropy and Mse"
+                "{WHO}: CUDA has no Loss::{loss:?}; it runs CrossEntropy, Nll, Mse, L1, Huber and \
+                 SmoothL1"
             )));
         }
+        loss.check_threshold(WHO)?;
         let mut m = CudaModel::compile(model, params, batch_size, cuda)?;
         if m.params.is_empty() {
             return Err(Error::InvalidData(format!(
@@ -598,7 +625,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
             )));
         }
         let targets = match (self.loss, batch.targets) {
-            (Loss::CrossEntropy, TargetsView::Classes(labels)) if labels.len() == b => {
+            (loss, TargetsView::Classes(labels)) if loss.needs_classes() && labels.len() == b => {
                 if let Some((row, &label)) = labels.iter().enumerate().find(|(_, l)| **l >= output)
                 {
                     return Err(Error::InvalidData(format!(
@@ -610,7 +637,9 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                 self.labels.extend(labels.iter().map(|&l| l as u32));
                 None
             }
-            (Loss::Mse, TargetsView::Values(t)) if t.shape().dims() == [b, output] => {
+            (loss, TargetsView::Values(t))
+                if !loss.needs_classes() && t.shape().dims() == [b, output] =>
+            {
                 Some(t.data())
             }
             (loss, _) => {
@@ -697,6 +726,8 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                 match &pass.loss {
                     LossKernel::CrossEntropy(ce) => ce.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                     LossKernel::Mse(mse) => mse.run(&y, &t, &mut grad, (&mut loss_out, 0)),
+                    LossKernel::Nll(nll) => nll.run(&y, &t, &mut grad, (&mut loss_out, 0)),
+                    LossKernel::Regression(r) => r.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                 },
             );
         }
@@ -1523,7 +1554,18 @@ impl<'c> TrainPass<'c> {
                 cuda,
                 (u32_of(rows), u32_of(out_width)),
             )?),
-            _ => LossKernel::Mse(MeanSquaredError::new(cuda, u32_of(rows * out_width))?),
+            Loss::Nll => LossKernel::Nll(NegativeLogLikelihood::new(
+                cuda,
+                (u32_of(rows), u32_of(out_width)),
+            )?),
+            _ => match regression(loss) {
+                Some(kind) => LossKernel::Regression(RegressionLoss::new(
+                    cuda,
+                    u32_of(rows * out_width),
+                    kind,
+                )?),
+                None => LossKernel::Mse(MeanSquaredError::new(cuda, u32_of(rows * out_width))?),
+            },
         };
 
         // The backward pass, last layer first. A parameter's gradient is written once, by its

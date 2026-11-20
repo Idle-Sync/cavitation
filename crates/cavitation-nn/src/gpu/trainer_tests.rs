@@ -2,9 +2,9 @@
 //! training tape's from the same weights, batch and dropout masks, on the test MLP, a small
 //! CNN (convolution, batch norm, max pooling, dropout), a CNN through average and adaptive
 //! average pooling, `mnist-cnn` and `cifar-cnn`, with the max-pooling winners that differ from
-//! the `f64` tape's listed; the parameters after one SGD step within the update's bound; two
-//! runs giving the same bits; and a step on non-finite inputs leaving the parameters and the
-//! optimiser's state as they were.
+//! the `f64` tape's listed, and every loss besides cross-entropy on an MLP; the parameters
+//! after one SGD step within the update's bound; two runs giving the same bits; and a step
+//! on non-finite inputs leaving the parameters and the optimiser's state as they were.
 //!
 //! The gradient check is a tolerance, not a derived bound: each tensor's worst difference
 //! from the `f64` gradient must be under 2⁻¹² of the tensor's largest `f64` gradient plus
@@ -17,7 +17,7 @@
 //! that a failure.
 
 use cavitation_core::{
-    Conv2dGeom, Gate, Graph, ParamStore, Pool2dGeom, Real, Reduction, Rng, Tensor, TensorView,
+    Conv2dGeom, Gate, Graph, ParamStore, Pool2dGeom, Real, Rng, Tensor, TensorView,
 };
 use cavitation_gpu::{Backend, Gpu};
 
@@ -128,6 +128,10 @@ struct Data {
     rows: usize,
     /// One label per row.
     labels: Vec<usize>,
+    /// The loss the step minimises.
+    loss: Loss,
+    /// For a loss on values, `[rows, outputs]` targets; empty otherwise.
+    values: Vec<f32>,
 }
 
 impl Data {
@@ -140,6 +144,23 @@ impl Data {
             labels: (0..rows)
                 .map(|_| (rng.range(0.0, classes as f64) as usize).min(classes - 1))
                 .collect(),
+            loss: Loss::CrossEntropy,
+            values: Vec::new(),
+        }
+    }
+
+    /// The batch for `loss`: for a loss on values, with `outputs` targets per row in
+    /// `[−1, 1)` from `seed`.
+    fn for_loss(self, loss: Loss, outputs: usize, seed: u64) -> Data {
+        let values = if loss.needs_classes() {
+            Vec::new()
+        } else {
+            uniform(seed, self.rows * outputs, -1.0, 1.0)
+        };
+        Data {
+            loss,
+            values,
+            ..self
         }
     }
 
@@ -147,7 +168,14 @@ impl Data {
     fn view(&self) -> BatchView<'_, f32> {
         BatchView {
             x: TensorView::from_slice(&self.x, &[self.rows, self.x.len() / self.rows]).unwrap(),
-            targets: TargetsView::Classes(&self.labels),
+            targets: if self.loss.needs_classes() {
+                TargetsView::Classes(&self.labels)
+            } else {
+                let outputs = self.values.len() / self.rows;
+                TargetsView::Values(
+                    TensorView::from_slice(&self.values, &[self.rows, outputs]).unwrap(),
+                )
+            },
         }
     }
 }
@@ -156,7 +184,7 @@ impl Data {
 type Pooled = (usize, Vec<f64>);
 
 /// Each parameter's gradient on the `f64` training tape (seed 0, step 1, as a trainer's
-/// first step), with cross-entropy, in the `f64` store's parameter order, and each max
+/// first step), with the batch's loss, in the `f64` store's parameter order, and each max
 /// pooling's input, by layer.
 fn tape_gradients(t: &mut Twin, data: &Data) -> (Vec<Vec<f64>>, Vec<Pooled>) {
     let x64: Vec<f64> = data.x.iter().map(|&v| f64::from(v)).collect();
@@ -176,7 +204,10 @@ fn tape_gradients(t: &mut Twin, data: &Data) -> (Vec<Vec<f64>>, Vec<Pooled>) {
                 pooled.push((i, tape.value(trace.input(i)).data().to_vec()));
             }
         }
-        let loss = tape.softmax_cross_entropy(out, &data.labels, Reduction::Mean);
+        let wide: Vec<f64> = data.values.iter().map(|&v| f64::from(v)).collect();
+        let values = (!wide.is_empty())
+            .then(|| TensorView::from_slice(&wide, &[data.rows, wide.len() / data.rows]).unwrap());
+        let loss = data.loss.record_f64(&mut tape, out, &data.labels, values);
         tape.backward(loss, &mut t.params64.grads);
     }
     let grads = (t.net64.parameter_names().into_iter())
@@ -248,15 +279,8 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
             momentum: 0.0,
             weight_decay: 0.0,
         };
-        let mut trainer = GpuTrainer::new(
-            &t.net,
-            &t.params,
-            &still,
-            Loss::CrossEntropy,
-            data.rows,
-            gpu,
-        )
-        .unwrap();
+        let mut trainer =
+            GpuTrainer::new(&t.net, &t.params, &still, data.loss, data.rows, gpu).unwrap();
         trainer.step(&t.net, data.view()).unwrap();
         let got = trainer.last_gradients();
         let winners = trainer.last_winners();
@@ -411,6 +435,38 @@ fn pool_layers_match_the_tape() {
         let t = twin(|p, s| pool_cnn(p, s, to), |p, s| pool_cnn(p, s, to), seed);
         let what = format!("adaptive pooling to {to:?}");
         check_gradients(t, &Data::new(seed, 6, 98, 5, (-1.0, 1.0)), &what);
+    }
+}
+
+/// The losses on value targets the GPU trains, with thresholds that put the test MLP's
+/// outputs against targets in `[−1, 1)` on both branches, and smooth L1's `beta` of 0.
+const VALUE_LOSSES: [Loss; 7] = [
+    Loss::Mse,
+    Loss::L1,
+    Loss::Huber { delta: 0.5 },
+    Loss::Huber { delta: 1.0 },
+    Loss::SmoothL1 { beta: 0.5 },
+    Loss::SmoothL1 { beta: 1.0 },
+    Loss::SmoothL1 { beta: 0.0 },
+];
+
+/// Each loss besides cross-entropy: the negative log-likelihood after an MLP whose every
+/// `Linear` ends in a log-softmax, and each of `VALUE_LOSSES` after the test MLP on targets
+/// in `[−1, 1)`: the GPU's gradients against the `f64` tape's, within the tolerance above.
+#[test]
+fn every_loss_matches_the_tape() {
+    let t = twin(
+        |p, s| softmax_mlp(p, s, true),
+        |p, s| softmax_mlp(p, s, true),
+        170,
+    );
+    let data = Data::new(170, 24, 12, 4, (-2.0, 2.0)).for_loss(Loss::Nll, 4, 270);
+    check_gradients(t, &data, "Nll");
+    for (k, loss) in VALUE_LOSSES.into_iter().enumerate() {
+        let seed = 171 + k as u64;
+        let t = twin(mlp::<f64>, mlp::<f32>, seed);
+        let data = Data::new(seed, 24, 12, 4, (-2.0, 2.0)).for_loss(loss, 4, seed + 100);
+        check_gradients(t, &data, &format!("{loss:?}"));
     }
 }
 

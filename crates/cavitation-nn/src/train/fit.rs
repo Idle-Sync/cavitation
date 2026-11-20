@@ -86,8 +86,32 @@ impl Loss {
     }
 
     /// Whether the loss takes class labels rather than target values.
-    fn needs_classes(self) -> bool {
+    pub(crate) fn needs_classes(self) -> bool {
         matches!(self, Loss::CrossEntropy | Loss::Nll)
+    }
+
+    /// Checks the threshold of [`Huber`](Loss::Huber) and [`SmoothL1`](Loss::SmoothL1) as
+    /// the tape checks the `f32` [`record`](Loss::record) gives it, where the tape panics:
+    /// [`Error::InvalidData`] naming `who`, with the tape's message, for a `delta` that is not
+    /// above 0 or a `beta` below 0 as an `f32`, NaN either way. The GPU engines refuse such
+    /// a loss before training.
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    pub(crate) fn check_threshold(self, who: &str) -> Result<(), Error> {
+        match self {
+            Loss::Huber { delta } if (delta as f32).is_nan() || delta as f32 <= 0.0 => {
+                Err(Error::InvalidData(format!(
+                    "{who}: huber: delta must be positive, but it is {:?}",
+                    delta as f32
+                )))
+            }
+            Loss::SmoothL1 { beta } if (beta as f32).is_nan() || (beta as f32) < 0.0 => {
+                Err(Error::InvalidData(format!(
+                    "{who}: smooth_l1: beta must not be negative, but it is {:?}",
+                    beta as f32
+                )))
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Panics, naming the loss and the kind of targets, if `targets` do not suit the loss.
@@ -152,6 +176,37 @@ impl Loss {
                     }
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, any(feature = "gpu", feature = "cuda")))]
+impl Loss {
+    /// [`record`](Loss::record) on an `f64` tape, for the GPU engines' tests: class `labels`
+    /// for a class loss, else the target `values` (recorded as an input first), with the
+    /// threshold the `f32` tape takes, widened.
+    pub(crate) fn record_f64(
+        self,
+        tape: &mut Tape<'_, f64>,
+        out: Var,
+        labels: &[usize],
+        values: Option<TensorView<'_, f64>>,
+    ) -> Var {
+        let mean = Reduction::Mean;
+        match (self, values) {
+            (Loss::CrossEntropy, _) => tape.softmax_cross_entropy(out, labels, mean),
+            (Loss::Nll, _) => tape.nll(out, labels, mean),
+            (loss, Some(values)) => {
+                let t = tape.input(values);
+                match loss {
+                    Loss::Mse => tape.mse(out, t, mean),
+                    Loss::L1 => tape.l1(out, t, mean),
+                    Loss::Huber { delta } => tape.huber(out, t, f64::from(delta as f32), mean),
+                    Loss::SmoothL1 { beta } => tape.smooth_l1(out, t, f64::from(beta as f32), mean),
+                    other => unimplemented!("Loss::{other:?} on an f64 tape"),
+                }
+            }
+            (loss, None) => panic!("Loss::{loss:?} needs target values"),
         }
     }
 }
