@@ -359,32 +359,49 @@ fn softmax_layers_track_the_cpu_fit() {
 /// a run on CUDA tracks the CPU run of the same `FitConfig`, each epoch's mean loss and
 /// validation loss (through the trainer's model) within 2⁻¹⁰ of the CPU's and the final
 /// parameters, the slopes among them, within 2⁻¹⁰ of each tensor's largest value plus 2⁻¹⁶,
-/// over 3 epochs of 50 rows at batch 16 (a last batch of 2) with Adam; the slopes move.
+/// over 3 epochs of 50 rows at batch 16 (a last batch of 2) with Adam, and once with AdamW's
+/// decoupled weight decay of 0.05; the slopes move.
 #[test]
 fn prelu_layers_track_the_cpu_fit() {
     let train = classes(72, 50, 12, 4);
     let held_out = classes(73, 20, 12, 4);
-    let config = || FitConfig {
+    // Adam, or AdamW with the decay when there is one.
+    let config = |decay: f64| FitConfig {
         epochs: 3,
         batch: 16,
-        optimizer: OptimizerConfig::Adam {
-            lr: 0.01,
-            weight_decay: 0.0,
+        optimizer: if decay == 0.0 {
+            OptimizerConfig::Adam {
+                lr: 0.01,
+                weight_decay: 0.0,
+            }
+        } else {
+            OptimizerConfig::AdamW {
+                lr: 0.01,
+                weight_decay: decay,
+            }
         },
         shuffle_seed: Some(3),
         health: Health::quiet(),
         validation: Some(held_out.clone()),
         ..FitConfig::default()
     };
-    for (seed, shared) in [(98, false), (99, true)] {
-        let what = if shared { "shared PReLU" } else { "PReLU" };
+    for (seed, shared, decay) in [(98, false, 0.0), (99, true, 0.0), (100, false, 0.05)] {
+        let what = format!(
+            "{}{}",
+            if shared { "shared PReLU" } else { "PReLU" },
+            if decay == 0.0 {
+                ""
+            } else {
+                " with AdamW's decay"
+            }
+        );
         let mut start = ParamStore::new();
         let net = prelu_mlp::<f32>(&mut start, seed, shared);
         let mut cpu = start.clone();
-        let on_cpu = fit(&net, &mut cpu, &train, config()).unwrap();
+        let on_cpu = fit(&net, &mut cpu, &train, config(decay)).unwrap();
         with_cuda(|cuda| {
             let mut params = start.clone();
-            let on_device = fit(&net, &mut params, &train, on(cuda, config())).unwrap();
+            let on_device = fit(&net, &mut params, &train, on(cuda, config(decay))).unwrap();
             let mut worst = 0.0f64;
             for (g, c) in on_device.epochs.iter().zip(&on_cpu.epochs) {
                 let (gv, cv) = (

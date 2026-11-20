@@ -32,6 +32,10 @@ const MAX_PRELU_CHANNELS: usize = 65_535;
 /// chunks of 4,096, one workgroup each along a dispatch dimension.
 const MAX_PRELU_ROWS: usize = 65_535 * 4096;
 
+/// The most values a PReLU may take per batch on either engine: its kernels index them with
+/// 32-bit integers, and the slope gradient's sums take at most 2³¹.
+const MAX_PRELU_VALUES: usize = 1 << 31;
+
 /// The engine a plan is built for: the name its messages start with, and whether the wgpu
 /// engine's own limits apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,10 +306,11 @@ impl Plan {
     ///
     /// - [`Error::Unsupported`] if the model has no layers, a layer is not one a GPU runs or
     ///   has parameters its GPU form does not use (by index and name), an id is used in two
-    ///   roles, no layer fixes the input width, a PReLU has more than 65,535 slopes, or (on
-    ///   the wgpu engine) a convolution's batch is above 65,535, a softmax's above 16,776,960,
-    ///   a PReLU's slope gradient would sum more than 268,431,360 values per slope, a GEMM's
-    ///   side is above 4,194,240, or a batch norm's eps is below 2⁻¹²⁶ in `f32` and not 0.
+    ///   roles, no layer fixes the input width, a PReLU has more than 65,535 slopes or takes
+    ///   more than 2³¹ values per batch, or (on the wgpu engine) a convolution's batch is
+    ///   above 65,535, a softmax's above 16,776,960, a PReLU's slope gradient would sum more
+    ///   than 268,431,360 values per slope, a GEMM's side is above 4,194,240, or a batch
+    ///   norm's eps is below 2⁻¹²⁶ in `f32` and not 0.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports, a
     ///   mask is not as wide as its layer's output, a batch count does not hold one value, a
@@ -366,6 +371,16 @@ impl Plan {
             }
             if engine.wgpu_limits {
                 check_wgpu_limits(&kind, batch, width, i, name, who)?;
+            }
+            if matches!(kind, Kind::Prelu { .. })
+                && batch
+                    .checked_mul(width)
+                    .is_none_or(|n| n > MAX_PRELU_VALUES)
+            {
+                return Err(Error::Unsupported(format!(
+                    "{who}: layer {i} ({name}) is a PReLU over {batch} rows of {width} values, \
+                     more than the {MAX_PRELU_VALUES} per batch the GPU takes"
+                )));
             }
             let outputs = kind.output_width(width);
             if outputs == 0 {

@@ -136,7 +136,8 @@ impl<'c> CudaModel<'c> {
     ///   card or NVIDIA's libraries refuse a layer's shape or its memory: a size cuDNN's or
     ///   cuBLAS's `int` does not hold, a convolution with no deterministic algorithm that
     ///   uses no tensor cores, a batch norm of more than 65,535 channels, or memory the card
-    ///   does not have. Also a PReLU of more than 65,535 slopes.
+    ///   does not have. Also a PReLU of more than 65,535 slopes or
+    ///   of more than 2³¹ values per batch.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
     ///   a mask is not as wide as its layer's output, a batch count does not hold one value,

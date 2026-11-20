@@ -157,14 +157,26 @@ impl Prelu {
 /// gradient.
 ///
 /// - **Forward** and **input gradient:** one multiplication per value, as the tape's, so on
-///   normal values and products they are the CPU's bits; a subnormal is flushed. NaN stays
-///   NaN, and the derivative is the slope at exactly 0, as on the CPU.
+///   normal values and products they are the CPU's bits. NaN stays NaN, and the derivative is
+///   the slope at exactly 0, as on the CPU.
+/// - **Flushed subnormals:** on a GPU that flushes subnormals, a subnormal result is flushed,
+///   and a positive subnormal input is read as 0, so it is taken as not above 0. Its output
+///   is then `slope · x` flushed (±0) instead of `x`, off by a subnormal only, but its input
+///   gradient is `g · slope` instead of `g`: an error of the size of the gradient itself, not
+///   of a subnormal. Its slope-gradient term is `g · 0`, which adds nothing, as the CPU adds
+///   nothing for a value above 0, so the slopes' gradient is unaffected. CUDA's kernels keep
+///   subnormals and have none of this.
 /// - **Slopes' gradient:** each channel's `Σ g·x` over its values not above 0, each term one
 ///   correctly rounded product (a NaN `x` makes the sum NaN, as on the CPU), summed in
 ///   [`ChannelSums`](super::ChannelSums)' fixed tree rather than the CPU's order: within
 ///   `2(L + 2)·2⁻²⁴·Σ|g·x|` of the exact sum of the same `f32` terms, for `L = rows` terms per
-///   channel, plus `3L · 2⁻¹²⁶` for the terms and partial sums a GPU may flush. On terms whose
-///   partial sums are exact it is the CPU's sum bit for bit.
+///   channel, plus `3L · 2⁻¹²⁶` for the products and partial sums a GPU may flush. A
+///   subnormal `x` or `g` that the hardware reads as 0 is outside this bound: its term is
+///   lost before the product is formed. The any-order bound holds with room to spare: a term
+///   passes through at most 16 additions in its lane, 8 levels of the workgroup's tree and
+///   one merge per chunk of 4,096, an addition depth of about `24 + L/4096`, far below the
+///   `L + 2` the bound allows. On terms whose partial sums are exact it is the CPU's sum bit
+///   for bit.
 ///
 /// The tree depends on the shape alone, so two runs give the same bits. `tests/prelu.rs`
 /// checks each.

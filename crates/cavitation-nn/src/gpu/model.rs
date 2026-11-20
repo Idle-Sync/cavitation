@@ -127,11 +127,11 @@ impl GpuModel {
     ///   names the layer's index and name. Also if no layer fixes the input width, or a
     ///   parameter or a batch of a layer's inputs or outputs is larger than the GPU binds,
     ///   the model has a convolution and `batch` is above 65,535 or a softmax and `batch` is
-    ///   above 16,776,960, a PReLU has more than 65,535 slopes or its slope gradient would sum
-    ///   more than 268,431,360 values per slope, a `Linear`'s batch, inputs or outputs or a
-    ///   convolution's output pixels or channels are above 4,194,240, a batch norm's eps is
-    ///   below 2⁻¹²⁶ in `f32` (and not 0), or the parameters, running statistics and masks
-    ///   together are larger than one GPU buffer.
+    ///   above 16,776,960, a PReLU has more than 65,535 slopes, takes more than 2³¹ values
+    ///   per batch or its slope gradient would sum more than 268,431,360 values per slope, a
+    ///   `Linear`'s batch, inputs or outputs or a convolution's output pixels or channels are
+    ///   above 4,194,240, a batch norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the
+    ///   parameters, running statistics and masks together are larger than one GPU buffer.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
     ///   a mask is not as wide as its layer's output, a batch count does not hold one value,
@@ -768,8 +768,9 @@ mod tests {
 
     /// A PReLU is planned with its slopes as a trained parameter, one per column or one
     /// shared; a PReLU of more than 65,535 slopes is refused on both engines, one whose
-    /// weight does not hold one value per slope is invalid, and the wgpu engine refuses a
-    /// slope gradient over more than 268,431,360 values per slope, which CUDA takes.
+    /// weight does not hold one value per slope is invalid, the wgpu engine refuses a slope
+    /// gradient over more than 268,431,360 values per slope, which CUDA takes, and both refuse
+    /// more than 2³¹ values per batch.
     #[test]
     fn prelu_is_planned_with_its_limits() {
         use crate::Prelu;
@@ -841,5 +842,19 @@ mod tests {
         assert!(Plan::build(&net, &store, 268_431_360).is_ok());
         assert!(Plan::build(&net, &store, 268_431_361).is_err());
         assert!(Plan::build_for(&net, &store, 268_431_361, Engine::CUDA).is_ok());
+        // Either engine takes at most 2³¹ values per batch through a PReLU.
+        let net = Sequential::new().push(Prelu::new(&mut store, 65_535));
+        for engine in [Engine::WGPU, Engine::CUDA] {
+            assert!(Plan::build_for(&net, &store, 32_768, engine).is_ok());
+            let err = Plan::build_for(&net, &store, 32_769, engine).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: {}: layer 0 (prelu) is a PReLU over 32769 rows of 65535 \
+                     values, more than the 2147483648 per batch the GPU takes",
+                    engine.name
+                )
+            );
+        }
     }
 }

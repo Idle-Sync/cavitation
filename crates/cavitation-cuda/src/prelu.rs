@@ -193,13 +193,14 @@ impl<'c> Prelu<'c> {
             )));
         }
         let n = values(rows, channels)?;
-        let mut buffers = vec![
+        check_buffers(&[
             (x, "input", n),
             (slope, "slopes", channels),
             (&*out, "output", n),
-        ];
-        buffers.extend(g.map(|g| (g, "gradient", n)));
-        check_buffers(&buffers);
+        ]);
+        if let Some(g) = g {
+            check_buffers(&[(g, "gradient", n)]);
+        }
         if n == 0 {
             return Ok(());
         }

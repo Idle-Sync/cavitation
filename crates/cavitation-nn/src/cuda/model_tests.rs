@@ -62,7 +62,8 @@ fn every_kind(params: &mut ParamStore) -> Sequential {
 /// The plan names `CudaModel::compile` in its refusals, and the wgpu engine's limits (a
 /// convolution's batch above 65,535, a softmax's above 16,776,960, a PReLU's slope gradient
 /// over more than 268,431,360 values per slope, a batch norm's eps below 2⁻¹²⁶) do not apply;
-/// a PReLU of more than 65,535 slopes is refused on both.
+/// a PReLU of more than 65,535 slopes, or over more than 2³¹ values per batch, is refused on
+/// both.
 #[test]
 fn the_plan_refuses_under_cudas_name() {
     let mut params = ParamStore::new();
@@ -103,6 +104,18 @@ fn the_plan_refuses_under_cudas_name() {
     }
     let net = Sequential::new().push(Prelu::new(&mut store, 2));
     assert!(Plan::build_for(&net, &store, 268_431_361, Engine::CUDA).is_ok());
+    // A shared slope over more than 2³¹ values per batch is refused when the model compiles.
+    let mut rng = Rng::seed(1);
+    let net = Sequential::new()
+        .push(Linear::new(&mut store, 2, 4096, &mut rng))
+        .push(Prelu::new(&mut store, 1));
+    assert!(Plan::build_for(&net, &store, 524_288, Engine::CUDA).is_ok());
+    let err = Plan::build_for(&net, &store, 524_289, Engine::CUDA).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unsupported: CudaModel::compile: layer 1 (prelu) is a PReLU over 524289 rows of 4096 \
+         values, more than the 2147483648 per batch the GPU takes"
+    );
     assert!(Plan::build_for(&net, &store, 268_431_361, Engine::WGPU).is_err());
     let wide = Sequential::new().push(Prelu::new(&mut store, 65_536));
     let err = Plan::build_for(&wide, &store, 2, Engine::CUDA).unwrap_err();

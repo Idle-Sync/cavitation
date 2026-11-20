@@ -3,14 +3,19 @@
 //!
 //! - **Forward** and **input gradient:** the bits of the `f32` tape's output and of its
 //!   input gradient (one multiplication each), on seeded values and on zeros of both signs,
-//!   infinities, NaN, the extreme normals and ±1; a subnormal result is flushed. Positive
-//!   subnormal inputs are left out: a GPU that flushes them may take them as 0 and use the
-//!   slope.
+//!   infinities, NaN, the extreme normals and ±1; a NaN matches any NaN, and a subnormal
+//!   result may be flushed. Positive subnormal inputs are left out: a GPU that flushes them
+//!   reads them as 0, so their input gradient is `g · slope` instead of `g` (see
+//!   `PreluKernels`).
 //! - **Slopes' gradient:** each channel's sum within `2(L + 2)·u·Σ|g·x| + 3L·2⁻¹²⁶` of the
 //!   exact (`f64`) sum of the same `f32` terms `g·x` over the values not above 0, for
 //!   `L = rows`, the bound `PreluKernels` states; on small integers, whose sums are exact in
 //!   any order, the `f32` tape's bits. A NaN input makes its channel's sum NaN and leaves
-//!   the others alone, as on the CPU.
+//!   the others alone, as on the CPU. The `3L·2⁻¹²⁶` covers flushed products and partial
+//!   sums, not flushed operands: a subnormal `x` or `g` read as 0 is outside the bound, and
+//!   the values here are drawn from `[−1, 1)` with no subnormals among them. The any-order
+//!   term holds for large `L` with room to spare: the tree's addition depth is about
+//!   `24 + L/4096`, far below `L + 2`.
 //!
 //! Every output starts as NaN, so a value left unwritten fails, and a second run gives the
 //! same bits. The tests skip without a GPU, unless `CAVITATION_GPU_REQUIRED=1`.
@@ -297,7 +302,8 @@ fn slope_grad_bad_values() {
 }
 
 /// A call refuses an output that is one of its inputs, an input gradient without its
-/// gradient and a buffer too short, naming the kernel.
+/// gradient, a buffer too short and a slope gradient over more than 65,535 channels, naming
+/// the kernel.
 #[test]
 fn calls_refuse_bad_buffers() {
     for_each_gpu(|gpu| {
@@ -337,5 +343,9 @@ fn calls_refuse_bad_buffers() {
             kernels.slope_grad_call(steps, pool, (2, 4), &a, &out, &a);
         });
         assert!(text.contains("different"), "{text}");
+        let text = message(&mut || {
+            kernels.slope_grad_call(steps, pool, (1, 65_536), &a, &out, &s);
+        });
+        assert!(text.contains("more than 65535 in a dimension"), "{text}");
     });
 }

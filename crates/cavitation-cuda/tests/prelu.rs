@@ -3,7 +3,7 @@
 //!
 //! - **Forward** and **input gradient:** the bits of the `f32` tape's output and of its
 //!   input gradient, on seeded values and on zeros of both signs, infinities, NaN, the
-//!   extreme normals, subnormals and ±1.
+//!   extreme normals, subnormals and ±1, a NaN matching any NaN.
 //! - **Slopes' gradient:** each channel's sum within `2(L + 2)·u·Σ|g·x|` of the exact (`f64`)
 //!   sum of the same `f32` terms `g·x` over the values not above 0, for `L = rows`, the bound
 //!   `Prelu` states (the WGSL kernels' without their flushing allowance); on small integers,
@@ -270,7 +270,8 @@ fn slope_grad_bad_values() {
 }
 
 /// The refusals: a gradient missing or given against the operation, a shape too large for
-/// the kernels' indices or the sums' grid, and a buffer too short.
+/// the kernels' indices, the sums' grid (more than 65,535 channels) or the sums' 2³¹ values,
+/// and a buffer too short.
 #[test]
 fn refusals() {
     let Some(cuda) = Cuda::new() else { return };
@@ -301,6 +302,13 @@ fn refusals() {
         .slope_grad(&x, &x, &mut partials, &mut ds, 1, 70_000)
         .unwrap_err();
     assert!(err.to_string().contains("65535 channels"), "{err}");
+    let err = kernels
+        .slope_grad(&x, &x, &mut partials, &mut ds, (1 << 31) + 1, 1)
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("more than the 2147483648"),
+        "{err}"
+    );
     let text = panic_message(|| {
         kernels
             .run(PreluOp::Forward, &x, &s, None, &mut out, 3, 4)
