@@ -22,16 +22,22 @@ pub const MPS_VAR: &str = "CAVITATION_MPS";
 /// # Errors
 ///
 /// Returns a message for a value other than `0` or `1`.
-#[cfg_attr(
-    not(target_os = "macos"),
-    allow(dead_code, reason = "read only where there is Metal")
-)]
 pub(crate) fn mps_allowed(value: Option<&str>) -> Result<bool, String> {
     match value {
         None | Some("1") => Ok(true),
         Some("0") => Ok(false),
         Some(other) => Err(format!("{MPS_VAR} takes 0 or 1, not `{other}`")),
     }
+}
+
+/// Whether [`MPS_VAR`] allows Metal's own kernels.
+///
+/// # Panics
+///
+/// If it has a value other than `0` or `1`.
+fn mps_on() -> bool {
+    let value = std::env::var(MPS_VAR).ok();
+    mps_allowed(value.as_deref()).unwrap_or_else(|e| panic!("{e}"))
 }
 
 #[cfg(target_os = "macos")]
@@ -52,8 +58,13 @@ mod elsewhere {
     pub(crate) enum RawBuffer {}
 
     impl Metal {
-        /// No Metal here.
+        /// No Metal here; an invalid `CAVITATION_MPS` is still refused.
+        ///
+        /// # Panics
+        ///
+        /// If `CAVITATION_MPS` has a value other than `0` or `1`.
         pub(crate) fn open(_: &wgpu::Device, _: &wgpu::Queue) -> Option<Metal> {
+            super::mps_on();
             None
         }
 
@@ -119,12 +130,6 @@ mod apple {
         queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     }
 
-    // SAFETY: Apple documents `MTLDevice` and `MTLCommandQueue` as thread-safe; wgpu's Metal
-    // backend shares the same objects between threads.
-    unsafe impl Send for Metal {}
-    // SAFETY: as for `Send`.
-    unsafe impl Sync for Metal {}
-
     impl fmt::Debug for Metal {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.debug_struct("Metal")
@@ -150,13 +155,17 @@ mod apple {
 
     impl RawBuffer {
         /// The `MTLBuffer`.
-        #[allow(dead_code, reason = "used by the Metal kernels and the tests")]
         pub(crate) fn get(&self) -> &ProtocolObject<dyn MTLBuffer> {
             &self.0
         }
     }
 
     impl Metal {
+        /// wgpu's `MTLDevice`.
+        pub(crate) fn device(&self) -> &ProtocolObject<dyn MTLDevice> {
+            &self.device
+        }
+
         /// wgpu's `MTLDevice` and queue when `device` and `queue` are wgpu's Metal backend and
         /// [`MPS_VAR`](super::MPS_VAR) allows it; `None` on another backend or with
         /// `CAVITATION_MPS=0`.
@@ -165,8 +174,7 @@ mod apple {
         ///
         /// If `CAVITATION_MPS` has a value other than `0` or `1`.
         pub(crate) fn open(device: &wgpu::Device, queue: &wgpu::Queue) -> Option<Metal> {
-            let value = std::env::var(super::MPS_VAR).ok();
-            if !super::mps_allowed(value.as_deref()).unwrap_or_else(|e| panic!("{e}")) {
+            if !super::mps_on() {
                 return None;
             }
             // SAFETY: the raw device is only retained here, never destroyed.
@@ -182,30 +190,46 @@ mod apple {
         }
 
         /// A buffer of `size` bytes for `usage`, made on the `MTLDevice` in private storage
-        /// with tracked hazards, filled with zeros (as wgpu fills a new buffer before its
-        /// first read), and handed to wgpu; with its `MTLBuffer`. `None` for a usage that
-        /// maps the buffer, which wgpu makes itself, or if Metal refuses the buffer.
+        /// with tracked hazards, filled with zeros (wgpu fills a new buffer with zeros before
+        /// its first read) and handed to wgpu; with its `MTLBuffer`. `None` for a usage other
+        /// than storage, uniform and copies, which wgpu makes itself: mapping needs shared
+        /// storage, and wgpu checks and pads index, vertex and indirect buffers.
+        ///
+        /// # Panics
+        ///
+        /// If Metal refuses the buffer, or the fill fails, as wgpu panics on a buffer it
+        /// cannot make.
         pub(crate) fn create_buffer(
             &self,
             device: &wgpu::Device,
             size: u64,
             usage: wgpu::BufferUsages,
         ) -> Option<(wgpu::Buffer, RawBuffer)> {
-            if usage.intersects(wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE) {
+            let ours = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::UNIFORM
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST;
+            if usage.is_empty() || !ours.contains(usage) {
                 return None;
             }
-            let len = usize::try_from(size).ok()?;
+            let len = usize::try_from(size).expect("a buffer size the host can address");
             let raw = self
                 .device
-                .newBufferWithLength_options(len, MTLResourceOptions::StorageModePrivate)?;
+                .newBufferWithLength_options(len, MTLResourceOptions::StorageModePrivate)
+                .unwrap_or_else(|| panic!("Metal refused a buffer of {size} bytes"));
             autoreleasepool(|_| {
-                let cb = self.queue.commandBuffer()?;
-                let blit = cb.blitCommandEncoder()?;
+                let cb = self.queue.commandBuffer().expect("a Metal command buffer");
+                let blit = cb.blitCommandEncoder().expect("a Metal blit encoder");
                 blit.fillBuffer_range_value(&raw, NSRange::new(0, len), 0);
                 blit.endEncoding();
                 cb.commit();
-                Some(())
-            })?;
+                cb.waitUntilCompleted();
+                assert!(
+                    cb.status() == MTLCommandBufferStatus::Completed,
+                    "zero-filling a new buffer of {size} bytes failed: {:?}",
+                    cb.error().map(|e| e.localizedDescription().to_string())
+                );
+            });
             // SAFETY: `raw` is a buffer of `size` bytes on wgpu's own device, and no other
             // owner destroys it.
             let hal = unsafe { wgpu::hal::metal::Device::buffer_from_raw(raw.clone(), size) };
@@ -216,19 +240,19 @@ mod apple {
                 mapped_at_creation: false,
             };
             // SAFETY: `hal` was made on this device's `MTLDevice`, with `size` bytes in
-            // private storage, which every usage but mapping allows; it is initialised (to
-            // zeros, by the fill committed above, which runs before any later submission on
-            // the queue).
+            // private storage, which storage, uniform and copy usages allow; it holds zeros,
+            // the fill having completed, so wgpu may take it as initialised.
             let buffer = unsafe { device.create_buffer_from_hal::<HalMetal>(hal, &descriptor) };
             Some((buffer, RawBuffer(raw)))
         }
     }
 
-    /// Metal work for a step: encodes its commands into an MPS command buffer, which may
-    /// commit and continue (as MPSGraph does). It runs after the step's work recorded before
-    /// it and before the work recorded after it.
+    /// Metal work for a step. It runs after the step's work recorded before it and before
+    /// the work recorded after it.
     pub(crate) trait MetalOp: fmt::Debug + Send + Sync {
-        /// Encodes the work into `cb`.
+        /// Encodes the work into `cb`'s current command buffer
+        /// (`rootCommandBuffer`): it ends every encoder it opens and does not commit `cb`,
+        /// which the step does after; it may commit and continue (as MPSGraph does).
         fn encode(&self, cb: &MPSCommandBuffer);
     }
 
@@ -245,7 +269,8 @@ mod apple {
     pub(crate) struct Committed {
         /// The first command buffer the work was encoded into.
         first: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
-        /// The last: the same as `first` unless the work committed and continued.
+        /// The last, which the step commits: the same as `first` unless the work committed
+        /// and continued.
         last: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         /// The profile entry it is timed in, if any.
         entry: Option<usize>,
@@ -301,11 +326,11 @@ mod apple {
                     // SAFETY: the queue is wgpu's, alive for as long as `metal`.
                     let cb =
                         unsafe { MPSCommandBuffer::commandBufferFromCommandQueue(&metal.queue) };
-                    // SAFETY: an MPS command buffer always has a root command buffer.
+                    // SAFETY: an MPS command buffer always has a current command buffer.
                     let first = unsafe { cb.rootCommandBuffer() };
                     op.encode(&cb);
-                    // SAFETY: as above: the command buffer being encoded, after the work.
-                    let last = unsafe { cb.commandBuffer() };
+                    // SAFETY: as above; after a commit and continue it is the new one.
+                    let last = unsafe { cb.rootCommandBuffer() };
                     cb.commit();
                     committed.push(Committed {
                         first,
@@ -324,7 +349,9 @@ mod apple {
     ///
     /// # Panics
     ///
-    /// If a command buffer did not complete, with Metal's error.
+    /// If the first or the last command buffer of a piece did not complete, with Metal's
+    /// error. A command buffer the work committed in between (by committing and continuing)
+    /// is not checked: MPS hands it no further out.
     pub(crate) fn wait(committed: &mut Vec<Committed>, times: &mut Vec<(usize, Option<f64>)>) {
         for c in committed.drain(..) {
             for cb in [&c.first, &c.last] {
@@ -377,7 +404,8 @@ mod tests {
         use super::super::MetalOp;
         use crate::{Backend, BufferPool, Gpu, PooledBuffer, StepEncoder, StepSizes};
 
-        /// Metal work that copies `len` bytes from one buffer to another with a blit.
+        /// Metal work that copies `len` bytes from one buffer to another with blits, in two
+        /// halves with a commit and continue between them when `split`, as MPSGraph may do.
         #[derive(Debug)]
         struct Copy {
             /// The buffer read.
@@ -386,6 +414,24 @@ mod tests {
             to: Retained<ProtocolObject<dyn MTLBuffer>>,
             /// The bytes copied.
             len: usize,
+            /// Whether to commit and continue between the halves.
+            split: bool,
+        }
+
+        impl Copy {
+            /// Blits `len` bytes at `at` into `cb`'s current command buffer.
+            fn blit(&self, cb: &MPSCommandBuffer, at: usize, len: usize) {
+                // SAFETY: an MPS command buffer always has a current command buffer.
+                let raw = unsafe { cb.rootCommandBuffer() };
+                let blit = raw.blitCommandEncoder().expect("a blit encoder");
+                // SAFETY: both buffers hold at least `at + len` bytes.
+                unsafe {
+                    blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
+                        &self.from, at, &self.to, at, len,
+                    );
+                }
+                blit.endEncoding();
+            }
         }
 
         // SAFETY: Metal buffers may be used from any thread.
@@ -395,16 +441,20 @@ mod tests {
 
         impl MetalOp for Copy {
             fn encode(&self, cb: &MPSCommandBuffer) {
-                // SAFETY: the command buffer is being encoded and has no open encoder.
-                let raw = unsafe { cb.commandBuffer() };
-                let blit = raw.blitCommandEncoder().expect("a blit encoder");
-                // SAFETY: both buffers hold at least `len` bytes.
-                unsafe {
-                    blit.copyFromBuffer_sourceOffset_toBuffer_destinationOffset_size(
-                        &self.from, 0, &self.to, 0, self.len,
-                    );
+                if self.split {
+                    let half = self.len / 2;
+                    self.blit(cb, 0, half);
+                    // SAFETY: the first half's encoder is ended.
+                    let before = unsafe { cb.rootCommandBuffer() };
+                    // SAFETY: as above.
+                    unsafe { cb.commitAndContinue() };
+                    // SAFETY: as above.
+                    let after = unsafe { cb.rootCommandBuffer() };
+                    assert!(!std::ptr::eq(&*before, &*after), "a new command buffer");
+                    self.blit(cb, half, self.len - half);
+                } else {
+                    self.blit(cb, 0, self.len);
                 }
-                blit.endEncoding();
             }
         }
 
@@ -422,12 +472,14 @@ mod tests {
                 .retain()
         }
 
+        /// The little-endian bytes of `v`.
         fn bytes(v: &[u32]) -> Vec<u8> {
             v.iter().flat_map(|x| x.to_le_bytes()).collect()
         }
 
-        /// Storage buffers from the pool have their `MTLBuffer`, start as zeros, and keep it
-        /// when reused; a buffer that maps is wgpu's own.
+        /// Storage buffers from the pool have their `MTLBuffer`, read as zeros (as fresh
+        /// pages would without the fill, so the fill itself is not told apart here), and keep
+        /// it when reused; a buffer that maps is wgpu's own.
         #[test]
         fn pooled_buffers_are_metal_buffers() {
             let Some(gpu) = metal_gpu() else { return };
@@ -455,7 +507,8 @@ mod tests {
 
         /// Metal work runs after the commands recorded before it and before those recorded
         /// after it: an upload, a Metal copy, a wgpu copy of what the Metal copy wrote and a
-        /// second upload over the first buffer read back as recorded, in two steps in a row.
+        /// second upload over the first buffer read back as recorded, in four steps in a row,
+        /// every other one with a commit and continue inside the Metal work.
         #[test]
         fn metal_work_runs_in_step_order() {
             let Some(gpu) = metal_gpu() else { return };
@@ -469,10 +522,13 @@ mod tests {
                 pool.take(4 * n, usage),
                 pool.take(4 * n, usage),
             );
-            let copy = Arc::new(Copy {
-                from: raw(&a),
-                to: raw(&b),
-                len: 4 * n as usize,
+            let copies = [false, true].map(|split| {
+                Arc::new(Copy {
+                    from: raw(&a),
+                    to: raw(&b),
+                    len: 4 * n as usize,
+                    split,
+                })
             });
             let mut steps = StepEncoder::new(
                 &gpu,
@@ -482,12 +538,12 @@ mod tests {
                     ..StepSizes::default()
                 },
             );
-            for round in 0..2u32 {
+            for round in 0..4u32 {
                 let first: Vec<u32> = (0..n as u32).map(|i| i * 3 + round).collect();
                 let second: Vec<u32> = (0..n as u32).map(|i| i ^ 0x5a5a).collect();
                 let mut step = steps.begin();
                 step.upload(a.buffer(), 0, &bytes(&first));
-                step.metal(copy.clone());
+                step.metal(copies[round as usize % 2].clone());
                 step.copy(b.buffer(), 0, c.buffer(), 0, 4 * n);
                 step.upload(a.buffer(), 0, &bytes(&second));
                 step.read_back(a.buffer(), 0, 4 * n);
@@ -502,7 +558,9 @@ mod tests {
             }
         }
 
-        /// A profiled step times Metal work as a pass of its span, from its command buffer.
+        /// A profiled step times Metal work as a pass of its span, from its first command
+        /// buffer's start to its last's end across a commit and continue; work outside a span
+        /// is not timed.
         #[test]
         fn profiled_metal_work_is_timed() {
             let Some(gpu) = metal_gpu() else { return };
@@ -519,10 +577,13 @@ mod tests {
                 from: raw(&a),
                 to: raw(&b),
                 len: len as usize,
+                split: true,
             });
             let mut steps = StepEncoder::new(&gpu, StepSizes::default());
             steps.set_profiling(true);
             let mut step = steps.begin();
+            // Outside any span the work runs and is not timed.
+            step.metal(copy.clone());
             step.span("before");
             step.clear(a.buffer(), 0, 256);
             step.span("metal");
@@ -531,17 +592,51 @@ mod tests {
             let spans = out.spans();
             assert_eq!(spans[1].0, "metal");
             let span = spans[1].1.expect("the Metal work is timed");
-            // A profiled span opens a timed pass of its own, here empty, before the work.
+            // The span's timed pass, still empty, is taken over by the work.
             let timed = out.timed();
-            assert_eq!(timed.iter().filter(|t| t.span == 1).count(), 2);
+            assert_eq!(timed.iter().filter(|t| t.span == 1).count(), 1);
             let last = timed.last().unwrap();
             assert_eq!((last.span, last.kind), (1, crate::TimedKind::Pass));
             let metal = last.nanoseconds.expect("the Metal work's own time");
             // Copying 64 MiB takes more than 10 µs on any Apple GPU.
             assert!(
-                metal > 1e4 && span >= metal,
+                metal > 1e4 && span == metal,
                 "{metal} ns of a span of {span} ns"
             );
+            pool.give(a);
+            pool.give(b);
+        }
+
+        /// A step dropped before it is finished leaves nothing behind: the next step runs only
+        /// its own commands and times only its own work.
+        #[test]
+        fn an_abandoned_step_leaves_nothing() {
+            let Some(gpu) = metal_gpu() else { return };
+            let mut pool = BufferPool::new(&gpu);
+            let usage = wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST;
+            let (a, b) = (pool.take(256, usage), pool.take(256, usage));
+            let copy = Arc::new(Copy {
+                from: raw(&a),
+                to: raw(&b),
+                len: 256,
+                split: false,
+            });
+            let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+            steps.set_profiling(true);
+            {
+                let mut step = steps.begin();
+                step.upload(a.buffer(), 0, &bytes(&[7; 64]));
+                step.span("dropped");
+                step.metal(copy.clone());
+            }
+            let mut step = steps.begin();
+            step.span("kept");
+            step.read_back(b.buffer(), 0, 256);
+            let out = step.finish();
+            assert!(out.bytes().iter().all(|&x| x == 0), "the dropped copy ran");
+            assert_eq!(out.spans().len(), 1);
             pool.give(a);
             pool.give(b);
         }

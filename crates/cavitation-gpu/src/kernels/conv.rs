@@ -9,6 +9,14 @@
 //!   `dx`.
 //! - [`ConvWeightGrad`]: the weight gradient. Its CPU twin is `conv2d_backward_reference`'s
 //!   `dw`.
+//!
+//! On a Metal adapter (macOS, unless `CAVITATION_MPS=0`), the three passes run through Apple's
+//! MPSGraph instead, compiled once per shape in `f32` with no reduced precision, on the same
+//! buffers: the forward pass with its bias, the input gradient and the weight gradient, each
+//! overwriting its output. They are held to the WGSL kernels' bounds below, and exact on
+//! small integers; on an Apple M4 the worst output of the kernel tests is at 0.131 of the
+//! forward bound, 0.132 of the input gradient's and 0.019 of the weight gradient's (0.131,
+//! 0.125 and 0.018 for WGSL), and a second run gives the same bits.
 
 use super::bindings::{Kind, layout};
 use super::gemm::{DIMS_BYTES, GemmDims, grid, square_grid, wide_allowed};
@@ -698,6 +706,14 @@ impl ConvForward {
         }
         dims.check_buffers(&tensors, out, &read);
         let gemm = dims.gemm((oh, ow));
+        #[cfg(target_os = "macos")]
+        if let Some(graph) = super::conv_mps::forward(steps.gpu(), dims, x, weight, bias, out) {
+            return ConvCall {
+                dims,
+                gemm,
+                run: ConvRun::Metal(graph),
+            };
+        }
         let params = upload_params(steps, pool, &gemm, &dims.uniform(ow, bias.is_some()));
         // Without a bias the shader never reads binding 5, so the weight stands in for it.
         let group = bind(
@@ -716,8 +732,7 @@ impl ConvForward {
         ConvCall {
             dims,
             gemm,
-            params,
-            group,
+            run: ConvRun::Wgsl { params, group },
         }
     }
 
@@ -735,11 +750,7 @@ impl ConvForward {
     ///
     /// See [`ConvForward`].
     pub fn record(&self, step: &mut Step<'_>, call: &ConvCall) {
-        let d = call.gemm;
-        match (grid(d.m, d.n, d.batch), &self.wide) {
-            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
-            _ => step.dispatch_grid(&self.pipeline, &call.group, square_grid(d.m, d.n, d.batch)),
-        }
+        call.record(step, &self.pipeline, self.wide.as_ref());
     }
 }
 
@@ -754,12 +765,25 @@ impl ConvForward {
 pub struct ConvCall {
     /// The shape.
     dims: ConvDims,
-    /// The batched GEMM it runs.
+    /// The batched GEMM the WGSL kernel runs.
     gemm: GemmDims,
-    /// The GEMM's `Dims` uniform and the `Conv` or `ConvGrad` uniform, from the pool.
-    params: [PooledBuffer; 2],
-    /// The bind group.
-    group: wgpu::BindGroup,
+    /// How the pass runs.
+    run: ConvRun,
+}
+
+/// How a prepared convolution pass runs.
+#[derive(Debug)]
+enum ConvRun {
+    /// Through the WGSL kernel.
+    Wgsl {
+        /// The GEMM's `Dims` uniform and the `Conv` or `ConvGrad` uniform, from the pool.
+        params: [PooledBuffer; 2],
+        /// The bind group.
+        group: wgpu::BindGroup,
+    },
+    /// Through MPSGraph, on Metal.
+    #[cfg(target_os = "macos")]
+    Metal(std::sync::Arc<super::conv_mps::ConvGraph>),
 }
 
 impl ConvCall {
@@ -779,9 +803,35 @@ impl ConvCall {
     ///
     /// See [`ConvForward`].
     pub fn release(self, pool: &mut BufferPool) {
-        let [a, b] = self.params;
-        pool.give(a);
-        pool.give(b);
+        match self.run {
+            ConvRun::Wgsl { params: [a, b], .. } => {
+                pool.give(a);
+                pool.give(b);
+            }
+            #[cfg(target_os = "macos")]
+            ConvRun::Metal(_) => {}
+        }
+    }
+
+    /// Records the pass into `step`: through `pipeline`, or `wide` where the GEMM's wide tile
+    /// fits, or as Metal work.
+    fn record(
+        &self,
+        step: &mut Step<'_>,
+        pipeline: &wgpu::ComputePipeline,
+        wide: Option<&wgpu::ComputePipeline>,
+    ) {
+        match &self.run {
+            ConvRun::Wgsl { group, .. } => {
+                let d = self.gemm;
+                match (grid(d.m, d.n, d.batch), wide) {
+                    ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, group, wide_grid),
+                    _ => step.dispatch_grid(pipeline, group, square_grid(d.m, d.n, d.batch)),
+                }
+            }
+            #[cfg(target_os = "macos")]
+            ConvRun::Metal(graph) => step.metal(graph.clone()),
+        }
     }
 }
 
@@ -930,6 +980,14 @@ impl ConvInputGrad {
             &[weight, dy],
         );
         let gemm = dims.grad_gemm();
+        #[cfg(target_os = "macos")]
+        if let Some(graph) = super::conv_mps::input_grad(steps.gpu(), dims, weight, dy, dx) {
+            return ConvCall {
+                dims,
+                gemm,
+                run: ConvRun::Metal(graph),
+            };
+        }
         let params = upload_params(steps, pool, &gemm, &dims.grad_uniform(size));
         let group = bind(
             steps,
@@ -940,8 +998,7 @@ impl ConvInputGrad {
         ConvCall {
             dims,
             gemm,
-            params,
-            group,
+            run: ConvRun::Wgsl { params, group },
         }
     }
 
@@ -959,11 +1016,7 @@ impl ConvInputGrad {
     ///
     /// See [`ConvInputGrad`].
     pub fn record(&self, step: &mut Step<'_>, call: &ConvCall) {
-        let d = call.gemm;
-        match (grid(d.m, d.n, d.batch), &self.wide) {
-            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
-            _ => step.dispatch_grid(&self.pipeline, &call.group, square_grid(d.m, d.n, d.batch)),
-        }
+        call.record(step, &self.pipeline, self.wide.as_ref());
     }
 }
 
@@ -1169,6 +1222,14 @@ impl ConvWeightGrad {
             "{dims:?} needs {} blocks of {WEIGHT_GRAD_BLOCK} positions, more than {MAX_WORKGROUPS_PER_DIMENSION}",
             gemm.batch
         );
+        #[cfg(target_os = "macos")]
+        if let Some(graph) = super::conv_mps::weight_grad(steps.gpu(), dims, x, dy, dw) {
+            return ConvWeightGradCall {
+                dims,
+                gemm,
+                run: WeightGradRun::Metal(graph),
+            };
+        }
         let partials = pool.take(4 * partial_len, wgpu::BufferUsages::STORAGE);
         let params = upload_params(steps, pool, &gemm, &dims.weight_grad_uniform(size));
         let group = bind(
@@ -1186,10 +1247,12 @@ impl ConvWeightGrad {
         ConvWeightGradCall {
             dims,
             gemm,
-            params,
-            partials,
-            group,
-            merge_group,
+            run: WeightGradRun::Wgsl {
+                params,
+                partials,
+                group,
+                merge_group,
+            },
         }
     }
 
@@ -1206,16 +1269,24 @@ impl ConvWeightGrad {
     ///
     /// See [`ConvWeightGrad`].
     pub fn record(&self, step: &mut Step<'_>, call: &ConvWeightGradCall) {
-        let d = call.gemm;
-        match (grid(d.m, d.n, d.batch), &self.wide) {
-            ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, &call.group, wide_grid),
-            _ => step.dispatch_grid(&self.pipeline, &call.group, square_grid(d.m, d.n, d.batch)),
+        match &call.run {
+            WeightGradRun::Wgsl {
+                group, merge_group, ..
+            } => {
+                let d = call.gemm;
+                match (grid(d.m, d.n, d.batch), &self.wide) {
+                    ((true, wide_grid), Some(wide)) => step.dispatch_grid(wide, group, wide_grid),
+                    _ => step.dispatch_grid(&self.pipeline, group, square_grid(d.m, d.n, d.batch)),
+                }
+                step.dispatch_split(
+                    &self.merge,
+                    merge_group,
+                    (d.m * d.n).div_ceil(MERGE_WORKGROUP),
+                );
+            }
+            #[cfg(target_os = "macos")]
+            WeightGradRun::Metal(graph) => step.metal(graph.clone()),
         }
-        step.dispatch_split(
-            &self.merge,
-            &call.merge_group,
-            (d.m * d.n).div_ceil(MERGE_WORKGROUP),
-        );
     }
 }
 
@@ -1229,16 +1300,29 @@ impl ConvWeightGrad {
 pub struct ConvWeightGradCall {
     /// The shape.
     dims: ConvDims,
-    /// The batched GEMM of the first pass, one product per block.
+    /// The batched GEMM of the WGSL kernel's first pass, one product per block.
     gemm: GemmDims,
-    /// The GEMM's `Dims` uniform and the `ConvWeightGrad` uniform, from the pool.
-    params: [PooledBuffer; 2],
-    /// One partial weight gradient per block, from the pool.
-    partials: PooledBuffer,
-    /// The first pass's bind group.
-    group: wgpu::BindGroup,
-    /// The merge's bind group.
-    merge_group: wgpu::BindGroup,
+    /// How the gradient runs.
+    run: WeightGradRun,
+}
+
+/// How a prepared weight gradient runs.
+#[derive(Debug)]
+enum WeightGradRun {
+    /// Through the WGSL kernel's two passes.
+    Wgsl {
+        /// The GEMM's `Dims` uniform and the `ConvWeightGrad` uniform, from the pool.
+        params: [PooledBuffer; 2],
+        /// One partial weight gradient per block, from the pool.
+        partials: PooledBuffer,
+        /// The first pass's bind group.
+        group: wgpu::BindGroup,
+        /// The merge's bind group.
+        merge_group: wgpu::BindGroup,
+    },
+    /// Through MPSGraph, on Metal.
+    #[cfg(target_os = "macos")]
+    Metal(std::sync::Arc<super::conv_mps::ConvGraph>),
 }
 
 impl ConvWeightGradCall {
@@ -1277,9 +1361,68 @@ impl ConvWeightGradCall {
     ///
     /// See [`ConvWeightGrad`].
     pub fn release(self, pool: &mut BufferPool) {
-        let [a, b] = self.params;
-        pool.give(a);
-        pool.give(b);
-        pool.give(self.partials);
+        match self.run {
+            WeightGradRun::Wgsl {
+                params: [a, b],
+                partials,
+                ..
+            } => {
+                pool.give(a);
+                pool.give(b);
+                pool.give(partials);
+            }
+            #[cfg(target_os = "macos")]
+            WeightGradRun::Metal(_) => {}
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod metal_tests {
+    //! On a Metal adapter, the three convolution passes run through MPSGraph, and with no
+    //! Metal they run through WGSL.
+
+    use super::*;
+    use crate::Backend;
+
+    /// Every pass of a convolution prepared on Metal is Metal work; the same calls on a GPU
+    /// without Metal's handles (`CAVITATION_MPS=0`) are WGSL.
+    #[test]
+    fn passes_run_through_mps_on_metal() {
+        let Some(gpu) = Gpu::with_backend(Backend::Metal) else {
+            return;
+        };
+        let mut cache = PipelineCache::new(&gpu);
+        let mut pool = BufferPool::new(&gpu);
+        let mut steps = StepEncoder::new(&gpu, crate::StepSizes::default());
+        let dims = ConvDims {
+            padding: (1, 1),
+            ..ConvDims::new(2, 3, 4, (6, 5), (3, 3))
+        };
+        let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST;
+        let x = pool.take(4 * dims.x_len(), usage);
+        let w = pool.take(4 * dims.weight_len(), usage);
+        let b = pool.take(4 * u64::from(dims.out_channels), usage);
+        let y = pool.take(4 * dims.out_len(), usage);
+        let (dx, dw) = (
+            pool.take(4 * dims.x_len(), usage),
+            pool.take(4 * dims.weight_len(), usage),
+        );
+        let forward = ConvForward::new(&gpu, &mut cache).unwrap();
+        let input = ConvInputGrad::new(&gpu, &mut cache).unwrap();
+        let weight = ConvWeightGrad::new(&gpu, &mut cache).unwrap();
+        let f = forward.call(&mut steps, &mut pool, dims, &x, &w, Some(&b), &y);
+        let i = input.call(&mut steps, &mut pool, dims, &w, &y, &dx);
+        let g = weight.call(&mut steps, &mut pool, dims, &x, &y, &dw);
+        let metal = gpu.metal().is_some();
+        assert_eq!(matches!(f.run, ConvRun::Metal(_)), metal);
+        assert_eq!(matches!(i.run, ConvRun::Metal(_)), metal);
+        assert_eq!(matches!(g.run, WeightGradRun::Metal(_)), metal);
+        f.release(&mut pool);
+        i.release(&mut pool);
+        g.release(&mut pool);
+        for buffer in [x, w, b, y, dx, dw] {
+            pool.give(buffer);
+        }
     }
 }

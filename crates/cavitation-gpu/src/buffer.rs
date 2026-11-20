@@ -106,7 +106,10 @@ impl PooledBuffer {
 
     /// The `MTLBuffer` under [`buffer`](Self::buffer), when the pool made it on Metal's
     /// device (on a Metal adapter, unless `CAVITATION_MPS=0`, for a usage that does not map).
-    #[allow(dead_code, reason = "used by the Metal kernels and the tests")]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "read only where there is Metal")
+    )]
     pub(crate) fn raw(&self) -> Option<&RawBuffer> {
         self.raw.as_ref()
     }

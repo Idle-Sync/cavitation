@@ -42,7 +42,10 @@ pub struct StepSizes {
     pub spans: u32,
     /// The most timed compute passes one profiled step has: one per span, and one more
     /// for each span's dispatches that follow an upload, clear or readback recorded inside
-    /// that span (a copy ends the pass it interrupts). With encoder timestamps, each run of
+    /// that span (a copy ends the pass it interrupts), or follow Metal work recorded inside
+    /// that span (on Metal, a convolution's pass). Metal work itself takes none: it is timed
+    /// by its command buffers, or takes over its span's pass when nothing was dispatched in
+    /// it yet. With encoder timestamps, each run of
     /// copies in a span is timed too; a span begins with a pass, so a step never has more
     /// copy runs than passes, and room is kept for as many. The timestamps must fit wgpu's
     /// 4,096 queries: at most 2,048 timed passes, or 1,024 with encoder timestamps.
@@ -107,7 +110,9 @@ pub enum Timing {
 /// What one timed entry of a profiled step covers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TimedKind {
-    /// One compute pass, timed from its beginning to its end.
+    /// One compute pass, timed from its beginning to its end; or, on Metal, one piece of
+    /// Metal work (a convolution's pass), timed from the start of its first command buffer
+    /// to the end of its last.
     Pass,
     /// One run of consecutive copies (uploads, clears, readbacks) between passes inside a
     /// span, timed by timestamps written on the encoder before and after it. Copies before
@@ -123,19 +128,24 @@ pub struct Timed {
     pub span: usize,
     /// A pass or a run of copies.
     pub kind: TimedKind,
-    /// Its GPU time in nanoseconds, from its own two timestamps, or `None` if its end reads
-    /// before its beginning.
+    /// Its GPU time in nanoseconds, from its own two timestamps (Metal work: from its
+    /// command buffers' start and end), or `None` if its end reads before its beginning.
     pub nanoseconds: Option<f64>,
 }
 
-/// The timed entries of the step being recorded and their query indices: entry `e` writes
-/// queries `2e` and `2e + 1`. Kept apart from the encoder so the order of entries is tested
+/// The timed entries of the step being recorded and their query indices: the `s`-th entry
+/// timed by timestamps writes queries `2s` and `2s + 1`; Metal work, timed by its command
+/// buffers, writes none. Kept apart from the encoder so the order of entries is tested
 /// without a GPU.
 #[derive(Debug)]
 struct Timeline {
     /// The entries in the order they were begun; their times are filled in when the step
     /// finishes.
     entries: Vec<Timed>,
+    /// Each entry's pair of queries, `None` for Metal work.
+    slots: Vec<Option<u32>>,
+    /// The pairs of queries used so far.
+    queries: u32,
     /// The timed passes so far.
     passes: u32,
     /// Whether the last entry is a run of copies not yet closed.
@@ -147,6 +157,8 @@ impl Timeline {
     fn with_capacity(passes: u32) -> Timeline {
         Timeline {
             entries: Vec::with_capacity(2 * passes as usize),
+            slots: Vec::with_capacity(2 * passes as usize),
+            queries: 0,
             passes: 0,
             open_copies: false,
         }
@@ -155,6 +167,8 @@ impl Timeline {
     /// Empties it for a new step.
     fn clear(&mut self) {
         self.entries.clear();
+        self.slots.clear();
+        self.queries = 0;
         self.passes = 0;
         self.open_copies = false;
     }
@@ -181,7 +195,7 @@ impl Timeline {
         if self.open_copies {
             return None;
         }
-        let runs = self.entries.len() as u32 - self.passes;
+        let runs = self.queries - self.passes;
         assert!(
             runs < self.passes,
             "a run of copies follows a pass of its span, so runs never outnumber passes"
@@ -196,17 +210,38 @@ impl Timeline {
         if !std::mem::replace(&mut self.open_copies, false) {
             return None;
         }
-        Some(2 * (self.entries.len() as u32 - 1) + 1)
+        Some(2 * (self.queries - 1) + 1)
     }
 
-    /// Adds an entry and returns its index.
+    /// Adds Metal work of `span` as a pass with no queries, and returns its entry.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "Metal work is recorded only where there is Metal")
+    )]
+    fn metal(&mut self, span: usize) -> usize {
+        debug_assert!(
+            !self.open_copies,
+            "a run of copies is closed before Metal work"
+        );
+        self.entries.push(Timed {
+            span,
+            kind: TimedKind::Pass,
+            nanoseconds: None,
+        });
+        self.slots.push(None);
+        self.entries.len() - 1
+    }
+
+    /// Adds an entry timed by a pair of queries and returns the pair's index.
     fn push(&mut self, span: usize, kind: TimedKind) -> u32 {
         self.entries.push(Timed {
             span,
             kind,
             nanoseconds: None,
         });
-        self.entries.len() as u32 - 1
+        self.slots.push(Some(self.queries));
+        self.queries += 1;
+        self.queries - 1
     }
 }
 
@@ -550,6 +585,15 @@ impl StepEncoder {
         self.sizes
     }
 
+    /// The GPU the steps run on.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(dead_code, reason = "read only by the Metal kernels")
+    )]
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
     /// Starts recording a step. Its staging buffer is ready to write: if the GPU has not
     /// finished with it, this waits. A step dropped without [`Step::finish`] is discarded.
     ///
@@ -580,10 +624,12 @@ impl StepEncoder {
             });
         self.spans.clear();
         self.timeline.clear();
+        self.pieces.clear();
         Step {
             steps: self,
             encoder: Some(encoder),
             pass: None,
+            empty_entry: None,
             span: None,
             uploaded: 0,
             read: 0,
@@ -621,6 +667,9 @@ pub struct Step<'a> {
     encoder: Option<wgpu::CommandEncoder>,
     /// The compute pass being recorded, if any.
     pass: Option<wgpu::ComputePass<'static>>,
+    /// The profile entry of the timed pass being recorded while it has no dispatch yet:
+    /// Metal work recorded then takes the entry over instead of adding one.
+    empty_entry: Option<usize>,
     /// The index of the span being recorded, if any.
     span: Option<usize>,
     /// The bytes of the staging buffer used so far, each upload rounded up to 8 bytes.
@@ -974,6 +1023,7 @@ impl<'a> Step<'a> {
         if self.pass.is_none() {
             self.begin_pass();
         }
+        self.empty_entry = None;
         let pass = self.pass.as_mut().expect("a pass was just begun");
         pass.set_pipeline(pipeline);
         pass.set_bind_group(0, bind_group, &[]);
@@ -1058,7 +1108,8 @@ impl<'a> Step<'a> {
             ..
         } = self;
         let encoder = encoder.expect("the step is being recorded");
-        let entries = steps.timeline.entries.len() as u64;
+        let entries = u64::from(steps.timeline.queries);
+        let timed = !steps.timeline.entries.is_empty();
         let timestamp_at = round_up(steps.sizes.readback_bytes, ALIGN);
         // The timestamps resolve in a submission of their own, after the step's has
         // finished: on Metal, a resolve in the step's own command buffer, or in a second one
@@ -1133,11 +1184,17 @@ impl<'a> Step<'a> {
                     .get_mapped_range(..map_end)
                     .expect("the readback buffer is mapped");
                 steps.host.extend_from_slice(&view[..user_bytes as usize]);
-                if let Some(t) = steps.timestamps.as_ref().filter(|_| entries > 0) {
-                    let (ticks, _) = view[timestamp_at as usize..map_end as usize].as_chunks::<8>();
+                if let Some(t) = steps.timestamps.as_ref().filter(|_| timed) {
+                    let ticks = if entries > 0 {
+                        view[timestamp_at as usize..map_end as usize]
+                            .as_chunks::<8>()
+                            .0
+                    } else {
+                        &[]
+                    };
                     add_span_times(
                         &mut steps.spans,
-                        &mut steps.timeline.entries,
+                        &mut steps.timeline,
                         ticks,
                         t.period,
                         &steps.metal_times,
@@ -1145,6 +1202,14 @@ impl<'a> Step<'a> {
                 }
             }
             steps.readback.unmap();
+        } else if let Some(t) = steps.timestamps.as_ref().filter(|_| timed) {
+            add_span_times(
+                &mut steps.spans,
+                &mut steps.timeline,
+                &[],
+                t.period,
+                &steps.metal_times,
+            );
         }
         StepOutput {
             bytes: &steps.host,
@@ -1153,35 +1218,35 @@ impl<'a> Step<'a> {
         }
     }
 
-    /// Begins a compute pass, timed when profiling with timestamps inside a span.
-    ///
     /// Records Metal work (Metal Performance Shaders) into the step: it runs after
     /// everything recorded before it and before everything recorded after it, on the same
     /// queue and buffers. The step's wgpu commands so far are closed into a command buffer
     /// of their own, and the work is encoded and committed in its place when the step is
     /// finished. A profiled step times the work as a pass of the current span, from the
-    /// start of its first command buffer to the end of its last.
+    /// start of its first command buffer to the end of its last; the work takes over the
+    /// span's timed pass when nothing has been dispatched in it yet.
     ///
     /// # Panics
     ///
-    /// If the GPU is not Metal's with `CAVITATION_MPS` allowing it ([`Gpu::metal`]), or the
-    /// step has more timed passes than [`StepSizes::timed_passes`].
+    /// If the GPU is not Metal's with `CAVITATION_MPS` allowing it ([`Gpu::metal`]). Metal
+    /// work takes none of the step's timestamp queries, so it does not count against
+    /// [`StepSizes::timed_passes`].
     #[cfg(target_os = "macos")]
-    #[allow(dead_code, reason = "used by the Metal kernels and the tests")]
     pub(crate) fn metal(&mut self, op: Arc<dyn metal::MetalOp>) {
         assert!(
             self.steps.gpu.metal().is_some(),
             "Metal work needs a Metal adapter with {} allowing it",
             metal::MPS_VAR
         );
+        let empty = self.empty_entry;
         self.end_pass();
         self.close_copies();
         let timed = self.steps.timestamps.is_some() && self.steps.profiling;
-        let max = self.steps.sizes.timed_passes;
-        let entry = self
-            .span
-            .filter(|_| timed)
-            .map(|span| self.steps.timeline.pass(span, max) as usize);
+        let entry = empty.or_else(|| {
+            self.span
+                .filter(|_| timed)
+                .map(|span| self.steps.timeline.metal(span))
+        });
         let next =
             self.steps
                 .gpu
@@ -1197,6 +1262,8 @@ impl<'a> Step<'a> {
         self.steps.pieces.push(Piece::Metal(op, entry));
     }
 
+    /// Begins a compute pass, timed when profiling with timestamps inside a span.
+    ///
     /// # Panics
     ///
     /// If the step has more timed passes than [`StepSizes::timed_passes`].
@@ -1210,8 +1277,10 @@ impl<'a> Step<'a> {
             .zip(self.span);
         let max = self.steps.sizes.timed_passes;
         let timeline = &mut self.steps.timeline;
+        let mut entry = None;
         let writes = timed.map(|(t, span)| {
             let index = timeline.pass(span, max);
+            entry = Some(index as usize);
             wgpu::ComputePassTimestampWrites {
                 query_set: &t.queries,
                 beginning_of_pass_write_index: Some(2 * index),
@@ -1225,11 +1294,13 @@ impl<'a> Step<'a> {
             timestamp_writes: writes,
         });
         self.pass = Some(pass.forget_lifetime());
+        self.empty_entry = entry;
     }
 
     /// Ends the compute pass being recorded, if any, so copies can be recorded.
     fn end_pass(&mut self) {
         self.pass = None;
+        self.empty_entry = None;
     }
 
     /// Ends the compute pass being recorded, if any, before a copy; when profiling with
@@ -1280,15 +1351,18 @@ impl<'a> Step<'a> {
 /// (entry, nanoseconds) instead, timed by their command buffers.
 fn add_span_times(
     spans: &mut [(&'static str, Option<f64>)],
-    entries: &mut [Timed],
+    timeline: &mut Timeline,
     ticks: &[[u8; 8]],
     period: f64,
     metal: &[(usize, Option<f64>)],
 ) {
-    for (e, entry) in entries.iter_mut().enumerate() {
-        let begin = u64::from_le_bytes(ticks[2 * e]);
-        let end = u64::from_le_bytes(ticks[2 * e + 1]);
-        entry.nanoseconds = (end >= begin).then(|| (end - begin) as f64 * period);
+    let entries = &mut timeline.entries;
+    for (entry, slot) in entries.iter_mut().zip(&timeline.slots) {
+        entry.nanoseconds = slot.and_then(|s| {
+            let begin = u64::from_le_bytes(ticks[2 * s as usize]);
+            let end = u64::from_le_bytes(ticks[2 * s as usize + 1]);
+            (end >= begin).then(|| (end - begin) as f64 * period)
+        });
     }
     for &(e, nanoseconds) in metal {
         entries[e].nanoseconds = nanoseconds;
@@ -1478,15 +1552,14 @@ mod tests {
             .collect()
     }
 
-    /// Entries for `spans` and `kinds`, not yet timed.
-    fn entries(of: &[(usize, TimedKind)]) -> Vec<Timed> {
-        of.iter()
-            .map(|&(span, kind)| Timed {
-                span,
-                kind,
-                nanoseconds: None,
-            })
-            .collect()
+    /// A timeline of entries for `spans` and `kinds`, each timed by its own queries, not
+    /// yet timed.
+    fn entries(of: &[(usize, TimedKind)]) -> Timeline {
+        let mut line = Timeline::with_capacity(of.len() as u32);
+        for &(span, kind) in of {
+            line.push(span, kind);
+        }
+        line
     }
 
     /// Each entry's time comes from its own two timestamps, whatever the order of
@@ -1502,7 +1575,7 @@ mod tests {
         let mut timed = entries(&[(0, Pass), (0, Copies), (0, Pass), (1, Pass), (3, Pass)]);
         let raw = ticks(&[(500, 510), (510, 520), (100, 130), (300, 301), (700, 700)]);
         add_span_times(&mut spans, &mut timed, &raw, 2.0, &[]);
-        let times: Vec<Option<f64>> = timed.iter().map(|t| t.nanoseconds).collect();
+        let times: Vec<Option<f64>> = timed.entries.iter().map(|t| t.nanoseconds).collect();
         assert_eq!(
             times,
             [Some(20.0), Some(20.0), Some(60.0), Some(2.0), Some(0.0)]
@@ -1532,9 +1605,47 @@ mod tests {
             let mut timed = entries(&[(0, Pass), (0, Copies)]);
             add_span_times(&mut spans, &mut timed, &raw, 1.0, &[]);
             assert_eq!(spans, [("a", None)], "{timed:?}");
-            assert_eq!(timed.iter().filter(|t| t.nanoseconds.is_none()).count(), 1);
-            assert!(timed.iter().all(|t| t.nanoseconds != Some(0.0)));
+            let entries = &timed.entries;
+            assert_eq!(
+                entries.iter().filter(|t| t.nanoseconds.is_none()).count(),
+                1
+            );
+            assert!(entries.iter().all(|t| t.nanoseconds != Some(0.0)));
         }
+    }
+
+    /// Metal work takes no queries: the passes around it read their own timestamps, the
+    /// work takes the time its command buffers give, and its span adds both; a span with only
+    /// Metal work is timed with no timestamps at all.
+    #[test]
+    fn metal_work_takes_no_queries() {
+        use TimedKind::Pass;
+        let mut spans = vec![("a", None), ("b", None)];
+        let mut line = Timeline::with_capacity(2);
+        line.pass(0, 2);
+        let work = line.metal(0);
+        line.pass(0, 2);
+        let only = line.metal(1);
+        assert_eq!((line.queries, line.passes), (2, 2));
+        assert_eq!(line.slots, [Some(0), None, Some(1), None]);
+        let raw = ticks(&[(10, 15), (40, 50)]);
+        add_span_times(
+            &mut spans,
+            &mut line,
+            &raw,
+            1.0,
+            &[(work, Some(100.0)), (only, Some(7.0))],
+        );
+        let kinds: Vec<_> = line.entries.iter().map(|t| (t.span, t.kind)).collect();
+        assert_eq!(kinds, [(0, Pass), (0, Pass), (0, Pass), (1, Pass)]);
+        let times: Vec<_> = line.entries.iter().map(|t| t.nanoseconds).collect();
+        assert_eq!(times, [Some(5.0), Some(100.0), Some(10.0), Some(7.0)]);
+        assert_eq!(spans, [("a", Some(115.0)), ("b", Some(7.0))]);
+        let mut spans = vec![("c", None)];
+        let mut line = Timeline::with_capacity(1);
+        let w = line.metal(0);
+        add_span_times(&mut spans, &mut line, &[], 1.0, &[(w, Some(3.0))]);
+        assert_eq!(spans, [("c", Some(3.0))]);
     }
 
     /// The recording order of one profiled step with encoder timestamps: span, upload,

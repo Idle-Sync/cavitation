@@ -28,12 +28,13 @@ cavitation-core = { path = "../cavitation-core", version = "0.4.1" }
 
 # On macOS, Apple's Metal Performance Shaders run on wgpu's own Metal device and queue, on
 # the same buffers: the Objective-C runtime, Metal's types (the versions wgpu's Metal
-# backend uses) and MPS's command buffer.
+# backend uses), MPS's command buffer, and MPSGraph, which runs the convolutions.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.5"
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSError", "NSRange", "NSString"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSRange", "NSString", "NSValue"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "objc2-core-foundation", "MTLAllocation", "MTLBlitCommandEncoder", "MTLBuffer", "MTLCommandBuffer", "MTLCommandEncoder", "MTLCommandQueue", "MTLDevice", "MTLResource"] }
-objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["std", "MPSCore", "MPSCommandBuffer"] }
+objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = ["std", "MPSCore", "MPSCoreTypes", "MPSCommandBuffer"] }
+objc2-metal-performance-shaders-graph = { version = "0.3.2", default-features = false, features = ["std", "objc2-metal-performance-shaders", "MPSGraph", "MPSGraphArithmeticOps", "MPSGraphConvolutionOps", "MPSGraphCore", "MPSGraphDevice", "MPSGraphExecutable", "MPSGraphMemoryOps", "MPSGraphOperation", "MPSGraphTensor", "MPSGraphTensorData"] }
 
 [dev-dependencies]
 # The CPU optimisers the optimiser kernel's twin is pinned to (tests/optimizer.rs). nn
