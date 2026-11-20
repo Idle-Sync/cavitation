@@ -458,22 +458,27 @@ impl Plan {
 ///
 /// [`Error::Unsupported`] if no layer fixes its input width, or the doubled width overflows.
 fn input_width(model: &Sequential<f32>, kinds: &[Kind], who: &str) -> Result<usize, Error> {
-    let refuse = || {
-        Error::Unsupported(format!(
-            "{who}: no layer of the model fixes its input width"
-        ))
-    };
     let (first, width) = (0..model.len())
         .find_map(|i| {
             let fixed = model.layer(i).input_width().or(kinds[i].declared_input());
             fixed.map(|w| (i, w))
         })
-        .ok_or_else(refuse)?;
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{who}: no layer of the model fixes its input width"
+            ))
+        })?;
     kinds[..first]
         .iter()
         .filter(|k| matches!(k, Kind::Glu(_)))
         .try_fold(width, |w, _| w.checked_mul(2))
-        .ok_or_else(refuse)
+        .ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{who}: layer {first} ({}) takes input width {width}, which the GLUs before \
+                 it double past what memory can index",
+                model.layer(first).name()
+            ))
+        })
 }
 
 /// Refuses what the wgpu kernels cannot run: a convolution over more than 65,535 images, a

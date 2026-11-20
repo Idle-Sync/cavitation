@@ -265,14 +265,16 @@ fn gate_bounds(gate: Gate, b: f64) -> (f64, f64, f64, f64) {
 }
 
 /// The gate's inputs `b`: a dense sweep of [−10, 10] in steps of 1/64, seeded values in
-/// [−8, 8], and the tails where the gates saturate and the exponential flushes, up to ±1e12
-/// (GELU's `f32` derivative is NaN from about 1.8e19 on the CPU and the GPU alike).
+/// [−8, 8], the tails where the gates saturate and the exponential flushes, up to ±1e12
+/// (GELU's `f32` derivative is NaN from about 1.8e19 on the CPU and the GPU alike), and ±1e-40,
+/// subnormal, which a GPU that flushes reads as 0: the gate there differs from its value at 0
+/// by about 1e-40, inside `F`.
 fn sweep(seed: u64) -> Vec<f32> {
     let mut v: Vec<f32> = (-640..=640).map(|i| i as f32 / 64.0).collect();
     v.extend(seeded_values(seed, 20_000, -8.0, 8.0));
     v.extend([
         -1e12, -50.0, -20.0, 20.0, 50.0, 1e12, -87.0, -90.0, -104.0, -110.0, 87.0, 104.0, 1e-30,
-        -1e-30,
+        -1e-30, 1e-40, -1e-40,
     ]);
     v
 }

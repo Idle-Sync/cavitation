@@ -444,6 +444,33 @@ mod tests {
         }
     }
 
+    /// A layer that passes its input on and fixes an input width more than half of `usize`.
+    struct Huge;
+
+    impl<T: Real> Layer<T> for Huge {
+        fn name(&self) -> &str {
+            "huge"
+        }
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        fn input_width(&self) -> Option<usize> {
+            Some(usize::MAX / 2 + 1)
+        }
+        fn forward(&self, _: &mut Tape<'_, T>, x: Var) -> Var {
+            x
+        }
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+        fn inference(
+            &self,
+            _: &cavitation_core::ParamValues<f32>,
+        ) -> Option<crate::InferenceLayer> {
+            Some(crate::InferenceLayer::Identity)
+        }
+    }
+
     /// Runs `body` on each GPU this platform has, one per backend, and returns how many ran.
     fn for_each_gpu(mut body: impl FnMut(&Gpu)) -> usize {
         let mut ran = 0;
@@ -910,6 +937,16 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "unsupported: GpuModel::compile: no layer of the model fixes its input width"
+        );
+        let doubled = Sequential::new().push(Glu { gate: Gate::Relu }).push(Huge);
+        let err = Plan::build(&doubled, &params, 8).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "unsupported: GpuModel::compile: layer 1 (huge) takes input width {}, which the \
+                 GLUs before it double past what memory can index",
+                usize::MAX / 2 + 1
+            )
         );
 
         let odd = Sequential::new()
