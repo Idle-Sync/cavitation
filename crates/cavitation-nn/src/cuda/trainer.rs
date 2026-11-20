@@ -418,7 +418,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         // The ReLU layers whose outputs the dead-neuron check reads, with their values per
         // channel as the CPU check groups them.
         let relus: Vec<(usize, usize)> = (0..m.layers.len())
-            .filter(|&i| matches!(m.layers[i].kind, Kind::Activation(Act::Relu)))
+            .filter(|&i| matches!(m.layers[i].kind, Kind::Activation(Act::Relu | Act::Relu6)))
             .map(|i| (i, channel_size(model, i, m.layers[i].outputs).unwrap_or(1)))
             .collect();
         let mut relu_words = Vec::with_capacity(relus.len());
@@ -1608,10 +1608,10 @@ impl<'c> TrainPass<'c> {
                 }
                 Kind::Activation(act) => {
                     let dx = s.values(n_in)?;
-                    let (op, alpha, from_output) = backward_op(act);
+                    let (op, from_output) = backward_op(act);
                     backward.push(Op::Elementwise {
                         op,
-                        alpha,
+                        settings: act.settings(),
                         n: n_in,
                         a: if from_output { saved.pre } else { x },
                         b: Some(g),

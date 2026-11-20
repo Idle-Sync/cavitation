@@ -36,8 +36,10 @@
 //!   weight gradient, bias gradient; measured in `tests/linear.rs`.
 //!
 //! - [`Elementwise`] and [`ElementwiseOp`]: add, multiply, scale and the activations (ReLU,
-//!   leaky ReLU, tanh, the sigmoid, GELU in both forms), forward and backward, as this
-//!   crate's own kernels, each the twin of its CPU code (`tests/elementwise.rs`).
+//!   leaky ReLU, tanh, the sigmoid, GELU in both forms, ELU, SELU, CELU, SiLU, Mish,
+//!   softplus, softsign, hardtanh, the hard sigmoid and hard swish, log-sigmoid), forward and
+//!   backward, as this crate's own kernels, each the twin of its CPU code
+//!   (`tests/elementwise.rs`).
 //!
 //! - [`Dropout`]: dropout and the neuron mask (`Tape::keep_where`) with a bit-packed `u32`
 //!   mask, forward and backward, as this crate's own kernels, each the CPU's bits

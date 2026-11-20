@@ -3,9 +3,9 @@
 //! step and skip counts, and Adam's update counts unchanged by a skipped step), a gradient
 //! that overflows to infinity while the loss stays finite named as on the CPU, an epoch of
 //! skipped steps refused as on the CPU, and the warnings of seeded runs (the norm checks on
-//! every parameter, and dead ReLU neurons after a `Linear` and after a convolution) matching
-//! the CPU's kind for kind, step for step and name for name, with each norm within 2⁻¹⁰ of the
-//! CPU's.
+//! every parameter, and dead ReLU and ReLU6 neurons after a `Linear` and after a convolution)
+//! matching the CPU's kind for kind, step for step and name for name, with each norm within
+//! 2⁻¹⁰ of the CPU's.
 //!
 //! Each comparison first checks that the CPU run sent the warnings it is about, so two empty
 //! lists never pass. Without a GPU every test says so and checks nothing;
@@ -20,7 +20,7 @@ use super::GpuTrainer;
 use super::forward_tests::{mlp, twin};
 use crate::{
     BatchView, Conv2d, Flatten, Health, Init, Linear, Loss, MaxPool2d, OnNonFinite,
-    OptimizerConfig, Relu, Sequential, TargetsView, Trainer, Warning, WarningKind,
+    OptimizerConfig, Relu, Relu6, Sequential, TargetsView, Trainer, Warning, WarningKind,
 };
 
 /// Runs `body` on each GPU this platform has, one per backend, and returns how many ran.
@@ -633,4 +633,49 @@ fn dead_relus_match_the_cpu() {
             });
         }
     }
+}
+
+/// A `Linear` → ReLU6 with three of its nine neurons pushed far below 0 by their biases,
+/// under the default health checks: ReLU6 is checked for dead neurons as ReLU is, and the
+/// reports of two epochs (and every other warning) match the CPU's.
+#[test]
+fn dead_relu6_neurons_match_the_cpu() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(67);
+    let net = Sequential::new()
+        .push(Linear::new(&mut params, 12, 9, &mut rng))
+        .push(Relu6)
+        .push(Linear::new(&mut params, 9, 4, &mut rng));
+    let bias = net.layer(0).as_linear().unwrap().bias().unwrap();
+    let mut b = params.value(bias).data().to_vec();
+    for k in [1, 4, 7] {
+        b[k] = -100.0;
+    }
+    *params.value_mut(bias) = Tensor::from_vec(b, &[9]).unwrap();
+    let batches: Vec<Data> = (0..2).map(|s| Data::new(84 + s, 6, 12, 4)).collect();
+    let epoch: Vec<&Data> = batches.iter().collect();
+    let epochs = vec![epoch.clone(), epoch];
+    let cpu = cpu_run(
+        &net,
+        &params,
+        &adam(),
+        Loss::CrossEntropy,
+        6,
+        Health::default(),
+        &epochs,
+    );
+    assert_eq!(count(&cpu.warnings, WarningKind::DeadNeurons), 2, "{cpu:?}");
+    for_each_gpu(|gpu| {
+        let (g, _) = gpu_run(
+            gpu,
+            &net,
+            &params,
+            &adam(),
+            Loss::CrossEntropy,
+            6,
+            Health::default(),
+            &epochs,
+        );
+        same_warnings(&g.warnings, &cpu.warnings, "relu6");
+    });
 }

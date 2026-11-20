@@ -61,6 +61,67 @@ pub(crate) enum Act {
     GeluTanh,
     /// GELU's erf form.
     GeluErf,
+    /// `x` above 0, `alpha · (eˣ − 1)` elsewhere.
+    Elu(f64),
+    /// The scaled ELU.
+    Selu,
+    /// `x` above 0, `alpha · (e^(x/alpha) − 1)` elsewhere, with a positive `alpha`.
+    Celu(f64),
+    /// `x · σ(x)`.
+    Silu,
+    /// `x · tanh(softplus(x))`.
+    Mish,
+    /// `ln(1 + e^(beta·x)) / beta`, and `x` once `beta · x` passes the threshold.
+    Softplus {
+        /// The sharpness.
+        beta: f64,
+        /// The value of `beta · x` above which the output is `x`.
+        threshold: f64,
+    },
+    /// `x / (1 + |x|)`.
+    Softsign,
+    /// `min(max(x, 0), 6)`, which the hardtanh kernels run, apart from hardtanh since the
+    /// dead-ReLU check reads it.
+    Relu6,
+    /// `x` clamped to `[min, max]`.
+    Hardtanh {
+        /// The lower bound.
+        min: f64,
+        /// The upper bound.
+        max: f64,
+    },
+    /// The piecewise-linear sigmoid.
+    Hardsigmoid,
+    /// `x · hardsigmoid(x)`.
+    Hardswish,
+    /// `ln σ(x)`.
+    LogSigmoid,
+}
+
+impl Act {
+    /// The two settings an element-wise kernel takes, rounded to `f32` as the CPU's layer
+    /// rounds them: the slope, `alpha` or `beta` first, and the threshold or the upper bound
+    /// second (the lower bound first for hardtanh); 0 where the activation has none.
+    pub(crate) fn settings(self) -> (f32, f32) {
+        match self {
+            Act::LeakyRelu(alpha) | Act::Elu(alpha) | Act::Celu(alpha) => (alpha as f32, 0.0),
+            Act::Softplus { beta, threshold } => (beta as f32, threshold as f32),
+            Act::Hardtanh { min, max } => (min as f32, max as f32),
+            Act::Relu6 => (0.0, 6.0),
+            Act::Relu
+            | Act::Tanh
+            | Act::Sigmoid
+            | Act::GeluTanh
+            | Act::GeluErf
+            | Act::Selu
+            | Act::Silu
+            | Act::Mish
+            | Act::Softsign
+            | Act::Hardsigmoid
+            | Act::Hardswish
+            | Act::LogSigmoid => (0.0, 0.0),
+        }
+    }
 }
 
 /// A batch-norm layer's running statistics on a GPU.
@@ -542,7 +603,35 @@ fn kind(
         ActivationKind::Sigmoid => Act::Sigmoid,
         ActivationKind::Gelu(GeluApprox::Tanh) => Act::GeluTanh,
         ActivationKind::Gelu(GeluApprox::Exact) => Act::GeluErf,
-        _ => return refuse("is an activation the GPU does not run"),
+        ActivationKind::Elu(alpha) => Act::Elu(alpha),
+        ActivationKind::Selu => Act::Selu,
+        ActivationKind::Celu(alpha) => {
+            // The kernels need `x / alpha` at or below 0 wherever `x` is, as the CPU's kernel
+            // has it for a positive alpha; for any other alpha the CPU takes std's `exp_m1`.
+            if !(alpha > 0.0 && (alpha as f32) > 0.0) {
+                return refuse(&format!(
+                    "is a CELU with alpha {alpha}; the GPU runs a positive alpha only"
+                ));
+            }
+            Act::Celu(alpha)
+        }
+        ActivationKind::Silu => Act::Silu,
+        ActivationKind::Mish => Act::Mish,
+        ActivationKind::Softplus { beta, threshold } => Act::Softplus { beta, threshold },
+        ActivationKind::Softsign => Act::Softsign,
+        ActivationKind::Hardtanh { min, max } => {
+            // The CPU's `Tape::hardtanh` panics on these, so no device trains them.
+            if min.is_nan() || max.is_nan() || min > max {
+                return refuse(&format!(
+                    "is a hardtanh with min {min} and max {max}; min must not exceed max"
+                ));
+            }
+            Act::Hardtanh { min, max }
+        }
+        ActivationKind::Relu6 => Act::Relu6,
+        ActivationKind::Hardsigmoid => Act::Hardsigmoid,
+        ActivationKind::Hardswish => Act::Hardswish,
+        ActivationKind::LogSigmoid => Act::LogSigmoid,
     };
     Ok(Kind::Activation(act))
 }

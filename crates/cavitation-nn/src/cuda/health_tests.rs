@@ -3,9 +3,9 @@
 //! overflows to infinity while the loss stays finite named as on the CPU, a finite gradient
 //! whose `f32` sum of squares overflows reported as exploding, an epoch of skipped steps
 //! refused as on the CPU, and the warnings of seeded runs (the norm checks on every
-//! parameter, and dead ReLU neurons after a `Linear` and after a convolution) matching the
-//! CPU's kind for kind, step for step and name for name, with each norm within 2⁻¹⁰ of the
-//! CPU's.
+//! parameter, and dead ReLU and ReLU6 neurons after a `Linear` and after a convolution)
+//! matching the CPU's kind for kind, step for step and name for name, with each norm within
+//! 2⁻¹⁰ of the CPU's.
 //!
 //! Without CUDA every test says so and checks nothing; `CAVITATION_CUDA_REQUIRED=1` makes
 //! that a failure.
@@ -19,7 +19,7 @@ use super::CudaTrainer;
 use super::test_util::{Data, mlp, twin, with_cuda};
 use crate::{
     Conv2d, Flatten, Health, Init, Linear, Loss, MaxPool2d, OnNonFinite, OptimizerConfig, Relu,
-    Sequential, Trainer, Warning, WarningKind,
+    Relu6, Sequential, Trainer, Warning, WarningKind,
 };
 
 /// The warnings a sink has received.
@@ -468,4 +468,41 @@ fn dead_relus_match_the_cpu() {
             });
         }
     }
+}
+
+/// A `Linear` → ReLU6 with three of its nine neurons pushed far below 0 by their biases,
+/// under the default health checks: ReLU6 is checked for dead neurons as ReLU is, and the
+/// reports of two epochs (and every other warning) match the CPU's.
+#[test]
+fn dead_relu6_neurons_match_the_cpu() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(67);
+    let net = Sequential::new()
+        .push(Linear::new(&mut params, 12, 9, &mut rng))
+        .push(Relu6)
+        .push(Linear::new(&mut params, 9, 4, &mut rng));
+    let bias = net.layer(0).as_linear().unwrap().bias().unwrap();
+    let mut b = params.value(bias).data().to_vec();
+    for k in [1, 4, 7] {
+        b[k] = -100.0;
+    }
+    *params.value_mut(bias) = Tensor::from_vec(b, &[9]).unwrap();
+    let batches: Vec<Data> = (0..2).map(|s| Data::new(84 + s, 6, 12, 4)).collect();
+    let epoch: Vec<&Data> = batches.iter().collect();
+    let epochs = vec![epoch.clone(), epoch];
+    let loss = Loss::CrossEntropy;
+    let cpu = cpu_run(&net, &params, &adam(), loss, Health::default(), &epochs);
+    assert_eq!(count(&cpu.warnings, WarningKind::DeadNeurons), 2, "{cpu:?}");
+    with_cuda(|cuda| {
+        let (g, _) = cuda_run(
+            cuda,
+            &net,
+            &params,
+            &adam(),
+            loss,
+            Health::default(),
+            &epochs,
+        );
+        same_warnings(&g.warnings, &cpu.warnings, "relu6");
+    });
 }

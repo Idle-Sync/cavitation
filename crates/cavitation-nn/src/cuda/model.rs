@@ -46,13 +46,12 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// It runs the layers [`GpuModel`](crate::GpuModel) runs, from the same checks:
 /// [`Linear`](crate::Linear) (through cuBLAS), [`Conv2d`](crate::Conv2d) (through cuDNN),
 /// [`MaxPool2d`](crate::MaxPool2d), [`AvgPool2d`](crate::AvgPool2d),
-/// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout),
-/// [`Flatten`](crate::Flatten), [`Identity`](crate::Identity) and the activations
-/// [`Relu`](crate::Relu), [`LeakyRelu`](crate::LeakyRelu), [`Tanh`](crate::Tanh),
-/// [`Sigmoid`](crate::Sigmoid) and [`Gelu`](crate::Gelu) (both forms).
-/// [`compile`](CudaModel::compile) refuses any other layer, naming its index and name. Neuron
-/// masks set on the model when it is compiled are compiled in; a mask set later needs a new
-/// compile.
+/// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten),
+/// [`Identity`](crate::Identity) and every built-in activation (ReLU, leaky ReLU, tanh, the
+/// sigmoid, GELU in both forms, ELU, SELU, CELU with a positive `alpha`, SiLU, Mish, softplus,
+/// softsign, hardtanh with `min <= max`, ReLU6, the hard sigmoid, the hard swish and log-sigmoid).
+/// [`compile`](CudaModel::compile) refuses any other layer, naming its index and name. Neuron masks
+/// set on the model when it is compiled are compiled in; a mask set later needs a new compile.
 ///
 /// A batch-norm layer's `num_batches_tracked` stays on the host, since only the host
 /// decides whether a step's running-statistics update ran.

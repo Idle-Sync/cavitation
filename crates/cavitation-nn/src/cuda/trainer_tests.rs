@@ -27,7 +27,10 @@ use std::time::Duration;
 use cavitation_core::{Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
 
 use super::CudaTrainer;
-use super::test_util::{Data, Twin, cifar_cnn, mlp, mnist_cnn, off, small_cnn, twin, with_cuda};
+use super::test_util::{
+    Data, Twin, activation_mlp, cifar_cnn, mlp, mnist_cnn, more_activations, off, small_cnn, twin,
+    with_cuda,
+};
 use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
 /// The unit roundoff of `f32`.
@@ -207,6 +210,25 @@ fn gradients_match_the_tape() {
     check_gradients(t, &Data::within(1, 24, 12, 4, (-2.0, 2.0)), "mlp");
     let t = twin(small_cnn::<f64>, small_cnn::<f32>, 22);
     check_gradients(t, &Data::new(2, 6, 2 * 64, 5), "small cnn");
+}
+
+/// Each activation beyond ReLU, tanh, the sigmoid and GELU, twice in an MLP: the card's
+/// gradients against the `f64` tape's, within the tolerance above.
+#[test]
+fn every_activation_matches_the_tape() {
+    for (i, kind) in more_activations().into_iter().enumerate() {
+        let seed = 60 + i as u64;
+        let t = twin(
+            |p, s| activation_mlp(p, s, kind),
+            |p, s| activation_mlp(p, s, kind),
+            seed,
+        );
+        check_gradients(
+            t,
+            &Data::within(seed, 24, 12, 4, (-2.0, 2.0)),
+            &format!("{kind:?}"),
+        );
+    }
 }
 
 /// One `mnist-cnn` step and one `cifar-cnn` step.

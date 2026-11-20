@@ -12,7 +12,8 @@ use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, wgpu,
 };
 
-use super::model::{Act, CompiledLayer, GpuMask, GpuModel, GpuTensor, Kind};
+use super::model::{CompiledLayer, GpuMask, GpuModel, GpuTensor, Kind};
+use super::trainer::forward_op;
 use crate::train::{Evaluation, measure};
 use crate::{Dataset, Loss, Sequential, Targets};
 
@@ -200,21 +201,14 @@ impl Forward {
                 }
                 Kind::Activation(act) => {
                     let out = new(&mut values, pool);
-                    let (op, alpha) = match act {
-                        Act::Relu => (Elementwise::Relu, 0.0),
-                        Act::LeakyRelu(slope) => (Elementwise::LeakyRelu, slope as f32),
-                        Act::Tanh => (Elementwise::Tanh, 0.0),
-                        Act::Sigmoid => (Elementwise::Sigmoid, 0.0),
-                        Act::GeluTanh => (Elementwise::GeluTanh, 0.0),
-                        Act::GeluErf => (Elementwise::GeluErf, 0.0),
-                    };
+                    let (alpha, scale) = act.settings();
                     let call = kernels.elementwise.call(
                         steps,
                         pool,
-                        op,
+                        forward_op(act),
                         u32_of(n),
                         alpha,
-                        0.0,
+                        scale,
                         &values[x],
                         None,
                         &values[out],

@@ -1,9 +1,13 @@
-//! The element-wise GPU kernels: add, multiply and scale; ReLU and leaky ReLU, tanh, the
-//! sigmoid and GELU (both forms), forward and backward; and dropout and neuron masks with a
-//! bit-packed mask.
-//! Their CPU twins are `cavitation-core`'s: the one-rounding operations match it bit for bit
-//! on normal values, and tanh, the sigmoid and GELU are the CPU kernels' formulas ported
-//! operation for operation, within the bounds their tests state.
+//! The element-wise GPU kernels: add, multiply and scale; the activations (ReLU and leaky
+//! ReLU, tanh, the sigmoid, GELU in both forms, ELU, SELU, CELU, SiLU, Mish, softplus,
+//! softsign, hardtanh, the hard sigmoid and hard swish, and log-sigmoid), forward and
+//! backward; and dropout and neuron masks with a bit-packed mask.
+//! Their CPU twins are `cavitation-core`'s: the one-rounding operations and the clamps match
+//! it bit for bit on normal values, and the activations built on an exponential or a
+//! logarithm are the CPU kernels' formulas ported operation for operation, within the bounds
+//! their tests state. Those tests ran on Vulkan and DX12, not on Metal, for which wgpu
+//! compiles shaders with fast math on: there the flushed subnormals and the division may
+//! differ.
 
 use std::num::NonZeroU64;
 
@@ -24,7 +28,8 @@ const DROPOUT: Shader = Shader {
 /// Threads per workgroup in both shaders.
 const WORKGROUP: u32 = 256;
 
-/// The bytes of the shaders' `Params` uniform: the length, `alpha`, `scale` and padding.
+/// The bytes of the shaders' `Params` uniform: the length, `alpha`, `scale`, and a word
+/// that is always 0 (the element-wise shader hides values from its compiler with it).
 const PARAMS_BYTES: u64 = 16;
 
 /// One element-wise operation. `a` is its first input, `b` its second (the gradient flowing
@@ -72,6 +77,52 @@ pub enum Elementwise {
     GeluErf,
     /// `b` times `Φ(a) + a · φ(a)`, the derivative of GELU's erf form at the input `a`.
     GeluErfBackward,
+    /// ELU with `alpha`: `a` above 0, `alpha · (e^a − 1)` at or below.
+    Elu,
+    /// `b · (1 above 0, alpha · e^a at or below)`, with `a` the forward input.
+    EluBackward,
+    /// SELU, `scale · elu(a)` with PyTorch's `scale` and `alpha`.
+    Selu,
+    /// `b · (scale above 0, scale · alpha · e^a at or below)`, with `a` the forward input.
+    SeluBackward,
+    /// CELU with `alpha` (positive): `a` above 0, `alpha · (e^(a/alpha) − 1)` at or below.
+    Celu,
+    /// `b · (1 above 0, e^(a/alpha) at or below)`, with `a` the forward input.
+    CeluBackward,
+    /// SiLU, `a · σ(a)`.
+    Silu,
+    /// `b · σ(a) · (1 + a · (1 − σ(a)))`, with `a` the forward input.
+    SiluBackward,
+    /// Mish, `a · tanh(softplus(a))`, softplus at `beta` 1 and threshold 20.
+    Mish,
+    /// `b · (t + a · σ(a) · (1 − t²))`, `t = tanh(softplus(a))`, with `a` the forward input.
+    MishBackward,
+    /// Softplus with `beta` in `alpha` and the threshold in `scale`: `a` where `beta · a` is above
+    /// the threshold, `ln(1 + e^(beta·a)) / beta` at or below.
+    Softplus,
+    /// `b · (1 where beta · a is above the threshold, σ(beta · a) at or below)`, with `a` the
+    /// forward input.
+    SoftplusBackward,
+    /// Softsign, `a / (1 + |a|)`.
+    Softsign,
+    /// `b · 1 / (1 + |a|)²`, with `a` the forward input.
+    SoftsignBackward,
+    /// Hardtanh: `a` clamped to `[alpha, scale]` (ReLU6 is `[0, 6]`), NaN for NaN.
+    Hardtanh,
+    /// `b · (1 strictly inside (alpha, scale), 0 at and beyond the bounds)`, NaN for a NaN `a`.
+    HardtanhBackward,
+    /// The hard sigmoid: 0 up to −3, 1 from 3, `a / 6 + 1/2` between.
+    Hardsigmoid,
+    /// `b · (1/6 strictly inside (−3, 3), 0 elsewhere)`, NaN for a NaN `a`.
+    HardsigmoidBackward,
+    /// The hard swish: 0 up to −3, `a` from 3, `a · (a + 3) / 6` between.
+    Hardswish,
+    /// `b · (0 below −3, 1 above 3, a / 3 + 1/2 on [−3, 3])`, NaN for a NaN `a`.
+    HardswishBackward,
+    /// Log-sigmoid, `ln σ(a)`, as `0 − softplus(−a)`.
+    LogSigmoid,
+    /// `b · σ(−a)`, with `a` the forward input.
+    LogSigmoidBackward,
     /// `a · m`, `m` = `scale` where the mask in `b` has the element's bit set and 0 where it is
     /// clear (so a dropped −3 is −0 and a dropped NaN stays NaN):
     /// dropout forward, and its backward pass on the gradient with the same mask.
@@ -84,7 +135,7 @@ pub enum Elementwise {
 
 impl Elementwise {
     /// Every operation, in declaration order.
-    pub const ALL: [Elementwise; 17] = [
+    pub const ALL: [Elementwise; 39] = [
         Elementwise::Add,
         Elementwise::Mul,
         Elementwise::Scale,
@@ -100,6 +151,28 @@ impl Elementwise {
         Elementwise::GeluTanhBackward,
         Elementwise::GeluErf,
         Elementwise::GeluErfBackward,
+        Elementwise::Elu,
+        Elementwise::EluBackward,
+        Elementwise::Selu,
+        Elementwise::SeluBackward,
+        Elementwise::Celu,
+        Elementwise::CeluBackward,
+        Elementwise::Silu,
+        Elementwise::SiluBackward,
+        Elementwise::Mish,
+        Elementwise::MishBackward,
+        Elementwise::Softplus,
+        Elementwise::SoftplusBackward,
+        Elementwise::Softsign,
+        Elementwise::SoftsignBackward,
+        Elementwise::Hardtanh,
+        Elementwise::HardtanhBackward,
+        Elementwise::Hardsigmoid,
+        Elementwise::HardsigmoidBackward,
+        Elementwise::Hardswish,
+        Elementwise::HardswishBackward,
+        Elementwise::LogSigmoid,
+        Elementwise::LogSigmoidBackward,
         Elementwise::Dropout,
         Elementwise::KeepWhere,
     ];
@@ -125,6 +198,17 @@ impl Elementwise {
                 | Elementwise::Sigmoid
                 | Elementwise::GeluTanh
                 | Elementwise::GeluErf
+                | Elementwise::Elu
+                | Elementwise::Selu
+                | Elementwise::Celu
+                | Elementwise::Silu
+                | Elementwise::Mish
+                | Elementwise::Softplus
+                | Elementwise::Softsign
+                | Elementwise::Hardtanh
+                | Elementwise::Hardsigmoid
+                | Elementwise::Hardswish
+                | Elementwise::LogSigmoid
         )
     }
 
@@ -146,6 +230,28 @@ impl Elementwise {
             Elementwise::GeluTanhBackward => "gelu_tanh_backward",
             Elementwise::GeluErf => "gelu_erf_forward",
             Elementwise::GeluErfBackward => "gelu_erf_backward",
+            Elementwise::Elu => "elu",
+            Elementwise::EluBackward => "elu_backward",
+            Elementwise::Selu => "selu",
+            Elementwise::SeluBackward => "selu_backward",
+            Elementwise::Celu => "celu",
+            Elementwise::CeluBackward => "celu_backward",
+            Elementwise::Silu => "silu",
+            Elementwise::SiluBackward => "silu_backward",
+            Elementwise::Mish => "mish",
+            Elementwise::MishBackward => "mish_backward",
+            Elementwise::Softplus => "softplus",
+            Elementwise::SoftplusBackward => "softplus_backward",
+            Elementwise::Softsign => "softsign",
+            Elementwise::SoftsignBackward => "softsign_backward",
+            Elementwise::Hardtanh => "hardtanh",
+            Elementwise::HardtanhBackward => "hardtanh_backward",
+            Elementwise::Hardsigmoid => "hardsigmoid",
+            Elementwise::HardsigmoidBackward => "hardsigmoid_backward",
+            Elementwise::Hardswish => "hardswish",
+            Elementwise::HardswishBackward => "hardswish_backward",
+            Elementwise::LogSigmoid => "log_sigmoid",
+            Elementwise::LogSigmoidBackward => "log_sigmoid_backward",
             Elementwise::Dropout => return (DROPOUT, "dropout"),
             Elementwise::KeepWhere => return (DROPOUT, "keep_where"),
         };
@@ -251,8 +357,10 @@ impl ElementwiseKernels {
     }
 
     /// Prepares `op` over `n` elements of `a` (and `b`, when [`Elementwise::takes_b`])
-    /// into `out`, with `alpha` (for [`Elementwise::Scale`] and the leaky ReLUs) and `scale`
-    /// (for [`Elementwise::Dropout`], `1 / f32(1 − p)` as the CPU rounds it): its uniform, taken from
+    /// into `out`, with `alpha` (for [`Elementwise::Scale`], the leaky ReLUs, ELU and CELU;
+    /// `beta` for softplus; the lower bound for hardtanh) and `scale` (for
+    /// [`Elementwise::Dropout`], `1 / f32(1 − p)` as the CPU rounds it; the threshold for
+    /// softplus; the upper bound for hardtanh): its uniform, taken from
     /// `pool` and uploaded in a step of its own, and its bind group. Made once, when a model
     /// is compiled. An operation that does not read `b` binds `a` in its place. `out` must be
     /// a different buffer from `a` and `b`: wgpu does not let one buffer be read and written in

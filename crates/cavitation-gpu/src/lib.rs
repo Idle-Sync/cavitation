@@ -21,8 +21,10 @@
 //!   readback buffers made once, with GPU timestamps per pass, per run of copies where the
 //!   device can write them between passes, and per span when profiling ([`Timing`] names
 //!   what is not timed).
-//! - [`kernels::ElementwiseKernels`]: add, multiply, scale, ReLU, leaky ReLU, tanh, the
-//!   sigmoid, GELU (both forms) forward and backward, and dropout with a bit-packed mask.
+//! - [`kernels::ElementwiseKernels`]: add, multiply, scale, and the activations (ReLU, leaky
+//!   ReLU, tanh, the sigmoid, GELU in both forms, ELU, SELU, CELU, SiLU, Mish, softplus,
+//!   softsign, hardtanh, the hard sigmoid and hard swish, log-sigmoid) forward and backward,
+//!   and dropout with a bit-packed mask.
 //! - [`kernels::MaxPool2d`] and [`kernels::AvgPool2d`]: max and average pooling, forward
 //!   and backward, max pooling bit for bit with the CPU's (winners, ties and NaNs) and
 //!   average pooling within a stated rounding bound.

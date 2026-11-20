@@ -1,15 +1,23 @@
-//! The element-wise kernels against their CPU twins on every backend this machine has.
+//! The element-wise kernels against their CPU twins on each backend this machine tries
+//! (`Backend::on_this_platform`: Vulkan and DX12 here, never Metal on this machine). wgpu
+//! compiles Metal shaders with fast math on, so there the flushed subnormals and the
+//! division may differ from what these tests measured elsewhere.
+//!
 //! The one-rounding operations (add, multiply, scale, ReLU and leaky ReLU forward and
-//! backward, dropout) give the CPU's bits on normal values, NaN, ±0 and ±∞ included. tanh,
-//! the sigmoid and GELU (both forms), forward and backward, are within their stated bounds
-//! of the f64 tape's values. Each test skips without a GPU, unless `CAVITATION_GPU_REQUIRED=1`
-//! makes that a failure.
+//! backward, dropout) and the clamps (hardtanh and ReLU6, the hard sigmoid and the hard
+//! swish, forward and backward) give the CPU's bits on normal values, ±0 and ±∞ included,
+//! and NaN for NaN. tanh, the sigmoid, GELU (both forms), ELU, SELU, CELU, SiLU, Mish,
+//! softplus, softsign and log-sigmoid, forward and backward, are within their stated bounds
+//! of the f64 tape's values, give the CPU's bits on ±0 and ±∞, and NaN for NaN. Each test
+//! skips without a GPU, unless `CAVITATION_GPU_REQUIRED=1` makes that a failure.
 
 mod common;
 
-use cavitation_core::{GeluApprox, Graph, ParamStore, Tensor};
+use cavitation_core::{GeluApprox, Graph, ParamStore, Real, Tape, Tensor, Var};
 use cavitation_gpu::kernels::{Elementwise, ElementwiseKernels};
-use common::{Kit, U, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values};
+use common::{
+    FLOOR, Kit, U, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values,
+};
 
 /// Values every one-rounding twin includes besides the generated ones: zeros of both signs,
 /// infinities, NaN, the extreme normals, and values around 0.
@@ -487,5 +495,360 @@ fn misuse_is_refused() {
             )
         }));
         assert!(too_short.is_err());
+    });
+}
+
+/// An activation the CPU trains, with its settings, as the tests below run it.
+#[derive(Clone, Copy, Debug)]
+enum Act {
+    /// ELU with `alpha`.
+    Elu(f32),
+    /// SELU.
+    Selu,
+    /// CELU with `alpha`.
+    Celu(f32),
+    /// SiLU.
+    Silu,
+    /// Mish.
+    Mish,
+    /// Softplus with `beta` and the threshold.
+    Softplus(f32, f32),
+    /// Softsign.
+    Softsign,
+    /// Hardtanh with `min` and `max` (ReLU6 is `[0, 6]`).
+    Hardtanh(f32, f32),
+    /// The hard sigmoid.
+    Hardsigmoid,
+    /// The hard swish.
+    Hardswish,
+    /// Log-sigmoid.
+    LogSigmoid,
+}
+
+impl Act {
+    /// The forward and backward operations, with their `alpha` and `scale`.
+    fn ops(self) -> (Elementwise, Elementwise, f32, f32) {
+        match self {
+            Act::Elu(alpha) => (Elementwise::Elu, Elementwise::EluBackward, alpha, 0.0),
+            Act::Selu => (Elementwise::Selu, Elementwise::SeluBackward, 0.0, 0.0),
+            Act::Celu(alpha) => (Elementwise::Celu, Elementwise::CeluBackward, alpha, 0.0),
+            Act::Silu => (Elementwise::Silu, Elementwise::SiluBackward, 0.0, 0.0),
+            Act::Mish => (Elementwise::Mish, Elementwise::MishBackward, 0.0, 0.0),
+            Act::Softplus(beta, threshold) => (
+                Elementwise::Softplus,
+                Elementwise::SoftplusBackward,
+                beta,
+                threshold,
+            ),
+            Act::Softsign => (
+                Elementwise::Softsign,
+                Elementwise::SoftsignBackward,
+                0.0,
+                0.0,
+            ),
+            Act::Hardtanh(min, max) => (
+                Elementwise::Hardtanh,
+                Elementwise::HardtanhBackward,
+                min,
+                max,
+            ),
+            Act::Hardsigmoid => (
+                Elementwise::Hardsigmoid,
+                Elementwise::HardsigmoidBackward,
+                0.0,
+                0.0,
+            ),
+            Act::Hardswish => (
+                Elementwise::Hardswish,
+                Elementwise::HardswishBackward,
+                0.0,
+                0.0,
+            ),
+            Act::LogSigmoid => (
+                Elementwise::LogSigmoid,
+                Elementwise::LogSigmoidBackward,
+                0.0,
+                0.0,
+            ),
+        }
+    }
+
+    /// Records the activation on `tape`, as the CPU's layer does.
+    fn record<T: Real>(self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+        let c = |v: f32| T::from_f64(f64::from(v));
+        match self {
+            Act::Elu(alpha) => tape.elu(x, c(alpha)),
+            Act::Selu => tape.selu(x),
+            Act::Celu(alpha) => tape.celu(x, c(alpha)),
+            Act::Silu => tape.silu(x),
+            Act::Mish => tape.mish(x),
+            Act::Softplus(beta, threshold) => tape.softplus(x, c(beta), c(threshold)),
+            Act::Softsign => tape.softsign(x),
+            Act::Hardtanh(min, max) => tape.hardtanh(x, c(min), c(max)),
+            Act::Hardsigmoid => tape.hardsigmoid(x),
+            Act::Hardswish => tape.hardswish(x),
+            Act::LogSigmoid => tape.log_sigmoid(x),
+        }
+    }
+}
+
+/// The tape's values of `act` at `x` and, with `g` flowing back, its gradient, in `T`: the
+/// CPU's own `f32` arithmetic, or the `f64` reference.
+fn tape_of<T: Real>(act: Act, x: &[f32], g: &[f32]) -> (Vec<T>, Vec<T>) {
+    let n = x.len();
+    let widen = |v: &[f32]| {
+        v.iter()
+            .map(|&v| T::from_f64(f64::from(v)))
+            .collect::<Vec<T>>()
+    };
+    let mut params: ParamStore<T> = ParamStore::default();
+    let id = params.add(Tensor::from_vec(widen(x), &[n]).expect("shape"));
+    let gs = Tensor::from_vec(widen(g), &[n]).expect("shape");
+    let mut graph: Graph<T> = Graph::default();
+    let mut tape = graph.tape(&params.values);
+    let xv = tape.param(id);
+    let gv = tape.input(gs.view());
+    let y = act.record(&mut tape, xv);
+    let values = tape.value(y).data().to_vec();
+    let weighted = tape.mul(y, gv);
+    let loss = tape.sum(weighted);
+    tape.backward(loss, &mut params.grads);
+    drop(tape);
+    (values, params.grad(id).data().to_vec())
+}
+
+/// The CPU's `f32` values and gradients of `act`, as `f32`.
+fn cpu_f32(act: Act, x: &[f32], g: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    tape_of::<f32>(act, x, g)
+}
+
+/// The values every activation twin includes: zeros of both signs, infinities, NaN, the
+/// extreme normals, and the breakpoints of the clamps (±3, ±1, 0, 6, the hardtanh bounds
+/// below) with their neighbours.
+fn special_values() -> Vec<f32> {
+    let mut v = SPECIAL.to_vec();
+    for p in [-6.0f32, -3.0, -2.5, -1.0, 0.5, 1.0, 3.0, 6.0, 20.0, 10.0] {
+        v.extend([p, p.next_up(), p.next_down()]);
+    }
+    v.extend([
+        1e-30, -1e-30, 2.9e-8, -2.9e-8, 3.0e-8, -3.0e-8, -17.5, -17.6,
+    ]);
+    v
+}
+
+/// The piecewise-linear activations, hardtanh (with ReLU6's bounds and two others), the hard
+/// sigmoid and the hard swish, forward and backward from the input, give the CPU's bits on
+/// the special values and the breakpoints with their neighbours, and on a sweep between.
+#[test]
+fn clamps_give_the_cpus_bits() {
+    for_each_gpu(|gpu| {
+        let mut x = special_values();
+        x.extend(sweep(9));
+        x.extend((0..20_000).map(|i| -3.0 + 6.0 * i as f32 / 20_000.0));
+        let g = seeded_values(10, x.len(), -2.0, 2.0);
+        let mut kit = Kit::new(gpu, 4 * x.len() as u64);
+        let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
+        for act in [
+            Act::Hardtanh(-1.0, 1.0),
+            Act::Hardtanh(0.0, 6.0),
+            Act::Hardtanh(-2.5, 0.5),
+            Act::Hardsigmoid,
+            Act::Hardswish,
+        ] {
+            let (forward, backward, alpha, scale) = act.ops();
+            let (want, grad) = cpu_f32(act, &x, &g);
+            let y = run(&mut kit, &kernels, forward, &x, None, alpha, scale);
+            assert_exact(&y, &want, &format!("{act:?}"));
+            let d = run(&mut kit, &kernels, backward, &x, Some(&g), alpha, scale);
+            assert_exact(&d, &grad, &format!("{act:?} backward"));
+        }
+    });
+}
+
+/// The `f64` sigmoid.
+fn sigma(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// For `act` at `x` with `g` flowing back, the bounds the forward value and the gradient
+/// are held to against the `f64` tape, given its value `y`: each `(c, size, extra)`, the
+/// bound being `c · u · size + extra`. See [`exponential_activation_twins`].
+fn bounds(act: Act, x: f64, y: f64, g: f64) -> [(f64, f64, f64); 2] {
+    let g = g.abs();
+    let flush = (1.0 + x.abs()) * FLOOR;
+    match act {
+        Act::Elu(alpha) => {
+            let d = if x > 0.0 {
+                1.0
+            } else {
+                f64::from(alpha).abs() * x.exp()
+            };
+            [(8.0, y.abs(), 0.0), (8.0, g * d, 0.0)]
+        }
+        Act::Selu => {
+            let d = if x > 0.0 { 1.05 } else { 1.76 * x.exp() };
+            [(12.0, y.abs(), 0.0), (8.0, g * d, 0.0)]
+        }
+        Act::Celu(alpha) => {
+            let z = x / f64::from(alpha);
+            let d = if x > 0.0 {
+                1.0
+            } else {
+                z.exp() * (1.0 + z.abs())
+            };
+            [(12.0, y.abs(), 0.0), (8.0, g * d, 0.0)]
+        }
+        Act::Silu => {
+            let s = sigma(x);
+            [
+                (10.0, y.abs(), flush),
+                (12.0, g * s * (1.0 + x.abs()), g * flush),
+            ]
+        }
+        Act::Mish => {
+            let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+            let (t, s) = (sp.tanh(), sigma(x));
+            [
+                (16.0, y.abs(), 2.0 * flush),
+                (
+                    32.0,
+                    g * (t.abs() + x.abs() * s * (1.0 + t * t)),
+                    2.0 * g * flush,
+                ),
+            ]
+        }
+        Act::Softplus(beta, threshold) => {
+            let z = f64::from(beta) * x;
+            let s = sigma(z);
+            let above = z > f64::from(threshold);
+            [
+                (12.0, y.abs() + x.abs() * s, FLOOR / f64::from(beta).abs()),
+                (
+                    10.0,
+                    if above {
+                        0.0
+                    } else {
+                        g * s * (1.0 + z.abs() * (1.0 - s))
+                    },
+                    0.0,
+                ),
+            ]
+        }
+        Act::Softsign => [
+            (8.0, y.abs(), 0.0),
+            (12.0, g / (1.0 + x.abs()).powi(2), 0.0),
+        ],
+        Act::LogSigmoid => [(8.0, y.abs(), 0.0), (10.0, g * sigma(-x), 0.0)],
+        Act::Hardtanh(..) | Act::Hardsigmoid | Act::Hardswish => {
+            unreachable!("the clamps are exact")
+        }
+    }
+}
+
+/// The activations built on an exponential, a logarithm or a division, forward and backward
+/// from the input, within stated bounds of the `f64` tape, each `c · u` times the size of the
+/// value or the gradient, plus `extra` where a flushed subnormal is multiplied by `x`:
+///
+/// - ELU, `8u|y|` (`e^x − 1` within 2 ulp, one more than the CPU's kernel, and the product
+///   by `alpha`); backward `8u|g · alpha · e^x|` (`exp_neg` within 2 ulp, two products).
+/// - SELU, `12u|y|` (ELU's, and the two constants and the product by the scale rounded to
+///   `f32`); backward `8u|g · d|`.
+/// - CELU, `12u|y|` (WGSL's division within 2.5 ulp, which `e^y − 1` carries with a
+///   relative condition of at most 1, then ELU's); backward `8u|g| · e^z · (1 + |z|)`,
+///   `z = x / alpha`, the division's error scaled by `z`.
+/// - SiLU, `10u|y|` (the sigmoid within 4 ulp, as its own twin, and the product), and
+///   `12u|g| · σ(x) · (1 + |x|)` backward, the sigmoid's error reaching `1 − σ` and `x`.
+/// - Mish, `16u|y|` (softplus within 3 ulp and the tanh within 4, both carried with a
+///   condition of at most 1, and the product); backward `32u|g| · (|t| + |x|·σ(x)·(1 + t²))`,
+///   `t`'s error doubled in `t²`.
+/// - Softplus, `12u · (|y| + |x|·σ(z))`, `z = beta · x` (the rounding of `z` scaled by the
+///   slope, softplus within 3 ulp and the division by `beta`); backward
+///   `10u|g| · σ(z) · (1 + |z|·(1 − σ(z)))`.
+/// - Softsign, `8u|y|` (the sum and the division); backward `12u|g| / (1 + |x|)²`.
+/// - Log-sigmoid, `8u|y|` (softplus within 3 ulp); backward `10u|g| · σ(−x)`.
+///
+/// A flushed sigmoid or softplus (`x` beyond about ±87) is off by at most 2⁻¹²⁶, times `x`
+/// where it multiplies `x`: the `extra` term, `(1 + |x|) · 2⁻¹²⁶`.
+#[test]
+fn exponential_activation_twins() {
+    for_each_gpu(|gpu| {
+        let mut x = sweep(11);
+        x.extend((-240..=240).map(|i| i as f32 / 8.0));
+        x.extend([
+            1e-30, -1e-30, 2.9e-8, -2.9e-8, 3.0e-8, -3.0e-8, -17.5, -17.6,
+        ]);
+        let g = seeded_values(12, x.len(), -2.0, 2.0);
+        let mut kit = Kit::new(gpu, 4 * x.len() as u64);
+        let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
+        for act in [
+            Act::Elu(1.0),
+            Act::Elu(0.25),
+            Act::Selu,
+            Act::Celu(1.0),
+            Act::Celu(1.5),
+            Act::Silu,
+            Act::Mish,
+            Act::Softplus(1.0, 20.0),
+            Act::Softplus(1.5, 10.0),
+            Act::Softsign,
+            Act::LogSigmoid,
+        ] {
+            let (forward, backward, alpha, scale) = act.ops();
+            let (want, grad) = tape_of::<f64>(act, &x, &g);
+            let b: Vec<[(f64, f64, f64); 2]> = (0..x.len())
+                .map(|i| bounds(act, f64::from(x[i]), want[i], f64::from(g[i])))
+                .collect();
+            let y = run(&mut kit, &kernels, forward, &x, None, alpha, scale);
+            let worst = assert_within(
+                &y,
+                &want,
+                |i| b[i][0].0 * U * b[i][0].1 + b[i][0].2,
+                &format!("{act:?}"),
+            );
+            println!("{act:?} forward: worst {:.3} of its bound", worst.ratio());
+            let d = run(&mut kit, &kernels, backward, &x, Some(&g), alpha, scale);
+            let worst = assert_within(
+                &d,
+                &grad,
+                |i| b[i][1].0 * U * b[i][1].1 + b[i][1].2,
+                &format!("{act:?} backward"),
+            );
+            println!("{act:?} backward: worst {:.3} of its bound", worst.ratio());
+        }
+    });
+}
+
+/// On ±0 and ±∞ the activations built on an exponential, a logarithm or a division give
+/// the CPU's bits, forward and backward (−0 stays −0 where the CPU keeps it), and NaN for
+/// NaN.
+#[test]
+fn exponential_activations_on_special_values() {
+    for_each_gpu(|gpu| {
+        let x = [0.0f32, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+        let g = [1.5f32, -0.75, 1.5, -0.75, 1.0];
+        let mut kit = Kit::new(gpu, 1 << 12);
+        let kernels = ElementwiseKernels::new(gpu, &mut kit.cache).expect("build");
+        for act in [
+            Act::Elu(1.0),
+            Act::Selu,
+            Act::Celu(1.5),
+            Act::Silu,
+            Act::Mish,
+            Act::Softplus(1.0, 20.0),
+            Act::Softsign,
+            Act::LogSigmoid,
+        ] {
+            let (forward, backward, alpha, scale) = act.ops();
+            let (want, grad) = cpu_f32(act, &x, &g);
+            let y = run(&mut kit, &kernels, forward, &x, None, alpha, scale);
+            assert_exact(&y, &want, &format!("{act:?}"));
+            let d = run(&mut kit, &kernels, backward, &x, Some(&g), alpha, scale);
+            assert_exact(&d, &grad, &format!("{act:?} backward"));
+        }
     });
 }
