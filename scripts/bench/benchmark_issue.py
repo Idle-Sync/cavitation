@@ -4,17 +4,17 @@
 #
 #   python scripts/bench/benchmark_issue.py --machine B --python <python with torch and numpy> \
 #       --devices cpu,cuda,vulkan,dx12 [--suites cnn,numpy,conv] [--nets NAMES] [--epochs N] \
-#       [--rows N] [--conv-batch N] [--hardware "AMD Ryzen 7 2700X; NVIDIA GTX 1660 Super"] \
-#       [--os "Windows 10"] [--issue 361] [--dry-run] [--render-only] [--note TEXT] \
-#       [--note-about TEXT] [--todo TEXT] [--remove-note TEXT] [--remove-todo TEXT] \
-#       [--import FILE] [--replace-body]
+#       [--rows N] [--numpy-threads N] [--conv-batch N] \
+#       [--hardware "AMD Ryzen 7 2700X; NVIDIA GTX 1660 Super"] [--os "Windows 10"] [--issue 361] \
+#       [--dry-run] [--render-only] [--note TEXT] [--note-about TEXT] [--todo TEXT] \
+#       [--remove-note TEXT] [--remove-todo TEXT] [--import FILE] [--replace-body]
 #
 # Suites (`--suites`, default `cnn`):
 # - `cnn`: `cavitation-bench mnist-cnn` and `cifar-cnn` on each device named, against PyTorch
 #   (`scripts/bench/torch_cnn.py`, which the benchmark runs itself). Rows `mnist-cnn` and
 #   `cifar-cnn`, timed by the epoch.
 # - `numpy`: the v0.1 MLP benchmarks on the CPU against numpy (`scripts/bench/numpy_mlp.py`,
-#   which the benchmark runs itself, at numpy's default BLAS settings): `mnist --batch 128`
+#   which the benchmark runs itself, its BLAS at `--numpy-threads` threads): `mnist --batch 128`
 #   (row `mlp-mnist-b128`, timed by the epoch), `mnist --batch 32` (`mlp-mnist-b32`), `digits`
 #   (`mlp-digits`, timed by the training sample) and `latency` (`latency`, one input through
 #   the digits network, timed by the call). They need the MNIST data in `data/mnist/`.
@@ -33,8 +33,12 @@
 #
 # Devices: `cpu` (against PyTorch on the CPU), `cuda` (against PyTorch on CUDA), `metal`
 # (against PyTorch on MPS), `vulkan` and `dx12` (Cavitation only: PyTorch has no such engine).
-# Every run uses 4 threads (`CAVITATION_THREADS=4`), the CNNs seed 0 and their own epochs and
-# rows unless `--epochs` or `--rows` says otherwise. A CNN epoch's time is the median of the
+# Every run gives Cavitation 4 threads (`CAVITATION_THREADS=4`); PyTorch runs at 4 threads
+# (`torch_cnn.py` at Cavitation's count, `torch_conv.py --threads 4`), and numpy's BLAS at
+# `--numpy-threads` (default 4, set through `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS`,
+# `MKL_NUM_THREADS` and `VECLIB_MAXIMUM_THREADS`; the "Threads, kernel" column shows it in
+# brackets). The CNNs run with seed 0 and their own epochs and rows unless `--epochs` or
+# `--rows` says otherwise. A CNN epoch's time is the median of the
 # epochs after the first; the numpy and conv benchmarks report their own medians.
 #
 # Run it by hand, not in CI: a full run takes about an hour of the machine, which must be
@@ -145,11 +149,25 @@ def epoch_seconds(epochs):
     return statistics.median(times[1:] if len(times) > 1 else times)
 
 
-def bench_env(tdir):
+# The variables that set the thread count of numpy's BLAS: OpenBLAS's, OpenMP's (OpenBLAS
+# built with OpenMP, and BLIS), MKL's and Apple Accelerate's.
+BLAS_THREADS = ["OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"]
+
+
+def bench_env(tdir, blas_threads=None):
+    """The environment of a `cavitation-bench` run: 4 threads for Cavitation, and with
+    `blas_threads` that many for numpy's BLAS."""
     env = dict(os.environ, CAVITATION_THREADS="4", CARGO_TARGET_DIR=tdir)
     for name in ["CAVITATION_CUDNN_BENCHMARK", "CAVITATION_GPU_BACKEND", "CAVITATION_DEVICE", "CAVITATION_KERNEL"]:
         env.pop(name, None)
+    if blas_threads is not None:
+        env.update({name: str(blas_threads) for name in BLAS_THREADS})
     return env
+
+
+def blas_prefix(blas_threads):
+    """The variables a numpy run sets, as the commands block shows them."""
+    return " ".join(f"{name}={blas_threads}" for name in BLAS_THREADS) + " "
 
 
 def shown_command(cmd, python, label):
@@ -207,12 +225,25 @@ def numpy_seconds(value, unit_label):
     raise ValueError(f"unknown unit {unit_label}")
 
 
-def numpy_row(results, net, command):
-    """The row of numpy benchmark `net` from the `results.json` that its run wrote."""
+def numpy_run_name(net):
+    """The name `cavitation-bench` gives the run of numpy benchmark `net`, such as
+    `mnist batch 32`."""
+    args = NUMPY_RUNS[net][0]
+    if args[0] == "latency":
+        return "latency"
+    batch = args[args.index("--batch") + 1] if "--batch" in args else "128"
+    return f"{args[0]} batch {batch}"
+
+
+def numpy_row(results, net, command, blas_threads):
+    """The row of numpy benchmark `net` from the `results.json` that its run wrote, with
+    numpy's BLAS at `blas_threads` threads."""
     runs = results.get("runs") or []
     if len(runs) != 1:
         raise ValueError(f"results.json holds {len(runs)} runs, not 1")
     r = runs[0]
+    if r.get("name") != numpy_run_name(net):
+        raise ValueError(f"results.json holds the run {r.get('name')!r}, not {numpy_run_name(net)!r} for {net}")
     cav, unit = numpy_seconds(r["cavitation"], r["unit"])
     base, _ = numpy_seconds(r["numpy"], r["unit"])
     want = NUMPY_RUNS[net][1]
@@ -230,6 +261,7 @@ def numpy_row(results, net, command):
         "batch": int(batch.group(1)) if batch else None,
         "kernel": results.get("kernel"),
         "threads": results.get("threads"),
+        "baseline_threads": blas_threads,
         "torch_about": f"numpy {results.get('numpy_version')}; {results.get('blas_default')}",
         "command": command,
     }
@@ -241,11 +273,13 @@ def measure_numpy(root, binary, tdir, net, args):
         os.remove(result)
     cmd = [binary] + NUMPY_RUNS[net][0] + ["--python", args.python]
     print("running:", " ".join(cmd[1:]), flush=True)
-    subprocess.run(cmd, check=True, cwd=root, env=bench_env(tdir))
+    subprocess.run(cmd, check=True, cwd=root, env=bench_env(tdir, args.numpy_threads))
     with open(result, encoding="utf-8") as f:
         results = json.load(f)
-    command = "cavitation-bench " + shown_command(cmd[1:], args.python, "<python with numpy>")
-    return [numpy_row(results, net, command)]
+    command = blas_prefix(args.numpy_threads) + "cavitation-bench " + shown_command(
+        cmd[1:], args.python, "<python with numpy>"
+    )
+    return [numpy_row(results, net, command, args.numpy_threads)]
 
 
 CONV_LINE = re.compile(r"^(conv[1-4]) \S+ \S+\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)")
@@ -321,10 +355,11 @@ def default_fields(row):
     back-filled ones): no mode, the benchmark's library and the benchmark's unit."""
     row["mode"] = row.get("mode") or ""
     suite = SUITE_OF.get(row.get("net"))
-    if suite:
-        row["baseline"] = row.get("baseline") or BASELINE[suite]
-        default_unit = NUMPY_RUNS[row["net"]][1] if row["net"] in NUMPY_RUNS else "pass" if suite == "conv" else "epoch"
-        row["unit"] = row.get("unit") or default_unit
+    if suite is None:
+        sys.exit(f"a row has the unknown benchmark {row.get('net')!r}; known: {', '.join(NETS)}")
+    row["baseline"] = row.get("baseline") or BASELINE[suite]
+    default_unit = NUMPY_RUNS[row["net"]][1] if row["net"] in NUMPY_RUNS else "pass" if suite == "conv" else "epoch"
+    row["unit"] = row.get("unit") or default_unit
 
 
 def normalise(data):
@@ -415,12 +450,17 @@ def add_row(data, row):
         data["history"].append(earlier)
 
 
+def note_about(note):
+    return "" if isinstance(note, str) else (note.get("about") or "")
+
+
 def add_note(data, note):
     """Adds `note`; a note with the same text is replaced in its place, so an import can give
-    an existing note its About."""
+    an existing note its About. A note without an About leaves the existing note as it is."""
     for i, have in enumerate(data["notes"]):
         if note_text(have) == note_text(note):
-            data["notes"][i] = note
+            if note_about(note) or not note_about(have):
+                data["notes"][i] = note
             return
     data["notes"].append(note)
 
@@ -554,7 +594,7 @@ def render(data):
         out.append(
             "Commands, as each row ran them (the release build of `cavitation-bench`, with "
             "`CAVITATION_THREADS=4`; it runs the PyTorch or numpy side itself, except `conv`, whose "
-            "PyTorch side is `torch_conv.py`):"
+            "PyTorch side is `torch_conv.py`; the numpy runs set the thread count of numpy's BLAS):"
         )
         out.append("")
         out.append("```")
@@ -572,7 +612,7 @@ def render(data):
         out.append("| About | Note |")
         out.append("|---|---|")
         for note in data["notes"]:
-            about = "–" if isinstance(note, str) else (note.get("about") or "–")
+            about = note_about(note) or "–"
             out.append(f"| {table_text(about)} | {table_text(note_text(note))} |")
         out.append("")
     if data["history"]:
@@ -641,7 +681,9 @@ def numpy_table(out, data, missing):
         "The v0.1 MLP benchmarks on the CPU against the same network, batch, data and steps in numpy "
         "(`scripts/bench/numpy_mlp.py`): an epoch of the MNIST MLP (784 → 1024 → 256 → 10, plain "
         "SGD) at batch 128 and 32, a training sample of the digits MLP (64 → 256 → 128 → 10) at "
-        "batch 128, and one input through the digits MLP in inference mode (`latency`)."
+        "batch 128, and one input through the digits MLP in inference mode (`latency`). Where a run "
+        "set the thread count of numpy's BLAS, the Measurements table gives it in brackets beside "
+        "Cavitation's."
     )
     out.append("")
     out.append("| Machine | Device | " + " | ".join(nets) + " |")
@@ -725,7 +767,10 @@ def measurement_table(out, rows):
             size = f"{row['epochs']} × {row['rows']:,}"
         elif row.get("batch") is not None:
             size = f"batch {row['batch']}"
-        threads = ", ".join(shown(row.get(k)) for k in ["threads", "kernel"])
+        threads = shown(row.get("threads"))
+        if row.get("baseline_threads") is not None:
+            threads += f" ({BASELINE_NAMES[row['baseline']]} {row['baseline_threads']})"
+        threads += ", " + shown(row.get("kernel"))
         source = table_text("; ".join(t for t in [row.get("source"), row.get("note")] if t) or "–")
         out.append(
             f"| {row['machine']} | {device_label(row['device'], row['mode'])} | {row['net']} "
@@ -757,6 +802,9 @@ def main():
     )
     p.add_argument("--epochs", type=int, help="epochs of the CNNs")
     p.add_argument("--rows", type=int, help="training rows of the CNNs")
+    p.add_argument(
+        "--numpy-threads", type=int, default=4, help="threads of numpy's BLAS in the numpy suites (default 4)"
+    )
     p.add_argument("--conv-batch", type=int, default=CONV_BATCH, help="batch of the conv suite (default 128)")
     p.add_argument("--hardware", help="CPU and GPU names, kept for the machine once given")
     p.add_argument("--os", help="operating system, kept for the machine once given")
@@ -773,6 +821,8 @@ def main():
     args = p.parse_args()
     if args.note_about is not None and not args.note:
         sys.exit("--note-about gives the About of the --note texts; give at least one --note")
+    if args.numpy_threads < 1:
+        sys.exit("--numpy-threads must be a positive number")
     if args.conv_batch < 1:
         sys.exit("--conv-batch must be a positive number")
 
