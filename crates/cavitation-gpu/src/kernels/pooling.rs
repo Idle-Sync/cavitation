@@ -1,6 +1,7 @@
-//! 2-D max and average pooling on the GPU, forward and backward, as the CPU kernels in
-//! `cavitation_core::kernels::pooling` compute them: max pooling bit for bit on normal
-//! values (the same winners, ties and NaNs), average pooling within its rounding bound.
+//! 2-D max, average and adaptive average pooling on the GPU, forward and backward, as the CPU
+//! kernels in `cavitation_core::kernels::pooling` compute them: max pooling bit for bit on
+//! normal values (the same winners, ties and NaNs), average and adaptive average pooling
+//! within their rounding bounds.
 //!
 //! Each kernel is specialised for one geometry and batch through `override` constants, and
 //! numbers its threads over a two-dimensional grid, so any batch fits. The backward passes
@@ -265,6 +266,94 @@ const AVG_BACKWARD: Shader = Shader {
                 for (var ox = x0; ox <= x1; ox = ox + 1u) {
                     let c = window(ox, KW, SW, PW, W);
                     acc = acc + grad_out[(plane * OH + oy) * OW + ox] / divisor(r, c);
+                }
+            }
+            grad_in[j] = acc;
+        }
+        "
+    ),
+};
+
+/// The adaptive-pooling sizes as `override` constants, and the window both adaptive kernels
+/// share: along an axis of `size` pooled to `out`, output `o` averages
+/// `floor(o · size / out) .. ceil((o + 1) · size / out)`, as `adaptive_window` in the CPU
+/// kernel computes it. With `size` and `out` swapped, the same function gives the outputs
+/// whose windows hold pixel `o`: `floor(o · out / size) .. ceil((o + 1) · out / size)`.
+macro_rules! adaptive_common {
+    () => {
+        "
+        override H: u32;
+        override W: u32;
+        override OH: u32;
+        override OW: u32;
+
+        // The window of output `o` of `out` along an axis of `size`, as (start, end).
+        fn window(o: u32, out: u32, size: u32) -> vec2<u32> {
+            return vec2<u32>(o * size / out, ((o + 1u) * size + out - 1u) / out);
+        }
+
+        // An output's share of its window's sum: divided by the window's height, then by its
+        // width, as the CPU divides.
+        fn mean(sum: f32, r: vec2<u32>, c: vec2<u32>) -> f32 {
+            return sum / f32(r.y - r.x) / f32(c.y - c.x);
+        }
+        "
+    };
+}
+
+/// Adaptive average pooling forward, one thread per output: the sum of its window's pixels
+/// in row-major order, divided by the window's height and then its width.
+const ADAPTIVE_FORWARD: Shader = Shader {
+    name: "adaptive_avg_pool2d forward",
+    source: concat!(
+        entry!(),
+        adaptive_common!(),
+        "
+        @group(0) @binding(0) var<storage, read> x: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+
+        fn body(i: u32) {
+            let ox = i % OW;
+            let oy = (i / OW) % OH;
+            let base = (i / (OW * OH)) * H * W;
+            let r = window(oy, OH, H);
+            let c = window(ox, OW, W);
+            var acc = 0.0;
+            for (var y = r.x; y < r.y; y = y + 1u) {
+                for (var xx = c.x; xx < c.y; xx = xx + 1u) {
+                    acc = acc + x[base + y * W + xx];
+                }
+            }
+            out[i] = mean(acc, r, c);
+        }
+        "
+    ),
+};
+
+/// Adaptive average pooling backward, one thread per input pixel: adds to the pixel's
+/// gradient each covering output's gradient divided by that output's window height and then
+/// its width, the outputs in plane order, as the CPU adds them.
+const ADAPTIVE_BACKWARD: Shader = Shader {
+    name: "adaptive_avg_pool2d backward",
+    source: concat!(
+        entry!(),
+        adaptive_common!(),
+        "
+        @group(0) @binding(0) var<storage, read> grad_out: array<f32>;
+        @group(0) @binding(1) var<storage, read_write> grad_in: array<f32>;
+
+        fn body(j: u32) {
+            let col = j % W;
+            let row = (j / W) % H;
+            let plane = j / (W * H);
+            let ys = window(row, H, OH);
+            let xs = window(col, W, OW);
+            var acc = grad_in[j];
+            for (var oy = ys.x; oy < ys.y; oy = oy + 1u) {
+                let r = window(oy, OH, H);
+                for (var ox = xs.x; ox < xs.y; ox = ox + 1u) {
+                    let c = window(ox, OW, W);
+                    acc = acc + mean(grad_out[(plane * OH + oy) * OW + ox], r, c);
                 }
             }
             grad_in[j] = acc;
@@ -909,6 +998,299 @@ impl AvgPool2d {
     ///     let group = pool2d.backward_bind_group(&mut steps, &dy, &dx);
     ///     let mut step = steps.begin();
     ///     pool2d.backward(&mut step, &group);
+    ///     let _ = step.finish();
+    /// }
+    /// ```
+    pub fn backward(&self, step: &mut Step<'_>, group: &wgpu::BindGroup) {
+        dispatch(step, &self.backward, group, self.inputs);
+    }
+}
+
+/// Adaptive average pooling on the GPU for one shape and batch size, as
+/// `cavitation_core::kernels::pooling::adaptive_avg_pool2d` and
+/// `adaptive_avg_pool2d_backward` compute it: `channels` planes of `input` (height, width)
+/// pooled to `output`, output `(i, j)` the mean of rows `floor(i · h / oh) ..
+/// ceil((i + 1) · h / oh)` and the same columns for `j`, its window's sum divided by the
+/// window's height and then by its width. The backward pass adds each output's gradient,
+/// divided the same way, to every pixel of its window, one thread per input pixel adding its
+/// outputs in the CPU's order, so it needs no atomics and gives the same bits on every run.
+///
+/// As with [`AvgPool2d`], the sums may be added in any order and WGSL's division is accurate
+/// to 2.5 ulp, so the results agree with the exact values of the f32 inputs within a rounding
+/// bound, not bit for bit. On normal inputs, an output summing at most `n` pixels of a window
+/// of `dh · dw` is within `(2(n + 2) + 11) · 2⁻²⁴ · Σ|x| / (dh · dw) + 2⁻¹²⁶`, and an input
+/// gradient that at most `m` outputs cover within
+/// `(2(m + 3) + 10) · 2⁻²⁴ · (|dx| + Σ|dy / (dh · dw)|) + 2⁻¹²⁶`: the average pooling's
+/// bounds with a second division, the absolute term covering a result the GPU flushes to
+/// zero. NaN and ±∞ follow IEEE arithmetic as on the CPU; subnormal inputs are outside the
+/// bound, since the GPU may read them as zero.
+///
+/// # Examples
+///
+/// Without a GPU the example does nothing:
+///
+/// ```
+/// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+/// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+///
+/// if let Some(gpu) = Gpu::new() {
+///     // One 1 x 4 image pooled to 1 x 3: windows [0, 2), [1, 3) and [2, 4).
+///     let pool = AdaptiveAvgPool2d::new(&mut PipelineCache::new(&gpu), 1, (1, 4), (1, 3), 1);
+///     let pool = pool.unwrap();
+///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+///         | wgpu::BufferUsages::COPY_SRC;
+///     let mut buffers = BufferPool::new(&gpu);
+///     let (x, out) = (buffers.take(16, usage), buffers.take(12, usage));
+///     let sizes = StepSizes { upload_bytes: 16, readback_bytes: 12, ..StepSizes::default() };
+///     let mut steps = StepEncoder::new(&gpu, sizes);
+///     let group = pool.forward_bind_group(&mut steps, &x, &out);
+///     let mut step = steps.begin();
+///     let pixels = [1.0f32, 3.0, 5.0, 7.0].iter().flat_map(|v| v.to_le_bytes());
+///     let pixels: Vec<u8> = pixels.collect();
+///     step.upload(x.buffer(), 0, &pixels);
+///     pool.forward(&mut step, &group);
+///     step.read_back(out.buffer(), 0, 12);
+///     let bytes = step.finish().bytes();
+///     let means: Vec<f32> =
+///         bytes.chunks(4).map(|b| f32::from_le_bytes(b.try_into().unwrap())).collect();
+///     assert_eq!(means, [2.0, 4.0, 6.0]);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AdaptiveAvgPool2d {
+    /// Channels, input size and output size.
+    sizes: (usize, (usize, usize), (usize, usize)),
+    /// Images per batch.
+    batch: usize,
+    /// The forward kernel, specialised for the sizes and batch.
+    forward: wgpu::ComputePipeline,
+    /// The backward kernel, specialised for the sizes and batch.
+    backward: wgpu::ComputePipeline,
+    /// Outputs in a batch: one forward thread each.
+    outputs: u32,
+    /// Input pixels in a batch: one backward thread each.
+    inputs: u32,
+}
+
+impl AdaptiveAvgPool2d {
+    /// The forward and backward kernels for `batch` images of `channels` planes of `input`
+    /// (height, width) pooled to `output`, built (or found) in `cache`.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if a kernel does not build on this GPU.
+    ///
+    /// # Panics
+    ///
+    /// As the CPU's `adaptive_avg_pool2d`, if a size is 0; also if `batch` or `channels` is
+    /// 0, a batch holds more than 2³¹ inputs or outputs, or along an axis
+    /// `(size + 1) · (out + 1)` does not fit in a `u32` (it bounds the window arithmetic's
+    /// intermediates).
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{Gpu, PipelineCache};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 64, (7, 7), (1, 1), 32).unwrap();
+    ///     assert_eq!(pool.batch(), 32);
+    /// }
+    /// ```
+    pub fn new(
+        cache: &mut PipelineCache,
+        channels: usize,
+        input: (usize, usize),
+        output: (usize, usize),
+        batch: usize,
+    ) -> Result<AdaptiveAvgPool2d, GpuError> {
+        assert!(
+            batch > 0 && channels > 0,
+            "adaptive_avg_pool2d: the batch and the channels must be at least 1, got {batch} \
+             and {channels}"
+        );
+        assert!(
+            input.0 > 0 && input.1 > 0 && output.0 > 0 && output.1 > 0,
+            "adaptive_avg_pool2d: the sizes must be at least 1, got input {input:?} and output \
+             {output:?}"
+        );
+        let fits = |size: usize, out: usize| {
+            (size.checked_add(1))
+                .zip(out.checked_add(1))
+                .and_then(|(a, b)| a.checked_mul(b))
+                .is_some_and(|v| v <= u32::MAX as usize)
+        };
+        assert!(
+            fits(input.0, output.0) && fits(input.1, output.1),
+            "adaptive_avg_pool2d: the window arithmetic of input {input:?} and output \
+             {output:?} does not fit the kernel's u32s"
+        );
+        let values = |(h, w): (usize, usize)| {
+            (batch.checked_mul(channels))
+                .and_then(|v| v.checked_mul(h))
+                .and_then(|v| v.checked_mul(w))
+                .unwrap_or(usize::MAX)
+        };
+        let outputs = total(values(output));
+        let inputs = total(values(input));
+        let constants = |threads: u32| {
+            vec![
+                ("WORKGROUP", f64::from(WORKGROUP)),
+                ("TOTAL", f64::from(threads)),
+                ("H", input.0 as f64),
+                ("W", input.1 as f64),
+                ("OH", output.0 as f64),
+                ("OW", output.1 as f64),
+            ]
+        };
+        Ok(AdaptiveAvgPool2d {
+            sizes: (channels, input, output),
+            batch,
+            forward: cache.get(ADAPTIVE_FORWARD, "main", &constants(outputs))?,
+            backward: cache.get(ADAPTIVE_BACKWARD, "main", &constants(inputs))?,
+            outputs,
+            inputs,
+        })
+    }
+
+    /// Channels, input size and output size, as the CPU layer's `sizes`.
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{Gpu, PipelineCache};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 3, (7, 5), (3, 2), 2).unwrap();
+    ///     assert_eq!(pool.sizes(), (3, (7, 5), (3, 2)));
+    /// }
+    /// ```
+    pub fn sizes(&self) -> (usize, (usize, usize), (usize, usize)) {
+        self.sizes
+    }
+
+    /// Images per batch.
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{Gpu, PipelineCache};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 3, (7, 5), (3, 2), 2).unwrap();
+    ///     assert_eq!(pool.batch(), 2);
+    /// }
+    /// ```
+    pub fn batch(&self) -> usize {
+        self.batch
+    }
+
+    /// The forward pass's bind group, made once: the batch's images `x` and its outputs
+    /// `out`, both `f32`.
+    ///
+    /// # Panics
+    ///
+    /// If a buffer does not hold exactly the batch's values, naming it.
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 1, (4, 4), (2, 2), 1).unwrap();
+    ///     let mut buffers = BufferPool::new(&gpu);
+    ///     let usage = wgpu::BufferUsages::STORAGE;
+    ///     let (x, out) = (buffers.take(64, usage), buffers.take(16, usage));
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let _group = pool.forward_bind_group(&mut steps, &x, &out);
+    /// }
+    /// ```
+    pub fn forward_bind_group(
+        &self,
+        steps: &mut StepEncoder,
+        x: &PooledBuffer,
+        out: &PooledBuffer,
+    ) -> wgpu::BindGroup {
+        check_buffer("the input", x, self.inputs as usize);
+        check_buffer("the output", out, self.outputs as usize);
+        bind_buffers(steps, &self.forward, &[x, out])
+    }
+
+    /// Records the forward pass in `step`, with a group from
+    /// [`forward_bind_group`](Self::forward_bind_group).
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 1, (4, 4), (2, 2), 1).unwrap();
+    ///     let mut buffers = BufferPool::new(&gpu);
+    ///     let usage = wgpu::BufferUsages::STORAGE;
+    ///     let (x, out) = (buffers.take(64, usage), buffers.take(16, usage));
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let group = pool.forward_bind_group(&mut steps, &x, &out);
+    ///     let mut step = steps.begin();
+    ///     pool.forward(&mut step, &group);
+    ///     let _ = step.finish();
+    /// }
+    /// ```
+    pub fn forward(&self, step: &mut Step<'_>, group: &wgpu::BindGroup) {
+        dispatch(step, &self.forward, group, self.outputs);
+    }
+
+    /// The backward pass's bind group, made once: the output gradient `dy` and the input
+    /// gradient `dx`, which the pass adds to, both `f32`.
+    ///
+    /// # Panics
+    ///
+    /// If a buffer does not hold exactly the batch's values, naming it.
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 1, (4, 4), (2, 2), 1).unwrap();
+    ///     let mut buffers = BufferPool::new(&gpu);
+    ///     let usage = wgpu::BufferUsages::STORAGE;
+    ///     let (dy, dx) = (buffers.take(16, usage), buffers.take(64, usage));
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let _group = pool.backward_bind_group(&mut steps, &dy, &dx);
+    /// }
+    /// ```
+    pub fn backward_bind_group(
+        &self,
+        steps: &mut StepEncoder,
+        dy: &PooledBuffer,
+        dx: &PooledBuffer,
+    ) -> wgpu::BindGroup {
+        check_buffer("the output gradient", dy, self.outputs as usize);
+        check_buffer("the input gradient", dx, self.inputs as usize);
+        bind_buffers(steps, &self.backward, &[dy, dx])
+    }
+
+    /// Records the backward pass in `step`, with a group from
+    /// [`backward_bind_group`](Self::backward_bind_group): adds each output gradient,
+    /// divided by its window's height and then its width, to every pixel of its window.
+    ///
+    /// ```
+    /// use cavitation_gpu::kernels::AdaptiveAvgPool2d;
+    /// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+    ///
+    /// if let Some(gpu) = Gpu::new() {
+    ///     let mut cache = PipelineCache::new(&gpu);
+    ///     let pool = AdaptiveAvgPool2d::new(&mut cache, 1, (4, 4), (2, 2), 1).unwrap();
+    ///     let mut buffers = BufferPool::new(&gpu);
+    ///     let usage = wgpu::BufferUsages::STORAGE;
+    ///     let (dy, dx) = (buffers.take(16, usage), buffers.take(64, usage));
+    ///     let mut steps = StepEncoder::new(&gpu, StepSizes::default());
+    ///     let group = pool.backward_bind_group(&mut steps, &dy, &dx);
+    ///     let mut step = steps.begin();
+    ///     pool.backward(&mut step, &group);
     ///     let _ = step.finish();
     /// }
     /// ```

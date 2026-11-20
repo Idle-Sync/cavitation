@@ -3,16 +3,20 @@
 //! and subnormals included, with its winners, on windows built to hold the ties and NaNs
 //! that decide a winner. Max pooling backward is compared bit for bit after flushing the
 //! reference's subnormals, on sums that round. Average pooling is compared exactly on small
-//! integers with power-of-two divisors, and within its rounding bound on seeded values. The
+//! integers with power-of-two divisors, and within its rounding bound on seeded values.
+//! Adaptive average pooling is compared exactly on small integers with NaNs, infinities and
+//! signed zeros among them where every window's height and width are powers of two, and
+//! within its rounding bound on seeded values; the bound is derived beside its test. The
 //! tests skip without a GPU, unless `CAVITATION_GPU_REQUIRED=1`.
 
 mod common;
 
 use cavitation_core::Pool2dGeom;
 use cavitation_core::kernels::pooling::{
-    avg_pool2d, avg_pool2d_backward, max_pool2d_backward, max_pool2d_reference,
+    adaptive_avg_pool2d, adaptive_avg_pool2d_backward, avg_pool2d, avg_pool2d_backward,
+    max_pool2d_backward, max_pool2d_reference,
 };
-use cavitation_gpu::kernels::{AvgPool2d, MaxPool2d};
+use cavitation_gpu::kernels::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 use common::{
     Kit, Seeded, U, assert_exact, assert_within, exact_values, for_each_gpu, seeded_values,
 };
@@ -540,6 +544,9 @@ fn pipelines_are_built_once() {
         assert_eq!(kit.cache.pipelines_built() - before, 4);
         MaxPool2d::new(&mut kit.cache, &geom, 3).unwrap();
         assert_eq!(kit.cache.pipelines_built() - before, 6);
+        AdaptiveAvgPool2d::new(&mut kit.cache, 4, (8, 8), (3, 3), 2).unwrap();
+        AdaptiveAvgPool2d::new(&mut kit.cache, 4, (8, 8), (3, 3), 2).unwrap();
+        assert_eq!(kit.cache.pipelines_built() - before, 8);
     });
 }
 
@@ -562,5 +569,265 @@ fn bind_groups_check_buffer_sizes() {
             message.contains("the winners holds 12 bytes, expected 16"),
             "{message}"
         );
+    });
+}
+
+/// One adaptive-pooling case: channels, input size, output size and batch.
+type Adaptive = (usize, (usize, usize), (usize, usize), usize);
+
+/// The shapes the adaptive-pooling rounding twin runs: global pooling of the CNN heads,
+/// uneven windows that overlap (7 → 3) beside even ones (5 → 2 across), an output larger
+/// than its input (4 → 6, pixels shared by two outputs), overlapping windows of 3 (9 → 4),
+/// and an output equal to its input.
+fn adaptive_cases() -> Vec<Adaptive> {
+    vec![
+        (8, (32, 32), (1, 1), 2),
+        (3, (7, 5), (3, 2), 2),
+        (2, (4, 6), (6, 4), 3),
+        (4, (9, 9), (4, 4), 1),
+        (2, (5, 5), (5, 5), 2),
+    ]
+}
+
+/// The CPU's window along an axis: `floor(o · size / out) .. ceil((o + 1) · size / out)`.
+fn adaptive_window(o: usize, out: usize, size: usize) -> std::ops::Range<usize> {
+    o * size / out..((o + 1) * size).div_ceil(out)
+}
+
+/// Along one axis of `size` pooled to `out`: the longest window, and the most outputs whose
+/// windows hold one pixel.
+fn adaptive_axis(size: usize, out: usize) -> (usize, usize) {
+    let longest = (0..out)
+        .map(|o| adaptive_window(o, out, size).len())
+        .max()
+        .unwrap();
+    let covers = (0..size)
+        .map(|p| {
+            (0..out)
+                .filter(|&o| adaptive_window(o, out, size).contains(&p))
+                .count()
+        })
+        .max()
+        .unwrap();
+    (longest, covers)
+}
+
+/// A kit whose steps can move the largest buffer of an adaptive case.
+fn adaptive_kit(gpu: &cavitation_gpu::Gpu, (c, (h, w), (oh, ow), batch): Adaptive) -> Kit {
+    Kit::new(gpu, 4 * (batch * c * (h * w).max(oh * ow)) as u64)
+}
+
+/// The GPU's adaptive-pooling outputs for `x`.
+fn gpu_adaptive(kit: &mut Kit, (c, input, output, batch): Adaptive, x: &[f32]) -> Vec<f32> {
+    let pool = AdaptiveAvgPool2d::new(&mut kit.cache, c, input, output, batch).unwrap();
+    let (xb, out) = (kit.upload(x), kit.zeros(batch * c * output.0 * output.1));
+    let group = pool.forward_bind_group(&mut kit.steps, &xb, &out);
+    let mut step = kit.steps.begin();
+    pool.forward(&mut step, &group);
+    let _ = step.finish();
+    let result = kit.read(&out);
+    kit.pool.give(xb);
+    kit.pool.give(out);
+    result
+}
+
+/// The GPU's adaptive-pooling input gradient: `dx` plus each output gradient's share.
+fn gpu_adaptive_backward(
+    kit: &mut Kit,
+    (c, input, output, batch): Adaptive,
+    dy: &[f32],
+    dx: &[f32],
+) -> Vec<f32> {
+    let pool = AdaptiveAvgPool2d::new(&mut kit.cache, c, input, output, batch).unwrap();
+    let (dyb, dxb) = (kit.upload(dy), kit.upload(dx));
+    let group = pool.backward_bind_group(&mut kit.steps, &dyb, &dxb);
+    let mut step = kit.steps.begin();
+    pool.backward(&mut step, &group);
+    let _ = step.finish();
+    let result = kit.read(&dxb);
+    kit.pool.give(dyb);
+    kit.pool.give(dxb);
+    result
+}
+
+/// `values` with every seventh value replaced, in turn, by a quiet NaN, both infinities and
+/// both zeros: the special values that keep their meaning on a GPU that flushes subnormals.
+fn with_infinities(mut values: Vec<f32>) -> Vec<f32> {
+    let specials = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0, 0.0];
+    for (k, v) in values.iter_mut().step_by(7).enumerate() {
+        *v = specials[k % specials.len()];
+    }
+    values
+}
+
+/// Adaptive average pooling, forward and backward, on small integers with NaNs, infinities
+/// and signed zeros among them, on shapes whose every window is a power of two high and wide
+/// (6 → 4 and 8 → 4, overlapping windows of 2; 8 → 2 and 8 → 1; 2 → 4, each pixel shared by
+/// two outputs): every sum is exact in any order and so are the divisions by powers of two
+/// on the backends measured, so the GPU gives the CPU's `f32` bits, NaN wherever the CPU has
+/// NaN and each infinity where the CPU has it.
+#[test]
+fn adaptive_pool_exact_twin() {
+    let cases = [
+        (2, (6, 8), (4, 4), 2),
+        (3, (8, 8), (2, 1), 2),
+        (2, (2, 2), (4, 4), 3),
+    ];
+    for_each_gpu(|gpu| {
+        for (s, case) in cases.into_iter().enumerate() {
+            let (c, input, output, batch) = case;
+            let (ins, outs) = (
+                batch * c * input.0 * input.1,
+                batch * c * output.0 * output.1,
+            );
+            let s = s as u64;
+            let mut kit = adaptive_kit(gpu, case);
+            let what = format!("adaptive_avg_pool2d {case:?}");
+            for x in [
+                exact_values(1500 + s, ins),
+                with_infinities(exact_values(1510 + s, ins)),
+            ] {
+                let mut want = vec![0.0; outs];
+                adaptive_avg_pool2d(batch, c, input, output, &x, &mut want);
+                assert_exact(&gpu_adaptive(&mut kit, case, &x), &want, &what);
+            }
+            for dy in [
+                exact_values(1520 + s, outs),
+                with_infinities(exact_values(1530 + s, outs)),
+            ] {
+                let dx = exact_values(1540 + s, ins);
+                let mut want = dx.clone();
+                adaptive_avg_pool2d_backward(batch, c, input, output, &dy, &mut want);
+                let got = gpu_adaptive_backward(&mut kit, case, &dy, &dx);
+                assert_exact(&got, &want, &format!("{what} backward"));
+            }
+        }
+    });
+}
+
+/// Adaptive average pooling on seeded values, forward and backward, against an f64 reference
+/// of the same f32 inputs.
+///
+/// The bound: with `u = 2⁻²⁴`, a sum of `n` terms in any order is within `(n − 1)·u·Σ|x|`
+/// of the exact sum (to first order), and each of the two divisions, by the window's height
+/// `dh` and then its width `dw`, is accurate to WGSL's 2.5 ulp, at most `5u` of its result.
+/// An output summing at most `n` pixels (the longest window's height times the longest
+/// window's width) is therefore within `(n − 1 + 10)·u·Σ|x| / (dh·dw)`, and the test allows
+/// `(2(n + 2) + 11)·u·Σ|x| / (dh·dw)`, the average pooling's bound with a second division,
+/// which keeps the doubling that covers the second-order terms. An input gradient adds its
+/// own value and at most `m` shares `dy / dh / dw` (each within `10u` of its exact value):
+/// within `(m + 10)·u·(|dx| + Σ|dy / (dh·dw)|)`, allowed `(2(m + 3) + 10)·u·(…)`. The
+/// assertion adds 2⁻¹²⁶ for a result the GPU flushes to zero.
+#[test]
+fn adaptive_pool_rounding_twin() {
+    for_each_gpu(|gpu| {
+        let (mut worst_forward, mut worst_backward) = (0.0f64, 0.0f64);
+        for (s, case) in adaptive_cases().into_iter().enumerate() {
+            let (c, input, output, batch) = case;
+            let s = s as u64;
+            let mut kit = adaptive_kit(gpu, case);
+            let (ins, outs) = (
+                batch * c * input.0 * input.1,
+                batch * c * output.0 * output.1,
+            );
+            let (rows, rows_cover) = adaptive_axis(input.0, output.0);
+            let (cols, cols_cover) = adaptive_axis(input.1, output.1);
+            let (n, m) = ((rows * cols) as f64, (rows_cover * cols_cover) as f64);
+            let wide = |v: &[f32]| v.iter().map(|&x| f64::from(x)).collect::<Vec<f64>>();
+            let abs = |v: &[f64]| v.iter().map(|x| x.abs()).collect::<Vec<f64>>();
+            let what = format!("adaptive_avg_pool2d {case:?}");
+
+            let x = seeded_values(1600 + s, ins, -1.0, 1.0);
+            let (mut reference, mut scale) = (vec![0.0; outs], vec![0.0; outs]);
+            adaptive_avg_pool2d(batch, c, input, output, &wide(&x), &mut reference);
+            adaptive_avg_pool2d(batch, c, input, output, &abs(&wide(&x)), &mut scale);
+            let worst = assert_within(
+                &gpu_adaptive(&mut kit, case, &x),
+                &reference,
+                |i| (2.0 * (n + 2.0) + 11.0) * U * scale[i],
+                &what,
+            );
+            worst_forward = worst_forward.max(worst.ratio());
+
+            let dy = seeded_values(1700 + s, outs, -1.0, 1.0);
+            let dx = seeded_values(1800 + s, ins, -1.0, 1.0);
+            let (mut reference, mut scale) = (wide(&dx), abs(&wide(&dx)));
+            adaptive_avg_pool2d_backward(batch, c, input, output, &wide(&dy), &mut reference);
+            adaptive_avg_pool2d_backward(batch, c, input, output, &abs(&wide(&dy)), &mut scale);
+            let worst = assert_within(
+                &gpu_adaptive_backward(&mut kit, case, &dy, &dx),
+                &reference,
+                |i| (2.0 * (m + 3.0) + 10.0) * U * scale[i],
+                &format!("{what} backward"),
+            );
+            worst_backward = worst_backward.max(worst.ratio());
+        }
+        println!(
+            "adaptive_avg_pool2d: worst {worst_forward:.3} of its bound forward, \
+             {worst_backward:.3} backward"
+        );
+    });
+}
+
+/// Adaptive pooling over the split grid: a 4100 × 4100 image pooled to its own size copies
+/// it forward and adds `dy` to `dx` backward, every value exactly once.
+#[test]
+fn adaptive_pool_covers_a_split_grid() {
+    for_each_gpu(|gpu| {
+        let case = (1, (4100, 4100), (4100, 4100), 1);
+        let mut kit = adaptive_kit(gpu, case);
+        let n = 4100 * 4100;
+        let x = exact_values(1900, n);
+        assert_exact(&gpu_adaptive(&mut kit, case, &x), &x, "adaptive 4100");
+        let dy = exact_values(1901, n);
+        let dx = exact_values(1902, n);
+        let want: Vec<f32> = dx.iter().zip(&dy).map(|(a, b)| a + b).collect();
+        assert_exact(
+            &gpu_adaptive_backward(&mut kit, case, &dy, &dx),
+            &want,
+            "adaptive 4100 backward",
+        );
+    });
+}
+
+/// Two runs of both adaptive passes on the same seeded inputs give the same bits.
+#[test]
+fn adaptive_pool_runs_give_the_same_bits() {
+    for_each_gpu(|gpu| {
+        let case = (3, (7, 5), (3, 2), 2);
+        let mut kit = adaptive_kit(gpu, case);
+        let x = mixed_values(2000, 2 * 3 * 35);
+        let dy = mixed_values(2001, 2 * 3 * 6);
+        let dx = mixed_values(2002, 2 * 3 * 35);
+        let first = gpu_adaptive(&mut kit, case, &x);
+        assert_bits(&gpu_adaptive(&mut kit, case, &x), &first, "adaptive again");
+        let first = gpu_adaptive_backward(&mut kit, case, &dy, &dx);
+        assert_bits(
+            &gpu_adaptive_backward(&mut kit, case, &dy, &dx),
+            &first,
+            "adaptive backward again",
+        );
+    });
+}
+
+/// A size of 0, as the CPU refuses it, and sizes whose window arithmetic overflows a `u32`
+/// panic when the kernels are made, naming the sizes.
+#[test]
+fn adaptive_pool_refuses_bad_sizes() {
+    for_each_gpu(|gpu| {
+        let mut kit = Kit::new(gpu, 64);
+        for (input, output, says) in [
+            ((4, 4), (0, 1), "the sizes must be at least 1"),
+            ((70_000, 1), (70_000, 1), "does not fit the kernel's u32s"),
+        ] {
+            let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _ = AdaptiveAvgPool2d::new(&mut kit.cache, 1, input, output, 1);
+            }));
+            let message = refused.expect_err("refused");
+            let message = message
+                .downcast_ref::<String>()
+                .expect("a formatted message");
+            assert!(message.contains(says), "{message}");
+        }
     });
 }
