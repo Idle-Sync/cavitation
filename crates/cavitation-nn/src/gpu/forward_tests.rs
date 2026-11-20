@@ -10,6 +10,9 @@
 //!   magnitude, so on the CNNs this bound is loose; the printed ratio and the bound's width
 //!   say how loose.
 //!
+//! An MLP with a softmax or a log-softmax after each `Linear` is checked against the CPU's
+//! `InferenceModel` instead, within 2⁻¹⁰ of its largest output.
+//!
 //! Without a GPU every test says so and checks nothing; `CAVITATION_GPU_REQUIRED=1` makes
 //! that a failure.
 
@@ -20,8 +23,9 @@ use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuModel;
 use crate::{
-    ActivationKind, ActivationLayer, BatchNorm2d, Conv2d, Dropout, Flatten, InferenceLayer, Init,
-    Linear, MaxPool2d, NeuronMask, Relu, Sequential, Tanh, Trace,
+    ActivationKind, ActivationLayer, BatchNorm2d, Conv2d, Dropout, Flatten, InferenceLayer,
+    InferenceModel, Init, Linear, LogSoftmax, MaxPool2d, NeuronMask, Relu, Sequential, Softmax,
+    Tanh, Trace,
 };
 
 /// The unit roundoff of `f32`.
@@ -61,6 +65,26 @@ pub(super) fn mlp<T: Real>(params: &mut ParamStore<T>, seed: u64) -> Sequential<
         .push(Linear::new(params, 16, 9, &mut rng))
         .push(Relu)
         .push(Linear::new(params, 9, 4, &mut rng))
+}
+
+/// An MLP 12 → 16 → 9 → 4 with a softmax, or a log-softmax if `log`, after each `Linear`, in
+/// either precision.
+pub(super) fn softmax_mlp<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    log: bool,
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let rows = |net: Sequential<T>| {
+        if log {
+            net.push(LogSoftmax)
+        } else {
+            net.push(Softmax)
+        }
+    };
+    let net = rows(Sequential::new_generic().push(Linear::new(params, 12, 16, &mut rng)));
+    let net = rows(net.push(Linear::new(params, 16, 9, &mut rng)));
+    rows(net.push(Linear::new(params, 9, 4, &mut rng)))
 }
 
 /// The activations the GPU engines run besides ReLU, leaky ReLU, tanh, the sigmoid and GELU,
@@ -557,4 +581,29 @@ fn short_batches_ignore_stale_rows() {
             .collect();
         assert_eq!(short, full[..20]);
     });
+}
+
+/// Softmax and log-softmax after each `Linear` of an MLP: the model's evaluation-mode outputs
+/// against the CPU's `InferenceModel`, within 2⁻¹⁰ of the CPU's largest output.
+#[test]
+fn softmax_layers_infer_as_the_cpu() {
+    for (seed, log) in [(94, false), (95, true)] {
+        let what = if log { "log-softmax" } else { "softmax" };
+        let mut params = ParamStore::new();
+        let net = softmax_mlp::<f32>(&mut params, seed, log);
+        let batch = 23;
+        let input = Tensor::from_vec(uniform(seed, batch * 12, -2.0, 2.0), &[batch, 12]).unwrap();
+        let mut cpu = InferenceModel::compile(&net, &params).unwrap();
+        let want = cpu.infer_batch(input.view()).data().to_vec();
+        for_each_gpu(|gpu| {
+            let mut model = GpuModel::compile(&net, &params, batch, gpu).unwrap();
+            let got = model.infer_batch(input.view()).data().to_vec();
+            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let off = (got.iter().zip(&want))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("{what}: off by {off:.3e} of a largest output {scale:.3e}");
+            assert!(off <= scale / 1024.0, "{what}: off by {off:e} of {scale:e}");
+        });
+    }
 }

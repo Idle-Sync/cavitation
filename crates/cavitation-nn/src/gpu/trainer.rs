@@ -12,7 +12,8 @@ use cavitation_gpu::kernels::{
     ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
     ConvWeightGradCall, CrossEntropyCall, DeadRelu, DeadReluCall, Elementwise, ElementwiseCall,
     FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, MaxPool2d, MeanSquaredError, MseCall,
-    OptimizerKernel, OptimizerRule, RunningUpdate, SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
+    OptimizerKernel, OptimizerRule, RowSoftmax, RowSoftmaxCall, RunningUpdate, SoftmaxCrossEntropy,
+    SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepOutput,
@@ -86,6 +87,8 @@ enum Op {
     Sums(ChannelSumsCall),
     /// An element-wise operation.
     Elementwise(ElementwiseCall),
+    /// A softmax or log-softmax over each row, forward or backward.
+    Softmax(RowSoftmaxCall),
     /// Pooling forward: the kernel's index in [`TrainPass::pools`] and the bind group.
     PoolForward(usize, wgpu::BindGroup),
     /// Pooling backward: the kernel's index and the bind group.
@@ -1713,6 +1716,7 @@ fn record(ops: &[Op], model: &Kernels, train: &TrainKernels, pools: &[Pool], ste
             Op::ConvWeight(call) => train.conv_weight.record(step, call),
             Op::Sums(call) => train.sums.record(step, call),
             Op::Elementwise(call) => model.elementwise.record(step, call),
+            Op::Softmax(call) => model.softmax.record(step, call),
             Op::PoolForward(k, group) => match &pools[*k] {
                 Pool::Max(p) => p.forward(step, group),
                 Pool::Avg(p) => p.forward(step, group),
@@ -1840,6 +1844,25 @@ impl TrainPass {
                         u32_of(n),
                         alpha,
                         scale,
+                        &values[x],
+                        None,
+                        &values[out],
+                    )));
+                    out
+                }
+                Kind::Softmax { log } => {
+                    let out = take(&mut values, pool);
+                    let op = if log {
+                        RowSoftmax::LogSoftmax
+                    } else {
+                        RowSoftmax::Softmax
+                    };
+                    let shape = (u32_of(batch), u32_of(layer.outputs));
+                    forward.push(Op::Softmax(k.softmax.call(
+                        steps,
+                        pool,
+                        op,
+                        shape,
                         &values[x],
                         None,
                         &values[out],
@@ -2116,6 +2139,25 @@ impl TrainPass {
                         alpha,
                         scale,
                         a,
+                        Some(&grads[g]),
+                        &grads[dx],
+                    )));
+                    dx
+                }
+                Kind::Softmax { log } => {
+                    let dx = new_grad(&mut grads, pool, n_in);
+                    let op = if log {
+                        RowSoftmax::LogSoftmaxBackward
+                    } else {
+                        RowSoftmax::SoftmaxBackward
+                    };
+                    let shape = (u32_of(batch), u32_of(layer.outputs));
+                    backward.push(Op::Softmax(k.softmax.call(
+                        steps,
+                        pool,
+                        op,
+                        shape,
+                        &values[s.pre],
                         Some(&grads[g]),
                         &grads[dx],
                     )));

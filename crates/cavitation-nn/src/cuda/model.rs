@@ -4,7 +4,7 @@
 //! neuron masks.
 
 use cavitation_core::{Error, ParamId, ParamStore};
-use cavitation_cuda::{Cuda, CudaError, Dropout, Elementwise};
+use cavitation_cuda::{Cuda, CudaError, Dropout, Elementwise, RowSoftmax};
 
 use super::pass::{Forward, Parts, Shared, Store};
 use crate::Sequential;
@@ -49,7 +49,8 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten),
 /// [`Identity`](crate::Identity) and every built-in activation (ReLU, leaky ReLU, tanh, the
 /// sigmoid, GELU in both forms, ELU, SELU, CELU with a positive `alpha`, SiLU, Mish, softplus,
-/// softsign, hardtanh with `min <= max`, ReLU6, the hard sigmoid, the hard swish and log-sigmoid).
+/// softsign, hardtanh with `min <= max`, ReLU6, the hard sigmoid, the hard swish and log-sigmoid),
+/// and [`Softmax`](crate::Softmax) and [`LogSoftmax`](crate::LogSoftmax) over each row.
 /// [`compile`](CudaModel::compile) refuses any other layer, naming its index and name. Neuron masks
 /// set on the model when it is compiled are compiled in; a mask set later needs a new compile.
 ///
@@ -149,17 +150,17 @@ impl<'c> CudaModel<'c> {
     /// A layer the card does not run is refused by index and name:
     ///
     /// ```
-    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_core::{Gate, ParamStore, Rng};
     /// use cavitation_cuda::Cuda;
-    /// use cavitation_nn::{CudaModel, Linear, Sequential, Softmax};
+    /// use cavitation_nn::{CudaModel, Glu, Linear, Sequential};
     ///
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new()
-    ///     .push(Linear::new(&mut params, 4, 3, &mut Rng::seed(0)))
-    ///     .push(Softmax);
+    ///     .push(Linear::new(&mut params, 4, 4, &mut Rng::seed(0)))
+    ///     .push(Glu { gate: Gate::Sigmoid });
     /// if let Some(cuda) = Cuda::new() {
     ///     let err = CudaModel::compile(&net, &params, 8, &cuda).unwrap_err();
-    ///     assert!(err.to_string().contains("layer 1 (softmax)"), "{err}");
+    ///     assert!(err.to_string().contains("layer 1 (glu)"), "{err}");
     /// }
     /// ```
     pub fn compile(
@@ -203,6 +204,7 @@ impl<'c> CudaModel<'c> {
         let shared = Shared {
             elementwise: Elementwise::new(cuda).map_err(refuse)?,
             dropout: Dropout::new(cuda).map_err(refuse)?,
+            softmax: RowSoftmax::new(cuda).map_err(refuse)?,
         };
         let param_at: Vec<usize> = gpu_params.iter().map(|t| t.at).collect();
         let buffer_at: Vec<usize> = gpu_buffers.iter().map(|t| t.at).collect();

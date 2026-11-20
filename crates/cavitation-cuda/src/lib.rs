@@ -44,6 +44,10 @@
 //! - [`Dropout`]: dropout and the neuron mask (`Tape::keep_where`) with a bit-packed `u32`
 //!   mask, forward and backward, as this crate's own kernels, each the CPU's bits
 //!   (`tests/dropout.rs`).
+//! - [`RowSoftmax`] and [`RowSoftmaxOp`]: softmax and log-softmax over each row, forward and
+//!   backward, as this crate's own kernels, one thread per row in the CPU's order: the
+//!   softmax's backward pass the CPU's bits, the others within the WGSL kernels' stated
+//!   bounds (`tests/softmax.rs`).
 //!
 //! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
 //!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
@@ -123,6 +127,7 @@ mod module;
 mod optimizer;
 mod pooling;
 mod reduce;
+mod softmax;
 mod sys;
 
 pub use batch_norm::{BatchNorm2d, BatchStats, RunningUpdate};
@@ -139,3 +144,4 @@ pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
 pub use reduce::ChannelDims;
+pub use softmax::{RowSoftmax, RowSoftmaxOp};

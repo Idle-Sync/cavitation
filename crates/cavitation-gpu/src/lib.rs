@@ -25,6 +25,8 @@
 //!   ReLU, tanh, the sigmoid, GELU in both forms, ELU, SELU, CELU, SiLU, Mish, softplus,
 //!   softsign, hardtanh, the hard sigmoid and hard swish, log-sigmoid) forward and backward,
 //!   and dropout with a bit-packed mask.
+//! - [`kernels::RowSoftmaxKernels`]: softmax and log-softmax over each row, forward and
+//!   backward, one thread per row in the CPU's order.
 //! - [`kernels::MaxPool2d`] and [`kernels::AvgPool2d`]: max and average pooling, forward
 //!   and backward, max pooling bit for bit with the CPU's (winners, ties and NaNs) and
 //!   average pooling within a stated rounding bound.

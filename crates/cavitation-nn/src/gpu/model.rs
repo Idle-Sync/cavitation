@@ -51,7 +51,8 @@ pub(crate) struct GpuMask {
 /// [`Softplus`](crate::Softplus), [`Softsign`](crate::Softsign), [`Hardtanh`](crate::Hardtanh)
 /// (with `min <= max`), [`Relu6`](crate::Relu6), [`Hardsigmoid`](crate::Hardsigmoid),
 /// [`Hardswish`](crate::Hardswish) and [`LogSigmoid`](crate::LogSigmoid), each as an
-/// [`ActivationLayer`](crate::ActivationLayer) too. Neuron masks set on the model when it is
+/// [`ActivationLayer`](crate::ActivationLayer) too, and [`Softmax`](crate::Softmax) and
+/// [`LogSoftmax`](crate::LogSoftmax) over each row. Neuron masks set on the model when it is
 /// compiled are compiled in; a mask set later needs a new compile.
 ///
 /// A batch-norm layer's `num_batches_tracked` stays on the host, since only the host
@@ -123,10 +124,11 @@ impl GpuModel {
     ///   runs (see [`GpuModel`]) or has parameters its GPU form does not use; the message
     ///   names the layer's index and name. Also if no layer fixes the input width, or a
     ///   parameter or a batch of a layer's inputs or outputs is larger than the GPU binds,
-    ///   the model has a convolution and `batch` is above 65,535, a `Linear`'s batch,
-    ///   inputs or outputs or a convolution's output pixels or channels are above 4,194,240, a batch
-    ///   norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the parameters, running statistics
-    ///   and masks together are larger than one GPU buffer.
+    ///   the model has a convolution and `batch` is above 65,535 or a softmax and `batch` is
+    ///   above 16,776,960, a `Linear`'s batch, inputs or outputs or a convolution's output
+    ///   pixels or channels are above 4,194,240, a batch norm's eps is below 2⁻¹²⁶ in `f32`
+    ///   (and not 0), or the parameters, running statistics and masks together are larger
+    ///   than one GPU buffer.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
     ///   a mask is not as wide as its layer's output, a batch count does not hold one value,
@@ -141,17 +143,17 @@ impl GpuModel {
     /// A layer the GPU does not run is refused by index and name:
     ///
     /// ```
-    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_core::{Gate, ParamStore, Rng};
     /// use cavitation_gpu::Gpu;
-    /// use cavitation_nn::{GpuModel, Linear, Sequential, Softmax};
+    /// use cavitation_nn::{GpuModel, Glu, Linear, Sequential};
     ///
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new()
-    ///     .push(Linear::new(&mut params, 4, 3, &mut Rng::seed(0)))
-    ///     .push(Softmax);
+    ///     .push(Linear::new(&mut params, 4, 4, &mut Rng::seed(0)))
+    ///     .push(Glu { gate: Gate::Sigmoid });
     /// if let Some(gpu) = Gpu::new() {
     ///     let err = GpuModel::compile(&net, &params, 8, &gpu).unwrap_err();
-    ///     assert!(err.to_string().contains("layer 1 (softmax)"), "{err}");
+    ///     assert!(err.to_string().contains("layer 1 (glu)"), "{err}");
     /// }
     /// ```
     pub fn compile(
@@ -406,14 +408,15 @@ fn u32_bytes(words: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use cavitation_core::{
-        Conv2dGeom, GeluApprox, ParamId, ParamStore, Pool2dGeom, Real, Rng, Tape, Var,
+        Conv2dGeom, Gate, GeluApprox, ParamId, ParamStore, Pool2dGeom, Real, Rng, Tape, Var,
     };
     use cavitation_gpu::{Backend, Gpu};
 
     use super::{Act, GpuModel, Kind, Plan, pack_rows};
     use crate::{
-        AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Hardtanh, Init, Layer,
-        LeakyRelu, Linear, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh,
+        AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh, Init, Layer,
+        LeakyRelu, Linear, LogSoftmax, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax,
+        Tanh,
     };
 
     /// A layer with no inference form.
@@ -566,8 +569,10 @@ mod tests {
             (
                 Sequential::new()
                     .push(linear(&mut params, &mut rng))
-                    .push(Softmax),
-                "unsupported: GpuModel::compile: layer 1 (softmax) is not a layer the GPU runs",
+                    .push(Glu {
+                        gate: Gate::Sigmoid,
+                    }),
+                "unsupported: GpuModel::compile: layer 1 (glu) is not a layer the GPU runs",
             ),
             (
                 Sequential::new()
@@ -659,6 +664,26 @@ mod tests {
             "unsupported: GpuModel::compile: layer 0 (conv2d) is a convolution, which takes at \
              most 65535 images per batch on the GPU, not 65536"
         );
+        // A softmax takes one thread per row, 65,535 workgroups of 256.
+        let mut store = ParamStore::new();
+        let norm =
+            BatchNorm2d::with_options(&mut store, 2, (2, 2), 1e-5, Some(0.1), true, true).unwrap();
+        for (net, log) in [
+            (Sequential::new().push(norm.clone()).push(Softmax), false),
+            (Sequential::new().push(norm).push(LogSoftmax), true),
+        ] {
+            let plan = Plan::build(&net, &store, 16_776_960).unwrap();
+            assert_eq!(plan.layers[1].kind, Kind::Softmax { log });
+            let err = Plan::build(&net, &store, 16_776_961).unwrap_err();
+            let name = net.layer(1).name().to_string();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "unsupported: GpuModel::compile: layer 1 ({name}) is a softmax, which takes \
+                     at most 16776960 rows per batch on the GPU, not 16776961"
+                )
+            );
+        }
     }
 
     /// The masks' bits repeat each row's for every row of the batch, low bit first.

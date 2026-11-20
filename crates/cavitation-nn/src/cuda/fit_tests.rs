@@ -17,7 +17,8 @@ use cavitation_cuda::Cuda;
 
 use super::CudaTrainer;
 use super::test_util::{
-    activation_mlp, bits, classes, cumulative_cnn, mlp, more_activations, off, with_cuda,
+    activation_mlp, bits, classes, cumulative_cnn, mlp, more_activations, off, softmax_mlp,
+    with_cuda,
 };
 use crate::train::{Choice, fit_choosing};
 use crate::{
@@ -276,6 +277,79 @@ fn every_activation_tracks_the_cpu_fit() {
             }
             println!(
                 "{kind:?}: worst loss off by {worst:.3e} of the CPU's; parameters {worst_param:.4} of the tolerance"
+            );
+        });
+    }
+}
+
+/// Softmax and log-softmax after each `Linear` of an MLP: a run on CUDA tracks the CPU run of
+/// the same `FitConfig`, each epoch's mean loss and validation loss (through the trainer's
+/// model) within 2⁻¹⁰ of the CPU's and the final parameters within 2⁻¹⁰ of each tensor's
+/// largest value plus 2⁻¹⁶, over 3 epochs of 50 rows at batch 16 (a last batch of 2) with
+/// Adam.
+#[test]
+fn softmax_layers_track_the_cpu_fit() {
+    let train = classes(72, 50, 12, 4);
+    let held_out = classes(73, 20, 12, 4);
+    let config = || FitConfig {
+        epochs: 3,
+        batch: 16,
+        optimizer: OptimizerConfig::Adam {
+            lr: 0.01,
+            weight_decay: 0.0,
+        },
+        shuffle_seed: Some(3),
+        health: Health::quiet(),
+        validation: Some(held_out.clone()),
+        ..FitConfig::default()
+    };
+    for (seed, log) in [(92, false), (93, true)] {
+        let what = if log { "log-softmax" } else { "softmax" };
+        let mut start = ParamStore::new();
+        let net = softmax_mlp::<f32>(&mut start, seed, log);
+        let mut cpu = start.clone();
+        let on_cpu = fit(&net, &mut cpu, &train, config()).unwrap();
+        with_cuda(|cuda| {
+            let mut params = start.clone();
+            let on_device = fit(&net, &mut params, &train, on(cuda, config())).unwrap();
+            let mut worst = 0.0f64;
+            for (g, c) in on_device.epochs.iter().zip(&on_cpu.epochs) {
+                let (gv, cv) = (
+                    g.validation.as_ref().unwrap(),
+                    c.validation.as_ref().unwrap(),
+                );
+                for (got, want, which) in [
+                    (g.mean_loss, c.mean_loss, "mean loss"),
+                    (gv.loss, cv.loss, "validation loss"),
+                ] {
+                    let off = (got - want).abs() / want.abs();
+                    assert!(
+                        off <= 1.0 / 1024.0,
+                        "{what}: epoch {}: {which} {got}, the CPU's {want}",
+                        g.epoch
+                    );
+                    worst = worst.max(off);
+                }
+            }
+            let mut worst_param = 0.0f32;
+            for (name, id) in net.state_names() {
+                let (a, b) = (params.value(id).data(), cpu.value(id).data());
+                let scale = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let off = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                let tolerance = scale / 1024.0 + 1.0 / 65536.0;
+                assert!(
+                    off <= tolerance,
+                    "{what}: {name} off by {off:e} of {scale:e}"
+                );
+                worst_param = worst_param.max(off / tolerance);
+            }
+            println!(
+                "{what}: worst loss off by {worst:.3e} of the CPU's; parameters {worst_param:.4} \
+                 of the tolerance"
             );
         });
     }
