@@ -71,21 +71,26 @@ impl Cuda {
     pub fn buffer(&self, bytes: usize) -> Result<DeviceBuffer<'_>, CudaError> {
         // The driver refuses an allocation of no bytes, so an empty buffer takes four.
         let allocated = bytes.max(4);
-        self.bind()?;
+        let _bound = self.bind()?;
         let mut pointer: DevicePtr = 0;
         // SAFETY: the pointer is to a live address, written once, and the card's context
-        // is current on this thread.
+        // is current on this thread, with the lock held.
         let code = unsafe { (self.driver.cuMemAlloc_v2)(&mut pointer, allocated) };
         self.check("cuMemAlloc_v2", code)?;
-        let buffer = DeviceBuffer {
+        // SAFETY: the address was just allocated with `allocated` bytes.
+        let code = unsafe { (self.driver.cuMemsetD8_v2)(pointer, 0, allocated) };
+        if let Err(error) = self.check("cuMemsetD8_v2", code) {
+            // Freed here, under the lock already held: a `DeviceBuffer` dropped now would
+            // take it again.
+            // SAFETY: the address came from `cuMemAlloc_v2` just above and is freed once.
+            unsafe { (self.driver.cuMemFree_v2)(pointer) };
+            return Err(error);
+        }
+        Ok(DeviceBuffer {
             cuda: self,
             pointer,
             bytes,
-        };
-        // SAFETY: the address was just allocated with `allocated` bytes.
-        let code = unsafe { (self.driver.cuMemsetD8_v2)(pointer, 0, allocated) };
-        self.check("cuMemsetD8_v2", code)?;
-        Ok(buffer)
+        })
     }
 }
 
@@ -125,7 +130,7 @@ impl DeviceBuffer<'_> {
         if bytes == 0 {
             return Ok(());
         }
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         // SAFETY: `data` is `bytes` readable bytes, and the buffer holds at least as many.
         let code = unsafe {
             (self.cuda.driver.cuMemcpyHtoD_v2)(self.pointer, data.as_ptr().cast::<c_void>(), bytes)
@@ -167,7 +172,7 @@ impl DeviceBuffer<'_> {
         if bytes == 0 {
             return Ok(());
         }
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         // SAFETY: `out` is `bytes` writable bytes, the buffer holds at least as many, and
         // every bit pattern is a value of a `Scalar`.
         let code = unsafe {
@@ -179,17 +184,111 @@ impl DeviceBuffer<'_> {
         };
         self.cuda.check("cuMemcpyDtoH_v2", code)
     }
+
+    /// Copies `bytes` bytes of `from`, starting `from_at` bytes into it, into this buffer
+    /// starting `at` bytes in, after the work already given to the card. The copy is queued
+    /// on the card and returns without waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the driver reports an error.
+    ///
+    /// # Panics
+    ///
+    /// If either range runs past its buffer's end, or the two buffers were allocated in two
+    /// different [`Cuda`]s.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::Cuda;
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let mut from = cuda.buffer(12).unwrap();
+    ///     from.write(&[1.0f32, 2.0, 3.0]).unwrap();
+    ///     let mut to = cuda.buffer(12).unwrap();
+    ///     to.copy_from(4, &from, 0, 8).unwrap();
+    ///     let mut back = [0.0f32; 3];
+    ///     to.read(&mut back).unwrap();
+    ///     assert_eq!(back, [0.0, 1.0, 2.0]);
+    /// }
+    /// ```
+    pub fn copy_from(
+        &mut self,
+        at: usize,
+        from: &DeviceBuffer<'_>,
+        from_at: usize,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        assert!(
+            std::ptr::eq(self.cuda, from.cuda),
+            "a copy between buffers of two different Cuda handles"
+        );
+        let fits = |start: usize, len: usize| start.checked_add(bytes).is_some_and(|e| e <= len);
+        assert!(
+            fits(at, self.bytes) && fits(from_at, from.bytes),
+            "a copy of {bytes} bytes from byte {from_at} of a buffer of {} to byte {at} of one \
+             of {}",
+            from.bytes,
+            self.bytes
+        );
+        if bytes == 0 {
+            return Ok(());
+        }
+        let _bound = self.cuda.bind()?;
+        // SAFETY: both ranges lie in live allocations of this context (checked above), and
+        // they do not overlap: `self`, borrowed mutably, is not `from`.
+        let code = unsafe {
+            (self.cuda.driver.cuMemcpyDtoD_v2)(
+                self.pointer + at as u64,
+                from.pointer + from_at as u64,
+                bytes,
+            )
+        };
+        self.cuda.check("cuMemcpyDtoD_v2", code)
+    }
+
+    /// Sets every byte of the buffer to zero, after the work already given to the card. The
+    /// write is queued on the card and returns without waiting for it.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if the driver reports an error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::Cuda;
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let mut buffer = cuda.buffer(8).unwrap();
+    ///     buffer.write(&[1.5f32, -2.0]).unwrap();
+    ///     buffer.zero().unwrap();
+    ///     let mut back = [1.0f32; 2];
+    ///     buffer.read(&mut back).unwrap();
+    ///     assert_eq!(back.map(f32::to_bits), [0, 0]);
+    /// }
+    /// ```
+    pub fn zero(&mut self) -> Result<(), CudaError> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        let _bound = self.cuda.bind()?;
+        // SAFETY: the address was allocated with at least `bytes` bytes in this context.
+        let code = unsafe { (self.cuda.driver.cuMemsetD8_v2)(self.pointer, 0, self.bytes) };
+        self.cuda.check("cuMemsetD8_v2", code)
+    }
 }
 
 impl Drop for DeviceBuffer<'_> {
     /// Waits for the card's work, which may still use the buffer, and frees it. Errors are
     /// not reported: there is no one to report them to.
     fn drop(&mut self) {
-        // Made current first; if that fails, the calls below fail too, and nothing else
-        // can be done.
-        let _ = self.cuda.bind();
+        // The lock is taken and the context made current first; if that fails, the calls
+        // below fail too, and nothing else can be done.
+        let _bound = self.cuda.bind_anyway();
         // SAFETY: the address came from `cuMemAlloc_v2` in the card's context, now current
-        // on this thread, and is freed once.
+        // on this thread with the lock held, and is freed once.
         unsafe {
             (self.cuda.driver.cuCtxSynchronize)();
             (self.cuda.driver.cuMemFree_v2)(self.pointer);

@@ -20,7 +20,11 @@ cavitation-inspect = { path = "../cavitation-inspect" }
 cavitation-nn = { path = "../cavitation-nn" }
 # The GPU, for `gemm-gpu`, behind the `gpu` feature (off by default).
 cavitation-gpu = { path = "../cavitation-gpu", optional = true }
+# NVIDIA's CUDA, for `--device cuda` on the CNNs, behind the `cuda` feature (off by default).
+cavitation-cuda = { path = "../cavitation-cuda", optional = true }
 
 [features]
 # The GPU benchmarks (`gemm-gpu`, and `--device gpu` for the CNNs); they add wgpu to the build.
 gpu = ["dep:cavitation-gpu", "cavitation-nn/gpu"]
+# `--device cuda` for the CNNs, through NVIDIA's libraries loaded when the program runs.
+cuda = ["dep:cavitation-cuda", "cavitation-nn/cuda"]

@@ -26,7 +26,7 @@
 //!   `B` transposed: the median of 20 GPU-timestamped runs after a warm-up by time (1 s by
 //!   default), in ms and GFLOPS, with the GPU clock from `nvidia-smi` before and after.
 //! - `mnist-cnn` and `cifar-cnn` `[--seed N] [--epochs N] [--rows N] [--python PATH]
-//!   [--cav-only] [--profile N] [--no-fuse] [--device auto|cpu|gpu] [--backend B]
+//!   [--cav-only] [--profile N] [--no-fuse] [--device auto|cuda|gpu|cpu] [--backend B]
 //!   [--torch-device D] [--deterministic]` train the v0.3 benchmark CNNs (LeNet-5's layout on
 //!   MNIST, Adam lr 1e-3, batch 64, 5 epochs; the batch-norm CIFAR network, batch 128, 10
 //!   epochs) here and then
@@ -130,8 +130,8 @@ const USAGE: &str = "usage: cavitation-bench <all|mnist|cifar|digits|latency|gem
     \x20 conv    [--batch N] [--parts]\n\
     \x20 mnist-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--cav-only] [--profile N] [--no-fuse]\n\
     \x20 cifar-cnn [--seed N] [--epochs N] [--rows N] [--python PATH] [--cav-only] [--profile N] [--no-fuse]\n\
-    \x20     (both CNNs) [--device auto|cpu|gpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
-    \x20     [--deterministic]; --device gpu needs the gpu feature, and auto is what `devices` marks\n\
+    \x20     (both CNNs) [--device auto|cuda|gpu|cpu] [--backend vulkan|dx12|metal] [--torch-device cpu|cuda|mps]\n\
+    \x20     [--deterministic]; --device gpu needs the gpu feature, --device cuda the cuda feature, and auto is what `devices` marks\n\
     \x20 subnormal [--steps N]\n\
     \x20 small   [--rounds N]\n\
     \x20 activation\n\
@@ -247,6 +247,11 @@ fn info() {
         Some(gpu) => println!("{}", gpu.info()),
         None => println!("gpu: none found"),
     }
+    #[cfg(feature = "cuda")]
+    match cavitation_cuda::Cuda::open() {
+        Ok(cuda) => println!("{}", cuda.info()),
+        Err(why) => println!("cuda: not available: {why}"),
+    }
 }
 
 /// Prints the devices this machine and this build can train on, best first, with the one
@@ -254,7 +259,7 @@ fn info() {
 ///
 /// # Errors
 ///
-/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cpu` or `gpu`.
+/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cuda`, `gpu` or `cpu`.
 fn devices() -> Result<(), String> {
     let list = cavitation_nn::devices().map_err(|e| e.to_string())?;
     println!("cpu: {}", machine::detect().cpu_model);
@@ -284,8 +289,8 @@ fn devices() -> Result<(), String> {
         None => println!("CAVITATION_DEVICE asks for a device that is not available."),
     }
     println!(
-        "Choose with --device auto|cpu|gpu (mnist-cnn, cifar-cnn), with FitConfig::device in a \
-         program, or for Device::Auto with CAVITATION_DEVICE=auto|cpu|gpu."
+        "Choose with --device auto|cuda|gpu|cpu (mnist-cnn, cifar-cnn), with FitConfig::device \
+         in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cuda|gpu|cpu."
     );
     Ok(())
 }

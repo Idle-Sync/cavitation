@@ -99,6 +99,7 @@ name = "cavitation"
 version = "0.4.1"
 dependencies = [
  "cavitation-core",
+ "cavitation-cuda",
  "cavitation-datasets",
  "cavitation-gpu",
  "cavitation-inspect",
@@ -112,6 +113,7 @@ name = "cavitation-bench"
 version = "0.4.1"
 dependencies = [
  "cavitation-core",
+ "cavitation-cuda",
  "cavitation-datasets",
  "cavitation-gpu",
  "cavitation-inspect",
@@ -174,6 +176,7 @@ name = "cavitation-nn"
 version = "0.4.1"
 dependencies = [
  "cavitation-core",
+ "cavitation-cuda",
  "cavitation-gpu",
  "safetensors",
  "serde_json",

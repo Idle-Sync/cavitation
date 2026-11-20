@@ -65,6 +65,8 @@
 mod activation;
 mod batch_norm;
 mod conv;
+#[cfg(feature = "cuda")]
+mod cuda;
 mod dropout;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -78,6 +80,8 @@ mod linear;
 mod mask;
 pub mod metrics;
 mod optim;
+#[cfg(any(feature = "gpu", feature = "cuda"))]
+mod plan;
 mod pooling;
 mod sequential;
 pub mod shrink;
@@ -92,6 +96,8 @@ pub use activation::{
 };
 pub use batch_norm::BatchNorm2d;
 pub use conv::Conv2d;
+#[cfg(feature = "cuda")]
+pub use cuda::{CudaModel, CudaOptimizerState, CudaStepProfile, CudaTrainer};
 pub use dropout::{Dropout, Flatten, Identity};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuModel, GpuOptimizerState, GpuStepProfile, GpuTrainer};

@@ -19,6 +19,7 @@ cavitation-nn = { path = "../cavitation-nn", version = "0.4.1" }
 cavitation-ml = { path = "../cavitation-ml", version = "0.4.1", optional = true }
 cavitation-inspect = { path = "../cavitation-inspect", version = "0.4.1", optional = true }
 cavitation-gpu = { path = "../cavitation-gpu", version = "0.4.1", optional = true }
+cavitation-cuda = { path = "../cavitation-cuda", version = "0.4.1", optional = true }
 
 [features]
 default = ["ml"]
@@ -28,6 +29,9 @@ ml = ["dep:cavitation-ml"]
 inspect = ["dep:cavitation-inspect"]
 # GPU mode through wgpu (Vulkan, Metal, DX12), re-exported as `cavitation::cavitation_gpu`; off by default.
 gpu = ["dep:cavitation-gpu", "cavitation-nn/gpu"]
+# Training on NVIDIA cards through CUDA, cuDNN and cuBLAS, loaded when the program runs,
+# re-exported as `cavitation::cavitation_cuda`; off by default.
+cuda = ["dep:cavitation-cuda", "cavitation-nn/cuda"]
 
 [dev-dependencies]
 # Real datasets for the examples and known-result tests.

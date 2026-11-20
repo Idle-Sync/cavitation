@@ -155,6 +155,8 @@ api! {
         fn cuMemcpyHtoD_v2(to: DevicePtr, from: *const c_void, bytes: usize) -> c_int;
         /// Copies device memory to host memory, after the context's earlier work.
         fn cuMemcpyDtoH_v2(to: *mut c_void, from: DevicePtr, bytes: usize) -> c_int;
+        /// Copies device memory to device memory, after the context's earlier work.
+        fn cuMemcpyDtoD_v2(to: DevicePtr, from: DevicePtr, bytes: usize) -> c_int;
         /// Loads a module from a NUL-terminated PTX text.
         fn cuModuleLoadData(module: *mut CuModule, image: *const c_void) -> c_int;
         /// Unloads a module.

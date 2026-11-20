@@ -19,8 +19,8 @@ use cavitation_core::kernels::{level, threads};
 use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng};
 use cavitation_datasets::{cifar10, mnist};
 use cavitation_nn::{
-    Adam, Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Dropout, Flatten, Health, Init, Linear,
-    Loss, MaxPool2d, Relu, Sequential, StepProfile, Trainer, accuracy, save,
+    Adam, Batch, BatchNorm2d, Batcher, Conv2d, Dataset, DeviceKind, Dropout, Flatten, Health, Init,
+    Linear, Loss, MaxPool2d, Relu, Sequential, StepProfile, Trainer, accuracy, save,
 };
 
 /// One of the two benchmark networks with its pinned schedule.
@@ -129,11 +129,12 @@ pub struct Options {
     /// `--profile N`: instead of training, time N steps layer by layer (after 3 warm-up
     /// steps) and print each layer's median forward and backward time.
     pub profile: Option<usize>,
-    /// `--device gpu`: train our side on the GPU (`GpuTrainer`), which needs the `gpu`
-    /// feature; `cpu`, the default, trains with `Trainer`; `auto` is the one of the two
-    /// that `cavitation_nn::devices` marks as chosen (the CPU with `--profile`, which times
-    /// the CPU trainer only).
-    pub gpu: bool,
+    /// `--device`: where our side trains. `gpu` is the GPU through wgpu (`GpuTrainer`),
+    /// which needs the `gpu` feature; `cuda` an NVIDIA card through CUDA (`CudaTrainer`),
+    /// which needs the `cuda` feature; `cpu`, the default, trains with `Trainer`; `auto` is
+    /// the device `cavitation_nn::devices` marks as chosen (the CPU with `--profile`, which
+    /// times the CPU trainer only).
+    pub device: DeviceKind,
     /// `--backend vulkan|dx12|metal`: the GPU backend, or the platform's default.
     pub backend: Option<String>,
     /// `--torch-device cpu|cuda|mps`: where the PyTorch side trains (default `cpu`).
@@ -145,14 +146,14 @@ pub struct Options {
     pub no_fuse: bool,
 }
 
-/// Whether `--device auto` trains on the GPU: whether the device
-/// `cavitation_nn::devices` marks as chosen is one. Prints that device's line.
+/// The device `--device auto` trains on: the one `cavitation_nn::devices` marks as chosen.
+/// Prints that device's line.
 ///
 /// # Errors
 ///
-/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cpu` or `gpu`, or asks for a
-/// device that is not available.
-fn auto_is_gpu() -> Result<bool, String> {
+/// Returns a message if `CAVITATION_DEVICE` is not `auto`, `cuda`, `gpu` or `cpu`, or asks
+/// for a device that is not available.
+fn auto_device() -> Result<DeviceKind, String> {
     let list = cavitation_nn::devices().map_err(|e| e.to_string())?;
     let entry = list.iter().find(|e| e.chosen).ok_or(
         "--device auto: CAVITATION_DEVICE asks for a device that is not available (see the \
@@ -162,18 +163,18 @@ fn auto_is_gpu() -> Result<bool, String> {
         "--device auto: {} ({}, {})",
         entry.kind, entry.name, entry.detail
     );
-    Ok(entry.kind == cavitation_nn::DeviceKind::Gpu)
+    Ok(entry.kind)
 }
 
 impl Options {
     /// Parses the arguments after the command for `net`. `--device auto` is resolved here,
-    /// which with the `gpu` feature opens the GPU to see that there is one, and trains on
-    /// the CPU with `--profile`.
+    /// which with the `gpu` and `cuda` features opens the GPU and CUDA to see whether they
+    /// are there, and trains on the CPU with `--profile`.
     ///
     /// # Errors
     ///
     /// Returns a message for an unknown argument, a missing value or a value that is not
-    /// a positive number (`--seed` may be 0), and as [`auto_is_gpu`] does.
+    /// a positive number (`--seed` may be 0), and as [`auto_device`] does.
     pub fn parse(net: Net, args: &[String]) -> Result<Options, String> {
         let mut o = Options {
             seed: 0,
@@ -182,7 +183,7 @@ impl Options {
             python: std::env::var("CAVITATION_BENCH_PYTHON").unwrap_or_else(|_| "python3".into()),
             cav_only: false,
             profile: None,
-            gpu: false,
+            device: DeviceKind::Cpu,
             backend: None,
             torch_device: "cpu".into(),
             deterministic: false,
@@ -207,11 +208,14 @@ impl Options {
                 "--cav-only" => o.cav_only = true,
                 "--profile" => o.profile = Some(number("--profile", rest.next(), false)?),
                 "--device" => match rest.next().map(String::as_str) {
-                    Some("cpu") => (o.gpu, auto) = (false, false),
-                    Some("gpu") => (o.gpu, auto) = (true, false),
-                    Some("auto") => (o.gpu, auto) = (false, true),
+                    Some("auto") => (o.device, auto) = (DeviceKind::Cpu, true),
+                    Some("cpu") => (o.device, auto) = (DeviceKind::Cpu, false),
+                    Some("gpu") => (o.device, auto) = (DeviceKind::Gpu, false),
+                    Some("cuda") => (o.device, auto) = (DeviceKind::Cuda, false),
                     other => {
-                        return Err(format!("--device takes auto, cpu or gpu, got {other:?}"));
+                        return Err(format!(
+                            "--device takes auto, cuda, gpu or cpu, got {other:?}"
+                        ));
                     }
                 },
                 "--backend" => {
@@ -238,13 +242,19 @@ impl Options {
         }
         if auto {
             // `--profile` times the CPU trainer only, whatever `auto` would pick.
-            o.gpu = auto_is_gpu()? && o.profile.is_none();
+            o.device = auto_device()?;
+            if o.profile.is_some() {
+                o.device = DeviceKind::Cpu;
+            }
         }
-        if o.backend.is_some() && !o.gpu {
+        if o.backend.is_some() && o.device != DeviceKind::Gpu {
             return Err("--backend needs --device gpu".into());
         }
-        if o.gpu && o.profile.is_some() {
-            return Err("--profile times the CPU trainer only; leave out --device gpu".into());
+        if o.device != DeviceKind::Cpu && o.profile.is_some() {
+            return Err(format!(
+                "--profile times the CPU trainer only; leave out --device {}",
+                o.device
+            ));
         }
         if o.deterministic && o.torch_device == "cpu" {
             return Err("--deterministic needs --torch-device cuda or mps".into());
@@ -411,6 +421,74 @@ fn train_ours_gpu(
     _: &Options,
 ) -> Result<Vec<Epoch>, String> {
     Err("--device gpu needs the gpu feature: build with --features gpu".into())
+}
+
+/// Trains `model` on an NVIDIA card through CUDA with `CudaTrainer`, as [`train_ours_gpu`]
+/// does on wgpu: the same batch order (a short last batch included), Adam at 1e-3,
+/// cross-entropy and dropout seed 0, and the test accuracy from the card's model after each
+/// epoch. Each step reads its loss back, so the epoch's time is the card's. The parameters
+/// are copied back to `params` at the end.
+#[cfg(feature = "cuda")]
+fn train_ours_cuda(
+    model: &Sequential,
+    params: &mut ParamStore,
+    train: &Dataset,
+    test: &Dataset,
+    net: Net,
+    o: &Options,
+) -> Result<Vec<Epoch>, String> {
+    use cavitation_cuda::Cuda;
+    use cavitation_nn::{CudaTrainer, OptimizerConfig};
+    let cuda = Cuda::open().map_err(|e| format!("--device cuda: CUDA cannot be used: {e}"))?;
+    println!("{}", cuda.info());
+    let adam = OptimizerConfig::Adam {
+        lr: 1e-3,
+        weight_decay: 0.0,
+    };
+    let mut trainer = CudaTrainer::new(model, params, &adam, Loss::CrossEntropy, net.batch, &cuda)
+        .map_err(|e| e.to_string())?;
+    trainer.set_dropout_seed(0);
+    let mut batcher = Batcher::new(train.len(), net.batch, Some(o.seed));
+    let mut batch = Batch::new(train, net.batch);
+    let mut epochs = Vec::with_capacity(o.epochs);
+    for e in 1..=o.epochs {
+        batcher.epoch();
+        let (mut sum, mut steps) = (0.0f64, 0usize);
+        let start = Instant::now();
+        for range in batcher.batches() {
+            let view = batcher.gather(train, range, &mut batch);
+            sum += f64::from(trainer.step(model, view).map_err(|e| e.to_string())?);
+            steps += 1;
+        }
+        let seconds = start.elapsed().as_secs_f64();
+        let epoch = Epoch {
+            loss: sum / steps as f64,
+            accuracy: trainer.model().accuracy(test),
+            seconds,
+        };
+        println!(
+            "  cav   epoch {e:2}: loss {:.4}, test accuracy {:.2}%, {:.1} s (cuda)",
+            epoch.loss,
+            epoch.accuracy * 100.0,
+            epoch.seconds
+        );
+        epochs.push(epoch);
+    }
+    trainer.sync_to(params);
+    Ok(epochs)
+}
+
+/// Without the `cuda` feature, `--device cuda` says how to get it.
+#[cfg(not(feature = "cuda"))]
+fn train_ours_cuda(
+    _: &Sequential,
+    _: &mut ParamStore,
+    _: &Dataset,
+    _: &Dataset,
+    _: Net,
+    _: &Options,
+) -> Result<Vec<Epoch>, String> {
+    Err("--device cuda needs the cuda feature: build with --features cuda".into())
 }
 
 /// The `--profile` run: trains `steps` + 3 batches of `train` in the seeded batch order, the
@@ -722,10 +800,10 @@ pub fn run(net: Net, o: &Options, dir_root: &Path) -> Result<(), String> {
         threads(),
         dir.display()
     );
-    let ours = if o.gpu {
-        train_ours_gpu(&model, &mut params, &train, &test, net, o)?
-    } else {
-        train_ours(&model, &mut params, &train, &test, net, o)?
+    let ours = match o.device {
+        DeviceKind::Gpu => train_ours_gpu(&model, &mut params, &train, &test, net, o)?,
+        DeviceKind::Cuda => train_ours_cuda(&model, &mut params, &train, &test, net, o)?,
+        _ => train_ours(&model, &mut params, &train, &test, net, o)?,
     };
     let rows = train.len();
     drop(train);
@@ -852,7 +930,12 @@ mod tests {
         assert_eq!(Options::parse(MNIST, &[]).unwrap().profile, None);
         let p = Options::parse(CIFAR, &args(&["--profile", "7"])).unwrap();
         assert_eq!(p.profile, Some(7));
-        assert!(!p.gpu && p.backend.is_none() && p.torch_device == "cpu" && !p.deterministic);
+        assert!(
+            p.device == DeviceKind::Cpu
+                && p.backend.is_none()
+                && p.torch_device == "cpu"
+                && !p.deterministic
+        );
         let g = Options::parse(
             CIFAR,
             &args(&[
@@ -866,7 +949,7 @@ mod tests {
             ]),
         )
         .unwrap();
-        assert!(g.gpu && g.deterministic);
+        assert!(g.device == DeviceKind::Gpu && g.deterministic);
         assert_eq!(
             (g.backend.as_deref(), g.torch_device.as_str()),
             (Some("metal"), "mps")
@@ -874,8 +957,10 @@ mod tests {
         // `auto` with `--profile` is the CPU, which is all `--profile` times; with
         // `CAVITATION_DEVICE` set to something `devices` refuses, it is that error.
         if let Ok(a) = Options::parse(CIFAR, &args(&["--device", "auto", "--profile", "3"])) {
-            assert!(!a.gpu && a.profile == Some(3));
+            assert!(a.device == DeviceKind::Cpu && a.profile == Some(3));
         }
+        let c = Options::parse(CIFAR, &args(&["--device", "cuda"])).unwrap();
+        assert_eq!(c.device, DeviceKind::Cuda);
         for bad in [
             &["--device", "tpu"][..],
             &["--device", "auto", "--backend", "vulkan"],
@@ -884,6 +969,8 @@ mod tests {
             &["--torch-device", "xla"],
             &["--deterministic"],
             &["--device", "gpu", "--profile", "3"],
+            &["--device", "cuda", "--profile", "3"],
+            &["--device", "cuda", "--backend", "vulkan"],
         ] {
             assert!(Options::parse(CIFAR, &args(bad)).is_err(), "{bad:?}");
         }

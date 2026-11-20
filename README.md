@@ -147,7 +147,7 @@ assert_eq!(net.layer(1).name(), "cube");
 
 ## Choosing a device
 
-Training runs on the CPU unless you ask otherwise. With the `gpu` feature (off by default) it can also run on a GPU through Vulkan, DX12 or Metal, and `cavitation-bench devices` lists what a machine offers, best first:
+Training runs on the CPU unless you ask otherwise. With the `gpu` feature (off by default) it can also run on a GPU through Vulkan, DX12 or Metal, with the `cuda` feature (off by default) on an NVIDIA card through CUDA, and `cavitation-bench devices` lists what a machine offers, best first:
 
 ```sh
 cargo run --release -p cavitation-bench --features gpu -- devices
@@ -157,21 +157,41 @@ cargo run --release -p cavitation-bench --features gpu -- devices
 cpu: AMD Ryzen 7 2700X Eight-Core Processor
 Devices this build can train on, best first:
   1. gpu  NVIDIA GeForce GTX 1660 SUPER, vulkan (also: dx12)  <- chosen
-          an NVIDIA card: NVIDIA's CUDA and cuDNN would train faster, and this library has no CUDA engine yet
+          an NVIDIA card: a build with the `cuda` feature trains on it faster, through NVIDIA's CUDA and cuDNN
   2. cpu  CPU, avx2, 16 threads
 Device::Auto and --device auto train on the gpu.
-Choose with --device auto|cpu|gpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cpu|gpu.
+Choose with --device auto|cuda|gpu|cpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cuda|gpu|cpu.
 ```
 
 In a program, `devices()` returns the same list, and `FitConfig::device` chooses:
 
 - `Device::Cpu`, the default: the CPU.
 - `Device::Gpu(&gpu)`: a GPU you opened with `cavitation_gpu::Gpu`.
-- `Device::Auto`: the GPU when there is one and it can train the run, the CPU otherwise. A run with hooks or a `StepControl`, or with a layer, loss or optimiser the GPU has no kernel for, trains on the CPU. `History::device` says where the run trained, and `History::device_note` why a GPU was left for the CPU.
+- `Device::Cuda(&cuda)`: an NVIDIA card you opened with `cavitation_cuda::Cuda`.
+- `Device::Auto`: CUDA when it opens and can train the run, then the GPU, then the CPU. A run with hooks or a `StepControl`, or with a layer, loss or optimiser a GPU has no kernel for, trains on the CPU. `History::device` says where the run trained, and `History::device_note` why a device was left.
 
-The environment variable `CAVITATION_DEVICE` (`auto`, `cpu` or `gpu`) restricts what `Device::Auto` picks. A GPU run agrees with the CPU run within the GPU kernels' stated error bounds, not bit for bit, so a run that must give the same bits on every machine names its device.
+The environment variable `CAVITATION_DEVICE` (`auto`, `cuda`, `gpu` or `cpu`) restricts what `Device::Auto` picks. A GPU run agrees with the CPU run within the GPU kernels' stated error bounds, not bit for bit, so a run that must give the same bits on every machine names its device.
 
 Measured on an NVIDIA GTX 1660 Super (Vulkan) and an AMD Ryzen 7 2700X (avx2, 16 threads) with `cargo run --release -p cavitation-bench --features gpu -- cifar-cnn --cav-only --rows 12800 --epochs 3 --device gpu` and `--device cpu`: an epoch of 12,800 CIFAR-10 images takes 2.54 s on the GPU and 14.21 s on the CPU; for `mnist-cnn`, 0.45 s and 0.97 s. On a small network the GPU gains nothing: the digits network's shape (64 → 256 → 128 → 10) at batch 32 takes 19.9 to 20.8 ms an epoch on the GPU and 18.9 to 19.5 ms on the CPU (`CAVITATION_GPU_BACKEND=vulkan cargo test --release -p cavitation-nn --features gpu --lib epoch_time_of_a_small_network_by_device -- --ignored --nocapture`). `Device::Auto` does not weigh the model's size, so name `Device::Cpu` for a network that small.
+
+**CUDA.** The `cuda` feature trains on an NVIDIA card through NVIDIA's own libraries, which are found and loaded when the program runs, so a build with the feature still starts on a machine without them and `devices` says what is missing. Install an NVIDIA driver, cuDNN 9, and cuBLAS and NVRTC from the CUDA toolkit (12 or 13) that cuDNN was built for; the libraries are looked for in the folders of `CAVITATION_CUDA_PATH`, `CUDNN_PATH` and `CUDA_PATH`, then where the operating system looks. On the machine above, with cuDNN in `CUDNN_PATH`:
+
+```sh
+cargo run --release -p cavitation-bench --features gpu,cuda -- devices
+```
+
+```text
+cpu: AMD Ryzen 7 2700X Eight-Core Processor
+Devices this build can train on, best first:
+  1. cuda NVIDIA GeForce GTX 1660 SUPER, CUDA 13.1, cuDNN 9.28.1, cuBLAS 13.2.2  <- chosen
+  2. gpu  NVIDIA GeForce GTX 1660 SUPER, vulkan (also: dx12)
+          an NVIDIA card: the cuda entry trains on it faster, through NVIDIA's CUDA and cuDNN
+  3. cpu  CPU, avx2, 16 threads
+Device::Auto and --device auto train on the cuda.
+Choose with --device auto|cuda|gpu|cpu (mnist-cnn, cifar-cnn), with FitConfig::device in a program, or for Device::Auto with CAVITATION_DEVICE=auto|cuda|gpu|cpu.
+```
+
+The convolution runs through cuDNN, with deterministic algorithms only, and `Linear` through cuBLAS; NVIDIA publishes no error bounds for either, so a CUDA run agrees with the CPU run within measured tolerances, and two CUDA runs give the same bits. An epoch of `cifar-cnn --cav-only --rows 12800 --epochs 3` takes 1.48 s with `--device cuda` on the machine above.
 
 ## The inspector
 

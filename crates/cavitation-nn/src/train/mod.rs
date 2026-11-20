@@ -17,22 +17,22 @@ mod step_log;
 mod stopping;
 
 pub use data::{Batch, BatchView, Batcher, Dataset, Targets, TargetsView};
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(all(test, any(feature = "gpu", feature = "cuda")))]
 pub(crate) use device::Choice;
 pub use device::{DeviceEntry, DeviceKind, devices};
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 pub(crate) use evaluate::measure;
 pub use evaluate::{Evaluation, Evaluator, confusion_matrix, evaluate};
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 pub(crate) use fit::argmax;
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(all(test, any(feature = "gpu", feature = "cuda")))]
 pub(crate) use fit::fit_choosing;
 pub use fit::{
     Device, EpochReport, FitConfig, History, Loss, LrSchedule, ModelHandle, OptimizerConfig,
     StepControl, StepInfo, StepProfile, Trainer, TrainerHandle, accuracy, fit, fit_controlled,
     fit_with_hooks,
 };
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 pub(crate) use fit::{StepRates, Watching};
 pub(crate) use fit::{check_dataset, check_widths};
 pub use standardize::Standardizer;

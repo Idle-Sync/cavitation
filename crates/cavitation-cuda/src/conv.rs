@@ -5,7 +5,7 @@ use std::ffi::{c_int, c_void};
 use std::fmt;
 
 use crate::buffer::DeviceBuffer;
-use crate::device::Cuda;
+use crate::device::{Bound, Cuda};
 use crate::error::CudaError;
 use crate::sys::{
     AlgoPerf, CUDNN_CROSS_CORRELATION, CUDNN_DETERMINISTIC, CUDNN_FLOAT, CUDNN_FMA_MATH, CUDNN_NCHW,
@@ -189,57 +189,102 @@ impl fmt::Display for ConvAlgorithms {
     }
 }
 
-/// A cuDNN descriptor, destroyed when dropped.
-struct Descriptor<'c> {
-    /// The CUDA whose cuDNN made it.
+/// A convolution's cuDNN descriptors, each null until it is created, destroyed together
+/// when dropped, with the lock taken for it. They are created with the lock held, by a
+/// caller that declares them before its guard, so that on an early return the guard is
+/// given back before they are dropped.
+struct Descriptors<'c> {
+    /// The CUDA whose cuDNN made them.
     cuda: &'c Cuda,
-    /// The descriptor.
-    raw: *mut c_void,
-    /// cuDNN's function that destroys it.
-    destroy: unsafe extern "system" fn(*mut c_void) -> c_int,
+    /// The input's tensor descriptor (and the input gradient's).
+    x: *mut c_void,
+    /// The weight's filter descriptor (and the weight gradient's).
+    w: *mut c_void,
+    /// The output's tensor descriptor (and the output gradient's).
+    y: *mut c_void,
+    /// The bias's tensor descriptor, 1 × out channels × 1 × 1.
+    bias: *mut c_void,
+    /// The convolution's descriptor.
+    conv: *mut c_void,
 }
 
-impl Drop for Descriptor<'_> {
+impl Drop for Descriptors<'_> {
     fn drop(&mut self) {
-        // SAFETY: the descriptor came from the matching create function and is destroyed
-        // once.
-        unsafe { (self.destroy)(self.raw) };
+        let api = &self.cuda.cudnn;
+        let all = [
+            (self.x, api.cudnnDestroyTensorDescriptor),
+            (self.y, api.cudnnDestroyTensorDescriptor),
+            (self.bias, api.cudnnDestroyTensorDescriptor),
+            (self.w, api.cudnnDestroyFilterDescriptor),
+            (self.conv, api.cudnnDestroyConvolutionDescriptor),
+        ];
+        if all.iter().all(|(raw, _)| raw.is_null()) {
+            return;
+        }
+        let _bound = self.cuda.bind_anyway();
+        for (raw, destroy) in all {
+            if !raw.is_null() {
+                // SAFETY: the descriptor came from the matching create function and is
+                // destroyed once, with the lock held.
+                unsafe { destroy(raw) };
+            }
+        }
     }
 }
 
-impl<'c> Descriptor<'c> {
-    /// Creates a descriptor with `create`, to be destroyed with `destroy`.
-    fn new(
-        cuda: &'c Cuda,
+impl<'c> Descriptors<'c> {
+    /// None created yet.
+    fn new(cuda: &'c Cuda) -> Descriptors<'c> {
+        let null = std::ptr::null_mut();
+        Descriptors {
+            cuda,
+            x: null,
+            w: null,
+            y: null,
+            bias: null,
+            conv: null,
+        }
+    }
+
+    /// Creates a descriptor with `create`, with the lock held.
+    fn create(
+        &self,
+        _bound: &Bound<'_>,
         what: &'static str,
         create: unsafe extern "system" fn(*mut *mut c_void) -> c_int,
-        destroy: unsafe extern "system" fn(*mut c_void) -> c_int,
-    ) -> Result<Descriptor<'c>, CudaError> {
+    ) -> Result<*mut c_void, CudaError> {
         let mut raw = std::ptr::null_mut();
-        // SAFETY: the pointer is to a live descriptor handle, written once.
+        // SAFETY: the pointer is to a live descriptor handle, written once; the lock is
+        // held.
         let status = unsafe { create(&mut raw) };
-        if status != 0 {
-            return Err(cuda.cudnn_error(what, status));
-        }
-        Ok(Descriptor { cuda, raw, destroy })
+        self.check(what, status)?;
+        Ok(raw)
     }
 
-    /// A 4-D float NCHW tensor descriptor.
-    fn tensor(cuda: &'c Cuda, dims: [c_int; 4]) -> Result<Descriptor<'c>, CudaError> {
-        let api = &cuda.cudnn;
-        let desc = Descriptor::new(
-            cuda,
+    /// Creates a 4-D float NCHW tensor descriptor, with the lock held. The caller stores
+    /// it in its field before setting it, so that it is destroyed if setting fails.
+    fn tensor(&self, bound: &Bound<'_>) -> Result<*mut c_void, CudaError> {
+        self.create(
+            bound,
             "cudnnCreateTensorDescriptor",
-            api.cudnnCreateTensorDescriptor,
-            api.cudnnDestroyTensorDescriptor,
-        )?;
+            self.cuda.cudnn.cudnnCreateTensorDescriptor,
+        )
+    }
+
+    /// Sets the tensor descriptor `raw`, one of these, to `dims`, with the lock held.
+    fn set_tensor(
+        &self,
+        _bound: &Bound<'_>,
+        raw: *mut c_void,
+        dims: [c_int; 4],
+    ) -> Result<(), CudaError> {
         let [n, c, h, w] = dims;
-        // SAFETY: the descriptor is live, and the layout and type are cuDNN's constants.
+        // SAFETY: the descriptor is live, the layout and type are cuDNN's constants, and the
+        // lock is held.
         let status = unsafe {
-            (api.cudnnSetTensor4dDescriptor)(desc.raw, CUDNN_NCHW, CUDNN_FLOAT, n, c, h, w)
+            (self.cuda.cudnn.cudnnSetTensor4dDescriptor)(raw, CUDNN_NCHW, CUDNN_FLOAT, n, c, h, w)
         };
-        desc.check("cudnnSetTensor4dDescriptor", status)?;
-        Ok(desc)
+        self.check("cudnnSetTensor4dDescriptor", status)
     }
 
     /// `Ok` for a cuDNN status of 0.
@@ -294,16 +339,8 @@ pub struct Conv2d<'c> {
     cuda: &'c Cuda,
     /// Its shape.
     shape: ConvShape,
-    /// The input's descriptor (and the input gradient's).
-    x: Descriptor<'c>,
-    /// The weight's descriptor (and the weight gradient's).
-    w: Descriptor<'c>,
-    /// The output's descriptor (and the output gradient's).
-    y: Descriptor<'c>,
-    /// The bias's descriptor, 1 × out channels × 1 × 1.
-    bias: Descriptor<'c>,
-    /// The convolution's descriptor.
-    conv: Descriptor<'c>,
+    /// Its cuDNN descriptors.
+    d: Descriptors<'c>,
     /// The forward algorithm's number.
     forward_algo: c_int,
     /// The input-gradient algorithm's number.
@@ -406,69 +443,72 @@ impl<'c> Conv2d<'c> {
         if lens.iter().any(|&n| c_int::try_from(n).is_err()) {
             return Err(invalid("a tensor has too many elements for cuDNN"));
         }
-        cuda.bind()?;
-        let api = &cuda.cudnn;
-
+        let (oh, ow) = (int(oh)?, int(ow)?);
+        let (kh, kw) = (int(shape.kernel.0)?, int(shape.kernel.1)?);
         let (n, cin, cout) = (
             int(shape.batch)?,
             int(shape.in_channels)?,
             int(shape.out_channels)?,
         );
-        let x = Descriptor::tensor(cuda, [n, cin, int(shape.input.0)?, int(shape.input.1)?])?;
-        let y = Descriptor::tensor(cuda, [n, cout, int(oh)?, int(ow)?])?;
-        let bias = Descriptor::tensor(cuda, [1, cout, 1, 1])?;
-        let w = Descriptor::new(
-            cuda,
+        let (ih, iw) = (int(shape.input.0)?, int(shape.input.1)?);
+        let padding = (int(shape.padding.0)?, int(shape.padding.1)?);
+        let stride = (int(shape.stride.0)?, int(shape.stride.1)?);
+        let dilation = (int(shape.dilation.0)?, int(shape.dilation.1)?);
+
+        // Declared before the guard, so that on an early return the lock is given back
+        // before they are destroyed, which takes it again.
+        let mut d = Descriptors::new(cuda);
+        let bound = cuda.bind()?;
+        let api = &cuda.cudnn;
+        d.x = d.tensor(&bound)?;
+        d.set_tensor(&bound, d.x, [n, cin, ih, iw])?;
+        d.y = d.tensor(&bound)?;
+        d.set_tensor(&bound, d.y, [n, cout, oh, ow])?;
+        d.bias = d.tensor(&bound)?;
+        d.set_tensor(&bound, d.bias, [1, cout, 1, 1])?;
+        d.w = d.create(
+            &bound,
             "cudnnCreateFilterDescriptor",
             api.cudnnCreateFilterDescriptor,
-            api.cudnnDestroyFilterDescriptor,
         )?;
-        // SAFETY: the descriptor is live; the type and layout are cuDNN's constants.
+        // SAFETY: the descriptor is live; the type and layout are cuDNN's constants; the
+        // lock is held, as for every cuDNN call below.
         let status = unsafe {
-            (api.cudnnSetFilter4dDescriptor)(
-                w.raw,
-                CUDNN_FLOAT,
-                CUDNN_NCHW,
-                cout,
-                cin,
-                int(shape.kernel.0)?,
-                int(shape.kernel.1)?,
-            )
+            (api.cudnnSetFilter4dDescriptor)(d.w, CUDNN_FLOAT, CUDNN_NCHW, cout, cin, kh, kw)
         };
-        w.check("cudnnSetFilter4dDescriptor", status)?;
-        let conv = Descriptor::new(
-            cuda,
+        d.check("cudnnSetFilter4dDescriptor", status)?;
+        d.conv = d.create(
+            &bound,
             "cudnnCreateConvolutionDescriptor",
             api.cudnnCreateConvolutionDescriptor,
-            api.cudnnDestroyConvolutionDescriptor,
         )?;
         // SAFETY: the descriptor is live; the mode and type are cuDNN's constants.
         let status = unsafe {
             (api.cudnnSetConvolution2dDescriptor)(
-                conv.raw,
-                int(shape.padding.0)?,
-                int(shape.padding.1)?,
-                int(shape.stride.0)?,
-                int(shape.stride.1)?,
-                int(shape.dilation.0)?,
-                int(shape.dilation.1)?,
+                d.conv,
+                padding.0,
+                padding.1,
+                stride.0,
+                stride.1,
+                dilation.0,
+                dilation.1,
                 CUDNN_CROSS_CORRELATION,
                 CUDNN_FLOAT,
             )
         };
-        conv.check("cudnnSetConvolution2dDescriptor", status)?;
+        d.check("cudnnSetConvolution2dDescriptor", status)?;
         // SAFETY: the descriptor is live, and the math type is cuDNN's constant.
-        let status = unsafe { (api.cudnnSetConvolutionMathType)(conv.raw, CUDNN_FMA_MATH) };
-        conv.check("cudnnSetConvolutionMathType", status)?;
+        let status = unsafe { (api.cudnnSetConvolutionMathType)(d.conv, CUDNN_FMA_MATH) };
+        d.check("cudnnSetConvolutionMathType", status)?;
 
         let mut dims: [c_int; 4] = [0; 4];
         let [dn, dc, dh, dw] = &mut dims;
         // SAFETY: the descriptors are live, and each pointer is to a live `c_int`.
         let status = unsafe {
-            (api.cudnnGetConvolution2dForwardOutputDim)(conv.raw, x.raw, w.raw, dn, dc, dh, dw)
+            (api.cudnnGetConvolution2dForwardOutputDim)(d.conv, d.x, d.w, dn, dc, dh, dw)
         };
-        conv.check("cudnnGetConvolution2dForwardOutputDim", status)?;
-        if dims != [n, cout, int(oh)?, int(ow)?] {
+        d.check("cudnnGetConvolution2dForwardOutputDim", status)?;
+        if dims != [n, cout, oh, ow] {
             return Err(invalid(&format!(
                 "cuDNN's output is {dims:?}, not [{n}, {cout}, {oh}, {ow}]"
             )));
@@ -481,7 +521,7 @@ impl<'c> Conv2d<'c> {
         let mut returned: c_int = 0;
         let count = ranked.len() as c_int;
         let rank = |status: c_int, what, returned: c_int, ranked: &[AlgoPerf]| {
-            conv.check(what, status)?;
+            d.check(what, status)?;
             Ok::<_, CudaError>(
                 ranked[..usize::try_from(returned).unwrap_or(0).min(ranked.len())].to_vec(),
             )
@@ -491,10 +531,10 @@ impl<'c> Conv2d<'c> {
         let status = unsafe {
             (api.cudnnGetConvolutionForwardAlgorithm_v7)(
                 handle,
-                x.raw,
-                w.raw,
-                conv.raw,
-                y.raw,
+                d.x,
+                d.w,
+                d.conv,
+                d.y,
                 count,
                 &mut returned,
                 ranked.as_mut_ptr(),
@@ -511,10 +551,10 @@ impl<'c> Conv2d<'c> {
             // SAFETY: as above, with a pointer to a live `usize`.
             let status = unsafe {
                 (api.cudnnGetConvolutionForwardWorkspaceSize)(
-                    handle, x.raw, w.raw, conv.raw, y.raw, algo, &mut bytes,
+                    handle, d.x, d.w, d.conv, d.y, algo, &mut bytes,
                 )
             };
-            conv.check("cudnnGetConvolutionForwardWorkspaceSize", status)?;
+            d.check("cudnnGetConvolutionForwardWorkspaceSize", status)?;
             Ok(bytes)
         })?;
 
@@ -522,10 +562,10 @@ impl<'c> Conv2d<'c> {
         let status = unsafe {
             (api.cudnnGetConvolutionBackwardDataAlgorithm_v7)(
                 handle,
-                w.raw,
-                y.raw,
-                conv.raw,
-                x.raw,
+                d.w,
+                d.y,
+                d.conv,
+                d.x,
                 count,
                 &mut returned,
                 ranked.as_mut_ptr(),
@@ -542,10 +582,10 @@ impl<'c> Conv2d<'c> {
             // SAFETY: as above, with a pointer to a live `usize`.
             let status = unsafe {
                 (api.cudnnGetConvolutionBackwardDataWorkspaceSize)(
-                    handle, w.raw, y.raw, conv.raw, x.raw, algo, &mut bytes,
+                    handle, d.w, d.y, d.conv, d.x, algo, &mut bytes,
                 )
             };
-            conv.check("cudnnGetConvolutionBackwardDataWorkspaceSize", status)?;
+            d.check("cudnnGetConvolutionBackwardDataWorkspaceSize", status)?;
             Ok(bytes)
         })?;
 
@@ -553,10 +593,10 @@ impl<'c> Conv2d<'c> {
         let status = unsafe {
             (api.cudnnGetConvolutionBackwardFilterAlgorithm_v7)(
                 handle,
-                x.raw,
-                y.raw,
-                conv.raw,
-                w.raw,
+                d.x,
+                d.y,
+                d.conv,
+                d.w,
                 count,
                 &mut returned,
                 ranked.as_mut_ptr(),
@@ -573,22 +613,20 @@ impl<'c> Conv2d<'c> {
             // SAFETY: as above, with a pointer to a live `usize`.
             let status = unsafe {
                 (api.cudnnGetConvolutionBackwardFilterWorkspaceSize)(
-                    handle, x.raw, y.raw, conv.raw, w.raw, algo, &mut bytes,
+                    handle, d.x, d.y, d.conv, d.w, algo, &mut bytes,
                 )
             };
-            conv.check("cudnnGetConvolutionBackwardFilterWorkspaceSize", status)?;
+            d.check("cudnnGetConvolutionBackwardFilterWorkspaceSize", status)?;
             Ok(bytes)
         })?;
+        // Given back before the allocation, which takes the lock itself.
+        drop(bound);
 
         let workspace = cuda.buffer(forward.2.max(input_grad.2).max(weight_grad.2))?;
         Ok(Conv2d {
             cuda,
             shape,
-            x,
-            w,
-            y,
-            bias,
-            conv,
+            d,
             forward_algo: forward.0,
             input_grad_algo: input_grad.0,
             weight_grad_algo: weight_grad.0,
@@ -623,7 +661,7 @@ impl<'c> Conv2d<'c> {
 
     /// `Ok` for a cuDNN status of 0.
     fn check(&self, what: &'static str, status: c_int) -> Result<(), CudaError> {
-        self.conv.check(what, status)
+        self.d.check(what, status)
     }
 
     /// `y = conv(x, w)`, plus `bias` per output channel when given: `x` NCHW, `w` OIHW,
@@ -650,7 +688,7 @@ impl<'c> Conv2d<'c> {
         if let Some(b) = bias {
             Self::fits(b, s.out_channels as usize, "bias");
         }
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         let api = &self.cuda.cudnn;
         // SAFETY: the handle and descriptors are live, every buffer holds its tensor
         // (checked above), the scratch buffer holds the algorithm's bytes, and the output,
@@ -659,16 +697,16 @@ impl<'c> Conv2d<'c> {
             (api.cudnnConvolutionForward)(
                 self.cuda.cudnn_handle,
                 factor(&ONE),
-                self.x.raw,
+                self.d.x,
                 x.pointer,
-                self.w.raw,
+                self.d.w,
                 w.pointer,
-                self.conv.raw,
+                self.d.conv,
                 self.forward_algo,
                 self.workspace.pointer,
                 self.algorithms.forward.1,
                 factor(&ZERO),
-                self.y.raw,
+                self.d.y,
                 y.pointer,
             )
         };
@@ -680,10 +718,10 @@ impl<'c> Conv2d<'c> {
                 (api.cudnnAddTensor)(
                     self.cuda.cudnn_handle,
                     factor(&ONE),
-                    self.bias.raw,
+                    self.d.bias,
                     b.pointer,
                     factor(&ONE),
-                    self.y.raw,
+                    self.d.y,
                     y.pointer,
                 )
             };
@@ -712,22 +750,22 @@ impl<'c> Conv2d<'c> {
         Self::fits(w, s.w_len(), "weight");
         Self::fits(dy, s.y_len(), "output gradient");
         Self::fits(dx, s.x_len(), "input gradient");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         // SAFETY: as in `forward`, for the input-gradient algorithm.
         let status = unsafe {
             (self.cuda.cudnn.cudnnConvolutionBackwardData)(
                 self.cuda.cudnn_handle,
                 factor(&ONE),
-                self.w.raw,
+                self.d.w,
                 w.pointer,
-                self.y.raw,
+                self.d.y,
                 dy.pointer,
-                self.conv.raw,
+                self.d.conv,
                 self.input_grad_algo,
                 self.workspace.pointer,
                 self.algorithms.input_grad.1,
                 factor(&ZERO),
-                self.x.raw,
+                self.d.x,
                 dx.pointer,
             )
         };
@@ -754,22 +792,22 @@ impl<'c> Conv2d<'c> {
         Self::fits(x, s.x_len(), "input");
         Self::fits(dy, s.y_len(), "output gradient");
         Self::fits(dw, s.w_len(), "weight gradient");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         // SAFETY: as in `forward`, for the weight-gradient algorithm.
         let status = unsafe {
             (self.cuda.cudnn.cudnnConvolutionBackwardFilter)(
                 self.cuda.cudnn_handle,
                 factor(&ONE),
-                self.x.raw,
+                self.d.x,
                 x.pointer,
-                self.y.raw,
+                self.d.y,
                 dy.pointer,
-                self.conv.raw,
+                self.d.conv,
                 self.weight_grad_algo,
                 self.workspace.pointer,
                 self.algorithms.weight_grad.1,
                 factor(&ZERO),
-                self.w.raw,
+                self.d.w,
                 dw.pointer,
             )
         };
@@ -794,17 +832,17 @@ impl<'c> Conv2d<'c> {
         let s = &self.shape;
         Self::fits(dy, s.y_len(), "output gradient");
         Self::fits(db, s.out_channels as usize, "bias gradient");
-        self.cuda.bind()?;
+        let _bound = self.cuda.bind()?;
         // SAFETY: the handle and descriptors are live, both buffers hold their tensors
         // (checked above), and with beta 0 the gradient is not read.
         let status = unsafe {
             (self.cuda.cudnn.cudnnConvolutionBackwardBias)(
                 self.cuda.cudnn_handle,
                 factor(&ONE),
-                self.y.raw,
+                self.d.y,
                 dy.pointer,
                 factor(&ZERO),
-                self.bias.raw,
+                self.d.bias,
                 db.pointer,
             )
         };
