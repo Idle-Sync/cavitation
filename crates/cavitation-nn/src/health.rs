@@ -1143,7 +1143,7 @@ impl<'s> HealthMonitor<'s> {
     }
 
     /// The checks this monitor runs: its [`Health`].
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub(crate) fn health(&self) -> &Health<'s> {
         &self.health
     }

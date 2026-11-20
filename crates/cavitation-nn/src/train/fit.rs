@@ -1808,22 +1808,28 @@ pub struct History {
     /// The kind of device the run trained on: what [`Device::Auto`] picked for it, or the
     /// kind [`FitConfig::device`] named. A default `History`, from no run, says the CPU.
     pub device: DeviceKind,
-    /// Under [`Device::Auto`], when a GPU opened and the run trained on the CPU because that
-    /// GPU could not train it: the reason, as `Device::Gpu` would have returned it. `None`
-    /// for every other run, a run kept on the CPU by a hook or a [`StepControl`] included.
+    /// Under [`Device::Auto`], when a device opened and the run trained on one after it in
+    /// [`devices`](crate::devices)' order because that device could not train it: the reason,
+    /// as `Device::Cuda` or `Device::Gpu` would have returned it (CUDA's, when both were
+    /// left). `None` for every other run, a run kept on the CPU by a hook or a
+    /// [`StepControl`] included.
     pub device_note: Option<String>,
 }
 
 /// Where [`fit`] trains: [`FitConfig::device`]. The CPU is the default; the `gpu` feature
-/// adds `Device::Gpu(&gpu)`, a GPU opened with `cavitation_gpu::Gpu`; and `Device::Auto`
-/// lets the run pick, as [`fit`] describes under "The device picked by `Device::Auto`".
-/// [`devices`](crate::devices) lists what this machine offers.
+/// adds `Device::Gpu(&gpu)`, a GPU opened with `cavitation_gpu::Gpu`; the `cuda` feature adds
+/// `Device::Cuda(&cuda)`, an NVIDIA card opened with `cavitation_cuda::Cuda`; and
+/// `Device::Auto` lets the run pick, as [`fit`] describes under "The device picked by
+/// `Device::Auto`". [`devices`](crate::devices) lists what this machine offers.
 ///
-/// The type and the field are there with or without the feature, so a `FitConfig` written
+/// The type and the field are there with or without the features, so a `FitConfig` written
 /// with every field named builds the same either way. The enum is `#[non_exhaustive]`: a
-/// `match` on it needs a `_` arm, and so compiles with and without the `Gpu` variant.
-/// Without the feature a hidden variant that can never be built holds the lifetime `'g`,
-/// which only `Gpu` uses.
+/// `match` on it needs a `_` arm, and so compiles with and without the `Gpu` and `Cuda`
+/// variants. Without the `gpu` feature a hidden variant that can never be built holds the
+/// lifetime `'g`, which only `Gpu` and `Cuda` use.
+///
+/// A `Cuda` handle stays on the thread that opened it, so with the `cuda` feature a `Device`,
+/// and the `FitConfig` that holds one, is not `Send`.
 ///
 /// # Examples
 ///
@@ -1854,9 +1860,12 @@ pub struct History {
 ///     ..FitConfig::default()
 /// };
 /// match fit(&net, &mut params, &data, config) {
-///     Ok(history) => assert!(matches!(history.device, DeviceKind::Cpu | DeviceKind::Gpu)),
-///     // `CAVITATION_DEVICE` asks for a GPU this machine or build does not have, or holds
-///     // something other than `auto`, `cpu` or `gpu`.
+///     Ok(history) => assert!(matches!(
+///         history.device,
+///         DeviceKind::Cpu | DeviceKind::Gpu | DeviceKind::Cuda
+///     )),
+///     // `CAVITATION_DEVICE` asks for a device this machine or build does not have, or holds
+///     // something other than `auto`, `cuda`, `gpu` or `cpu`.
 ///     Err(e) => assert!(e.to_string().contains("CAVITATION_DEVICE"), "{e}"),
 /// }
 /// ```
@@ -1890,19 +1899,54 @@ pub struct History {
 ///     assert!(history.epochs[99].mean_loss < history.epochs[0].mean_loss);
 /// }
 /// ```
+///
+/// On an NVIDIA card through CUDA (with the `cuda` feature):
+///
+#[cfg_attr(feature = "cuda", doc = "```")]
+#[cfg_attr(not(feature = "cuda"), doc = "```ignore")]
+/// use cavitation_core::{ParamStore, Rng, Tensor};
+/// use cavitation_cuda::Cuda;
+/// use cavitation_nn::{
+///     Dataset, Device, DeviceKind, FitConfig, Linear, Loss, OptimizerConfig, Sequential,
+///     Targets, fit,
+/// };
+///
+/// let data = Dataset {
+///     x: Tensor::from_vec(vec![0.0f32, 1.0, 2.0, 3.0], &[4, 1]).unwrap(),
+///     targets: Targets::Values(Tensor::from_vec(vec![1.0f32, 3.0, 5.0, 7.0], &[4, 1]).unwrap()),
+/// };
+/// let mut params = ParamStore::new();
+/// let net = Sequential::new().push(Linear::new(&mut params, 1, 1, &mut Rng::seed(0)));
+/// if let Some(cuda) = Cuda::new() {
+///     let config = FitConfig {
+///         epochs: 100,
+///         batch: 2,
+///         optimizer: OptimizerConfig::Sgd { lr: 0.05, momentum: 0.0, weight_decay: 0.0 },
+///         loss: Loss::Mse,
+///         device: Device::Cuda(&cuda),
+///         ..FitConfig::default()
+///     };
+///     let history = fit(&net, &mut params, &data, config).unwrap();
+///     assert_eq!(history.device, DeviceKind::Cuda);
+///     assert!(history.epochs[99].mean_loss < history.epochs[0].mean_loss);
+/// }
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 #[non_exhaustive]
 pub enum Device<'g> {
     /// The CPU, through [`Trainer`]: the default.
     #[default]
     Cpu,
-    /// The best device that can train the run: a GPU when this build and machine have one
-    /// and it can train the model, the CPU otherwise, after `CAVITATION_DEVICE`.
-    /// [`History::device`] says which it was.
+    /// The best device that can train the run: CUDA, then a GPU through wgpu, when this
+    /// build and machine have them and they can train the model, the CPU otherwise, after
+    /// `CAVITATION_DEVICE`. [`History::device`] says which it was.
     Auto,
     /// This GPU, through `GpuTrainer`, as [`fit`] describes under "On the GPU".
     #[cfg(feature = "gpu")]
     Gpu(&'g cavitation_gpu::Gpu),
+    /// This NVIDIA card, through `CudaTrainer`, as [`fit`] describes under "On CUDA".
+    #[cfg(feature = "cuda")]
+    Cuda(&'g cavitation_cuda::Cuda),
     /// Never built: it holds the lifetime a build without the `gpu` feature has no other
     /// use for.
     #[cfg(not(feature = "gpu"))]
@@ -1967,8 +2011,9 @@ pub struct FitConfig<'s> {
     /// sees the epoch the rule stops on. Copying the best parameters allocates once, at
     /// the first best epoch; later copies reuse that memory.
     pub early_stopping: Option<EarlyStopping>,
-    /// Where the run trains: on the CPU (the default), on a GPU, as [`fit`] describes
-    /// under "On the GPU", or on whichever of the two [`Device::Auto`] picks. On a GPU the
+    /// Where the run trains: on the CPU (the default), on a GPU or through CUDA, as [`fit`]
+    /// describes under "On the GPU" and "On CUDA", or on whichever [`Device::Auto`] picks.
+    /// On a GPU or through CUDA the
     /// parameters stay there and are copied back into the
     /// `ParamStore` only when the host reads them: before each `on_epoch` call, before an
     /// error met during training is returned, at the end, and for `early_stopping` only
@@ -2242,31 +2287,45 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// never applied, so under [`OnNonFinite::Stop`](crate::OnNonFinite) the returned parameters
 /// are those before that step.
 ///
+/// # On CUDA
+///
+/// With the `cuda` feature, `config.device` set to `Device::Cuda` trains the same run on that
+/// NVIDIA card through a `CudaTrainer`, as "On the GPU" describes for `Device::Gpu`: the same
+/// batches, learning rates, dropout masks, health checks, short last batch, validation,
+/// copies back, refusals and the same difference from the CPU. The convolution runs through
+/// cuDNN and `Linear` through cuBLAS, which publish no error bounds, so the values agree with
+/// the CPU's within measured tolerances, not bit for bit; cuDNN's algorithms are
+/// deterministic, so a run repeats.
+///
 /// # The device picked by `Device::Auto`
 ///
-/// With `config.device` set to [`Device::Auto`], the run trains on a GPU when all of these
-/// hold, and on the CPU otherwise:
-/// - the build has the `gpu` feature, and a GPU opens on one of the platform's backends
-///   (the one `cavitation_gpu::Gpu::open` picks);
-/// - no hook is registered and there is no [`StepControl`], which run on the CPU only;
-/// - a `GpuTrainer` can be built for the run: every layer, the loss, the optimiser and
-///   `config.health` are ones the GPU trains, and the validation set suits it.
+/// With `config.device` set to [`Device::Auto`], the run trains on the first of these that
+/// can train it, in [`devices`](crate::devices)' order, and on the CPU otherwise:
+/// - CUDA, when the build has the `cuda` feature, CUDA opens (`cavitation_cuda::Cuda::open`)
+///   and a `CudaTrainer` can be built for the run;
+/// - a GPU, when the build has the `gpu` feature, a GPU opens on one of the platform's
+///   backends (the one `cavitation_gpu::Gpu::open` picks) and a `GpuTrainer` can be built
+///   for the run.
 ///
-/// [`History::device`] says which device trained, and [`History::device_note`] why a GPU
-/// that opened was left for the CPU. The health settings are looked at before the trainer is
-/// built, which compiles the model's shaders; any other reason is found by building it. Each
-/// such run opens the GPU anew, so a program that calls `fit` many times opens it once
-/// itself and passes `Device::Gpu`. The two give the same run within the GPU
-/// kernels' error bounds, not bit for bit, so a run that must give the same bits on every
-/// machine names its device. The pick does not weigh the model's size: on a small network,
-/// where a step's upload, submit and readback weigh as much as its arithmetic, the GPU may
-/// gain nothing over the CPU.
+/// A trainer can be built when every layer, the loss, the optimiser and `config.health` are
+/// ones the engine trains and the validation set suits it. Neither is tried when a hook is
+/// registered or there is a [`StepControl`], which run on the CPU only.
+///
+/// [`History::device`] says which device trained, and [`History::device_note`] why a device
+/// that opened was left. The health settings are looked at before a trainer is built, which
+/// compiles the model's kernels; any other reason is found by building it. Each such run
+/// opens CUDA or the GPU anew, so a program that calls `fit` many times opens it once itself
+/// and passes `Device::Cuda` or `Device::Gpu`. Each gives the same run as the device it
+/// names, within its kernels' bounds of the CPU's, not bit for bit, so a run that must give
+/// the same bits on every machine names its device. The pick does not weigh the model's
+/// size: on a small network, where a step's upload, launches and readback weigh as much as
+/// its arithmetic, a GPU may gain nothing over the CPU.
 ///
 /// The environment variable `CAVITATION_DEVICE` restricts the pick, for `Device::Auto` only:
-/// `cpu` trains on the CPU; `gpu` trains on the GPU and returns [`Error::Unsupported`] where
-/// `Device::Gpu` would (and when no GPU opens, or the build has no `gpu` feature), with no
-/// fall-back to the CPU; `auto`, or leaving it unset, is the rule above. Any other value is
-/// [`Error::InvalidData`].
+/// `cpu` trains on the CPU; `cuda` or `gpu` trains on that device and returns
+/// [`Error::Unsupported`] where `Device::Cuda` or `Device::Gpu` would (and when it does not
+/// open, or the build lacks its feature), with no fall-back; `auto`, or leaving it unset, is
+/// the rule above. Any other value is [`Error::InvalidData`].
 ///
 /// # Panics
 ///
@@ -2311,8 +2370,8 @@ pub fn fit(
 /// # Errors
 ///
 /// Returns the same errors as [`fit`], and [`Error::Unsupported`] if a hook is registered
-/// and `config.device` is a GPU: a GPU step keeps its values on the GPU, where no hook can
-/// read them.
+/// and `config.device` is a GPU or CUDA: such a step keeps its values on the card, where no
+/// hook can read them.
 ///
 /// # Panics
 ///
@@ -2377,7 +2436,7 @@ pub fn fit_with_hooks(
 ///
 /// Returns the same errors as [`fit`]. A step that meets a health-check error ends the run
 /// with that error before the control sees it. Returns [`Error::Unsupported`] if
-/// `config.device` is a GPU: a control runs on the CPU only.
+/// `config.device` is a GPU or CUDA: a control runs on the CPU only.
 ///
 /// # Panics
 ///
@@ -2480,12 +2539,17 @@ fn run_fit_as(
     hooks: &mut Hooks<'_>,
     choice: Choice,
 ) -> Result<History, Error> {
-    // What `Device::Auto` picks: with `Choice::Best`, a GPU if one opens and the run has no
-    // hook and no control, and then the CPU takes over what that GPU cannot train
-    // (`fall_back`); with a kind asked for, that kind only.
+    // What `Device::Auto` picks: with `Choice::Best`, CUDA if it opens and then a GPU if
+    // one opens, when the run has no hook and no control, each taking over what the one
+    // before it cannot train and the CPU last (`fall_back`); with a kind asked for, that
+    // kind only.
     let auto = matches!(config.device, Device::Auto);
-    // Why a GPU that opened was left for the CPU.
-    #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+    #[cfg_attr(not(any(feature = "gpu", feature = "cuda")), allow(unused_variables))]
+    let cpu_only = matches!(run, Run::Controlled(..)) || !hooks.is_empty();
+    #[cfg_attr(not(any(feature = "gpu", feature = "cuda")), allow(unused_variables))]
+    let fall_back = auto && choice == Choice::Best;
+    // Why a device that opened was left for one after it.
+    #[cfg_attr(not(any(feature = "gpu", feature = "cuda")), allow(unused_mut))]
     let mut device_note: Option<String> = None;
     #[cfg(not(feature = "gpu"))]
     if auto && choice == Choice::Only(DeviceKind::Gpu) {
@@ -2494,10 +2558,35 @@ fn run_fit_as(
                 .to_string(),
         ));
     }
+    #[cfg(not(feature = "cuda"))]
+    if auto && choice == Choice::Only(DeviceKind::Cuda) {
+        return Err(Error::Unsupported(
+            "CAVITATION_DEVICE=cuda: this build has no CUDA support: build with the `cuda` \
+             feature"
+                .to_string(),
+        ));
+    }
+    #[cfg(feature = "cuda")]
+    let opened_cuda = {
+        use cavitation_cuda::Cuda;
+        match choice {
+            Choice::Only(DeviceKind::Cuda) if auto => {
+                let cuda = Cuda::open()
+                    .map_err(|e| Error::Unsupported(format!("CAVITATION_DEVICE=cuda: {e}")))?;
+                Some(cuda)
+            }
+            Choice::Best if auto && !cpu_only => Cuda::open().ok(),
+            _ => None,
+        }
+    };
+    #[cfg(feature = "cuda")]
+    let cuda = match config.device {
+        Device::Cuda(cuda) => Some(cuda),
+        _ => opened_cuda.as_ref(),
+    };
     #[cfg(feature = "gpu")]
     let opened = {
         use cavitation_gpu::{Backend, Gpu};
-        let cpu_only = matches!(run, Run::Controlled(..)) || !hooks.is_empty();
         match choice {
             Choice::Only(DeviceKind::Gpu) if auto => {
                 let gpu = Gpu::open(Backend::on_this_platform())
@@ -2513,23 +2602,34 @@ fn run_fit_as(
         Device::Gpu(gpu) => Some(gpu),
         _ => opened.as_ref(),
     };
-    #[cfg(feature = "gpu")]
-    let fall_back = auto && choice == Choice::Best;
-    #[cfg(feature = "gpu")]
-    if gpu.is_some() {
-        if matches!(run, Run::Controlled(..)) {
-            return Err(Error::Unsupported(
-                "fit_controlled: a control between steps runs on the CPU only; use fit with \
-                 Device::Gpu, or fit_controlled with Device::Cpu"
-                    .to_string(),
-            ));
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    {
+        #[cfg_attr(not(feature = "gpu"), allow(unused_mut))]
+        let mut card = false;
+        #[cfg(feature = "gpu")]
+        {
+            card |= gpu.is_some();
         }
-        if !hooks.is_empty() {
-            return Err(Error::Unsupported(
-                "fit_with_hooks: hooks run on the CPU only (a GPU step keeps its values on the \
-                 GPU); use fit with Device::Gpu, or fit_with_hooks with Device::Cpu"
-                    .to_string(),
-            ));
+        #[cfg(feature = "cuda")]
+        {
+            card |= cuda.is_some();
+        }
+        if card {
+            if matches!(run, Run::Controlled(..)) {
+                return Err(Error::Unsupported(
+                    "fit_controlled: a control between steps runs on the CPU only; use fit with \
+                     Device::Gpu or Device::Cuda, or fit_controlled with Device::Cpu"
+                        .to_string(),
+                ));
+            }
+            if !hooks.is_empty() {
+                return Err(Error::Unsupported(
+                    "fit_with_hooks: hooks run on the CPU only (a GPU step keeps its values on \
+                     the card); use fit with Device::Gpu or Device::Cuda, or fit_with_hooks \
+                     with Device::Cpu"
+                        .to_string(),
+                ));
+            }
         }
     }
     check_dataset(train)?;
@@ -2547,6 +2647,41 @@ fn run_fit_as(
     }
     let watched = check_watching(&config, validation_set.is_some())?;
     let mut watching = Watching::new(watched, config.early_stopping.take());
+    #[cfg(feature = "cuda")]
+    if let Some(cuda) = cuda {
+        // A run that can fall back looks at the health settings first: building the trainer
+        // compiles the model's kernels, which is wasted on a run those settings refuse.
+        let refused = match crate::cuda::CudaTrainer::check_health(&config.health) {
+            Err(e) if fall_back => Some(e),
+            _ => None,
+        };
+        let built = match refused {
+            Some(e) => Err(e),
+            None => crate::cuda::trainer_for(
+                run.model(),
+                params,
+                &config,
+                validation_set.as_ref(),
+                cuda,
+            ),
+        };
+        match built {
+            Ok(trainer) => {
+                return crate::cuda::fit_on_cuda(
+                    run.model(),
+                    params,
+                    train,
+                    config,
+                    validation_set,
+                    watching,
+                    trainer,
+                );
+            }
+            Err(e) if !fall_back => return Err(e),
+            // `Device::Auto`: the next device trains what CUDA cannot.
+            Err(e) => device_note = Some(e.to_string()),
+        }
+    }
     #[cfg(feature = "gpu")]
     if let Some(gpu) = gpu {
         // A run that can fall back looks at the health settings first: building the trainer
@@ -2563,7 +2698,7 @@ fn run_fit_as(
         };
         match built {
             Ok(trainer) => {
-                return crate::gpu::fit_on_gpu(
+                let mut history = crate::gpu::fit_on_gpu(
                     run.model(),
                     params,
                     train,
@@ -2571,11 +2706,17 @@ fn run_fit_as(
                     validation_set,
                     watching,
                     trainer,
-                );
+                )?;
+                // Why CUDA, which opened first, was left.
+                history.device_note = device_note;
+                return Ok(history);
             }
             Err(e) if !fall_back => return Err(e),
-            // `Device::Auto`: the CPU trains what this GPU cannot.
-            Err(e) => device_note = Some(e.to_string()),
+            // `Device::Auto`: the CPU trains what this GPU cannot; CUDA's reason, if CUDA
+            // was tried first, is kept.
+            Err(e) => {
+                device_note.get_or_insert(e.to_string());
+            }
         }
     }
     let mut trainer = Trainer::with_boxed(
@@ -4148,10 +4289,13 @@ mod tests {
         }
     }
 
-    /// A configuration, a trainer and their health checks can move to another thread.
+    /// A configuration, a trainer and their health checks can move to another thread; with
+    /// the `cuda` feature a configuration cannot, as `Device::Cuda` holds a `Cuda` handle,
+    /// which stays on its thread.
     const _: () = {
         /// Requires `T: Send`.
         const fn send<T: Send>() {}
+        #[cfg(not(feature = "cuda"))]
         send::<FitConfig<'static>>();
         send::<Trainer<'static>>();
         send::<Health<'static>>();
@@ -4161,8 +4305,10 @@ mod tests {
     /// thread, moved into `std::thread::spawn` with the data, model and parameters, and
     /// trains there: both callbacks ran on the worker, not on this thread (the epoch
     /// callback once per epoch, the sink on the steps, with a bound every gradient passes),
-    /// and the run gives the parameters of the same run on this thread, bit for bit.
+    /// and the run gives the parameters of the same run on this thread, bit for bit. With the
+    /// `cuda` feature a `FitConfig` is not `Send`, and the test is not built.
     #[test]
+    #[cfg(not(feature = "cuda"))]
     fn a_fit_config_moves_to_another_thread() {
         type Seen = Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>;
         let make = |epochs: Seen, warnings: Seen| FitConfig {
@@ -5511,9 +5657,10 @@ mod tests {
     }
 
     /// What `CAVITATION_DEVICE` asks restricts `Device::Auto`: `cpu` trains on the CPU, to the
-    /// bits of `Device::Cpu`; `gpu` without the `gpu` feature is `Unsupported` and names the
-    /// feature, and with it either trains on a GPU or, where none opens, is `Unsupported`
-    /// naming the variable. A run that names its device is not restricted.
+    /// bits of `Device::Cpu`; `gpu` (or `cuda`) without the `gpu` (or `cuda`) feature is
+    /// `Unsupported` and names the feature, and with it either trains on that device or,
+    /// where it does not open, is `Unsupported` naming the variable. A run that names its
+    /// device is not restricted.
     #[test]
     fn what_the_variable_asks_restricts_auto() {
         use DeviceKind::{Cpu, Gpu};
@@ -5550,6 +5697,20 @@ mod tests {
                     "CAVITATION_DEVICE=gpu: "
                 } else {
                     "build with the `gpu` feature"
+                };
+                assert!(why.contains(wanted), "{why}");
+            }
+            Err(other) => panic!("not Unsupported: {other}"),
+        }
+        match run(Device::Auto, Choice::Only(DeviceKind::Cuda)) {
+            Ok(cuda) => {
+                assert!(cfg!(feature = "cuda") && cuda.0 == DeviceKind::Cuda && cuda.1.is_none())
+            }
+            Err(Error::Unsupported(why)) => {
+                let wanted = if cfg!(feature = "cuda") {
+                    "CAVITATION_DEVICE=cuda: "
+                } else {
+                    "build with the `cuda` feature"
                 };
                 assert!(why.contains(wanted), "{why}");
             }

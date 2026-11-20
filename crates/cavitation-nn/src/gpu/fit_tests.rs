@@ -670,13 +670,16 @@ fn what_the_gpu_does_not_run_is_refused() {
 }
 
 /// The default device is the CPU, and a `FitConfig` that names a GPU still moves to another
-/// thread.
+/// thread (without the `cuda` feature, whose `Device::Cuda` keeps it on its thread).
 #[test]
 fn the_default_device_is_the_cpu() {
     assert!(matches!(FitConfig::default().device, Device::Cpu));
     assert!(matches!(Device::default(), Device::Cpu));
-    fn is_send<T: Send>(_: &T) {}
-    is_send(&FitConfig::default());
+    #[cfg(not(feature = "cuda"))]
+    {
+        fn is_send<T: Send>(_: &T) {}
+        is_send(&FitConfig::default());
+    }
     for_each_gpu(|gpu| {
         let config = FitConfig {
             device: Device::Gpu(gpu),
@@ -694,6 +697,17 @@ fn auto_is_unrestricted() -> bool {
         println!("CAVITATION_DEVICE is set: the Device::Auto tests check nothing");
     }
     unrestricted
+}
+
+/// Whether CUDA opens on a build with the `cuda` feature, where `Device::Auto` picks it
+/// before the wgpu GPU; says so when it does.
+fn cuda_picked_first() -> bool {
+    #[cfg(feature = "cuda")]
+    if cavitation_cuda::Cuda::open().is_ok() {
+        println!("CUDA opens: Device::Auto picks it before the wgpu GPU, so this checks nothing");
+        return true;
+    }
+    false
 }
 
 /// What a run left: the device it trained on, the parameters and each epoch's mean loss, by
@@ -720,7 +734,7 @@ fn cnn_run(device: Device<'_>, data: &Dataset) -> Outcome {
 fn auto_trains_on_the_gpu_it_opens() {
     use cavitation_gpu::{Backend, Gpu};
 
-    if !auto_is_unrestricted() {
+    if !auto_is_unrestricted() || cuda_picked_first() {
         return;
     }
     let data = classes(31, 22, 2 * 64, 5);
@@ -743,7 +757,7 @@ fn auto_trains_on_the_gpu_it_opens() {
 /// run trains, to the bits of `Device::Cpu`, and its history says the CPU.
 #[test]
 fn auto_leaves_to_the_cpu_what_the_gpu_does_not_run() {
-    if !auto_is_unrestricted() {
+    if !auto_is_unrestricted() || cuda_picked_first() {
         return;
     }
     let mut start = ParamStore::new();

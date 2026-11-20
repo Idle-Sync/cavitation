@@ -1140,7 +1140,7 @@ fn check_layers(model: &Sequential) -> Result<(), Error> {
 /// their outputs, `width` per row, to the (emptied) buffer it is given. The checks, the
 /// accuracy or R² and the loss (recorded on a tape from each batch's outputs, weighted by its
 /// rows) are the evaluator's.
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "gpu", feature = "cuda")), allow(dead_code))]
 pub(crate) fn measure(
     model: &Sequential,
     data: &Dataset,

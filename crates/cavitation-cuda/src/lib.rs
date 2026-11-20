@@ -67,7 +67,8 @@
 //!   tree, the step's finite flag the optimiser and the running statistics read, and the
 //!   dead-ReLU bits, the flag and the bits exact (`tests/health.rs`).
 //!
-//! Nothing in `cavitation-nn` trains through this crate yet.
+//! `cavitation-nn`'s `cuda` feature trains through this crate: its `CudaModel` and
+//! `CudaTrainer`, and `fit` with `Device::Cuda`.
 //!
 //! # What must be installed
 //!
