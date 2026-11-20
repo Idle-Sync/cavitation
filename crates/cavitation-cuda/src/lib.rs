@@ -51,6 +51,9 @@
 //! - [`Prelu`] and [`PreluOp`]: PReLU with one slope per column or one shared slope, as this
 //!   crate's own kernels: forward and the input's gradient the CPU's bits, and the slopes'
 //!   gradient in a fixed tree within a stated bound (`tests/prelu.rs`).
+//! - [`Glu`], [`GluGate`] and [`GluOp`]: gated linear units with a sigmoid, GELU, ReLU or
+//!   SiLU gate, forward and backward, as this crate's own kernels: the ReLU gate the CPU's
+//!   bits, the others within the WGSL kernels' stated bounds (`tests/glu.rs`).
 //!
 //! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
 //!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
@@ -122,6 +125,7 @@ mod dropout;
 mod elementwise;
 mod error;
 mod find;
+mod glu;
 mod health;
 mod library;
 mod linear;
@@ -141,6 +145,7 @@ pub use device::{Cuda, CudaInfo};
 pub use dropout::Dropout;
 pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
+pub use glu::{Glu, GluGate, GluOp};
 pub use health::{DeadRelu, FiniteFlag, SumSquares};
 pub use linear::{Linear, LinearShape};
 pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
