@@ -73,4 +73,6 @@ cargo run --release -p cavitation-bench -- cifar-cnn --seed 0 --cav-only    # Ca
 cargo run --release -p cavitation-bench -- cifar-cnn --profile 15            # time per layer, no training run
 ```
 
+Issue #361 keeps the latest ratio for each machine, device and network. After work on a device's speed, `scripts/bench/benchmark_issue.py --machine <letter> --python <python with torch> --devices <list>` reruns that device's two benchmarks and rewrites the issue; the script's header lists its options.
+
 The PyTorch side is `scripts/bench/torch_cnn.py`; `scripts/fixtures/requirements.txt` lists what its Python needs. Each run writes its results to `target/bench/cnn/<benchmark>-seed<N>/result.json`.
