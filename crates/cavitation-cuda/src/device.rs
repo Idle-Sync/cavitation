@@ -564,6 +564,11 @@ impl Cuda {
         (Bound { _lock: lock }, code)
     }
 
+    /// The card's ordinal handle.
+    pub(crate) fn device(&self) -> CuDevice {
+        self.device
+    }
+
     /// The compute architecture kernels are compiled for, as `10 * major + minor`: the
     /// card's, or the newest older one NVRTC knows.
     pub(crate) fn arch(&self) -> u32 {

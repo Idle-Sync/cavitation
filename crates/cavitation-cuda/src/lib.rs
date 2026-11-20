@@ -125,7 +125,7 @@ mod sys;
 
 pub use batch_norm::{BatchNorm2d, BatchStats, RunningUpdate};
 pub use buffer::{DeviceBuffer, Scalar};
-pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
+pub use conv::{Conv2d, ConvAlgorithms, ConvCandidates, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
 pub use dropout::Dropout;
 pub use elementwise::{Elementwise, ElementwiseOp};

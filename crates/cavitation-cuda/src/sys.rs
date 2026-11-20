@@ -287,6 +287,55 @@ api! {
             returned: *mut c_int,
             results: *mut AlgoPerf,
         ) -> c_int;
+        /// Runs every forward algorithm that fits `workspace_bytes` of scratch memory on the
+        /// given buffers and returns them fastest first, with their times.
+        fn cudnnFindConvolutionForwardAlgorithmEx(
+            handle: *mut c_void,
+            x_desc: *mut c_void,
+            x: DevicePtr,
+            w_desc: *mut c_void,
+            w: DevicePtr,
+            conv: *mut c_void,
+            y_desc: *mut c_void,
+            y: DevicePtr,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+        ) -> c_int;
+        /// The input-gradient algorithms timed on the given buffers, fastest first.
+        fn cudnnFindConvolutionBackwardDataAlgorithmEx(
+            handle: *mut c_void,
+            w_desc: *mut c_void,
+            w: DevicePtr,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            conv: *mut c_void,
+            dx_desc: *mut c_void,
+            dx: DevicePtr,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+        ) -> c_int;
+        /// The weight-gradient algorithms timed on the given buffers, fastest first.
+        fn cudnnFindConvolutionBackwardFilterAlgorithmEx(
+            handle: *mut c_void,
+            x_desc: *mut c_void,
+            x: DevicePtr,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            conv: *mut c_void,
+            dw_desc: *mut c_void,
+            dw: DevicePtr,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+        ) -> c_int;
         /// The scratch memory a forward algorithm needs.
         fn cudnnGetConvolutionForwardWorkspaceSize(
             handle: *mut c_void,
