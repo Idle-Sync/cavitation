@@ -154,9 +154,16 @@ api! {
         /// Sets `count` four-byte words of device memory to `value`, queued after the
         /// context's earlier work and returning without waiting for it.
         fn cuMemsetD32_v2(to: DevicePtr, value: c_uint, count: usize) -> c_int;
+        /// Copies host memory to device memory, after the context's earlier work; the host
+        /// waits for the copy.
+        fn cuMemcpyHtoD_v2(to: DevicePtr, from: *const c_void, bytes: usize) -> c_int;
+        /// Allocates page-locked host memory, which the card's copies read directly.
+        fn cuMemAllocHost_v2(pointer: *mut *mut c_void, bytes: usize) -> c_int;
+        /// Frees host memory from `cuMemAllocHost_v2`.
+        fn cuMemFreeHost(pointer: *mut c_void) -> c_int;
         /// Copies host memory to device memory, queued on `stream` after its earlier work.
-        /// From pageable host memory the data is copied to a staging buffer before it
-        /// returns, without waiting for the card.
+        /// From page-locked memory it returns without waiting, and the source must stay
+        /// allocated and unchanged until the copy is done.
         fn cuMemcpyHtoDAsync_v2(to: DevicePtr, from: *const c_void, bytes: usize, stream: CuStream) -> c_int;
         /// Copies device memory to host memory, after the context's earlier work.
         fn cuMemcpyDtoH_v2(to: *mut c_void, from: DevicePtr, bytes: usize) -> c_int;

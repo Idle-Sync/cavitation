@@ -76,7 +76,8 @@ fn placed(
             let at = starts[k] as u64;
             if at < start {
                 return Err(CudaError::Invalid(format!(
-                    "{what}: tensor {k} starts at {at}, inside the tensor before it, which                      ends at {start}"
+                    "{what}: tensor {k} starts at {at}, inside the tensor before it, which \
+                     ends at {start}"
                 )));
             }
             start = at;

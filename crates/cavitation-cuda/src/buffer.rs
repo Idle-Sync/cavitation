@@ -1,6 +1,7 @@
 //! Memory on the card: allocated, written from the host and read back.
 
 use std::ffi::c_void;
+use std::fmt;
 use std::sync::Arc;
 
 use crate::device::Cuda;
@@ -118,10 +119,9 @@ impl DeviceBuffer<'_> {
         self.bytes
     }
 
-    /// Copies `data` to the start of the buffer, after the work already given to the card.
-    /// The data is taken from `data` before the call returns, so `data` may change at once,
-    /// but the host does not wait for the card's earlier work: the copy is queued behind it,
-    /// before any work given later.
+    /// Copies `data` to the start of the buffer, after the work already given to the card:
+    /// the host waits for that work, then for the copy, so `data` may change or be freed as
+    /// soon as the call returns.
     ///
     /// # Errors
     ///
@@ -152,20 +152,12 @@ impl DeviceBuffer<'_> {
             return Ok(());
         }
         let _bound = self.cuda.bind()?;
-        // SAFETY: `data` is `bytes` readable bytes, and the buffer holds at least as many. On
-        // the null stream, from pageable host memory, "host memory is copied to a staging
-        // buffer immediately (no device synchronization is performed)", so `data` is not
-        // read after the call returns
-        // (https://docs.nvidia.com/cuda/cuda-driver-api/api-sync-behavior.html).
+        // SAFETY: `data` is `bytes` readable bytes, and the buffer holds at least as many.
+        // The copy is synchronous: `data` is not read after the call returns.
         let code = unsafe {
-            (self.cuda.driver.cuMemcpyHtoDAsync_v2)(
-                self.pointer,
-                data.as_ptr().cast::<c_void>(),
-                bytes,
-                std::ptr::null_mut(),
-            )
+            (self.cuda.driver.cuMemcpyHtoD_v2)(self.pointer, data.as_ptr().cast::<c_void>(), bytes)
         };
-        self.cuda.check("cuMemcpyHtoDAsync_v2", code)
+        self.cuda.check("cuMemcpyHtoD_v2", code)
     }
 
     /// Copies the start of the buffer into `out`, after the work already given to the
@@ -347,6 +339,10 @@ impl<'c> DeviceBuffer<'c> {
     /// connect. The caller must never pass a part and a buffer it overlaps to one call that
     /// writes either of them.
     ///
+    /// cuDNN and cuBLAS were timed, and their algorithms chosen, on allocations, which start
+    /// on 256-byte boundaries: on a part that does not, a library may run more slowly, or
+    /// refuse the call with an error.
+    ///
     /// # Panics
     ///
     /// If the part runs past the buffer's end, or `at` is not a multiple of 4.
@@ -369,7 +365,8 @@ impl<'c> DeviceBuffer<'c> {
     pub unsafe fn part(&self, at: usize, bytes: usize) -> DeviceBuffer<'c> {
         assert!(
             at.is_multiple_of(4) && at.checked_add(bytes).is_some_and(|end| end <= self.bytes),
-            "a part of {bytes} bytes at {at} does not lie in a buffer of {} bytes, four-byte              aligned",
+            "a part of {bytes} bytes at {at} does not lie in a buffer of {} bytes, four-byte \
+             aligned",
             self.bytes
         );
         DeviceBuffer {
@@ -393,6 +390,106 @@ impl Drop for Allocation<'_> {
         unsafe {
             (self.cuda.driver.cuCtxSynchronize)();
             (self.cuda.driver.cuMemFree_v2)(self.pointer);
+        }
+    }
+}
+
+/// Host memory pinned by the driver, which a copy queued on the card reads after the call
+/// that queued it returns: the crate's own, so no caller can free or change it while a copy
+/// reads it. Its owner rewrites it only once a sync point shows the last copy from it done.
+pub(crate) struct Staging<'c> {
+    /// The CUDA whose context pinned it.
+    cuda: &'c Cuda,
+    /// Its first word.
+    host: *mut u32,
+    /// Its length in words.
+    words: usize,
+}
+
+// SAFETY: the memory is owned by the staging buffer alone, like a `Box<[u32]>`, and is only
+// reached through `&mut self` (writes) or by the copies `upload` queues.
+unsafe impl Send for Staging<'_> {}
+// SAFETY: as for `Send`; `&self` gives no access to the memory's contents.
+unsafe impl Sync for Staging<'_> {}
+
+impl fmt::Debug for Staging<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Staging")
+            .field("words", &self.words)
+            .finish()
+    }
+}
+
+impl<'c> Staging<'c> {
+    /// `words` words (at least one) of pinned host memory, zeroed.
+    pub(crate) fn new(cuda: &'c Cuda, words: usize) -> Result<Staging<'c>, CudaError> {
+        let words = words.max(1);
+        let _bound = cuda.bind()?;
+        let mut host: *mut c_void = std::ptr::null_mut();
+        // SAFETY: the pointer is to a live address, written once; the context is current
+        // with the lock held.
+        let code = unsafe { (cuda.driver.cuMemAllocHost_v2)(&mut host, 4 * words) };
+        cuda.check("cuMemAllocHost_v2", code)?;
+        let host = host.cast::<u32>();
+        // SAFETY: the driver allocated `4 · words` bytes at `host`, aligned for any type.
+        unsafe { std::ptr::write_bytes(host, 0, words) };
+        Ok(Staging { cuda, host, words })
+    }
+
+    /// Writes `data` to the start of the staging memory, then queues its copy to the start
+    /// of `to` on the card, after the work already given to it, and returns without waiting.
+    ///
+    /// # Safety
+    ///
+    /// The last copy queued from this staging memory must have finished: a synchronous
+    /// read, a [`Cuda::synchronize`], or another point where the host waited for all the
+    /// card's work must lie between that copy and this call.
+    ///
+    /// # Panics
+    ///
+    /// If `data` is longer than the staging memory or than `to`.
+    pub(crate) unsafe fn upload(
+        &mut self,
+        data: &[u32],
+        to: &mut DeviceBuffer<'_>,
+    ) -> Result<(), CudaError> {
+        assert!(
+            data.len() <= self.words && 4 * data.len() <= to.bytes,
+            "{} words do not fit the staging memory ({} words) or the buffer ({} bytes)",
+            data.len(),
+            self.words,
+            to.bytes
+        );
+        // SAFETY: the memory holds `words` words, at least `data.len()`, and no copy reads
+        // it now (the caller's promise).
+        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.host, data.len()) };
+        let _bound = self.cuda.bind()?;
+        // SAFETY: the source is this staging buffer's pinned memory, which stays allocated
+        // and unchanged until the copy is done: it is freed only after a synchronisation in
+        // `drop`, and rewritten only under this function's contract. The destination holds
+        // the bytes (checked above).
+        let code = unsafe {
+            (self.cuda.driver.cuMemcpyHtoDAsync_v2)(
+                to.pointer,
+                self.host.cast::<c_void>().cast_const(),
+                4 * data.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        self.cuda.check("cuMemcpyHtoDAsync_v2", code)
+    }
+}
+
+impl Drop for Staging<'_> {
+    /// Waits for the card's work, which may still copy from the memory, and frees it.
+    fn drop(&mut self) {
+        let _bound = self.cuda.bind_anyway();
+        // SAFETY: the memory came from `cuMemAllocHost_v2` in this context, now current with
+        // the lock held; every copy from it is done after the synchronisation, and it is
+        // freed once.
+        unsafe {
+            (self.cuda.driver.cuCtxSynchronize)();
+            (self.cuda.driver.cuMemFreeHost)(self.host.cast::<c_void>());
         }
     }
 }

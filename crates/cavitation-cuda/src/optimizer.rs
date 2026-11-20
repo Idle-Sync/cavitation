@@ -7,7 +7,7 @@
 
 use std::fmt;
 
-use crate::buffer::DeviceBuffer;
+use crate::buffer::{DeviceBuffer, Staging};
 use crate::device::Cuda;
 use crate::error::CudaError;
 use crate::module::{Arg, Module};
@@ -335,6 +335,14 @@ pub struct OptimizerKernel<'c> {
     constants: DeviceBuffer<'c>,
     /// The finite flag the last launch read, copied by the kernel for [`commit`](Self::commit).
     seen: DeviceBuffer<'c>,
+    /// Pinned host memory the constants are copied from without the host waiting; rewritten
+    /// only after [`commit`](Self::commit)'s read shows the last copy done.
+    staging: Staging<'c>,
+    /// Whether a copy from the staging memory may still be running: set by each upload,
+    /// cleared by the synchronous read in [`commit`](Self::commit).
+    in_flight: bool,
+    /// The CUDA it runs on, to wait for a copy no commit waited for.
+    cuda: &'c Cuda,
     /// The constants' words, rebuilt in place every step.
     words: Vec<u32>,
     /// Blocks per launch: one per [`BLOCK`] elements of each parameter.
@@ -504,6 +512,9 @@ impl<'c> OptimizerKernel<'c> {
             function,
             table: table_buffer,
             constants: cuda.buffer(4 * words)?,
+            staging: Staging::new(cuda, words)?,
+            in_flight: false,
+            cuda,
             seen: cuda.buffer(4)?,
             words: vec![0; words],
             blocks: blocks as u32,
@@ -626,7 +637,16 @@ impl<'c> OptimizerKernel<'c> {
             ));
         }
         self.fill_constants(active)?;
-        self.constants.write(&self.words)?;
+        // An upload whose launch then failed was never committed: wait for its copy.
+        if self.in_flight {
+            self.cuda.synchronize()?;
+            self.in_flight = false;
+        }
+        // SAFETY: no copy from the staging memory is running: `commit` reads `seen`
+        // synchronously after the work queued before it, which includes the last copy, and
+        // clears `in_flight`; an upload no commit followed was waited for just above.
+        unsafe { self.staging.upload(&self.words, &mut self.constants)? };
+        self.in_flight = true;
         let mut args = vec![
             Arg::Buffer(values),
             Arg::Buffer(grads),
@@ -727,6 +747,8 @@ impl<'c> OptimizerKernel<'c> {
         }
         let mut flag = [0u32];
         self.seen.read(&mut flag)?;
+        // The read waited for all the card's earlier work, the constants' copy included.
+        self.in_flight = false;
         let ran = flag[0] == 0;
         if ran {
             for (count, &active) in self.steps.iter_mut().zip(&self.pending) {
