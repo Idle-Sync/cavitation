@@ -11,6 +11,7 @@ mod loss;
 mod optimizer;
 mod pooling;
 mod reduce;
+mod softmax;
 
 pub use batch_norm::{BatchNorm2d, BatchNormBackward, BatchNormForward, BatchStats, RunningUpdate};
 pub use conv::{
@@ -24,6 +25,7 @@ pub use loss::{CrossEntropyCall, MeanSquaredError, MseCall, SoftmaxCrossEntropy}
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AvgPool2d, MaxPool2d};
 pub use reduce::{BiasAdd, BiasAddCall, ChannelDims, ChannelSums, ChannelSumsCall};
+pub use softmax::{MAX_SOFTMAX_ROWS, RowSoftmax, RowSoftmaxCall, RowSoftmaxKernels};
 
 use crate::{PooledBuffer, StepEncoder, wgpu};
 
