@@ -38,6 +38,8 @@ Every run uses 4 threads (`CAVITATION_THREADS=4`, and `torch.set_num_threads(4)`
 | B | 1 | v0.3.0 | 71.13 | 72.94 | 116.38 | 86.92 | 1.34 |
 | B | 2 | v0.3.0 | 73.03 | 74.90 | 114.06 | 87.86 | 1.30 |
 | C | 0 | v0.3.0 | 76.63 | 74.66 | 30.26 | 43.13 | 0.70 |
+| B, `--device cuda`, NVIDIA GTX 1660 Super, heuristic algorithms (default) | 0 | 2149877 | 76.89 | 71.34 | 4.89 | 4.80 | 1.02 |
+| B, `--device cuda`, NVIDIA GTX 1660 Super, `CAVITATION_CUDNN_BENCHMARK=1` | 0 | 2149877 | 75.27 | 70.63 | 4.42 | 4.82 | 0.92 |
 
 ## Means over seeds
 
@@ -54,6 +56,7 @@ Every run uses 4 threads (`CAVITATION_THREADS=4`, and `torch.set_num_threads(4)`
 - Single seeds of cifar-cnn swing by about 2 points either way. The network has dropout, and its random masks differ between the two libraries. The means above average that out.
 - On machine B, cifar-cnn seed 1 overlapped Windows background maintenance (.NET native-image compilation and antivirus scans) from epoch 7 of Cavitation's half through PyTorch's half. Cavitation's epochs 7–10 took 115–120 s, against 112–113 s before. Shorter bursts touched epochs 4–6 of seed 2 and the first PyTorch epochs of seed 2.
 - Machine B's seeds 0 and 1 of mnist-cnn and seed 0 of cifar-cnn ran at e232af8, the rest at v0.3.0. The benchmark code is the same apart from one line, and cifar-cnn seed 1's first nine Cavitation epochs give identical losses at both commits.
+- The two `--device cuda` rows train both sides on machine B's NVIDIA GTX 1660 Super (driver 591.86), one after the other in one session: Cavitation through `CudaTrainer` (cuDNN 9.28.1, cuBLAS 13.2.2), by default with cuDNN's heuristic choice of convolution algorithms and in the second row with them timed (`CAVITATION_CUDNN_BENCHMARK=1`); PyTorch 2.14.1+cu130 (cuDNN 9.24.0) with `--torch-device cuda`, `cudnn.benchmark` False and deterministic off, so its accuracy differs between the rows. Command: `cargo run --release -p cavitation-bench --features cuda -- cifar-cnn --seed 0 --device cuda --torch-device cuda --python <python with CUDA torch>`. A game was running on the card throughout (35–37% utilisation before the first run, 92% before the second); PyTorch's median step was 11.83 ms in both runs, against 11.04 ms on the idle card. The commit is the last code change the runs were measured on.
 - On machine C, a background program used 30–45% of one core during the runs. The PyTorch build there reports `mkldnn False`.
 
 ## PyTorch as a fixed baseline

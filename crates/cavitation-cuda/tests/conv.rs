@@ -215,13 +215,20 @@ fn run(cuda: &Cuda, conv: &Conv2d<'_>) -> Run {
     }
 }
 
-/// The worst ratio of each pass of `s` to its reference, in [`TOLERANCE`]'s order.
-fn ratios(cuda: &Cuda, s: ConvShape) -> ([f64; 4], String) {
-    let conv = Conv2d::new(cuda, s).expect("set up the convolution");
-    let got = run(cuda, &conv);
-    let g = geom(&s);
+/// The f64 reference of each pass of `s` on [`inputs`], and the same on their absolute
+/// values (`Σ|terms|`), in [`TOLERANCE`]'s order.
+struct Reference {
+    /// The exact results.
+    exact: [Vec<f64>; 4],
+    /// The sums of the terms' absolute values.
+    size: [Vec<f64>; 4],
+}
+
+/// The reference of `s`.
+fn reference(s: &ConvShape) -> Reference {
+    let g = geom(s);
     let batch = s.batch as usize;
-    let [x, w, b, dy] = inputs(&s);
+    let [x, w, b, dy] = inputs(s);
     let ((x, xa), (w, wa), (b, ba), (dy, dya)) = (wide(&x), wide(&w), wide(&b), wide(&dy));
 
     let mut y = vec![0.0; s.y_len()];
@@ -238,13 +245,30 @@ fn ratios(cuda: &Cuda, s: ConvShape) -> ([f64; 4], String) {
     };
     let (dx, dw, db) = backward(&x, &w, &dy);
     let (dxa, dwa, dba) = backward(&xa, &wa, &dya);
+    Reference {
+        exact: [y, dx, dw, db],
+        size: [ysize, dxa, dwa, dba],
+    }
+}
+
+/// The worst ratio of each pass of `conv` to `reference`, in [`TOLERANCE`]'s order.
+fn ratios_of(cuda: &Cuda, conv: &Conv2d<'_>, reference: &Reference) -> [f64; 4] {
+    let got = run(cuda, conv);
+    let (e, z) = (&reference.exact, &reference.size);
+    [
+        worst_ratio(&got.y, &e[0], &z[0], "forward"),
+        worst_ratio(&got.dx, &e[1], &z[1], "input gradient"),
+        worst_ratio(&got.dw, &e[2], &z[2], "weight gradient"),
+        worst_ratio(&got.db, &e[3], &z[3], "bias gradient"),
+    ]
+}
+
+/// The worst ratio of each pass of `s` to its reference, in [`TOLERANCE`]'s order, with the
+/// algorithms [`Conv2d::new`] chose.
+fn ratios(cuda: &Cuda, s: ConvShape) -> ([f64; 4], String) {
+    let conv = Conv2d::new(cuda, s).expect("set up the convolution");
     (
-        [
-            worst_ratio(&got.y, &y, &ysize, "forward"),
-            worst_ratio(&got.dx, &dx, &dxa, "input gradient"),
-            worst_ratio(&got.dw, &dw, &dwa, "weight gradient"),
-            worst_ratio(&got.db, &db, &dba, "bias gradient"),
-        ],
+        ratios_of(cuda, &conv, &reference(&s)),
         conv.algorithms().to_string(),
     )
 }
@@ -331,4 +355,124 @@ fn within_measured_tolerance_at_training_batches() {
             );
         }
     }
+}
+
+/// Every algorithm each pass may run, not only the one timing chose here, is within the same
+/// tolerances and gives the same bits twice, on every shape at the small batches and the
+/// training ones: timing may choose another on another run or card. The candidates are run
+/// in rounds, the k-th of each pass together (the last again for a pass with fewer); the
+/// worst ratio of each pass's algorithm over all shapes is printed, and every one over its
+/// tolerance is named in the failure.
+#[test]
+fn every_candidate_within_measured_tolerance() {
+    let Some(cuda) = Cuda::new() else { return };
+    let mut worst: Vec<(&str, &str, f64)> = Vec::new();
+    let mut over = Vec::new();
+    for s in all_shapes().into_iter().chain(training_shapes()) {
+        let allowed = Conv2d::candidates(&cuda, s).expect("list the algorithms");
+        let reference = reference(&s);
+        let rounds = (allowed.forward.len())
+            .max(allowed.input_grad.len())
+            .max(allowed.weight_grad.len());
+        let nth = |list: &[(&'static str, usize)], k: usize| list[k.min(list.len() - 1)].0;
+        for k in 0..rounds {
+            let names = [
+                nth(&allowed.forward, k),
+                nth(&allowed.input_grad, k),
+                nth(&allowed.weight_grad, k),
+                "cudnnConvolutionBackwardBias",
+            ];
+            let conv = Conv2d::with_algorithms(&cuda, s, names[0], names[1], names[2])
+                .expect("set up the convolution");
+            let r = ratios_of(&cuda, &conv, &reference);
+            for (i, &(pass, t)) in TOLERANCE.iter().enumerate() {
+                match worst.iter_mut().find(|w| w.0 == pass && w.1 == names[i]) {
+                    Some(w) => w.2 = w.2.max(r[i]),
+                    None => worst.push((pass, names[i], r[i])),
+                }
+                if r[i] > t {
+                    over.push(format!(
+                        "{pass} {} of {s:?}: {:.2} u, tolerance {t}",
+                        names[i], r[i]
+                    ));
+                }
+            }
+            let (a, b) = (run(&cuda, &conv), run(&cuda, &conv));
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            let with = conv.algorithms();
+            assert_eq!(bits(&a.y), bits(&b.y), "forward of {s:?} with {with}");
+            assert_eq!(
+                bits(&a.dx),
+                bits(&b.dx),
+                "input gradient of {s:?} with {with}"
+            );
+            assert_eq!(
+                bits(&a.dw),
+                bits(&b.dw),
+                "weight gradient of {s:?} with {with}"
+            );
+        }
+    }
+    println!("worst |got - exact| / (u * sum|terms|) of each algorithm over all shapes:");
+    for (pass, name, r) in &worst {
+        println!("  {pass} {name}: {r:.2}");
+    }
+    assert!(
+        over.is_empty(),
+        "over the tolerance:
+{}",
+        over.join(
+            "
+"
+        )
+    );
+}
+
+/// By default each pass runs the heuristics' first allowed algorithm; with timing on, every
+/// convolution of one shape in a process runs the algorithms the first one chose, one of the
+/// candidates. A name that is not a candidate is refused.
+#[test]
+fn the_choice_is_fixed_and_allowed() {
+    let Some(cuda) = Cuda::new() else { return };
+    for timed in [false, true] {
+        cuda.set_cudnn_benchmark(timed);
+        for s in training_shapes() {
+            let first = Conv2d::new(&cuda, s).expect("set up").algorithms();
+            let again = Conv2d::new(&cuda, s).expect("set up").algorithms();
+            assert_eq!(first, again, "{s:?}");
+            let allowed = Conv2d::candidates(&cuda, s).expect("list the algorithms");
+            if !timed {
+                assert_eq!(
+                    (first.forward, first.input_grad, first.weight_grad),
+                    (
+                        allowed.forward[0],
+                        allowed.input_grad[0],
+                        allowed.weight_grad[0]
+                    ),
+                    "{s:?}"
+                );
+            }
+            assert!(allowed.forward.contains(&first.forward), "{s:?}: {first}");
+            assert!(
+                allowed.input_grad.contains(&first.input_grad),
+                "{s:?}: {first}"
+            );
+            assert!(
+                allowed.weight_grad.contains(&first.weight_grad),
+                "{s:?}: {first}"
+            );
+        }
+    }
+    cuda.set_cudnn_benchmark(false);
+    let s = shape(8, NETWORKS[4]);
+    let allowed = Conv2d::candidates(&cuda, s).expect("list the algorithms");
+    let (f, i) = (allowed.forward[0].0, allowed.input_grad[0].0);
+    // The 5 × 5 kernel allows no Winograd.
+    let err = Conv2d::with_algorithms(&cuda, s, f, i, "WINOGRAD_NONFUSED")
+        .expect_err("Winograd on 5 × 5 is refused")
+        .to_string();
+    assert!(
+        err.contains("not an allowed weight-gradient algorithm"),
+        "{err}"
+    );
 }

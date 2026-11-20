@@ -24,6 +24,10 @@ use crate::{
 /// What a failed call to the card names.
 const STEP: &str = "CudaTrainer::step";
 
+/// The alignment, in `f32`s, of each parameter in the flat buffers: 256 bytes, the alignment
+/// of an allocation of its own.
+const ALIGN: usize = 64;
+
 /// The loss of a training pass, set up for its rows.
 enum LossKernel<'c> {
     /// Softmax cross-entropy on class labels.
@@ -72,14 +76,15 @@ struct TrainPass<'c> {
     next: Vec<Vec<u32>>,
 }
 
-/// The optimiser on the card: the parameters and gradients laid end to end, its state
-/// buffers, and where each parameter sits.
+/// The optimiser on the card: the parameters and gradients laid end to end, each on a
+/// 256-byte boundary, which the layers read and write in place; its state buffers; and where
+/// each parameter sits.
 struct Flat<'c> {
     /// The update.
     kernel: OptimizerKernel<'c>,
-    /// Every parameter's values, end to end.
+    /// Every parameter's values, end to end; each parameter's own buffer is its part.
     values: usize,
-    /// Every parameter's gradient, end to end.
+    /// Every parameter's gradient, end to end; each gradient's buffer is its part.
     grads: usize,
     /// The state buffers: SGD's momentum, or Adam's first and second moments.
     state: Vec<usize>,
@@ -153,10 +158,9 @@ pub struct CudaStepProfile {
     /// for a `Linear` or a `Conv2d` after the first layer, in layer order; `None` for every
     /// other layer.
     pub backward_input: Vec<Option<Duration>>,
-    /// The health values: the finite flag, the sums of squares and the ReLU bits, with the
-    /// gradients' copy into the optimiser's flat buffer.
+    /// The health values: the finite flag, the sums of squares and the ReLU bits.
     pub health: Duration,
-    /// The optimiser's update and the copy of the values back out.
+    /// The optimiser's update.
     pub optimizer: Duration,
     /// Batch norm's running statistics.
     pub running: Duration,
@@ -185,7 +189,11 @@ pub struct CudaStepProfile {
 /// The convolution's passes run through cuDNN and `Linear`'s through cuBLAS, which publish no
 /// error bounds; their distance from the CPU is measured in `cavitation-cuda`'s tests and in
 /// this crate's, which hold each step's gradients within a tolerance of the `f64` tape's.
-/// cuDNN runs deterministic algorithms only, so two runs give the same bits.
+/// cuDNN runs deterministic algorithms only, chosen by its heuristics, so two runs give the
+/// same bits. With [`Cuda::set_cudnn_benchmark`] on (or `CAVITATION_CUDNN_BENCHMARK=1`), the
+/// algorithms are timed once per shape and the fastest kept: runs within one process still
+/// give the same bits, but another process or card may choose others and differ in the last
+/// bits.
 ///
 /// Every step runs the CPU trainer's [`Health`] checks (the default unless
 /// [`set_health`](CudaTrainer::set_health) changes it) on values the step reads back with its
@@ -421,14 +429,17 @@ impl<'c, 's> CudaTrainer<'c, 's> {
             words += DeadRelu::words(u32_of(channels)) as usize;
         }
         let lens: Vec<usize> = m.params.iter().map(|t| t.len).collect();
-        let elements: usize = lens.iter().sum();
-        let kernel = OptimizerKernel::new(cuda, rule, &lens).map_err(refuse)?;
+        // Each parameter starts on a 256-byte boundary in the flat buffers, as a buffer of
+        // its own would, so cuDNN and cuBLAS see the alignment they were timed on.
+        let mut offsets = Vec::with_capacity(lens.len());
+        let mut elements = 0usize;
+        for &len in &lens {
+            offsets.push(elements);
+            elements = (elements + len).next_multiple_of(ALIGN);
+        }
+        let kernel = OptimizerKernel::with_starts(cuda, rule, &lens, &offsets).map_err(refuse)?;
         let s = &mut m.store;
         let mut new = |n: usize| s.values(n).map_err(refuse);
-        let param_grads = lens
-            .iter()
-            .map(|&n| new(n))
-            .collect::<Result<Vec<_>, _>>()?;
         let values = new(elements)?;
         let grads = new(elements)?;
         let state = (0..rule.state_buffers())
@@ -436,8 +447,8 @@ impl<'c, 's> CudaTrainer<'c, 's> {
             .collect::<Result<Vec<_>, _>>()?;
         let n = lens.len();
         let checks = Checks {
-            finite: FiniteFlag::new(cuda, &lens).map_err(refuse)?,
-            squares: SumSquares::new(cuda, &lens).map_err(refuse)?,
+            finite: FiniteFlag::with_starts(cuda, &lens, &offsets).map_err(refuse)?,
+            squares: SumSquares::with_starts(cuda, &lens, &offsets).map_err(refuse)?,
             loss: new(1)?,
             flag: new(1)?,
             sums: new(n)?,
@@ -446,17 +457,24 @@ impl<'c, 's> CudaTrainer<'c, 's> {
             gathered: new(2 + 2 * n + words)?,
             host: vec![0; 2 + 2 * n + words],
         };
-        let mut offsets = Vec::with_capacity(n);
-        let mut at = 0;
-        for &len in &lens {
-            offsets.push(at);
-            at += len;
-        }
-        // The flat values start as the parameters, and the state at 0.
+        // The flat values start as the parameters, and the state at 0. Then each parameter's
+        // buffer becomes its place in the flat values, and each gradient its place in the
+        // flat gradients, so the optimiser and the health values read and write them where
+        // the layers do, with no copies.
+        let mut param_grads = Vec::with_capacity(n);
         for (t, &off) in m.params.iter().zip(&offsets) {
             m.store
                 .copy((values, off), (t.at, 0), t.len)
                 .map_err(refuse)?;
+            // SAFETY: a parameter's part of the flat values and its gradient's part of the
+            // flat gradients are only ever given to a call with buffers of other memory: the
+            // layers' activations and gradients, the other flat buffer, the optimiser's
+            // state and the health values' outputs. The flat buffers themselves go to the
+            // optimiser and the health kernels, which take no parameter or gradient part.
+            unsafe {
+                m.store.make_part(t.at, (values, off), t.len);
+                param_grads.push(m.store.part((grads, off), t.len));
+            }
         }
         let flat = Flat {
             kernel,
@@ -721,15 +739,9 @@ impl<'c, 's> CudaTrainer<'c, 's> {
             // A profiled step counts the drawing in its total alone.
             clock.lap();
         }
-        // The finite flag and the health values, from the gradients gathered end to end.
+        // The finite flag and the health values, from the gradients in the flat buffer.
         let flat = &mut self.flat;
         let checks = &mut self.checks;
-        for (k, (&g, &off)) in self.param_grads.iter().zip(&flat.offsets).enumerate() {
-            ran(
-                STEP,
-                s.copy((flat.grads, off), (g, 0), self.model.params[k].len),
-            );
-        }
         ran(
             STEP,
             checks.finite.run(
@@ -760,7 +772,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         if let Some(p) = profile.as_mut() {
             p.health = clock.lap();
         }
-        // The update, skipped on the card when the flag is set, and the values back out.
+        // The update, skipped on the card when the flag is set, in place in the parameters.
         {
             let mut values = s.get_mut(flat.values);
             let grads = s.get(flat.grads);
@@ -789,9 +801,6 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                 _ => unreachable!("an optimiser keeps at most two state buffers"),
             };
             ran(STEP, updated);
-        }
-        for (t, &off) in self.model.params.iter().zip(&flat.offsets) {
-            ran(STEP, s.copy((t.at, 0), (flat.values, off), t.len));
         }
         if let Some(p) = profile.as_mut() {
             p.optimizer = clock.lap();
@@ -1169,7 +1178,8 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     pub fn optimizer_state(&mut self) -> CudaOptimizerState {
         let flat = &self.flat;
         let lens: Vec<usize> = self.model.params.iter().map(|t| t.len).collect();
-        let total: usize = lens.iter().sum();
+        // The end of the last parameter: each starts on its boundary in the flat buffers.
+        let total = (flat.offsets.last().zip(lens.last())).map_or(0, |(&off, &n)| off + n);
         let buffers = (flat.state.iter())
             .map(|&at| {
                 let mut all = vec![0.0f32; total];

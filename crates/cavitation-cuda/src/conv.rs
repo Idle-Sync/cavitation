@@ -3,12 +3,14 @@
 
 use std::ffi::{c_int, c_void};
 use std::fmt;
+use std::sync::{Mutex, PoisonError};
 
 use crate::buffer::DeviceBuffer;
 use crate::device::{Bound, Cuda};
 use crate::error::CudaError;
 use crate::sys::{
-    AlgoPerf, CUDNN_CROSS_CORRELATION, CUDNN_DETERMINISTIC, CUDNN_FLOAT, CUDNN_FMA_MATH, CUDNN_NCHW,
+    AlgoPerf, CUDNN_CROSS_CORRELATION, CUDNN_DETERMINISTIC, CUDNN_FLOAT, CUDNN_FMA_MATH,
+    CUDNN_NCHW, CuDevice,
 };
 
 /// The most scratch memory one pass of a [`Conv2d`] may use: an algorithm that needs more
@@ -35,6 +37,15 @@ const INPUT_GRAD: [&str; 6] = [
     "WINOGRAD",
     "WINOGRAD_NONFUSED",
 ];
+/// The forward algorithms never run: `WINOGRAD_NONFUSED` was measured 137 u · Σ|terms| from
+/// the exact result on the 3 → 32 convolution at 32 × 32 over 128 images, above the forward
+/// tolerance of `tests/conv.rs` (128), where every other forward algorithm is within 11.
+const FORWARD_EXCLUDED: [&str; 1] = ["WINOGRAD_NONFUSED"];
+/// The input-gradient algorithms never run: measured on the shapes of `tests/conv.rs`,
+/// `FFT` up to 14 u · Σ|terms| from the exact result, `FFT_TILING` 113 and
+/// `WINOGRAD_NONFUSED` 238, above the input gradient's tolerance there (8), where `ALGO_1` and
+/// `WINOGRAD` are within 5.2.
+const INPUT_GRAD_EXCLUDED: [&str; 3] = ["FFT", "FFT_TILING", "WINOGRAD_NONFUSED"];
 /// cuDNN's weight-gradient (backward filter) algorithms, by their number.
 const WEIGHT_GRAD: [&str; 7] = [
     "ALGO_0",
@@ -61,7 +72,7 @@ const WEIGHT_GRAD: [&str; 7] = [
 /// assert_eq!(shape.output(), Some((32, 32)));
 /// assert_eq!(shape.y_len(), 128 * 32 * 32 * 32);
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConvShape {
     /// Images in the batch.
     pub batch: u32,
@@ -300,15 +311,22 @@ impl<'c> Descriptors<'c> {
 /// One 2-D convolution shape on the card, through cuDNN: the forward pass with an optional
 /// bias, the input gradient, the weight gradient and the bias gradient, in `f32`.
 ///
-/// The algorithms are chosen once, when the convolution is made: for each pass the first
-/// one cuDNN's heuristics rank that supports the shape, gives the same bits on every run
-/// (cuDNN's `CUDNN_DETERMINISTIC`), runs without tensor cores (`CUDNN_FMA_MATH`, so no
-/// product is rounded to a narrower type), needs at most [`MAX_WORKSPACE`] bytes of
-/// scratch memory, which the convolution holds, and is not Winograd unless the kernel is
-/// 3 × 3: on a 5 × 5 kernel cuDNN's Winograd weight gradient was measured 2,782 u · Σ|terms|
-/// from the exact result, where every other pass measured is within 55. cuDNN publishes no error bound for its
-/// algorithms, so how far each is from the exact result is measured, not proven: see this
-/// crate's `tests/conv.rs`.
+/// The algorithms are chosen once, when the convolution is made, among those that support
+/// the shape, give the same bits on every run (cuDNN's `CUDNN_DETERMINISTIC`), run without
+/// tensor cores (`CUDNN_FMA_MATH`, so no product is rounded to a narrower type), need at most
+/// [`MAX_WORKSPACE`] bytes of scratch memory, which the convolution holds, are not Winograd
+/// unless the kernel is 3 × 3, and are not among the few measured too far from the exact
+/// result: the forward pass's `WINOGRAD_NONFUSED`, and the input gradient's `FFT`,
+/// `FFT_TILING` and `WINOGRAD_NONFUSED`. [`Conv2d::candidates`] lists the rest. By default
+/// each pass runs the first of them cuDNN's heuristics rank, so two runs of a program on one
+/// card give the same bits; with [`Cuda::set_cudnn_benchmark`] (or
+/// `CAVITATION_CUDNN_BENCHMARK=1`) they are timed instead (see [`Conv2d::new`]).
+///
+/// On a 5 × 5 kernel cuDNN's Winograd weight gradient was measured 2,782 u · Σ|terms| from
+/// the exact result, where every algorithm allowed is within 18. cuDNN publishes no error
+/// bound for its algorithms, so how far each is from the exact result is measured, not
+/// proven: see this crate's `tests/conv.rs`, which runs every allowed algorithm of every
+/// pass on its shapes.
 ///
 /// Every pass is queued on the card and returns without waiting for it, like
 /// [`Kernel::launch`](crate::Kernel::launch).
@@ -373,18 +391,33 @@ fn factor(value: &f32) -> *const c_void {
     std::ptr::from_ref(value).cast()
 }
 
-/// The first algorithm of `ranked` that supports the shape, is deterministic, runs
-/// without tensor cores and is not Winograd unless `winograd`, among the first `returned`, with its number and its name in
-/// `names`; its scratch bytes are found by `workspace`, and one needing more than
-/// [`MAX_WORKSPACE`] is passed over.
-fn pick(
+/// One algorithm a pass may run: its number in its pass's enumeration, its name and the
+/// scratch bytes it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Algo {
+    /// Its number.
+    num: c_int,
+    /// Its name, as cuDNN's enumeration has it without the prefix.
+    name: &'static str,
+    /// The scratch memory it needs, in bytes.
+    bytes: usize,
+}
+
+/// Every algorithm of `ranked`, in its order, that supports the shape, is deterministic, runs
+/// without tensor cores, is not one of `excluded` nor Winograd unless `winograd`, and needs
+/// at most
+/// [`MAX_WORKSPACE`] bytes of scratch memory, as `workspace` finds them; an error naming the
+/// ones passed over when there is none.
+fn qualifying(
     pass: &str,
     names: &[&'static str],
+    excluded: &[&str],
     ranked: &[AlgoPerf],
     winograd: bool,
     mut workspace: impl FnMut(c_int) -> Result<usize, CudaError>,
-) -> Result<(c_int, &'static str, usize), CudaError> {
+) -> Result<Vec<Algo>, CudaError> {
     let mut seen = Vec::new();
+    let mut found = Vec::new();
     for perf in ranked {
         let name = usize::try_from(perf.algo)
             .ok()
@@ -395,6 +428,7 @@ fn pick(
         }
         if perf.determinism != CUDNN_DETERMINISTIC
             || perf.math_type != CUDNN_FMA_MATH
+            || excluded.contains(&name)
             || (!winograd && name.starts_with("WINOGRAD"))
         {
             seen.push(name);
@@ -405,22 +439,101 @@ fn pick(
             seen.push(name);
             continue;
         }
-        return Ok((perf.algo, name, bytes));
+        found.push(Algo {
+            num: perf.algo,
+            name,
+            bytes,
+        });
     }
-    Err(CudaError::Invalid(format!(
-        "cuDNN has no deterministic {pass} algorithm without tensor cores, within \
-         {MAX_WORKSPACE} bytes of scratch memory and, for a kernel other than 3 × 3, other \
-         than Winograd, for this convolution; it offered {}",
-        if seen.is_empty() {
-            "none".to_string()
-        } else {
-            seen.join(", ")
-        }
-    )))
+    if found.is_empty() {
+        return Err(CudaError::Invalid(format!(
+            "cuDNN has no deterministic {pass} algorithm without tensor cores, within \
+             {MAX_WORKSPACE} bytes of scratch memory and, for a kernel other than 3 × 3, other \
+             than Winograd, for this convolution; it offered {}",
+            if seen.is_empty() {
+                "none".to_string()
+            } else {
+                seen.join(", ")
+            }
+        )));
+    }
+    Ok(found)
 }
+
+/// The algorithm of `candidates` that `timed` (cuDNN's Find, fastest first) ranks first among
+/// those it ran without error and calls deterministic; the first candidate, the heuristics'
+/// choice, when it ranks none.
+fn fastest(candidates: &[Algo], timed: &[AlgoPerf]) -> Algo {
+    timed
+        .iter()
+        .filter(|perf| perf.status == 0 && perf.determinism == CUDNN_DETERMINISTIC)
+        .find_map(|perf| candidates.iter().find(|a| a.num == perf.algo))
+        .copied()
+        .unwrap_or(candidates[0])
+}
+
+/// The algorithms each pass of a convolution may run on this card, in the order cuDNN's
+/// heuristics rank them, each with the scratch bytes it needs: the ones that meet the
+/// conditions in [`Conv2d`]'s description. [`Conv2d::new`] runs the first of each list, or
+/// the fastest when [`Cuda::set_cudnn_benchmark`] is on; [`Conv2d::with_algorithms`] runs
+/// any of them.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_cuda::{Conv2d, ConvShape, Cuda};
+///
+/// if let Some(cuda) = Cuda::new() {
+///     let shape = ConvShape { padding: (1, 1), ..ConvShape::new(8, 3, 4, (8, 8), (3, 3)) };
+///     let allowed = Conv2d::candidates(&cuda, shape).unwrap();
+///     let chosen = Conv2d::new(&cuda, shape).unwrap().algorithms();
+///     assert!(allowed.forward.contains(&chosen.forward));
+/// }
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ConvCandidates {
+    /// The forward algorithms and their scratch bytes.
+    pub forward: Vec<(&'static str, usize)>,
+    /// The input-gradient algorithms and their scratch bytes.
+    pub input_grad: Vec<(&'static str, usize)>,
+    /// The weight-gradient algorithms and their scratch bytes.
+    pub weight_grad: Vec<(&'static str, usize)>,
+}
+
+/// A convolution's descriptors and the algorithms each pass may run.
+struct Setup<'c> {
+    /// The descriptors.
+    d: Descriptors<'c>,
+    /// The forward algorithms allowed, in the heuristics' order.
+    forward: Vec<Algo>,
+    /// The input-gradient algorithms allowed.
+    input_grad: Vec<Algo>,
+    /// The weight-gradient algorithms allowed.
+    weight_grad: Vec<Algo>,
+}
+
+/// The algorithms timing chose in this process for each card and shape, so that every
+/// [`Conv2d::new`] of one shape on one card with timing on runs the same ones, and so gives
+/// the same bits, whatever the timing of a later set-up would say.
+static CHOSEN: Mutex<Vec<Chosen>> = Mutex::new(Vec::new());
+
+/// One entry of [`CHOSEN`]: the card and the shape, and the forward, input-gradient and
+/// weight-gradient algorithms.
+type Chosen = ((CuDevice, ConvShape), [Algo; 3]);
 
 impl<'c> Conv2d<'c> {
     /// Sets up the convolution `shape` on `cuda`'s card and chooses its algorithms.
+    ///
+    /// By default each pass runs the first allowed algorithm cuDNN's heuristics rank. With
+    /// [`Cuda::set_cudnn_benchmark`] on (or `CAVITATION_CUDNN_BENCHMARK=1` when `cuda` was
+    /// opened), the first convolution of a shape on a card in a process times every allowed
+    /// algorithm of each pass on scratch buffers (cuDNN's `cudnnFindConvolution*AlgorithmEx`)
+    /// and keeps the fastest; every later one of that shape in the process runs the same
+    /// ones without timing, so its runs give the same bits. Timing may choose differently in
+    /// another process or on another card, which may then differ in the last bits; each
+    /// choice is one of [`Conv2d::candidates`], within the measured tolerances of this
+    /// crate's `tests/conv.rs`.
     ///
     /// # Errors
     ///
@@ -429,6 +542,212 @@ impl<'c> Conv2d<'c> {
     /// [`CudaError::Call`] if cuDNN refuses the shape or the scratch memory cannot be
     /// allocated.
     pub fn new(cuda: &'c Cuda, shape: ConvShape) -> Result<Conv2d<'c>, CudaError> {
+        let setup = Self::set_up(cuda, shape)?;
+        if !cuda.cudnn_benchmark() {
+            let algos = [setup.forward[0], setup.input_grad[0], setup.weight_grad[0]];
+            return Self::build(cuda, shape, setup, algos);
+        }
+        let key = (cuda.device(), shape);
+        let mut chosen = CHOSEN.lock().unwrap_or_else(PoisonError::into_inner);
+        let algos = match chosen.iter().find(|(k, _)| *k == key) {
+            Some(&(_, algos)) => algos,
+            None => {
+                let algos = Self::time(cuda, shape, &setup)?;
+                chosen.push((key, algos));
+                algos
+            }
+        };
+        drop(chosen);
+        Self::build(cuda, shape, setup, algos)
+    }
+
+    /// The algorithms each pass of `shape` may run on `cuda`'s card.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conv2d::new`].
+    pub fn candidates(cuda: &Cuda, shape: ConvShape) -> Result<ConvCandidates, CudaError> {
+        let setup = Self::set_up(cuda, shape)?;
+        let list = |v: &[Algo]| v.iter().map(|a| (a.name, a.bytes)).collect();
+        Ok(ConvCandidates {
+            forward: list(&setup.forward),
+            input_grad: list(&setup.input_grad),
+            weight_grad: list(&setup.weight_grad),
+        })
+    }
+
+    /// Sets up the convolution `shape` on `cuda`'s card with the named algorithms, each one
+    /// of [`Conv2d::candidates`] for its pass, without timing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Conv2d::new`], and [`CudaError::Invalid`] if a name is not one of its pass's
+    /// candidates.
+    pub fn with_algorithms(
+        cuda: &'c Cuda,
+        shape: ConvShape,
+        forward: &str,
+        input_grad: &str,
+        weight_grad: &str,
+    ) -> Result<Conv2d<'c>, CudaError> {
+        let setup = Self::set_up(cuda, shape)?;
+        let named = |pass: &str, list: &[Algo], name: &str| {
+            list.iter()
+                .find(|a| a.name == name)
+                .copied()
+                .ok_or_else(|| {
+                    CudaError::Invalid(format!(
+                        "convolution {shape:?}: {name} is not an allowed {pass} algorithm"
+                    ))
+                })
+        };
+        let algos = [
+            named("forward", &setup.forward, forward)?,
+            named("input-gradient", &setup.input_grad, input_grad)?,
+            named("weight-gradient", &setup.weight_grad, weight_grad)?,
+        ];
+        Self::build(cuda, shape, setup, algos)
+    }
+
+    /// The convolution with its descriptors and the algorithms `algos` (forward, input
+    /// gradient, weight gradient), and scratch memory for the one that needs most.
+    fn build(
+        cuda: &'c Cuda,
+        shape: ConvShape,
+        setup: Setup<'c>,
+        algos: [Algo; 3],
+    ) -> Result<Conv2d<'c>, CudaError> {
+        let [forward, input_grad, weight_grad] = algos;
+        let workspace = cuda.buffer(forward.bytes.max(input_grad.bytes).max(weight_grad.bytes))?;
+        Ok(Conv2d {
+            cuda,
+            shape,
+            d: setup.d,
+            forward_algo: forward.num,
+            input_grad_algo: input_grad.num,
+            weight_grad_algo: weight_grad.num,
+            algorithms: ConvAlgorithms {
+                forward: (forward.name, forward.bytes),
+                input_grad: (input_grad.name, input_grad.bytes),
+                weight_grad: (weight_grad.name, weight_grad.bytes),
+            },
+            workspace,
+        })
+    }
+
+    /// Times every allowed algorithm of each pass of `shape` on zeroed scratch buffers with
+    /// cuDNN's Find, and returns the fastest of each.
+    fn time(cuda: &'c Cuda, shape: ConvShape, setup: &Setup<'c>) -> Result<[Algo; 3], CudaError> {
+        let all = || {
+            (setup.forward.iter())
+                .chain(&setup.input_grad)
+                .chain(&setup.weight_grad)
+        };
+        let bytes = all().map(|a| a.bytes).max().unwrap_or(0);
+        // Declared before the guard, so that they are freed after it is given back. The
+        // input gradient is written over the input, and the weight gradient over the weight:
+        // their values are not read.
+        let x = cuda.buffer(4 * shape.x_len())?;
+        let w = cuda.buffer(4 * shape.w_len())?;
+        let y = cuda.buffer(4 * shape.y_len())?;
+        let scratch = cuda.buffer(bytes)?;
+        let d = &setup.d;
+        let handle = cuda.cudnn_handle;
+        let api = &cuda.cudnn;
+        let mut timed = [AlgoPerf::default(); 16];
+        let count = timed.len() as c_int;
+        let mut returned: c_int = 0;
+        let list = |status: c_int, what, returned: c_int, timed: &[AlgoPerf]| {
+            d.check(what, status)?;
+            Ok::<_, CudaError>(
+                timed[..usize::try_from(returned).unwrap_or(0).min(timed.len())].to_vec(),
+            )
+        };
+        let bound = cuda.bind()?;
+        // SAFETY: the handle and descriptors are live; each buffer holds its tensor and the
+        // scratch buffer `bytes` bytes; `timed` holds `count` results; the lock is held, as
+        // for the two calls below.
+        let status = unsafe {
+            (api.cudnnFindConvolutionForwardAlgorithmEx)(
+                handle,
+                d.x,
+                x.pointer,
+                d.w,
+                w.pointer,
+                d.conv,
+                d.y,
+                y.pointer,
+                count,
+                &mut returned,
+                timed.as_mut_ptr(),
+                scratch.pointer,
+                bytes,
+            )
+        };
+        let found = list(
+            status,
+            "cudnnFindConvolutionForwardAlgorithmEx",
+            returned,
+            &timed,
+        )?;
+        let forward = fastest(&setup.forward, &found);
+        // SAFETY: as above; dx is written over x.
+        let status = unsafe {
+            (api.cudnnFindConvolutionBackwardDataAlgorithmEx)(
+                handle,
+                d.w,
+                w.pointer,
+                d.y,
+                y.pointer,
+                d.conv,
+                d.x,
+                x.pointer,
+                count,
+                &mut returned,
+                timed.as_mut_ptr(),
+                scratch.pointer,
+                bytes,
+            )
+        };
+        let found = list(
+            status,
+            "cudnnFindConvolutionBackwardDataAlgorithmEx",
+            returned,
+            &timed,
+        )?;
+        let input_grad = fastest(&setup.input_grad, &found);
+        // SAFETY: as above; dw is written over w.
+        let status = unsafe {
+            (api.cudnnFindConvolutionBackwardFilterAlgorithmEx)(
+                handle,
+                d.x,
+                x.pointer,
+                d.y,
+                y.pointer,
+                d.conv,
+                d.w,
+                w.pointer,
+                count,
+                &mut returned,
+                timed.as_mut_ptr(),
+                scratch.pointer,
+                bytes,
+            )
+        };
+        let found = list(
+            status,
+            "cudnnFindConvolutionBackwardFilterAlgorithmEx",
+            returned,
+            &timed,
+        )?;
+        let weight_grad = fastest(&setup.weight_grad, &found);
+        drop(bound);
+        Ok([forward, input_grad, weight_grad])
+    }
+
+    /// Makes the descriptors of `shape` on `cuda`'s card and lists the algorithms each pass
+    /// may run.
+    fn set_up<'a>(cuda: &'a Cuda, shape: ConvShape) -> Result<Setup<'a>, CudaError> {
         let invalid = |why: &str| CudaError::Invalid(format!("convolution {shape:?}: {why}"));
         let (oh, ow) = shape
             .output()
@@ -546,17 +865,24 @@ impl<'c> Conv2d<'c> {
             returned,
             &ranked,
         )?;
-        let forward = pick("forward", &FORWARD, &list, winograd, |algo| {
-            let mut bytes = 0usize;
-            // SAFETY: as above, with a pointer to a live `usize`.
-            let status = unsafe {
-                (api.cudnnGetConvolutionForwardWorkspaceSize)(
-                    handle, d.x, d.w, d.conv, d.y, algo, &mut bytes,
-                )
-            };
-            d.check("cudnnGetConvolutionForwardWorkspaceSize", status)?;
-            Ok(bytes)
-        })?;
+        let forward = qualifying(
+            "forward",
+            &FORWARD,
+            &FORWARD_EXCLUDED,
+            &list,
+            winograd,
+            |algo| {
+                let mut bytes = 0usize;
+                // SAFETY: as above, with a pointer to a live `usize`.
+                let status = unsafe {
+                    (api.cudnnGetConvolutionForwardWorkspaceSize)(
+                        handle, d.x, d.w, d.conv, d.y, algo, &mut bytes,
+                    )
+                };
+                d.check("cudnnGetConvolutionForwardWorkspaceSize", status)?;
+                Ok(bytes)
+            },
+        )?;
 
         // SAFETY: as for the forward ranking.
         let status = unsafe {
@@ -577,17 +903,24 @@ impl<'c> Conv2d<'c> {
             returned,
             &ranked,
         )?;
-        let input_grad = pick("input-gradient", &INPUT_GRAD, &list, winograd, |algo| {
-            let mut bytes = 0usize;
-            // SAFETY: as above, with a pointer to a live `usize`.
-            let status = unsafe {
-                (api.cudnnGetConvolutionBackwardDataWorkspaceSize)(
-                    handle, d.w, d.y, d.conv, d.x, algo, &mut bytes,
-                )
-            };
-            d.check("cudnnGetConvolutionBackwardDataWorkspaceSize", status)?;
-            Ok(bytes)
-        })?;
+        let input_grad = qualifying(
+            "input-gradient",
+            &INPUT_GRAD,
+            &INPUT_GRAD_EXCLUDED,
+            &list,
+            winograd,
+            |algo| {
+                let mut bytes = 0usize;
+                // SAFETY: as above, with a pointer to a live `usize`.
+                let status = unsafe {
+                    (api.cudnnGetConvolutionBackwardDataWorkspaceSize)(
+                        handle, d.w, d.y, d.conv, d.x, algo, &mut bytes,
+                    )
+                };
+                d.check("cudnnGetConvolutionBackwardDataWorkspaceSize", status)?;
+                Ok(bytes)
+            },
+        )?;
 
         // SAFETY: as for the forward ranking.
         let status = unsafe {
@@ -608,34 +941,30 @@ impl<'c> Conv2d<'c> {
             returned,
             &ranked,
         )?;
-        let weight_grad = pick("weight-gradient", &WEIGHT_GRAD, &list, winograd, |algo| {
-            let mut bytes = 0usize;
-            // SAFETY: as above, with a pointer to a live `usize`.
-            let status = unsafe {
-                (api.cudnnGetConvolutionBackwardFilterWorkspaceSize)(
-                    handle, d.x, d.y, d.conv, d.w, algo, &mut bytes,
-                )
-            };
-            d.check("cudnnGetConvolutionBackwardFilterWorkspaceSize", status)?;
-            Ok(bytes)
-        })?;
-        // Given back before the allocation, which takes the lock itself.
-        drop(bound);
-
-        let workspace = cuda.buffer(forward.2.max(input_grad.2).max(weight_grad.2))?;
-        Ok(Conv2d {
-            cuda,
-            shape,
-            d,
-            forward_algo: forward.0,
-            input_grad_algo: input_grad.0,
-            weight_grad_algo: weight_grad.0,
-            algorithms: ConvAlgorithms {
-                forward: (forward.1, forward.2),
-                input_grad: (input_grad.1, input_grad.2),
-                weight_grad: (weight_grad.1, weight_grad.2),
+        let weight_grad = qualifying(
+            "weight-gradient",
+            &WEIGHT_GRAD,
+            &[],
+            &list,
+            winograd,
+            |algo| {
+                let mut bytes = 0usize;
+                // SAFETY: as above, with a pointer to a live `usize`.
+                let status = unsafe {
+                    (api.cudnnGetConvolutionBackwardFilterWorkspaceSize)(
+                        handle, d.x, d.y, d.conv, d.w, algo, &mut bytes,
+                    )
+                };
+                d.check("cudnnGetConvolutionBackwardFilterWorkspaceSize", status)?;
+                Ok(bytes)
             },
-            workspace,
+        )?;
+        drop(bound);
+        Ok(Setup {
+            d,
+            forward,
+            input_grad,
+            weight_grad,
         })
     }
 
@@ -894,10 +1223,10 @@ mod tests {
         assert_eq!(zero_stride.y_len(), 0);
     }
 
-    /// The first algorithm that is deterministic, without tensor cores and within the
-    /// scratch limit is picked; the error names the ones passed over.
+    /// The algorithms that are deterministic, without tensor cores and within the scratch
+    /// limit are kept in their order; the error names the ones passed over.
     #[test]
-    fn picking_passes_over_what_does_not_qualify() {
+    fn qualifying_passes_over_what_does_not_qualify() {
         let perf = |algo, status, determinism, math_type| AlgoPerf {
             algo,
             status,
@@ -911,20 +1240,92 @@ mod tests {
             perf(2, 0, 1, 1),
             perf(3, 0, 1, CUDNN_FMA_MATH),
             perf(5, 0, 1, CUDNN_FMA_MATH),
+            perf(6, 0, 1, CUDNN_FMA_MATH),
         ];
         let big = |algo| Ok(if algo == 3 { MAX_WORKSPACE + 1 } else { 64 });
+        let algo = |num, name| Algo {
+            num,
+            name,
+            bytes: 64,
+        };
         assert_eq!(
-            pick("weight-gradient", &WEIGHT_GRAD, &ranked, true, big).unwrap(),
-            (5, "WINOGRAD_NONFUSED", 64)
+            qualifying("weight-gradient", &WEIGHT_GRAD, &[], &ranked, true, big).unwrap(),
+            [algo(5, "WINOGRAD_NONFUSED"), algo(6, "FFT_TILING")]
         );
-        let err = pick("weight-gradient", &WEIGHT_GRAD, &ranked[..4], true, big)
-            .unwrap_err()
-            .to_string();
+        let err = qualifying(
+            "weight-gradient",
+            &WEIGHT_GRAD,
+            &[],
+            &ranked[..4],
+            true,
+            big,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("it offered ALGO_0, FFT, ALGO_3"), "{err}");
         // Without Winograd, the fifth (WINOGRAD_NONFUSED) is passed over too.
-        let err = pick("weight-gradient", &WEIGHT_GRAD, &ranked, false, big)
-            .unwrap_err()
-            .to_string();
+        assert_eq!(
+            qualifying("weight-gradient", &WEIGHT_GRAD, &[], &ranked, false, big).unwrap(),
+            [algo(6, "FFT_TILING")]
+        );
+        let err = qualifying(
+            "weight-gradient",
+            &WEIGHT_GRAD,
+            &[],
+            &ranked[..5],
+            false,
+            big,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("ALGO_3, WINOGRAD_NONFUSED"), "{err}");
+        // An excluded algorithm is passed over and named.
+        assert_eq!(
+            qualifying(
+                "weight-gradient",
+                &WEIGHT_GRAD,
+                &["WINOGRAD_NONFUSED"],
+                &ranked,
+                true,
+                big
+            )
+            .unwrap(),
+            [algo(6, "FFT_TILING")]
+        );
+    }
+
+    /// The fastest candidate Find ran without error and calls deterministic is chosen; one
+    /// it does not rank falls back to the heuristics' first.
+    #[test]
+    fn the_fastest_allowed_is_chosen() {
+        let candidates = [
+            Algo {
+                num: 1,
+                name: "ALGO_1",
+                bytes: 0,
+            },
+            Algo {
+                num: 2,
+                name: "FFT",
+                bytes: 8,
+            },
+        ];
+        let timed = |algo, status, determinism| AlgoPerf {
+            algo,
+            status,
+            determinism,
+            ..AlgoPerf::default()
+        };
+        // 0 is not a candidate, 3 failed, 2 is not deterministic here: 1 wins.
+        let found = [
+            timed(0, 0, 1),
+            timed(3, 1, 1),
+            timed(2, 0, 0),
+            timed(1, 0, 1),
+        ];
+        assert_eq!(fastest(&candidates, &found), candidates[0]);
+        let found = [timed(2, 0, 1), timed(1, 0, 1)];
+        assert_eq!(fastest(&candidates, &found), candidates[1]);
+        assert_eq!(fastest(&candidates, &[]), candidates[0]);
     }
 }

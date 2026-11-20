@@ -151,8 +151,20 @@ api! {
         fn cuMemFree_v2(pointer: DevicePtr) -> c_int;
         /// Sets `count` bytes of device memory to `value`.
         fn cuMemsetD8_v2(to: DevicePtr, value: u8, count: usize) -> c_int;
-        /// Copies host memory to device memory, after the context's earlier work.
+        /// Sets `count` four-byte words of device memory to `value`, queued after the
+        /// context's earlier work and returning without waiting for it.
+        fn cuMemsetD32_v2(to: DevicePtr, value: c_uint, count: usize) -> c_int;
+        /// Copies host memory to device memory, after the context's earlier work; the host
+        /// waits for the copy.
         fn cuMemcpyHtoD_v2(to: DevicePtr, from: *const c_void, bytes: usize) -> c_int;
+        /// Allocates page-locked host memory, which the card's copies read directly.
+        fn cuMemAllocHost_v2(pointer: *mut *mut c_void, bytes: usize) -> c_int;
+        /// Frees host memory from `cuMemAllocHost_v2`.
+        fn cuMemFreeHost(pointer: *mut c_void) -> c_int;
+        /// Copies host memory to device memory, queued on `stream` after its earlier work.
+        /// From page-locked memory it returns without waiting, and the source must stay
+        /// allocated and unchanged until the copy is done.
+        fn cuMemcpyHtoDAsync_v2(to: DevicePtr, from: *const c_void, bytes: usize, stream: CuStream) -> c_int;
         /// Copies device memory to host memory, after the context's earlier work.
         fn cuMemcpyDtoH_v2(to: *mut c_void, from: DevicePtr, bytes: usize) -> c_int;
         /// Copies device memory to device memory, after the context's earlier work.
@@ -286,6 +298,55 @@ api! {
             requested: c_int,
             returned: *mut c_int,
             results: *mut AlgoPerf,
+        ) -> c_int;
+        /// Runs every forward algorithm that fits `workspace_bytes` of scratch memory on the
+        /// given buffers and returns them fastest first, with their times.
+        fn cudnnFindConvolutionForwardAlgorithmEx(
+            handle: *mut c_void,
+            x_desc: *mut c_void,
+            x: DevicePtr,
+            w_desc: *mut c_void,
+            w: DevicePtr,
+            conv: *mut c_void,
+            y_desc: *mut c_void,
+            y: DevicePtr,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+        ) -> c_int;
+        /// The input-gradient algorithms timed on the given buffers, fastest first.
+        fn cudnnFindConvolutionBackwardDataAlgorithmEx(
+            handle: *mut c_void,
+            w_desc: *mut c_void,
+            w: DevicePtr,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            conv: *mut c_void,
+            dx_desc: *mut c_void,
+            dx: DevicePtr,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
+        ) -> c_int;
+        /// The weight-gradient algorithms timed on the given buffers, fastest first.
+        fn cudnnFindConvolutionBackwardFilterAlgorithmEx(
+            handle: *mut c_void,
+            x_desc: *mut c_void,
+            x: DevicePtr,
+            dy_desc: *mut c_void,
+            dy: DevicePtr,
+            conv: *mut c_void,
+            dw_desc: *mut c_void,
+            dw: DevicePtr,
+            requested: c_int,
+            returned: *mut c_int,
+            results: *mut AlgoPerf,
+            workspace: DevicePtr,
+            workspace_bytes: usize,
         ) -> c_int;
         /// The scratch memory a forward algorithm needs.
         fn cudnnGetConvolutionForwardWorkspaceSize(
