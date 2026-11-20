@@ -21,7 +21,7 @@ use cavitation_core::{
 use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuTrainer;
-use super::forward_tests::{Twin, mlp, twin};
+use super::forward_tests::{Twin, activation_mlp, mlp, more_activations, twin};
 use crate::{
     BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, Loss,
     MaxPool2d, NeuronMask, OptimizerConfig, Relu, Sequential, TargetsView, Trace,
@@ -325,6 +325,25 @@ fn gradients_match_the_tape() {
     check_gradients(t, &Data::new(1, 24, 12, 4, (-2.0, 2.0)), "mlp");
     let t = twin(small_cnn::<f64>, small_cnn::<f32>, 22);
     check_gradients(t, &Data::new(2, 6, 2 * 64, 5, (-1.0, 1.0)), "small cnn");
+}
+
+/// Each activation beyond ReLU, tanh, the sigmoid and GELU, twice in an MLP: the GPU's
+/// gradients against the `f64` tape's, within the tolerance above.
+#[test]
+fn every_activation_matches_the_tape() {
+    for (i, kind) in more_activations().into_iter().enumerate() {
+        let seed = 60 + i as u64;
+        let t = twin(
+            |p, s| activation_mlp(p, s, kind),
+            |p, s| activation_mlp(p, s, kind),
+            seed,
+        );
+        check_gradients(
+            t,
+            &Data::new(seed, 24, 12, 4, (-2.0, 2.0)),
+            &format!("{kind:?}"),
+        );
+    }
 }
 
 /// One `mnist-cnn` step and one `cifar-cnn` step.

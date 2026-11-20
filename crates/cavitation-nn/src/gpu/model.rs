@@ -45,9 +45,14 @@ pub(crate) struct GpuMask {
 /// [`Conv2d`](crate::Conv2d), [`MaxPool2d`](crate::MaxPool2d),
 /// [`AvgPool2d`](crate::AvgPool2d), [`BatchNorm2d`](crate::BatchNorm2d),
 /// [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten), [`Identity`](crate::Identity)
-/// and the activations [`Relu`](crate::Relu), [`LeakyRelu`](crate::LeakyRelu),
-/// [`Tanh`](crate::Tanh), [`Sigmoid`](crate::Sigmoid) and [`Gelu`](crate::Gelu) (both
-/// forms). Neuron masks set on the model when it is compiled are compiled in; a mask set
+/// and every built-in activation: [`Relu`](crate::Relu), [`LeakyRelu`](crate::LeakyRelu),
+/// [`Tanh`](crate::Tanh), [`Sigmoid`](crate::Sigmoid), [`Gelu`](crate::Gelu) (both forms),
+/// [`Elu`](crate::Elu), [`Selu`](crate::Selu), [`Celu`](crate::Celu) (with a positive
+/// `alpha`), [`Silu`](crate::Silu), [`Mish`](crate::Mish), [`Softplus`](crate::Softplus),
+/// [`Softsign`](crate::Softsign), [`Hardtanh`](crate::Hardtanh), [`Relu6`](crate::Relu6),
+/// [`Hardsigmoid`](crate::Hardsigmoid), [`Hardswish`](crate::Hardswish) and
+/// [`LogSigmoid`](crate::LogSigmoid), each as an [`ActivationLayer`](crate::ActivationLayer)
+/// too. Neuron masks set on the model when it is compiled are compiled in; a mask set
 /// later needs a new compile.
 ///
 /// A batch-norm layer's `num_batches_tracked` stays on the host, since only the host
@@ -408,7 +413,7 @@ mod tests {
 
     use super::{Act, GpuModel, Kind, Plan, pack_rows};
     use crate::{
-        AvgPool2d, BatchNorm2d, Conv2d, Dropout, Elu, Flatten, Gelu, Init, Layer, LeakyRelu,
+        AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Init, Layer, LeakyRelu,
         Linear, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh,
     };
 
@@ -568,8 +573,8 @@ mod tests {
             (
                 Sequential::new()
                     .push(linear(&mut params, &mut rng))
-                    .push(Elu::default()),
-                "unsupported: GpuModel::compile: layer 1 (elu) is an activation the GPU does not run",
+                    .push(Celu { alpha: -1.0 }),
+                "unsupported: GpuModel::compile: layer 1 (celu) is a CELU with alpha -1; the GPU runs a positive alpha only",
             ),
             (
                 Sequential::new()

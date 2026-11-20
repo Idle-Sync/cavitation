@@ -621,7 +621,7 @@ impl<'s> GpuTrainer<'s> {
         // The ReLU layers whose outputs the dead-neuron check reads, with their values per
         // channel as the CPU check groups them.
         let relus: Vec<(usize, usize)> = (0..m.layers.len())
-            .filter(|&i| matches!(m.layers[i].kind, Kind::Activation(Act::Relu)))
+            .filter(|&i| matches!(m.layers[i].kind, Kind::Activation(Act::Relu | Act::Relu6)))
             .map(|i| (i, channel_size(model, i, m.layers[i].outputs).unwrap_or(1)))
             .collect();
         let relu_words: usize = relus
@@ -1832,14 +1832,14 @@ impl TrainPass {
                 }
                 Kind::Activation(act) => {
                     let out = take(&mut values, pool);
-                    let (op, alpha) = forward_op(act);
+                    let (alpha, scale) = act.settings();
                     forward.push(Op::Elementwise(k.elementwise.call(
                         steps,
                         pool,
-                        op,
+                        forward_op(act),
                         u32_of(n),
                         alpha,
-                        0.0,
+                        scale,
                         &values[x],
                         None,
                         &values[out],
@@ -2105,7 +2105,8 @@ impl TrainPass {
                 }
                 Kind::Activation(act) => {
                     let dx = new_grad(&mut grads, pool, n_in);
-                    let (op, alpha, from_output) = backward_op(act);
+                    let (op, from_output) = backward_op(act);
+                    let (alpha, scale) = act.settings();
                     let a = if from_output { &values[s.pre] } else { x };
                     backward.push(Op::Elementwise(k.elementwise.call(
                         steps,
@@ -2113,7 +2114,7 @@ impl TrainPass {
                         op,
                         u32_of(n_in),
                         alpha,
-                        0.0,
+                        scale,
                         a,
                         Some(&grads[g]),
                         &grads[dx],
@@ -2313,27 +2314,49 @@ fn conv_dims(batch: usize, geom: &cavitation_core::Conv2dGeom) -> ConvDims {
     }
 }
 
-/// An activation's forward operation and its `alpha`.
-fn forward_op(act: Act) -> (Elementwise, f32) {
+/// An activation's forward operation.
+pub(super) fn forward_op(act: Act) -> Elementwise {
     match act {
-        Act::Relu => (Elementwise::Relu, 0.0),
-        Act::LeakyRelu(slope) => (Elementwise::LeakyRelu, slope as f32),
-        Act::Tanh => (Elementwise::Tanh, 0.0),
-        Act::Sigmoid => (Elementwise::Sigmoid, 0.0),
-        Act::GeluTanh => (Elementwise::GeluTanh, 0.0),
-        Act::GeluErf => (Elementwise::GeluErf, 0.0),
+        Act::Relu => Elementwise::Relu,
+        Act::LeakyRelu(_) => Elementwise::LeakyRelu,
+        Act::Tanh => Elementwise::Tanh,
+        Act::Sigmoid => Elementwise::Sigmoid,
+        Act::GeluTanh => Elementwise::GeluTanh,
+        Act::GeluErf => Elementwise::GeluErf,
+        Act::Elu(_) => Elementwise::Elu,
+        Act::Selu => Elementwise::Selu,
+        Act::Celu(_) => Elementwise::Celu,
+        Act::Silu => Elementwise::Silu,
+        Act::Mish => Elementwise::Mish,
+        Act::Softplus { .. } => Elementwise::Softplus,
+        Act::Softsign => Elementwise::Softsign,
+        Act::Hardtanh { .. } | Act::Relu6 => Elementwise::Hardtanh,
+        Act::Hardsigmoid => Elementwise::Hardsigmoid,
+        Act::Hardswish => Elementwise::Hardswish,
+        Act::LogSigmoid => Elementwise::LogSigmoid,
     }
 }
 
-/// An activation's backward operation, its `alpha`, and whether it reads the forward output
-/// (tanh and the sigmoid) rather than the input.
-fn backward_op(act: Act) -> (Elementwise, f32, bool) {
+/// An activation's backward operation, and whether it reads the forward output (tanh and the
+/// sigmoid) rather than the input.
+fn backward_op(act: Act) -> (Elementwise, bool) {
     match act {
-        Act::Relu => (Elementwise::ReluBackward, 0.0, false),
-        Act::LeakyRelu(slope) => (Elementwise::LeakyReluBackward, slope as f32, false),
-        Act::Tanh => (Elementwise::TanhBackward, 0.0, true),
-        Act::Sigmoid => (Elementwise::SigmoidBackward, 0.0, true),
-        Act::GeluTanh => (Elementwise::GeluTanhBackward, 0.0, false),
-        Act::GeluErf => (Elementwise::GeluErfBackward, 0.0, false),
+        Act::Relu => (Elementwise::ReluBackward, false),
+        Act::LeakyRelu(_) => (Elementwise::LeakyReluBackward, false),
+        Act::Tanh => (Elementwise::TanhBackward, true),
+        Act::Sigmoid => (Elementwise::SigmoidBackward, true),
+        Act::GeluTanh => (Elementwise::GeluTanhBackward, false),
+        Act::GeluErf => (Elementwise::GeluErfBackward, false),
+        Act::Elu(_) => (Elementwise::EluBackward, false),
+        Act::Selu => (Elementwise::SeluBackward, false),
+        Act::Celu(_) => (Elementwise::CeluBackward, false),
+        Act::Silu => (Elementwise::SiluBackward, false),
+        Act::Mish => (Elementwise::MishBackward, false),
+        Act::Softplus { .. } => (Elementwise::SoftplusBackward, false),
+        Act::Softsign => (Elementwise::SoftsignBackward, false),
+        Act::Hardtanh { .. } | Act::Relu6 => (Elementwise::HardtanhBackward, false),
+        Act::Hardsigmoid => (Elementwise::HardsigmoidBackward, false),
+        Act::Hardswish => (Elementwise::HardswishBackward, false),
+        Act::LogSigmoid => (Elementwise::LogSigmoidBackward, false),
     }
 }

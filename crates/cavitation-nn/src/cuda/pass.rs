@@ -170,11 +170,11 @@ pub(crate) enum Op {
         dy: usize,
         dx: usize,
     },
-    /// The element-wise operation `op` of `n` values of `a` (and `b`), with `alpha`: an
-    /// activation or its backward pass.
+    /// The element-wise operation `op` of `n` values of `a` (and `b`), with its two
+    /// settings (`alpha` and `scale`): an activation or its backward pass.
     Elementwise {
         op: ElementwiseOp,
-        alpha: f32,
+        settings: (f32, f32),
         n: usize,
         a: usize,
         b: Option<usize>,
@@ -284,20 +284,21 @@ fn run_op(
         }
         Op::Elementwise {
             op,
-            alpha,
+            settings: (alpha, scale),
             n,
             a,
             b,
             y,
         } => {
             let second = b.map(|b| s.get(b));
-            shared.elementwise.run(
+            shared.elementwise.run_with(
                 op,
                 &s.get(a),
                 second.as_deref(),
                 &mut s.get_mut(y),
                 n,
                 alpha,
+                scale,
             )
         }
         Op::Dropout {
@@ -496,28 +497,50 @@ pub(crate) fn norm_dims(
     ))
 }
 
-/// An activation's forward operation and its `alpha`.
-pub(crate) fn forward_op(act: Act) -> (ElementwiseOp, f32) {
+/// An activation's forward operation.
+pub(crate) fn forward_op(act: Act) -> ElementwiseOp {
     match act {
-        Act::Relu => (ElementwiseOp::Relu, 0.0),
-        Act::LeakyRelu(slope) => (ElementwiseOp::LeakyRelu, slope as f32),
-        Act::Tanh => (ElementwiseOp::Tanh, 0.0),
-        Act::Sigmoid => (ElementwiseOp::Sigmoid, 0.0),
-        Act::GeluTanh => (ElementwiseOp::GeluTanh, 0.0),
-        Act::GeluErf => (ElementwiseOp::GeluErf, 0.0),
+        Act::Relu => ElementwiseOp::Relu,
+        Act::LeakyRelu(_) => ElementwiseOp::LeakyRelu,
+        Act::Tanh => ElementwiseOp::Tanh,
+        Act::Sigmoid => ElementwiseOp::Sigmoid,
+        Act::GeluTanh => ElementwiseOp::GeluTanh,
+        Act::GeluErf => ElementwiseOp::GeluErf,
+        Act::Elu(_) => ElementwiseOp::Elu,
+        Act::Selu => ElementwiseOp::Selu,
+        Act::Celu(_) => ElementwiseOp::Celu,
+        Act::Silu => ElementwiseOp::Silu,
+        Act::Mish => ElementwiseOp::Mish,
+        Act::Softplus { .. } => ElementwiseOp::Softplus,
+        Act::Softsign => ElementwiseOp::Softsign,
+        Act::Hardtanh { .. } | Act::Relu6 => ElementwiseOp::Hardtanh,
+        Act::Hardsigmoid => ElementwiseOp::Hardsigmoid,
+        Act::Hardswish => ElementwiseOp::Hardswish,
+        Act::LogSigmoid => ElementwiseOp::LogSigmoid,
     }
 }
 
-/// An activation's backward operation, its `alpha`, and whether it reads the forward output
-/// (tanh and the sigmoid) rather than the input.
-pub(crate) fn backward_op(act: Act) -> (ElementwiseOp, f32, bool) {
+/// An activation's backward operation, and whether it reads the forward output (tanh and the
+/// sigmoid) rather than the input.
+pub(crate) fn backward_op(act: Act) -> (ElementwiseOp, bool) {
     match act {
-        Act::Relu => (ElementwiseOp::ReluBackward, 0.0, false),
-        Act::LeakyRelu(slope) => (ElementwiseOp::LeakyReluBackward, slope as f32, false),
-        Act::Tanh => (ElementwiseOp::TanhBackward, 0.0, true),
-        Act::Sigmoid => (ElementwiseOp::SigmoidBackward, 0.0, true),
-        Act::GeluTanh => (ElementwiseOp::GeluTanhBackward, 0.0, false),
-        Act::GeluErf => (ElementwiseOp::GeluErfBackward, 0.0, false),
+        Act::Relu => (ElementwiseOp::ReluBackward, false),
+        Act::LeakyRelu(_) => (ElementwiseOp::LeakyReluBackward, false),
+        Act::Tanh => (ElementwiseOp::TanhBackward, true),
+        Act::Sigmoid => (ElementwiseOp::SigmoidBackward, true),
+        Act::GeluTanh => (ElementwiseOp::GeluTanhBackward, false),
+        Act::GeluErf => (ElementwiseOp::GeluErfBackward, false),
+        Act::Elu(_) => (ElementwiseOp::EluBackward, false),
+        Act::Selu => (ElementwiseOp::SeluBackward, false),
+        Act::Celu(_) => (ElementwiseOp::CeluBackward, false),
+        Act::Silu => (ElementwiseOp::SiluBackward, false),
+        Act::Mish => (ElementwiseOp::MishBackward, false),
+        Act::Softplus { .. } => (ElementwiseOp::SoftplusBackward, false),
+        Act::Softsign => (ElementwiseOp::SoftsignBackward, false),
+        Act::Hardtanh { .. } | Act::Relu6 => (ElementwiseOp::HardtanhBackward, false),
+        Act::Hardsigmoid => (ElementwiseOp::HardsigmoidBackward, false),
+        Act::Hardswish => (ElementwiseOp::HardswishBackward, false),
+        Act::LogSigmoid => (ElementwiseOp::LogSigmoidBackward, false),
     }
 }
 
@@ -589,10 +612,9 @@ impl<'c> Forward<'c> {
                 }
                 Kind::Activation(act) => {
                     let y = store.values(n)?;
-                    let (op, alpha) = forward_op(act);
                     ops.push(Op::Elementwise {
-                        op,
-                        alpha,
+                        op: forward_op(act),
+                        settings: act.settings(),
                         n,
                         a: x,
                         b: None,

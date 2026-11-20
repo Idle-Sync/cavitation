@@ -8,8 +8,8 @@ use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Real, Rng, Tensor, Ten
 use cavitation_cuda::Cuda;
 
 use crate::{
-    BatchNorm2d, BatchView, Conv2d, Dataset, Dropout, Flatten, Init, Linear, MaxPool2d, Relu,
-    Sequential, Tanh, Targets, TargetsView,
+    ActivationKind, ActivationLayer, BatchNorm2d, BatchView, Conv2d, Dataset, Dropout, Flatten,
+    Init, Linear, MaxPool2d, Relu, Sequential, Tanh, Targets, TargetsView,
 };
 
 /// Runs `body` on CUDA if it opens, and returns whether it ran.
@@ -41,6 +41,48 @@ pub(super) fn mlp<T: Real>(params: &mut ParamStore<T>, seed: u64) -> Sequential<
         .push(Tanh)
         .push(Linear::new(params, 16, 9, &mut rng))
         .push(Relu)
+        .push(Linear::new(params, 9, 4, &mut rng))
+}
+
+/// The activations the GPU engines run besides ReLU, leaky ReLU, tanh, the sigmoid and GELU,
+/// each with settings that take both of its branches on the test data: softplus with a low
+/// threshold, hardtanh with bounds inside the values the first `Linear` gives.
+pub(super) fn more_activations() -> [ActivationKind; 12] {
+    [
+        ActivationKind::Elu(0.75),
+        ActivationKind::Selu,
+        ActivationKind::Celu(1.5),
+        ActivationKind::Silu,
+        ActivationKind::Mish,
+        ActivationKind::Softplus {
+            beta: 1.5,
+            threshold: 1.0,
+        },
+        ActivationKind::Softsign,
+        ActivationKind::Hardtanh {
+            min: -0.5,
+            max: 0.75,
+        },
+        ActivationKind::Relu6,
+        ActivationKind::Hardsigmoid,
+        ActivationKind::Hardswish,
+        ActivationKind::LogSigmoid,
+    ]
+}
+
+/// An MLP 12 → 16 → 9 → 4 with `kind` after each of the first two `Linear`s, in either
+/// precision.
+pub(super) fn activation_mlp<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    kind: ActivationKind,
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    Sequential::new_generic()
+        .push(Linear::new(params, 12, 16, &mut rng))
+        .push(ActivationLayer::<T>::new(kind))
+        .push(Linear::new(params, 16, 9, &mut rng))
+        .push(ActivationLayer::<T>::new(kind))
         .push(Linear::new(params, 9, 4, &mut rng))
 }
 
@@ -141,8 +183,8 @@ pub(super) struct Twin {
 /// running statistics and affine transform, get values away from their initial ones, so that
 /// each does work; then the `f64` values are made the `f32` ones.
 pub(super) fn twin(
-    build64: fn(&mut ParamStore<f64>, u64) -> Sequential<f64>,
-    build32: fn(&mut ParamStore, u64) -> Sequential,
+    build64: impl Fn(&mut ParamStore<f64>, u64) -> Sequential<f64>,
+    build32: impl Fn(&mut ParamStore, u64) -> Sequential,
     seed: u64,
 ) -> Twin {
     let mut params = ParamStore::new();

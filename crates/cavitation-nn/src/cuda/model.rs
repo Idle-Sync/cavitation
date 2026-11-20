@@ -47,9 +47,10 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// [`Linear`](crate::Linear) (through cuBLAS), [`Conv2d`](crate::Conv2d) (through cuDNN),
 /// [`MaxPool2d`](crate::MaxPool2d), [`AvgPool2d`](crate::AvgPool2d),
 /// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout),
-/// [`Flatten`](crate::Flatten), [`Identity`](crate::Identity) and the activations
-/// [`Relu`](crate::Relu), [`LeakyRelu`](crate::LeakyRelu), [`Tanh`](crate::Tanh),
-/// [`Sigmoid`](crate::Sigmoid) and [`Gelu`](crate::Gelu) (both forms).
+/// [`Flatten`](crate::Flatten), [`Identity`](crate::Identity) and every built-in activation
+/// (ReLU, leaky ReLU, tanh, the sigmoid, GELU in both forms, ELU, SELU, CELU with a positive
+/// `alpha`, SiLU, Mish, softplus, softsign, hardtanh, ReLU6, the hard sigmoid, the hard swish
+/// and log-sigmoid).
 /// [`compile`](CudaModel::compile) refuses any other layer, naming its index and name. Neuron
 /// masks set on the model when it is compiled are compiled in; a mask set later needs a new
 /// compile.

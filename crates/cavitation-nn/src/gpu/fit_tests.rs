@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use cavitation_core::{Conv2dGeom, Error, ParamStore, Pool2dGeom, Rng, Tensor};
 
 use super::GpuTrainer;
-use super::forward_tests::mlp;
+use super::forward_tests::{activation_mlp, mlp, more_activations};
 use super::health_tests::for_each_gpu;
 use crate::{
     Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Device, DeviceKind, Dropout, EarlyStopping,
@@ -277,6 +277,67 @@ fn fit_tracks_the_cpu_fit() {
             );
         }
     });
+}
+
+/// Each activation beyond ReLU, tanh, the sigmoid and GELU, twice in an MLP: a run on
+/// the GPU tracks the CPU run of the same `FitConfig`, each epoch's mean loss within 2⁻¹⁰ of
+/// the CPU's and the final parameters within 2⁻¹⁰ of each tensor's largest value plus 2⁻¹⁶,
+/// over 3 epochs of 50 rows at batch 16 (a last batch of 2) with Adam.
+#[test]
+fn every_activation_tracks_the_cpu_fit() {
+    let train = classes(70, 50, 12, 4);
+    let config = || FitConfig {
+        epochs: 3,
+        batch: 16,
+        optimizer: OptimizerConfig::Adam {
+            lr: 0.01,
+            weight_decay: 0.0,
+        },
+        shuffle_seed: Some(3),
+        health: Health::quiet(),
+        ..FitConfig::default()
+    };
+    for (i, kind) in more_activations().into_iter().enumerate() {
+        let mut start = ParamStore::new();
+        let net = activation_mlp::<f32>(&mut start, 80 + i as u64, kind);
+        let mut cpu = start.clone();
+        let on_cpu = fit(&net, &mut cpu, &train, config()).unwrap();
+        for_each_gpu(|gpu| {
+            let mut params = start.clone();
+            let on_device = fit(&net, &mut params, &train, on(gpu, config())).unwrap();
+            let mut worst = 0.0f64;
+            for (g, c) in on_device.epochs.iter().zip(&on_cpu.epochs) {
+                let off = (g.mean_loss - c.mean_loss).abs() / c.mean_loss.abs();
+                assert!(
+                    off <= 1.0 / 1024.0,
+                    "{kind:?}: epoch {}: mean loss {}, the CPU's {}",
+                    g.epoch,
+                    g.mean_loss,
+                    c.mean_loss
+                );
+                worst = worst.max(off);
+            }
+            let mut worst_param = 0.0f32;
+            for (name, id) in net.state_names() {
+                let (a, b) = (params.value(id).data(), cpu.value(id).data());
+                let scale = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let off = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                let tolerance = scale / 1024.0 + 1.0 / 65536.0;
+                assert!(
+                    off <= tolerance,
+                    "{kind:?}: {name} off by {off:e} of {scale:e}"
+                );
+                worst_param = worst_param.max(off / tolerance);
+            }
+            println!(
+                "{kind:?}: worst loss off by {worst:.3e} of the CPU's; parameters {worst_param:.4} of the tolerance"
+            );
+        });
+    }
 }
 
 /// Early stopping on the GPU ends the run with the best epoch's parameters, copied back when
