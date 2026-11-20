@@ -17,7 +17,8 @@ use cavitation_core::{Conv2dGeom, Error, Gate, ParamStore, Pool2dGeom, Rng, Tens
 
 use super::GpuTrainer;
 use super::forward_tests::{
-    GLU_GATES, activation_mlp, glu_mlp, mlp, more_activations, prelu_mlp, softmax_mlp,
+    ADAPTIVE_OUTPUTS, GLU_GATES, activation_mlp, glu_mlp, mlp, more_activations, pool_cnn,
+    prelu_mlp, softmax_mlp,
 };
 use super::health_tests::for_each_gpu;
 use crate::{
@@ -541,6 +542,79 @@ fn glu_layers_track_the_cpu_fit() {
         let what = format!("GLU with {gate:?}{}", if lead { ", leading" } else { "" });
         let mut start = ParamStore::new();
         let net = glu_mlp::<f32>(&mut start, 130 + k as u64, gate, lead);
+        let mut cpu = start.clone();
+        let on_cpu = fit(&net, &mut cpu, &train, config()).unwrap();
+        for_each_gpu(|gpu| {
+            let mut params = start.clone();
+            let on_device = fit(&net, &mut params, &train, on(gpu, config())).unwrap();
+            let mut worst = 0.0f64;
+            for (g, c) in on_device.epochs.iter().zip(&on_cpu.epochs) {
+                let (gv, cv) = (
+                    g.validation.as_ref().unwrap(),
+                    c.validation.as_ref().unwrap(),
+                );
+                for (got, want, which) in [
+                    (g.mean_loss, c.mean_loss, "mean loss"),
+                    (gv.loss, cv.loss, "validation loss"),
+                ] {
+                    let off = (got - want).abs() / want.abs();
+                    assert!(
+                        off <= 1.0 / 1024.0,
+                        "{what}: epoch {}: {which} {got}, the CPU's {want}",
+                        g.epoch
+                    );
+                    worst = worst.max(off);
+                }
+            }
+            let mut worst_param = 0.0f32;
+            for (name, id) in net.state_names() {
+                let (a, b) = (params.value(id).data(), cpu.value(id).data());
+                let scale = b.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+                let off = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                let tolerance = scale / 1024.0 + 1.0 / 65536.0;
+                assert!(
+                    off <= tolerance,
+                    "{what}: {name} off by {off:e} of {scale:e}"
+                );
+                worst_param = worst_param.max(off / tolerance);
+            }
+            println!(
+                "{what}: worst loss off by {worst:.3e} of the CPU's; parameters {worst_param:.4} \
+                 of the tolerance"
+            );
+        });
+    }
+}
+
+/// A CNN through average pooling and adaptive average pooling to each of `ADAPTIVE_OUTPUTS`:
+/// a run on the GPU tracks the CPU run of the same `FitConfig`, each epoch's mean loss and
+/// validation loss (through the trainer's model) within 2⁻¹⁰ of the CPU's and the final
+/// parameters within 2⁻¹⁰ of each tensor's largest value plus 2⁻¹⁶, over 3 epochs of 50
+/// rows at batch 16 (a last batch of 2) with Adam.
+#[test]
+fn pool_layers_track_the_cpu_fit() {
+    let train = classes(76, 50, 98, 5);
+    let held_out = classes(77, 20, 98, 5);
+    for (k, to) in ADAPTIVE_OUTPUTS.into_iter().enumerate() {
+        let config = || FitConfig {
+            epochs: 3,
+            batch: 16,
+            optimizer: OptimizerConfig::Adam {
+                lr: 0.01,
+                weight_decay: 0.0,
+            },
+            shuffle_seed: Some(3),
+            health: Health::quiet(),
+            validation: Some(held_out.clone()),
+            ..FitConfig::default()
+        };
+        let what = format!("adaptive pooling to {to:?}");
+        let mut start = ParamStore::new();
+        let net = pool_cnn::<f32>(&mut start, 160 + k as u64, to);
         let mut cpu = start.clone();
         let on_cpu = fit(&net, &mut cpu, &train, config()).unwrap();
         for_each_gpu(|gpu| {

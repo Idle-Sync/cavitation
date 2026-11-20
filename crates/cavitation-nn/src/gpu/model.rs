@@ -43,6 +43,7 @@ pub(crate) struct GpuMask {
 /// [`compile`](GpuModel::compile) refuses a model with a layer the GPU does not run, naming the
 /// layer's index and name. The layers it runs are [`Linear`](crate::Linear),
 /// [`Conv2d`](crate::Conv2d), [`MaxPool2d`](crate::MaxPool2d), [`AvgPool2d`](crate::AvgPool2d),
+/// [`AdaptiveAvgPool2d`](crate::AdaptiveAvgPool2d),
 /// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten),
 /// [`Identity`](crate::Identity) and every built-in activation: [`Relu`](crate::Relu),
 /// [`LeakyRelu`](crate::LeakyRelu), [`Tanh`](crate::Tanh), [`Sigmoid`](crate::Sigmoid),
@@ -129,7 +130,9 @@ impl GpuModel {
     ///   the model has a convolution and `batch` is above 65,535 or a softmax and `batch` is
     ///   above 16,776,960, a PReLU has more than 65,535 slopes, takes more than 2³¹ values
     ///   per batch or its slope gradient would sum more than 268,431,360 values per slope, a
-    ///   GLU takes more than 4,294,967,295 values per batch, a `Linear`'s batch, inputs or
+    ///   GLU takes more than 4,294,967,295 values per batch, an adaptive average pooling
+    ///   reads or writes more than 2³¹ values per batch or has an axis whose
+    ///   `(size + 1) · (out + 1)` is above 4,294,967,295, a `Linear`'s batch, inputs or
     ///   outputs or a convolution's output pixels or channels are above 4,194,240, a batch
     ///   norm's eps is below 2⁻¹²⁶ in `f32` (and not 0), or the parameters, running
     ///   statistics and masks together are larger than one GPU buffer.
@@ -137,8 +140,10 @@ impl GpuModel {
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
     ///   a GLU's input width is odd (the CPU's GLU panics on it), a mask is not as wide as its
     ///   layer's output, a batch count does not hold one value,
-    ///   a PReLU's weight does not hold one value per slope, or a batch norm that keeps no
-    ///   running statistics would see one value per channel; the message names the layer (and
+    ///   a PReLU's weight does not hold one value per slope, a batch norm that keeps no
+    ///   running statistics would see one value per channel, or a layer's inference form is
+    ///   an average pooling that is dilated or divides by 0, or an adaptive average pooling
+    ///   with a size of 0 (the CPU's layers refuse these); the message names the layer (and
     ///   both widths, where two differ).
     ///
     /// # Panics
@@ -147,20 +152,39 @@ impl GpuModel {
     ///
     /// # Examples
     ///
-    /// A layer the GPU does not run is refused by index and name:
+    /// A layer the GPU does not run, such as a layer of your own, is refused by index and
+    /// name:
     ///
     /// ```
-    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_core::{ParamId, ParamStore, Real, Rng, Tape, Var};
     /// use cavitation_gpu::Gpu;
-    /// use cavitation_nn::{AdaptiveAvgPool2d, GpuModel, Linear, Sequential};
+    /// use cavitation_nn::{GpuModel, Layer, Linear, Sequential};
+    ///
+    /// /// `x²`, a layer of your own: it has no inference form, so no GPU runs it.
+    /// struct Square;
+    ///
+    /// impl<T: Real> Layer<T> for Square {
+    ///     fn name(&self) -> &str {
+    ///         "square"
+    ///     }
+    ///     fn output_width(&self, input_width: usize) -> usize {
+    ///         input_width
+    ///     }
+    ///     fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+    ///         tape.mul(x, x)
+    ///     }
+    ///     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+    ///         Vec::new()
+    ///     }
+    /// }
     ///
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new()
     ///     .push(Linear::new(&mut params, 4, 4, &mut Rng::seed(0)))
-    ///     .push(AdaptiveAvgPool2d::new(1, (2, 2), (1, 1)).unwrap());
+    ///     .push(Square);
     /// if let Some(gpu) = Gpu::new() {
     ///     let err = GpuModel::compile(&net, &params, 8, &gpu).unwrap_err();
-    ///     assert!(err.to_string().contains("layer 1 (adaptive_avg_pool2d)"), "{err}");
+    ///     assert!(err.to_string().contains("layer 1 (square)"), "{err}");
     /// }
     /// ```
     pub fn compile(
@@ -420,6 +444,7 @@ mod tests {
     use cavitation_gpu::{Backend, Gpu};
 
     use super::{Act, GpuModel, Kind, Plan, pack_rows};
+    use crate::InferenceLayer;
     use crate::{
         AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu,
         Hardtanh, Init, Layer, LeakyRelu, Linear, LogSoftmax, MaxPool2d, NeuronMask, Relu,
@@ -441,6 +466,28 @@ mod tests {
         }
         fn parameters(&self) -> Vec<(&'static str, ParamId)> {
             Vec::new()
+        }
+    }
+
+    /// A layer of your own with no parameters whose inference form is the one it holds, as a
+    /// layer outside this crate could declare any form.
+    struct Formed(InferenceLayer);
+
+    impl<T: Real> Layer<T> for Formed {
+        fn name(&self) -> &str {
+            "formed"
+        }
+        fn output_width(&self, input_width: usize) -> usize {
+            input_width
+        }
+        fn forward(&self, _: &mut Tape<'_, T>, x: Var) -> Var {
+            x
+        }
+        fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+            Vec::new()
+        }
+        fn inference(&self, _: &cavitation_core::ParamValues<f32>) -> Option<InferenceLayer> {
+            Some(self.0.clone())
         }
     }
 
@@ -603,9 +650,13 @@ mod tests {
             (
                 Sequential::new()
                     .push(linear(&mut params, &mut rng))
-                    .push(AdaptiveAvgPool2d::new(3, (1, 1), (1, 1)).unwrap()),
-                "unsupported: GpuModel::compile: layer 1 (adaptive_avg_pool2d) is not a layer the \
-                 GPU runs",
+                    .push(Formed(InferenceLayer::Linear {
+                        w_t: vec![0.0; 9],
+                        bias: None,
+                        inputs: 3,
+                        outputs: 3,
+                    })),
+                "unsupported: GpuModel::compile: layer 1 (formed) is not a layer the GPU runs",
             ),
             (
                 Sequential::new()
@@ -726,6 +777,82 @@ mod tests {
                 )
             );
         }
+    }
+
+    /// Adaptive average pooling is planned with its sizes and widths; the pooling forms the
+    /// CPU's layers refuse (a dilated average pooling, a divisor of 0, an adaptive pooling with
+    /// a size of 0) are invalid data, and an adaptive pooling beyond the kernels' 32-bit
+    /// arithmetic or 2³¹ values per batch is unsupported, each naming the layer.
+    #[test]
+    fn pooling_forms_are_checked() {
+        let mut params = ParamStore::new();
+        let net = Sequential::new()
+            .push(AdaptiveAvgPool2d::new(3, (7, 5), (3, 2)).unwrap())
+            .push(Linear::new(&mut params, 18, 2, &mut Rng::seed(0)));
+        let plan = Plan::build(&net, &params, 4).unwrap();
+        assert_eq!(plan.input_width, 105);
+        assert_eq!(
+            plan.layers[0].kind,
+            Kind::AdaptiveAvgPool2d {
+                channels: 3,
+                input: (7, 5),
+                output: (3, 2)
+            }
+        );
+        assert_eq!((plan.layers[0].inputs, plan.layers[0].outputs), (105, 18));
+        let dilated = Pool2dGeom::with_options(1, (6, 6), (2, 2), (2, 2), (0, 0), (2, 2), false);
+        let avg = |geom, divisor_override| InferenceLayer::AvgPool2d {
+            geom,
+            count_include_pad: true,
+            divisor_override,
+        };
+        let adaptive = |input, output| InferenceLayer::AdaptiveAvgPool2d {
+            channels: 1,
+            input,
+            output,
+        };
+        let plain = Pool2dGeom::new(1, (6, 6), (2, 2)).unwrap();
+        let cases = [
+            (
+                avg(dilated.unwrap(), None),
+                1,
+                "invalid data: GpuModel::compile: layer 0 (formed) is an average pooling with \
+                 dilation (2, 2); average pooling takes none",
+            ),
+            (
+                avg(plain, Some(0)),
+                1,
+                "invalid data: GpuModel::compile: layer 0 (formed) is an average pooling with a \
+                 divisor of 0",
+            ),
+            (
+                adaptive((4, 4), (0, 2)),
+                1,
+                "invalid data: GpuModel::compile: layer 0 (formed) is an adaptive average \
+                 pooling with channels 1, input (4, 4) and output (0, 2); every count and size \
+                 must be at least 1",
+            ),
+            (
+                adaptive((70_000, 1), (70_000, 1)),
+                1,
+                "unsupported: GpuModel::compile: layer 0 (formed) is an adaptive average pooling \
+                 of (70000, 1) to (70000, 1), whose window arithmetic does not fit the GPU's \
+                 32-bit integers",
+            ),
+            (
+                adaptive((2, 1), (2, 1)),
+                (1 << 30) + 1,
+                "unsupported: GpuModel::compile: layer 0 (formed) is an adaptive average pooling \
+                 over more than the 2147483648 values per batch the GPU takes",
+            ),
+        ];
+        for (form, batch, message) in cases {
+            let net = Sequential::new().push(Formed(form));
+            let err = Plan::build(&net, &ParamStore::new(), batch).unwrap_err();
+            assert_eq!(err.to_string(), message);
+        }
+        let net = Sequential::new().push(Formed(adaptive((2, 1), (2, 1))));
+        assert!(Plan::build(&net, &ParamStore::new(), 1 << 30).is_ok());
     }
 
     /// The masks' bits repeat each row's for every row of the batch, low bit first.

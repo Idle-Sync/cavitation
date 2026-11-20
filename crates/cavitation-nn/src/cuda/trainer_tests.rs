@@ -1,9 +1,10 @@
 //! `CudaTrainer` against the CPU: each parameter's gradient after one step against the `f64`
 //! training tape's from the same weights, batch and dropout masks, on the test MLP (with a
-//! neuron mask), a small CNN (convolution, batch norm, max pooling, dropout), `mnist-cnn` and
-//! `cifar-cnn`; the parameters after one SGD step within the update's bound; two runs giving
-//! the same bits; a step on non-finite inputs leaving the parameters and the optimiser's state
-//! as they were; five steps tracking the CPU `Trainer`; and a profiled step.
+//! neuron mask), a small CNN (convolution, batch norm, max pooling, dropout), a CNN through
+//! average and adaptive average pooling, `mnist-cnn` and `cifar-cnn`; the parameters after one
+//! SGD step within the update's bound; two runs giving the same bits; a step on non-finite
+//! inputs leaving the parameters and the optimiser's state as they were; five steps tracking
+//! the CPU `Trainer`; and a profiled step.
 //!
 //! The `f64` reference takes the card's discrete decisions: each ReLU keeps the values whose
 //! input was above 0 on the card, and each max pooling takes the card's winners (as a sum over
@@ -28,8 +29,8 @@ use cavitation_core::{Gate, Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
 
 use super::CudaTrainer;
 use super::test_util::{
-    Data, GLU_GATES, Twin, activation_mlp, cifar_cnn, glu_mlp, mlp, mnist_cnn, more_activations,
-    off, prelu_mlp, small_cnn, softmax_mlp, twin, with_cuda,
+    ADAPTIVE_OUTPUTS, Data, GLU_GATES, Twin, activation_mlp, cifar_cnn, glu_mlp, mlp, mnist_cnn,
+    more_activations, off, pool_cnn, prelu_mlp, small_cnn, softmax_mlp, twin, with_cuda,
 };
 use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
@@ -279,6 +280,19 @@ fn glu_layers_match_the_tape() {
         let width = if lead { 24 } else { 12 };
         let what = format!("GLU with {gate:?}{}", if lead { ", leading" } else { "" });
         check_gradients(t, &Data::within(seed, 24, width, 4, (-2.0, 2.0)), &what);
+    }
+}
+
+/// A CNN through average pooling and adaptive average pooling to each of
+/// `ADAPTIVE_OUTPUTS` (overlapping windows, global pooling, an output larger than its input):
+/// the card's gradients against the `f64` tape's, within the tolerance above.
+#[test]
+fn pool_layers_match_the_tape() {
+    for (k, to) in ADAPTIVE_OUTPUTS.into_iter().enumerate() {
+        let seed = 150 + k as u64;
+        let t = twin(|p, s| pool_cnn(p, s, to), |p, s| pool_cnn(p, s, to), seed);
+        let what = format!("adaptive pooling to {to:?}");
+        check_gradients(t, &Data::new(seed, 6, 98, 5), &what);
     }
 }
 

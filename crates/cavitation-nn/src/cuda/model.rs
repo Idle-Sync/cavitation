@@ -46,6 +46,7 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// It runs the layers [`GpuModel`](crate::GpuModel) runs, from the same checks:
 /// [`Linear`](crate::Linear) (through cuBLAS), [`Conv2d`](crate::Conv2d) (through cuDNN),
 /// [`MaxPool2d`](crate::MaxPool2d), [`AvgPool2d`](crate::AvgPool2d),
+/// [`AdaptiveAvgPool2d`](crate::AdaptiveAvgPool2d),
 /// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten),
 /// [`Identity`](crate::Identity) and every built-in activation (ReLU, leaky ReLU, tanh, the
 /// sigmoid, GELU in both forms, ELU, SELU, CELU with a positive `alpha`, SiLU, Mish, softplus,
@@ -137,13 +138,17 @@ impl<'c> CudaModel<'c> {
     ///   cuBLAS's `int` does not hold, a convolution with no deterministic algorithm that
     ///   uses no tensor cores, a batch norm of more than 65,535 channels, or memory the card
     ///   does not have. Also a PReLU of more than 65,535 slopes or of more than 2³¹ values per
-    ///   batch, and a GLU of more than 4,294,967,295 values per batch.
+    ///   batch, a GLU of more than 4,294,967,295 values per batch, and an adaptive average
+    ///   pooling of more than 2³¹ values per batch or with an axis whose
+    ///   `(size + 1) · (out + 1)` is above 4,294,967,295.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
     ///   a GLU's input width is odd (the CPU's GLU panics on it), a mask is not as wide as its
     ///   layer's output, a batch count does not hold one value,
-    ///   a PReLU's weight does not hold one value per slope, or a batch norm that keeps no
-    ///   running statistics would see one value per channel; the message names the layer (and
+    ///   a PReLU's weight does not hold one value per slope, a batch norm that keeps no
+    ///   running statistics would see one value per channel, or a layer's inference form is
+    ///   an average pooling that is dilated or divides by 0, or an adaptive average pooling
+    ///   with a size of 0 (the CPU's layers refuse these); the message names the layer (and
     ///   both widths, where two differ).
     ///
     /// # Panics
@@ -152,20 +157,39 @@ impl<'c> CudaModel<'c> {
     ///
     /// # Examples
     ///
-    /// A layer the card does not run is refused by index and name:
+    /// A layer the card does not run, such as a layer of your own, is refused by index and
+    /// name:
     ///
     /// ```
-    /// use cavitation_core::{ParamStore, Rng};
+    /// use cavitation_core::{ParamId, ParamStore, Real, Rng, Tape, Var};
     /// use cavitation_cuda::Cuda;
-    /// use cavitation_nn::{AdaptiveAvgPool2d, CudaModel, Linear, Sequential};
+    /// use cavitation_nn::{CudaModel, Layer, Linear, Sequential};
+    ///
+    /// /// `x²`, a layer of your own: it has no inference form, so the card does not run it.
+    /// struct Square;
+    ///
+    /// impl<T: Real> Layer<T> for Square {
+    ///     fn name(&self) -> &str {
+    ///         "square"
+    ///     }
+    ///     fn output_width(&self, input_width: usize) -> usize {
+    ///         input_width
+    ///     }
+    ///     fn forward(&self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+    ///         tape.mul(x, x)
+    ///     }
+    ///     fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+    ///         Vec::new()
+    ///     }
+    /// }
     ///
     /// let mut params = ParamStore::new();
     /// let net = Sequential::new()
     ///     .push(Linear::new(&mut params, 4, 4, &mut Rng::seed(0)))
-    ///     .push(AdaptiveAvgPool2d::new(1, (2, 2), (1, 1)).unwrap());
+    ///     .push(Square);
     /// if let Some(cuda) = Cuda::new() {
     ///     let err = CudaModel::compile(&net, &params, 8, &cuda).unwrap_err();
-    ///     assert!(err.to_string().contains("layer 1 (adaptive_avg_pool2d)"), "{err}");
+    ///     assert!(err.to_string().contains("layer 1 (square)"), "{err}");
     /// }
     /// ```
     pub fn compile(

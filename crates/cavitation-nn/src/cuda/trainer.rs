@@ -1697,6 +1697,16 @@ impl<'c> TrainPass<'c> {
                     cleared.push(dx);
                     dx
                 }
+                Kind::AdaptiveAvgPool2d { .. } => {
+                    let dx = s.values(n_in)?;
+                    backward.push(Op::AdaptivePoolBackward {
+                        k: kernel(),
+                        dy: g,
+                        dx,
+                    });
+                    cleared.push(dx);
+                    dx
+                }
                 Kind::BatchNorm2d(norm) => {
                     let dx = s.values(n_in)?;
                     let affine = match (norm.weight, norm.bias) {

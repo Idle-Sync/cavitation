@@ -10,9 +10,9 @@ use cavitation_core::{
 use cavitation_cuda::Cuda;
 
 use crate::{
-    ActivationKind, ActivationLayer, BatchNorm2d, BatchView, Conv2d, Dataset, Dropout, Flatten,
-    Glu, Init, Linear, LogSoftmax, MaxPool2d, Prelu, Relu, Sequential, Softmax, Tanh, Targets,
-    TargetsView,
+    ActivationKind, ActivationLayer, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, BatchView, Conv2d,
+    Dataset, Dropout, Flatten, Glu, Init, Linear, LogSoftmax, MaxPool2d, Prelu, Relu, Sequential,
+    Softmax, Tanh, Targets, TargetsView,
 };
 
 /// Runs `body` on CUDA if it opens, and returns whether it ran.
@@ -116,6 +116,31 @@ pub(super) fn glu_mlp<T: Real>(
         .push(Glu { gate })
         .push(Linear::new(params, 9, 4, &mut rng))
 }
+
+/// A CNN on 2 × 7 × 7 images through both average poolings: a padded convolution to 4
+/// channels, ReLU, average pooling of 3 × 3 windows with stride 2, padding 1 and `ceil_mode`,
+/// not counting the padding (to 4 × 4), adaptive average pooling from 4 × 4 to `to`, flatten
+/// and a `Linear` to 5 classes, in either precision.
+pub(super) fn pool_cnn<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    to: (usize, usize),
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let conv = Conv2dGeom::with_options(2, 4, (7, 7), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+    let avg = Pool2dGeom::with_options(4, (7, 7), (3, 3), (2, 2), (1, 1), (1, 1), true).unwrap();
+    Sequential::new_generic()
+        .push(Conv2d::new(params, conv, &mut rng))
+        .push(Relu)
+        .push(AvgPool2d::with_options(avg, false, None).unwrap())
+        .push(AdaptiveAvgPool2d::new(4, (4, 4), to).unwrap())
+        .push(Flatten)
+        .push(Linear::new(params, 4 * to.0 * to.1, 5, &mut rng))
+}
+
+/// The adaptive poolings [`pool_cnn`] runs from 4 × 4: to 3 × 2 (overlapping windows down,
+/// even ones across), global pooling to 1 × 1, and to 6 × 5, larger than its input.
+pub(super) const ADAPTIVE_OUTPUTS: [(usize, usize); 3] = [(3, 2), (1, 1), (6, 5)];
 
 /// Every gate a GLU takes.
 pub(super) const GLU_GATES: [Gate; 5] = [
