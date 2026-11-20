@@ -1,26 +1,51 @@
 //! `CudaModel` against the CPU: the plan's refusals under CUDA's name, without the wgpu
 //! engine's own limits; every parameter, running statistic and mask read back bit for bit;
 //! the evaluation-mode outputs of a network with every layer kind the card runs (two of them
-//! masked), the masked MLP, `mnist-cnn` and `cifar-cnn` against the CPU's `InferenceModel`,
+//! masked), the masked MLP, `mnist-cnn`, `cifar-cnn` and a CNN through average and adaptive
+//! average pooling against the CPU's `InferenceModel`,
 //! each within 2⁻¹⁰ of the CPU's largest output (a measured agreement: cuDNN and cuBLAS
 //! publish no error bounds); short batches; and `evaluate` and `accuracy` against the CPU's.
 //!
 //! Without CUDA the tests that need it say so and check nothing;
 //! `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
 
-use cavitation_core::{Conv2dGeom, Gate, GeluApprox, ParamId, ParamStore, Pool2dGeom, Rng, Tensor};
+use cavitation_core::{
+    Conv2dGeom, Gate, GeluApprox, ParamId, ParamStore, Pool2dGeom, Real, Rng, Tape, Tensor, Var,
+};
 
 use super::CudaModel;
 use super::test_util::{
-    GLU_GATES, cifar_cnn, classes, glu_mlp, mlp, mnist_cnn, off, prelu_mlp, twin, uniform,
-    with_cuda,
+    ADAPTIVE_OUTPUTS, GLU_GATES, cifar_cnn, classes, glu_mlp, mlp, mnist_cnn, off, pool_cnn,
+    prelu_mlp, twin, uniform, with_cuda,
 };
 use crate::plan::{Engine, Plan, pack_rows};
 use crate::{
     AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Glu, Hardtanh,
-    InferenceModel, Init, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d, NeuronMask, Prelu, Relu,
-    Sequential, Sigmoid, Softmax, Tanh, accuracy, evaluate,
+    InferenceLayer, InferenceModel, Init, Layer, LeakyRelu, Linear, LogSoftmax, Loss, MaxPool2d,
+    NeuronMask, Prelu, Relu, Sequential, Sigmoid, Softmax, Tanh, accuracy, evaluate,
 };
+
+/// A layer of your own with no parameters whose inference form is the one it holds, as a
+/// layer outside this crate could declare any form.
+struct Formed(InferenceLayer);
+
+impl<T: Real> Layer<T> for Formed {
+    fn name(&self) -> &str {
+        "formed"
+    }
+    fn output_width(&self, input_width: usize) -> usize {
+        input_width
+    }
+    fn forward(&self, _: &mut Tape<'_, T>, x: Var) -> Var {
+        x
+    }
+    fn parameters(&self) -> Vec<(&'static str, ParamId)> {
+        Vec::new()
+    }
+    fn inference(&self, _: &cavitation_core::ParamValues<f32>) -> Option<InferenceLayer> {
+        Some(self.0.clone())
+    }
+}
 
 /// A small CNN with every kind of layer the card runs, two of them masked: 1 × 6 × 6 images
 /// through a convolution, batch norm, ReLU, max pooling, average pooling with padding,
@@ -63,21 +88,84 @@ fn every_kind(params: &mut ParamStore) -> Sequential {
 /// The plan names `CudaModel::compile` in its refusals, and the wgpu engine's limits (a
 /// convolution's batch above 65,535, a softmax's above 16,776,960, a PReLU's slope gradient
 /// over more than 268,431,360 values per slope, a batch norm's eps below 2⁻¹²⁶) do not apply;
-/// a PReLU of more than 65,535 slopes, or over more than 2³¹ values per batch, and a GLU over
-/// an odd width are refused on both.
+/// a PReLU of more than 65,535 slopes, or over more than 2³¹ values per batch, a GLU over an
+/// odd width, an average-pooling form that is dilated or divides by 0, and an adaptive pooling
+/// form with a size of 0 (invalid data) or beyond the kernels' 32-bit arithmetic or 2³¹ values
+/// per batch (unsupported) are refused on both; adaptive average pooling is planned with its
+/// widths.
 #[test]
 fn the_plan_refuses_under_cudas_name() {
     let mut params = ParamStore::new();
     let mut rng = Rng::seed(0);
     let net = Sequential::new()
         .push(Linear::new(&mut params, 4, 3, &mut rng))
-        .push(AdaptiveAvgPool2d::new(3, (1, 1), (1, 1)).unwrap());
+        .push(Formed(InferenceLayer::Linear {
+            w_t: vec![0.0; 9],
+            bias: None,
+            inputs: 3,
+            outputs: 3,
+        }));
     let err = Plan::build_for(&net, &params, 8, Engine::CUDA).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "unsupported: CudaModel::compile: layer 1 (adaptive_avg_pool2d) is not a layer the GPU \
-         runs"
+        "unsupported: CudaModel::compile: layer 1 (formed) is not a layer the GPU runs"
     );
+    let net = Sequential::new()
+        .push(AdaptiveAvgPool2d::new(3, (7, 5), (3, 2)).unwrap())
+        .push(Linear::new(&mut params, 18, 2, &mut rng));
+    let plan = Plan::build_for(&net, &params, 4, Engine::CUDA).unwrap();
+    assert_eq!((plan.layers[0].inputs, plan.layers[0].outputs), (105, 18));
+    let plain = Pool2dGeom::new(1, (6, 6), (2, 2)).unwrap();
+    let dilated =
+        Pool2dGeom::with_options(1, (6, 6), (2, 2), (2, 2), (0, 0), (2, 2), false).unwrap();
+    let avg = |geom, divisor_override| InferenceLayer::AvgPool2d {
+        geom,
+        count_include_pad: true,
+        divisor_override,
+    };
+    let adaptive = |input, output| InferenceLayer::AdaptiveAvgPool2d {
+        channels: 1,
+        input,
+        output,
+    };
+    for (form, batch, message) in [
+        (
+            avg(dilated, None),
+            1,
+            "invalid data: CudaModel::compile: layer 0 (formed) is an average pooling with \
+             dilation (2, 2); average pooling takes none",
+        ),
+        (
+            avg(plain, Some(0)),
+            1,
+            "invalid data: CudaModel::compile: layer 0 (formed) is an average pooling with a \
+             divisor of 0",
+        ),
+        (
+            adaptive((4, 4), (0, 2)),
+            1,
+            "invalid data: CudaModel::compile: layer 0 (formed) is an adaptive average pooling \
+             with channels 1, input (4, 4) and output (0, 2); every count and size must be at \
+             least 1",
+        ),
+        (
+            adaptive((70_000, 1), (70_000, 1)),
+            1,
+            "unsupported: CudaModel::compile: layer 0 (formed) is an adaptive average pooling \
+             of (70000, 1) to (70000, 1), whose window arithmetic does not fit the GPU's 32-bit \
+             integers",
+        ),
+        (
+            adaptive((2, 1), (2, 1)),
+            (1 << 30) + 1,
+            "unsupported: CudaModel::compile: layer 0 (formed) is an adaptive average pooling \
+             over more than the 2147483648 values per batch the GPU takes",
+        ),
+    ] {
+        let net = Sequential::new().push(Formed(form));
+        let err = Plan::build_for(&net, &ParamStore::new(), batch, Engine::CUDA).unwrap_err();
+        assert_eq!(err.to_string(), message);
+    }
     let net = Sequential::new()
         .push(Linear::new(&mut params, 4, 3, &mut rng))
         .push(Glu {
@@ -367,5 +455,18 @@ fn glu_layers_match_the_cpu() {
         let net = glu_mlp::<f32>(&mut params, seed, gate, false);
         let what = format!("GLU with {gate:?}");
         check_outputs(&net, &params, 23, &uniform(seed, 23 * 12, -2.0, 2.0), &what);
+    }
+}
+
+/// A CNN through average pooling and adaptive average pooling to each of
+/// [`ADAPTIVE_OUTPUTS`]: the evaluation-mode outputs against the CPU's `InferenceModel`.
+#[test]
+fn pool_layers_match_the_cpu() {
+    for (k, to) in ADAPTIVE_OUTPUTS.into_iter().enumerate() {
+        let seed = 140 + k as u64;
+        let mut params = ParamStore::new();
+        let net = pool_cnn::<f32>(&mut params, seed, to);
+        let what = format!("adaptive pooling to {to:?}");
+        check_outputs(&net, &params, 23, &uniform(seed, 23 * 98, -1.0, 1.0), &what);
     }
 }

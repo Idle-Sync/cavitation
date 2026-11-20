@@ -1,9 +1,10 @@
 //! `GpuTrainer` against the CPU: each parameter's gradient after one step against the `f64`
 //! training tape's from the same weights, batch and dropout masks, on the test MLP, a small
-//! CNN (convolution, batch norm, max pooling, dropout), `mnist-cnn` and `cifar-cnn`, with the
-//! max-pooling winners that differ from the `f64` tape's listed; the parameters after one SGD
-//! step within the update's bound; two runs giving the same bits; and a step on non-finite
-//! inputs leaving the parameters and the optimiser's state as they were.
+//! CNN (convolution, batch norm, max pooling, dropout), a CNN through average and adaptive
+//! average pooling, `mnist-cnn` and `cifar-cnn`, with the max-pooling winners that differ from
+//! the `f64` tape's listed; the parameters after one SGD step within the update's bound; two
+//! runs giving the same bits; and a step on non-finite inputs leaving the parameters and the
+//! optimiser's state as they were.
 //!
 //! The gradient check is a tolerance, not a derived bound: each tensor's worst difference
 //! from the `f64` gradient must be under 2⁻¹² of the tensor's largest `f64` gradient plus
@@ -22,7 +23,8 @@ use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuTrainer;
 use super::forward_tests::{
-    GLU_GATES, Twin, activation_mlp, glu_mlp, mlp, more_activations, prelu_mlp, softmax_mlp, twin,
+    ADAPTIVE_OUTPUTS, GLU_GATES, Twin, activation_mlp, glu_mlp, mlp, more_activations, pool_cnn,
+    prelu_mlp, softmax_mlp, twin,
 };
 use crate::{
     BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, Loss,
@@ -396,6 +398,19 @@ fn glu_layers_match_the_tape() {
         let width = if lead { 24 } else { 12 };
         let what = format!("GLU with {gate:?}{}", if lead { ", leading" } else { "" });
         check_gradients(t, &Data::new(seed, 24, width, 4, (-2.0, 2.0)), &what);
+    }
+}
+
+/// A CNN through average pooling and adaptive average pooling to each of
+/// `ADAPTIVE_OUTPUTS` (overlapping windows, global pooling, an output larger than its input):
+/// the GPU's gradients against the `f64` tape's, within the tolerance above.
+#[test]
+fn pool_layers_match_the_tape() {
+    for (k, to) in ADAPTIVE_OUTPUTS.into_iter().enumerate() {
+        let seed = 150 + k as u64;
+        let t = twin(|p, s| pool_cnn(p, s, to), |p, s| pool_cnn(p, s, to), seed);
+        let what = format!("adaptive pooling to {to:?}");
+        check_gradients(t, &Data::new(seed, 6, 98, 5, (-1.0, 1.0)), &what);
     }
 }
 

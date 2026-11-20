@@ -11,8 +11,9 @@
 //!   say how loose.
 //!
 //! An MLP with a softmax or a log-softmax after each `Linear`, one with a PReLU before each
-//! `Linear`, and one with a GLU of each gate after its first two `Linear`s, are checked against
-//! the CPU's `InferenceModel` instead, within 2⁻¹⁰ of its largest output.
+//! `Linear`, one with a GLU of each gate after its first two `Linear`s, and a CNN through
+//! average and adaptive average pooling, are checked against the CPU's `InferenceModel`
+//! instead, within 2⁻¹⁰ of its largest output.
 //!
 //! Without a GPU every test says so and checks nothing; `CAVITATION_GPU_REQUIRED=1` makes
 //! that a failure.
@@ -25,9 +26,9 @@ use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuModel;
 use crate::{
-    ActivationKind, ActivationLayer, BatchNorm2d, Conv2d, Dropout, Flatten, Glu, InferenceLayer,
-    InferenceModel, Init, Linear, LogSoftmax, MaxPool2d, NeuronMask, Prelu, Relu, Sequential,
-    Softmax, Tanh, Trace,
+    ActivationKind, ActivationLayer, AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, Conv2d, Dropout,
+    Flatten, Glu, InferenceLayer, InferenceModel, Init, Linear, LogSoftmax, MaxPool2d, NeuronMask,
+    Prelu, Relu, Sequential, Softmax, Tanh, Trace,
 };
 
 /// The unit roundoff of `f32`.
@@ -138,6 +139,31 @@ pub(super) fn glu_mlp<T: Real>(
         .push(Glu { gate })
         .push(Linear::new(params, 9, 4, &mut rng))
 }
+
+/// A CNN on 2 × 7 × 7 images through both average poolings: a padded convolution to 4
+/// channels, ReLU, average pooling of 3 × 3 windows with stride 2, padding 1 and `ceil_mode`,
+/// not counting the padding (to 4 × 4), adaptive average pooling from 4 × 4 to `to`, flatten
+/// and a `Linear` to 5 classes, in either precision.
+pub(super) fn pool_cnn<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    to: (usize, usize),
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let conv = Conv2dGeom::with_options(2, 4, (7, 7), (3, 3), (1, 1), (1, 1), (1, 1)).unwrap();
+    let avg = Pool2dGeom::with_options(4, (7, 7), (3, 3), (2, 2), (1, 1), (1, 1), true).unwrap();
+    Sequential::new_generic()
+        .push(Conv2d::new(params, conv, &mut rng))
+        .push(Relu)
+        .push(AvgPool2d::with_options(avg, false, None).unwrap())
+        .push(AdaptiveAvgPool2d::new(4, (4, 4), to).unwrap())
+        .push(Flatten)
+        .push(Linear::new(params, 4 * to.0 * to.1, 5, &mut rng))
+}
+
+/// The adaptive poolings [`pool_cnn`] runs from 4 × 4: to 3 × 2 (overlapping windows down,
+/// even ones across), global pooling to 1 × 1, and to 6 × 5, larger than its input.
+pub(super) const ADAPTIVE_OUTPUTS: [(usize, usize); 3] = [(3, 2), (1, 1), (6, 5)];
 
 /// Every gate a GLU takes.
 pub(super) const GLU_GATES: [Gate; 5] = [
@@ -706,6 +732,33 @@ fn glu_layers_infer_as_the_cpu() {
         let net = glu_mlp::<f32>(&mut params, seed, gate, false);
         let batch = 23;
         let input = Tensor::from_vec(uniform(seed, batch * 12, -2.0, 2.0), &[batch, 12]).unwrap();
+        let mut cpu = InferenceModel::compile(&net, &params).unwrap();
+        let want = cpu.infer_batch(input.view()).data().to_vec();
+        for_each_gpu(|gpu| {
+            let mut model = GpuModel::compile(&net, &params, batch, gpu).unwrap();
+            let got = model.infer_batch(input.view()).data().to_vec();
+            let scale = want.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let off = (got.iter().zip(&want))
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            println!("{what}: off by {off:.3e} of a largest output {scale:.3e}");
+            assert!(off <= scale / 1024.0, "{what}: off by {off:e} of {scale:e}");
+        });
+    }
+}
+
+/// A CNN through average pooling and adaptive average pooling to each of
+/// [`ADAPTIVE_OUTPUTS`]: the model's evaluation-mode outputs against the CPU's
+/// `InferenceModel`, within 2⁻¹⁰ of the CPU's largest output.
+#[test]
+fn pool_layers_infer_as_the_cpu() {
+    for (k, to) in ADAPTIVE_OUTPUTS.into_iter().enumerate() {
+        let what = format!("adaptive pooling to {to:?}");
+        let seed = 140 + k as u64;
+        let mut params = ParamStore::new();
+        let net = pool_cnn::<f32>(&mut params, seed, to);
+        let batch = 23;
+        let input = Tensor::from_vec(uniform(seed, batch * 98, -1.0, 1.0), &[batch, 98]).unwrap();
         let mut cpu = InferenceModel::compile(&net, &params).unwrap();
         let want = cpu.infer_batch(input.view()).data().to_vec();
         for_each_gpu(|gpu| {

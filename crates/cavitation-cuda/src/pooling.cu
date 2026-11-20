@@ -1,10 +1,10 @@
-// 2-D max and average pooling, forward and backward: a port of the four WGSL kernels in
-// cavitation-gpu's kernels/pooling.rs, operation for operation, compiled without fused
-// multiply-add. The host puts the geometry in front of this text as macros (FORWARD_TOTAL and
-// BACKWARD_TOTAL, the outputs and the input pixels of the batch; H, W, OH, OW, KH, KW, SH, SW,
-// PH, PW; DH and DW for max pooling, COUNT_PAD and DIVISOR for average pooling), as the WGSL
-// kernels take it in override constants, so one compiled module serves one geometry and
-// batch.
+// 2-D max, average and adaptive average pooling, forward and backward: a port of the six WGSL
+// kernels in cavitation-gpu's kernels/pooling.rs, operation for operation, compiled without
+// fused multiply-add. The host puts the geometry in front of this text as macros
+// (FORWARD_TOTAL and BACKWARD_TOTAL, the outputs and the input pixels of the batch; H, W, OH,
+// OW; KH, KW, SH, SW, PH, PW for max and average pooling; DH and DW for max pooling, COUNT_PAD
+// and DIVISOR for average pooling, ADAPTIVE for adaptive average pooling), as the WGSL kernels
+// take it in override constants, so one compiled module serves one geometry and batch.
 //
 // One thread per value: per output forward, per input pixel backward. The backward passes are
 // gathers, each input pixel adding its outputs' gradients in the CPU's order, so they need no
@@ -103,6 +103,60 @@ extern "C" __global__ void max_backward(const float *grad_out, const u32 *winner
             if (winners[o] == pos) {
                 acc = acc + grad_out[o];
             }
+        }
+    }
+    grad_in[t] = acc;
+}
+
+#elif defined(ADAPTIVE)
+
+// The window of output o of out along an axis of size, as (start, end): floor(o · size / out)
+// .. ceil((o + 1) · size / out), as adaptive_window in the CPU kernel computes it. With size
+// and out swapped, the outputs whose windows hold pixel o.
+__device__ __forceinline__ uint2 window(u32 o, u32 out, u32 size) {
+    return make_uint2(o * size / out, ((o + 1u) * size + out - 1u) / out);
+}
+
+// An output's share of its window's sum: divided by the window's height, then by its width,
+// as the CPU divides.
+__device__ __forceinline__ float mean(float sum, uint2 r, uint2 c) {
+    return sum / (float)(r.y - r.x) / (float)(c.y - c.x);
+}
+
+// Adaptive average pooling forward, one thread per output: the sum of its window's pixels in
+// row-major order, divided by the window's height and then its width.
+extern "C" __global__ void adaptive_forward(const float *x, float *out) {
+    VALUE(FORWARD_TOTAL)
+    u32 ox = t % OW;
+    u32 oy = (t / OW) % OH;
+    u32 base = (t / (OW * OH)) * H * W;
+    uint2 r = window(oy, OH, H);
+    uint2 c = window(ox, OW, W);
+    float acc = 0.0f;
+    for (u32 y = r.x; y < r.y; y = y + 1u) {
+        for (u32 xx = c.x; xx < c.y; xx = xx + 1u) {
+            acc = acc + x[base + y * W + xx];
+        }
+    }
+    out[t] = mean(acc, r, c);
+}
+
+// Adaptive average pooling backward, one thread per input pixel: adds to the pixel's gradient
+// each covering output's gradient divided by that output's window height and then its width,
+// the outputs in plane order, as the CPU adds them.
+extern "C" __global__ void adaptive_backward(const float *grad_out, float *grad_in) {
+    VALUE(BACKWARD_TOTAL)
+    u32 col = t % W;
+    u32 row = (t / W) % H;
+    u32 plane = t / (W * H);
+    uint2 ys = window(row, H, OH);
+    uint2 xs = window(col, W, OW);
+    float acc = grad_in[t];
+    for (u32 oy = ys.x; oy < ys.y; oy = oy + 1u) {
+        uint2 r = window(oy, OH, H);
+        for (u32 ox = xs.x; ox < xs.y; ox = ox + 1u) {
+            uint2 c = window(ox, OW, W);
+            acc = acc + mean(grad_out[(plane * OH + oy) * OW + ox], r, c);
         }
     }
     grad_in[t] = acc;

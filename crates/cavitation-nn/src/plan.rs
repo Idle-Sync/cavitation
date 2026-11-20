@@ -40,6 +40,40 @@ const MAX_PRELU_VALUES: usize = 1 << 31;
 /// 32-bit integers.
 const MAX_GLU_VALUES: usize = u32::MAX as usize;
 
+/// The most values an adaptive average pooling may read or write per batch on either engine:
+/// the wgpu kernels run one thread per value and take at most 2³¹ threads.
+const MAX_ADAPTIVE_VALUES: usize = 1 << 31;
+
+/// Why the GPU engines cannot run an adaptive average pooling of `input` to `output` whose
+/// larger side (input or output) holds `values` values per batch (`None` past `usize`), if
+/// they cannot: more than [`MAX_ADAPTIVE_VALUES`], or an axis whose `(size + 1) · (out + 1)`
+/// does not fit a `u32`, which bounds the kernels' window arithmetic.
+fn check_adaptive(
+    input: (usize, usize),
+    output: (usize, usize),
+    values: Option<usize>,
+) -> Result<(), String> {
+    if values.is_none_or(|n| n > MAX_ADAPTIVE_VALUES) {
+        return Err(format!(
+            "is an adaptive average pooling over more than the {MAX_ADAPTIVE_VALUES} values \
+             per batch the GPU takes"
+        ));
+    }
+    let fits = |size: usize, out: usize| {
+        (size.checked_add(1))
+            .zip(out.checked_add(1))
+            .and_then(|(a, b)| a.checked_mul(b))
+            .is_some_and(|v| v <= u32::MAX as usize)
+    };
+    if !fits(input.0, output.0) || !fits(input.1, output.1) {
+        return Err(format!(
+            "is an adaptive average pooling of {input:?} to {output:?}, whose window \
+             arithmetic does not fit the GPU's 32-bit integers"
+        ));
+    }
+    Ok(())
+}
+
 /// The engine a plan is built for: the name its messages start with, and whether the wgpu
 /// engine's own limits apply.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -228,6 +262,16 @@ pub(crate) enum Kind {
         /// The divisor used in place of the window's size, if any.
         divisor_override: Option<usize>,
     },
+    /// 2-D adaptive average pooling of `channels` planes of `input` to `output` (height,
+    /// width), PyTorch's windows.
+    AdaptiveAvgPool2d {
+        /// Channels of each image.
+        channels: usize,
+        /// Height and width of each input image.
+        input: (usize, usize),
+        /// Height and width of each output image.
+        output: (usize, usize),
+    },
     /// 2-D batch normalisation.
     BatchNorm2d(Norm),
     /// Dropout with this drop probability while training; the identity in evaluation.
@@ -243,6 +287,9 @@ impl Kind {
             Kind::Linear { inputs, .. } => Some(*inputs),
             Kind::Conv2d { geom, .. } => Some(geom.in_width()),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => Some(geom.in_width()),
+            Kind::AdaptiveAvgPool2d {
+                channels, input, ..
+            } => Some(channels * input.0 * input.1),
             Kind::BatchNorm2d(norm) => Some(norm.channels * norm.spatial),
             Kind::Prelu { channels, .. } => (*channels > 1).then_some(*channels),
             Kind::Activation(_)
@@ -259,6 +306,9 @@ impl Kind {
             Kind::Linear { outputs, .. } => *outputs,
             Kind::Conv2d { geom, .. } => geom.out_width(),
             Kind::MaxPool2d(geom) | Kind::AvgPool2d { geom, .. } => geom.out_width(),
+            Kind::AdaptiveAvgPool2d {
+                channels, output, ..
+            } => channels * output.0 * output.1,
             Kind::Glu(_) => width / 2,
             Kind::Activation(_)
             | Kind::Prelu { .. }
@@ -320,15 +370,21 @@ impl Plan {
     ///   has parameters its GPU form does not use (by index and name), an id is used in two
     ///   roles, no layer fixes the input width, a PReLU has more than 65,535 slopes or takes
     ///   more than 2³¹ values per batch, a GLU takes more than 4,294,967,295 values per batch,
-    ///   or (on the wgpu engine) a convolution's batch is above 65,535, a softmax's above
-    ///   16,776,960, a PReLU's slope gradient would sum more than 268,431,360 values per
-    ///   slope, a GEMM's side is above 4,194,240, or a batch norm's eps is below 2⁻¹²⁶ in
-    ///   `f32` and not 0.
+    ///   an adaptive average pooling reads or writes more than 2³¹ values per batch or has an
+    ///   axis whose `(size + 1) · (out + 1)` is above 4,294,967,295, or (on the wgpu engine) a
+    ///   convolution's batch is above 65,535, a softmax's above 16,776,960, a PReLU's slope
+    ///   gradient would sum more than 268,431,360 values per slope, a GEMM's side is above
+    ///   4,194,240, or a batch norm's eps is below 2⁻¹²⁶ in `f32` and not 0.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports, a
     ///   GLU's input width is odd, a mask is not as wide as its layer's output, a batch count
-    ///   does not hold one value, a PReLU's weight does not hold one value per slope, or a
-    ///   batch norm that keeps no running statistics would see one value per channel.
+    ///   does not hold one value, a PReLU's weight does not hold one value per slope, a batch
+    ///   norm that keeps no running statistics would see one value per channel, an average
+    ///   pooling is dilated or divides by 0 (`AvgPool2d::with_options` refuses both with
+    ///   `InvalidData`, `AvgPool2d::new` panics on a dilated geometry, and
+    ///   `InferenceModel::compile` panics on such a form), or an
+    ///   adaptive average pooling has a count or size of 0 or more values per image than
+    ///   `usize` holds (as `AdaptiveAvgPool2d::new` refuses it).
     pub(crate) fn build_for(
         model: &Sequential<f32>,
         params: &ParamStore<f32>,
@@ -402,6 +458,14 @@ impl Plan {
                     "{who}: layer {i} ({name}) is a GLU over {batch} rows of {width} values, \
                      more than the {MAX_GLU_VALUES} per batch the GPU takes"
                 )));
+            }
+            if let Kind::AdaptiveAvgPool2d { input, output, .. } = kind {
+                check_adaptive(
+                    input,
+                    output,
+                    batch.checked_mul(width.max(kind.output_width(width))),
+                )
+                .map_err(|why| Error::Unsupported(format!("{who}: layer {i} ({name}) {why}")))?;
             }
             let outputs = kind.output_width(width);
             if outputs == 0 {
@@ -627,6 +691,11 @@ fn kind(
             "{who}: layer {i} ({name}) {why}"
         )))
     };
+    let invalid = |why: &str| {
+        Err(Error::InvalidData(format!(
+            "{who}: layer {i} ({name}) {why}"
+        )))
+    };
     if let Some(linear) = layer.as_linear() {
         return Ok(Kind::Linear {
             inputs: linear.inputs(),
@@ -714,19 +783,46 @@ fn kind(
             count_include_pad,
             divisor_override,
         }) => {
+            // `AvgPool2d::with_options` refuses both as invalid data, and the CPU kernels panic
+            // on them.
             if geom.dilation() != (1, 1) {
-                return refuse(&format!(
-                    "is an average pooling with dilation {:?}; it takes none",
+                return invalid(&format!(
+                    "is an average pooling with dilation {:?}; average pooling takes none",
                     geom.dilation()
                 ));
             }
             if divisor_override == Some(0) {
-                return refuse("is an average pooling with a divisor of 0");
+                return invalid("is an average pooling with a divisor of 0");
             }
             return Ok(Kind::AvgPool2d {
                 geom,
                 count_include_pad,
                 divisor_override,
+            });
+        }
+        Some(InferenceLayer::AdaptiveAvgPool2d {
+            channels,
+            input,
+            output,
+        }) => {
+            // The CPU's `AdaptiveAvgPool2d::new` refuses both as invalid data.
+            if [channels, input.0, input.1, output.0, output.1].contains(&0) {
+                return invalid(&format!(
+                    "is an adaptive average pooling with channels {channels}, input {input:?} \
+                     and output {output:?}; every count and size must be at least 1"
+                ));
+            }
+            let values = |(h, w): (usize, usize)| channels.checked_mul(h)?.checked_mul(w);
+            if values(input).is_none() || values(output).is_none() {
+                return invalid(&format!(
+                    "is an adaptive average pooling with channels {channels}, input {input:?} \
+                     and output {output:?}, more values per image than memory can hold"
+                ));
+            }
+            return Ok(Kind::AdaptiveAvgPool2d {
+                channels,
+                input,
+                output,
             });
         }
         Some(InferenceLayer::Activation(kind)) => kind,

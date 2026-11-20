@@ -4,9 +4,9 @@
 
 use cavitation_core::{Error, TensorView};
 use cavitation_gpu::kernels::{
-    AvgPool2d, BatchNorm2d, BatchNormForward, BatchStats, BiasAdd, BiasAddCall, ChannelDims,
-    ConvCall, ConvDims, ConvForward, Elementwise, ElementwiseCall, ElementwiseKernels, Gemm,
-    GemmCall, GemmDims, Glu, GluCall, GluKernels, MaxPool2d, Prelu, PreluCall, PreluKernels,
+    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, BatchNormForward, BatchStats, BiasAdd, BiasAddCall,
+    ChannelDims, ConvCall, ConvDims, ConvForward, Elementwise, ElementwiseCall, ElementwiseKernels,
+    Gemm, GemmCall, GemmDims, Glu, GluCall, GluKernels, MaxPool2d, Prelu, PreluCall, PreluKernels,
     RowSoftmax, RowSoftmaxCall, RowSoftmaxKernels,
 };
 use cavitation_gpu::{
@@ -76,6 +76,8 @@ enum Op {
     MaxPool(MaxPool2d, wgpu::BindGroup),
     /// Average pooling with its kernel and bind group.
     AvgPool(AvgPool2d, wgpu::BindGroup),
+    /// Adaptive average pooling with its kernel and bind group.
+    AdaptivePool(AdaptiveAvgPool2d, wgpu::BindGroup),
     /// Batch normalisation, boxed: its prepared call is several times the size of the others.
     BatchNorm(Box<BatchNormForward>),
 }
@@ -313,6 +315,17 @@ impl Forward {
                     ops.push(Op::AvgPool(kernel, group));
                     out
                 }
+                Kind::AdaptiveAvgPool2d {
+                    channels,
+                    input,
+                    output,
+                } => {
+                    let out = new(&mut values, pool);
+                    let kernel = AdaptiveAvgPool2d::new(cache, channels, input, output, batch)?;
+                    let group = kernel.forward_bind_group(steps, &values[x], &values[out]);
+                    ops.push(Op::AdaptivePool(kernel, group));
+                    out
+                }
                 Kind::BatchNorm2d(norm) => {
                     let out = new(&mut values, pool);
                     let c = norm.channels;
@@ -408,6 +421,7 @@ impl Forward {
                 Op::Glu(call) => kernels.glu.record(step, call),
                 Op::MaxPool(kernel, group) => kernel.forward(step, group),
                 Op::AvgPool(kernel, group) => kernel.forward(step, group),
+                Op::AdaptivePool(kernel, group) => kernel.forward(step, group),
                 Op::BatchNorm(call) => kernels.batch_norm.record_forward(step, call),
             }
         }

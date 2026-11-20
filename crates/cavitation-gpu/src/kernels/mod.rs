@@ -28,7 +28,7 @@ pub use glu::{Glu, GluCall, GluKernels};
 pub use health::{DeadRelu, DeadReluCall, FiniteFlag, FiniteFlagCall, SumSquares, SumSquaresCall};
 pub use loss::{CrossEntropyCall, MeanSquaredError, MseCall, SoftmaxCrossEntropy};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
-pub use pooling::{AvgPool2d, MaxPool2d};
+pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};
 pub use prelu::{Prelu, PreluCall, PreluKernels};
 pub use reduce::{BiasAdd, BiasAddCall, ChannelDims, ChannelSums, ChannelSumsCall};
 pub use softmax::{MAX_SOFTMAX_ROWS, RowSoftmax, RowSoftmaxCall, RowSoftmaxKernels};

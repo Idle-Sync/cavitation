@@ -6,9 +6,9 @@ use std::cell::{Ref, RefCell, RefMut};
 
 use cavitation_core::{Conv2dGeom, Gate, GeluApprox, Pool2dGeom};
 use cavitation_cuda::{
-    AvgPool2d, BatchNorm2d, BatchStats, ChannelDims, Conv2d, ConvShape, Cuda, CudaError,
-    DeviceBuffer, Dropout, Elementwise, ElementwiseOp, Glu, GluGate, GluOp, Linear, LinearShape,
-    MaxPool2d, PoolShape, Prelu, PreluOp, RowSoftmax, RowSoftmaxOp,
+    AdaptiveAvgPool2d, AvgPool2d, BatchNorm2d, BatchStats, ChannelDims, Conv2d, ConvShape, Cuda,
+    CudaError, DeviceBuffer, Dropout, Elementwise, ElementwiseOp, Glu, GluGate, GluOp, Linear,
+    LinearShape, MaxPool2d, PoolShape, Prelu, PreluOp, RowSoftmax, RowSoftmaxOp,
 };
 
 use crate::plan::{Act, CompiledLayer, Kind};
@@ -118,6 +118,8 @@ pub(crate) struct Kernels<'c> {
     pub(crate) max_pools: Vec<MaxPool2d<'c>>,
     /// Each average pooling's.
     pub(crate) avg_pools: Vec<AvgPool2d<'c>>,
+    /// Each adaptive average pooling's.
+    pub(crate) adaptive_pools: Vec<AdaptiveAvgPool2d<'c>>,
     /// Each batch norm's, which remembers its last forward pass for the backward pass and the
     /// running update.
     pub(crate) norms: Vec<BatchNorm2d<'c>>,
@@ -261,6 +263,10 @@ pub(crate) enum Op {
     AvgPool { k: usize, x: usize, y: usize },
     /// Average pooling's backward pass, which adds to `dx`.
     AvgPoolBackward { k: usize, dy: usize, dx: usize },
+    /// Adaptive average pooling.
+    AdaptivePool { k: usize, x: usize, y: usize },
+    /// Adaptive average pooling's backward pass, which adds to `dx`.
+    AdaptivePoolBackward { k: usize, dy: usize, dx: usize },
     /// Batch norm with `eps`, from the `running` statistics `(mean, var)` or, with `None`,
     /// the batch's, with `affine` `(γ, β)` and the statistics written to `stats`.
     NormForward {
@@ -445,6 +451,12 @@ fn run_op(
         Op::AvgPool { k, x, y } => kernels.avg_pools[k].forward(&s.get(x), &mut s.get_mut(y)),
         Op::AvgPoolBackward { k, dy, dx } => {
             kernels.avg_pools[k].backward(&s.get(dy), &mut s.get_mut(dx))
+        }
+        Op::AdaptivePool { k, x, y } => {
+            kernels.adaptive_pools[k].forward(&s.get(x), &mut s.get_mut(y))
+        }
+        Op::AdaptivePoolBackward { k, dy, dx } => {
+            kernels.adaptive_pools[k].backward(&s.get(dy), &mut s.get_mut(dx))
         }
         Op::NormForward {
             k,
@@ -836,6 +848,27 @@ impl<'c> Forward<'c> {
                     s.kernel = Some(k.avg_pools.len() - 1);
                     ops.push(Op::AvgPool {
                         k: k.avg_pools.len() - 1,
+                        x,
+                        y,
+                    });
+                    y
+                }
+                Kind::AdaptiveAvgPool2d {
+                    channels,
+                    input,
+                    output,
+                } => {
+                    k.adaptive_pools.push(AdaptiveAvgPool2d::new(
+                        cuda,
+                        u32_of(rows, "a batch of")?,
+                        u32_of(channels, "a channel count")?,
+                        pair(input, "an image size")?,
+                        pair(output, "an output size")?,
+                    )?);
+                    let y = store.values(n)?;
+                    s.kernel = Some(k.adaptive_pools.len() - 1);
+                    ops.push(Op::AdaptivePool {
+                        k: k.adaptive_pools.len() - 1,
                         x,
                         y,
                     });

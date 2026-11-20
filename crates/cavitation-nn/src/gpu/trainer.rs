@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_gpu::kernels::{
-    AvgPool2d, BatchNormBackward, BatchNormForward, BatchStats, BiasAddCall, ChannelDims,
-    ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
+    AdaptiveAvgPool2d, AvgPool2d, BatchNormBackward, BatchNormForward, BatchStats, BiasAddCall,
+    ChannelDims, ChannelSums, ChannelSumsCall, ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad,
     ConvWeightGradCall, CrossEntropyCall, DeadRelu, DeadReluCall, Elementwise, ElementwiseCall,
     FiniteFlag, FiniteFlagCall, GemmCall, GemmDims, Glu, GluCall, MaxPool2d, MeanSquaredError,
     MseCall, OptimizerKernel, OptimizerRule, Prelu, PreluCall, RowSoftmax, RowSoftmaxCall,
@@ -68,6 +68,8 @@ enum Pool {
     Max(MaxPool2d),
     /// Average pooling.
     Avg(AvgPool2d),
+    /// Adaptive average pooling.
+    Adaptive(AdaptiveAvgPool2d),
 }
 
 /// One prepared call of a training step, forward or backward.
@@ -1738,10 +1740,12 @@ fn record(ops: &[Op], model: &Kernels, train: &TrainKernels, pools: &[Pool], ste
             Op::PoolForward(k, group) => match &pools[*k] {
                 Pool::Max(p) => p.forward(step, group),
                 Pool::Avg(p) => p.forward(step, group),
+                Pool::Adaptive(p) => p.forward(step, group),
             },
             Op::PoolBackward(k, group) => match &pools[*k] {
                 Pool::Max(p) => p.backward(step, group),
                 Pool::Avg(p) => p.backward(step, group),
+                Pool::Adaptive(p) => p.backward(step, group),
             },
             Op::NormForward(call) => model.batch_norm.record_forward(step, call),
             Op::NormBackward(call) => model.batch_norm.record_backward(step, call),
@@ -1937,6 +1941,19 @@ impl TrainPass {
                         AvgPool2d::new(cache, &geom, batch, count_include_pad, divisor_override)?;
                     let group = kernel.forward_bind_group(steps, &values[x], &values[out]);
                     pools.push(Pool::Avg(kernel));
+                    forward.push(Op::PoolForward(pools.len() - 1, group));
+                    s.pool = Some((pools.len() - 1, None));
+                    out
+                }
+                Kind::AdaptiveAvgPool2d {
+                    channels,
+                    input,
+                    output,
+                } => {
+                    let out = take(&mut values, pool);
+                    let kernel = AdaptiveAvgPool2d::new(cache, channels, input, output, batch)?;
+                    let group = kernel.forward_bind_group(steps, &values[x], &values[out]);
+                    pools.push(Pool::Adaptive(kernel));
                     forward.push(Op::PoolForward(pools.len() - 1, group));
                     s.pool = Some((pools.len() - 1, None));
                     out
@@ -2246,7 +2263,7 @@ impl TrainPass {
                     )));
                     dx
                 }
-                Kind::MaxPool2d(_) | Kind::AvgPool2d { .. } => {
+                Kind::MaxPool2d(_) | Kind::AvgPool2d { .. } | Kind::AdaptiveAvgPool2d { .. } => {
                     let dx = new_grad(&mut grads, pool, n_in);
                     let (kp, winners) = s.pool.expect("a pooling layer saves its kernel");
                     let group = match (&pools[kp], winners) {
@@ -2254,6 +2271,9 @@ impl TrainPass {
                             p.backward_bind_group(steps, &grads[g], &scratch[w], &grads[dx])
                         }
                         (Pool::Avg(p), _) => p.backward_bind_group(steps, &grads[g], &grads[dx]),
+                        (Pool::Adaptive(p), _) => {
+                            p.backward_bind_group(steps, &grads[g], &grads[dx])
+                        }
                         (Pool::Max(_), None) => unreachable!("max pooling saves its winners"),
                     };
                     backward.push(Op::PoolBackward(kp, group));
