@@ -151,6 +151,9 @@ api! {
         fn cuMemFree_v2(pointer: DevicePtr) -> c_int;
         /// Sets `count` bytes of device memory to `value`.
         fn cuMemsetD8_v2(to: DevicePtr, value: u8, count: usize) -> c_int;
+        /// Sets `count` four-byte words of device memory to `value`, queued after the
+        /// context's earlier work and returning without waiting for it.
+        fn cuMemsetD32_v2(to: DevicePtr, value: c_uint, count: usize) -> c_int;
         /// Copies host memory to device memory, after the context's earlier work.
         fn cuMemcpyHtoD_v2(to: DevicePtr, from: *const c_void, bytes: usize) -> c_int;
         /// Copies device memory to host memory, after the context's earlier work.

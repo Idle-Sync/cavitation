@@ -74,34 +74,31 @@ fn total(tensors: &[(u32, u32)]) -> u64 {
         .map_or(0, |&(s, l)| u64::from(s) + u64::from(l))
 }
 
-/// Partial sums a buffer needs for the longest of `tensors`, at least one.
-fn most_chunks(tensors: &[(u32, u32)]) -> usize {
-    tensors
-        .iter()
-        .map(|&(_, len)| ChannelDims::new(1, 1, len).chunks() as usize)
-        .max()
-        .unwrap_or(0)
-        .max(1)
+/// The words of a [`FlatTable`] for `tensors`: each tensor's start, length and first chunk,
+/// and the chunks of all of them together.
+fn table_words(tensors: &[(u32, u32)]) -> (Vec<u32>, u32) {
+    let mut words = Vec::with_capacity(3 * tensors.len());
+    let mut chunks = 0u32;
+    for &(start, len) in tensors {
+        words.extend([start, len, chunks]);
+        // At most 2³¹ / 4096 chunks in all, for tensors `flat` accepts.
+        chunks += ChannelDims::new(1, 1, len).chunks();
+    }
+    (words, chunks)
 }
 
 /// The kernels of one module and their handles.
 struct Kernels<'c> {
     /// The compiled sums and health kernels.
     module: Module<'c>,
-    /// The first pass of a sum of squares.
-    squares_partials: CuFunction,
-    /// The first pass of a count of non-finite values.
-    non_finite_partials: CuFunction,
+    /// The first pass of the sums of squares and counts of every tensor of a flat buffer.
+    flat_partials: CuFunction,
+    /// Their second pass, and the finite flag.
+    flat_merge: CuFunction,
     /// The first pass of a count of non-zero values per channel.
     non_zero_partials: CuFunction,
-    /// The sums' second pass, one thread per channel.
-    merge: CuFunction,
-    /// The second pass of one channel's sum into a word of the output.
-    merge_at: CuFunction,
-    /// The finite flag from the counts and the loss.
-    finite_fold: CuFunction,
-    /// The dead-ReLU bits from the counts.
-    dead_relu_pack: CuFunction,
+    /// The dead-ReLU counts' second pass and their bits.
+    dead_relu_merge_pack: CuFunction,
 }
 
 impl<'c> Kernels<'c> {
@@ -111,13 +108,10 @@ impl<'c> Kernels<'c> {
         let module = cuda.compile("health.cu", &format!("{}{SOURCE}", reduce::SOURCE))?;
         let f = |name: &str| module.function(name);
         Ok(Kernels {
-            squares_partials: f("squares_partials")?,
-            non_finite_partials: f("non_finite_partials")?,
+            flat_partials: f("flat_partials")?,
+            flat_merge: f("flat_merge")?,
             non_zero_partials: f("non_zero_partials")?,
-            merge: f("merge")?,
-            merge_at: f("merge_at")?,
-            finite_fold: f("finite_fold")?,
-            dead_relu_pack: f("dead_relu_pack")?,
+            dead_relu_merge_pack: f("dead_relu_merge_pack")?,
             module,
         })
     }
@@ -141,56 +135,93 @@ impl<'c> Kernels<'c> {
         // touches on this grid.
         unsafe { kernel.launch([grid[0], grid[1], 1], [BLOCK, 1, 1], args) }
     }
+}
 
-    /// Sums the terms of the tensor of `len` values that starts `start` values into `input`
-    /// into word `at` of `out`: the first pass `function` into `partials`, then the merge in
-    /// chunk order.
+/// The tensors of a flat buffer on the card, for the two passes over all of them: each
+/// tensor's `(start, len, first chunk)` as three `u32` words, and the chunks in all.
+struct FlatTable<'c> {
+    /// The words, three per tensor.
+    table: DeviceBuffer<'c>,
+    /// The chunks of all the tensors together: the first pass's blocks.
+    chunks: u32,
+}
+
+impl<'c> FlatTable<'c> {
+    /// The table of `tensors` (none for a flag of the loss alone), uploaded to `cuda`'s card.
+    fn new(cuda: &'c Cuda, tensors: &[(u32, u32)]) -> Result<FlatTable<'c>, CudaError> {
+        let (words, chunks) = table_words(tensors);
+        let mut table = cuda.buffer(4 * words.len())?;
+        table.write(&words)?;
+        Ok(FlatTable { table, chunks })
+    }
+
+    /// The first pass over every tensor of `grads`, with `want`'s bit 0 its sums of squares
+    /// into `squares` and bit 1 its counts of non-finite values into `non_finite`, one
+    /// partial sum per chunk; then the second pass of `partials` (one of the two) into words
+    /// `at` onwards of `out`, and, with `fold`, the finite flag from those counts and the
+    /// loss into word 0 of `fold`'s flag.
     ///
     /// # Safety
     ///
-    /// `function` must be `squares_partials` or `non_finite_partials`; `input` must hold
-    /// `start + len` values, at most 2³¹, with `len` above 0; `partials` must hold the
-    /// tensor's chunks and `out` `at + 1` floats, and neither may be `input`.
-    unsafe fn tensor_sum(
+    /// `grads` must hold the tensors' values, at most 2³¹; the partial buffers must hold
+    /// [`chunks`](Self::chunks) floats each, `out` `at` plus one per tensor, and the loss its
+    /// word; no output may be an input.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn run(
         &self,
-        function: CuFunction,
-        (input, start, len): (&DeviceBuffer<'_>, u32, u32),
+        k: &Kernels<'_>,
+        tensors: u32,
+        grads: &DeviceBuffer<'_>,
+        (squares, non_finite, want): (&DeviceBuffer<'_>, &DeviceBuffer<'_>, u32),
         partials: &DeviceBuffer<'_>,
         (out, at): (&DeviceBuffer<'_>, u32),
+        fold: Option<((&DeviceBuffer<'_>, u32), &DeviceBuffer<'_>)>,
     ) -> Result<(), CudaError> {
-        let dims = ChannelDims::new(1, 1, len);
-        let chunks = dims.chunks();
-        // SAFETY: the first pass takes (const float or u32 *input, u32 start, float
-        // *partials, u32 outer, u32 channels, u32 inner, u32 chunks); its grid of chunks
-        // (one channel) reads values start..start + len and writes `chunks` partial sums,
-        // which the caller promises the buffers hold.
-        unsafe {
-            self.launch(
-                function,
-                [chunks, 1],
-                &[
-                    Arg::Buffer(input),
-                    Arg::U32(start),
-                    Arg::Buffer(partials),
-                    Arg::U32(dims.outer),
-                    Arg::U32(dims.channels),
-                    Arg::U32(dims.inner),
-                    Arg::U32(chunks),
-                ],
-            )?;
+        if tensors > 0 {
+            // SAFETY: flat_partials takes (const float *g, const u32 *table, u32 tensors,
+            // float *squares, float *non_finite, u32 want); block b < chunks reads the
+            // table's three words for each tensor up to its own, the values of its chunk of
+            // its tensor, which `grads` holds, and writes word b of the partials `want`
+            // names, which hold `chunks` floats; the caller promises the rest.
+            unsafe {
+                k.launch(
+                    k.flat_partials,
+                    [self.chunks, 1],
+                    &[
+                        Arg::Buffer(grads),
+                        Arg::Buffer(&self.table),
+                        Arg::U32(tensors),
+                        Arg::Buffer(squares),
+                        Arg::Buffer(non_finite),
+                        Arg::U32(want),
+                    ],
+                )?;
+            }
         }
-        // SAFETY: merge_at takes (const float *partials, float *out, u32 at, u32 chunks),
-        // reads `chunks` partial sums and writes out[at], which the caller promises the
-        // buffers hold; one thread does the work.
+        let (loss, flag) = match fold {
+            Some(((loss, at), flag)) => ((loss, at), flag),
+            None => ((out, 0), out),
+        };
+        // SAFETY: flat_merge takes (const float *partials, const u32 *table, u32 tensors, u32
+        // total, float *out, u32 at, u32 fold, const u32 *loss, u32 loss_at, u32 *flag); one
+        // block reads every tensor's partial sums, below `chunks`, writes words at..at +
+        // tensors of out, and with fold reads loss[loss_at] and writes flag[0]; the caller
+        // promises the buffers hold them. Without fold the loss and flag are not touched.
         unsafe {
-            self.launch(
-                self.merge_at,
+            k.launch(
+                k.flat_merge,
                 [1, 1],
                 &[
                     Arg::Buffer(partials),
+                    Arg::Buffer(&self.table),
+                    Arg::U32(tensors),
+                    Arg::U32(self.chunks),
                     Arg::Buffer(out),
                     Arg::U32(at),
-                    Arg::U32(chunks),
+                    Arg::U32(u32::from(fold.is_some())),
+                    Arg::Buffer(loss.0),
+                    Arg::U32(loss.1),
+                    Arg::Buffer(flag),
                 ],
             )
         }
@@ -237,7 +268,9 @@ pub struct SumSquares<'c> {
     kernels: Kernels<'c>,
     /// Each tensor's start and length in the flat buffer.
     tensors: Vec<(u32, u32)>,
-    /// One partial sum per chunk of the longest tensor, reused tensor by tensor.
+    /// The tensors on the card.
+    table: FlatTable<'c>,
+    /// One partial sum per chunk of every tensor.
     partials: DeviceBuffer<'c>,
 }
 
@@ -267,10 +300,12 @@ impl<'c> SumSquares<'c> {
         }
         let tensors = flat(WHAT, lens)?;
         let kernels = Kernels::new(cuda)?;
+        let table = FlatTable::new(cuda, &tensors)?;
         Ok(SumSquares {
-            partials: cuda.buffer(4 * most_chunks(&tensors))?,
+            partials: cuda.buffer(4 * table.chunks as usize)?,
             kernels,
             tensors,
+            table,
         })
     }
 
@@ -304,22 +339,21 @@ impl<'c> SumSquares<'c> {
                 (out, "output", words),
             ],
         );
-        let k = &self.kernels;
-        for (at, &(start, len)) in (offset..).zip(&self.tensors) {
-            // SAFETY: the gradients hold start + len values, at most 2³¹ (checked when the
-            // kernel was made and above), and len is above 0; the partial sums are this
-            // kernel's own, sized for the longest tensor; out, borrowed mutably and so no
-            // input, holds word `at`, below `offset` plus the tensors (checked above).
-            unsafe {
-                k.tensor_sum(
-                    k.squares_partials,
-                    (grads, start, len),
-                    &self.partials,
-                    (out, at),
-                )?;
-            }
+        // SAFETY: the gradients hold every tensor's values, at most 2³¹ (checked when the
+        // kernel was made and above); the partial sums are this kernel's own, one per chunk;
+        // out, borrowed mutably and so no input, holds words offset onwards, one per tensor
+        // (checked above).
+        unsafe {
+            self.table.run(
+                &self.kernels,
+                self.tensors.len() as u32,
+                grads,
+                (&self.partials, &self.partials, 1),
+                &self.partials,
+                (out, offset),
+                None,
+            )
         }
-        Ok(())
     }
 }
 
@@ -359,7 +393,9 @@ pub struct FiniteFlag<'c> {
     kernels: Kernels<'c>,
     /// Each tensor's start and length in the flat buffer.
     tensors: Vec<(u32, u32)>,
-    /// One partial sum per chunk of the longest tensor, reused tensor by tensor.
+    /// The tensors on the card.
+    table: FlatTable<'c>,
+    /// One partial count per chunk of every tensor.
     partials: DeviceBuffer<'c>,
     /// Each tensor's count of non-finite values (one float when there are none).
     counts: DeviceBuffer<'c>,
@@ -386,11 +422,13 @@ impl<'c> FiniteFlag<'c> {
     pub fn new(cuda: &'c Cuda, lens: &[usize]) -> Result<FiniteFlag<'c>, CudaError> {
         let tensors = flat("finite flag", lens)?;
         let kernels = Kernels::new(cuda)?;
+        let table = FlatTable::new(cuda, &tensors)?;
         Ok(FiniteFlag {
-            partials: cuda.buffer(4 * most_chunks(&tensors))?,
+            partials: cuda.buffer(4 * table.chunks as usize)?,
             counts: cuda.buffer(4 * tensors.len().max(1))?,
             kernels,
             tensors,
+            table,
         })
     }
 
@@ -434,38 +472,22 @@ impl<'c> FiniteFlag<'c> {
                 (flag, "flag", 1),
             ],
         );
-        // Skip until the fold says otherwise: the copy follows the work already queued and
-        // precedes the launches below.
-        flag.write(&[1u32])?;
-        let k = &self.kernels;
-        for (at, &(start, len)) in (0u32..).zip(&self.tensors) {
-            // SAFETY: the gradients hold start + len values, at most 2³¹ (checked when the
-            // kernel was made and above), and len is above 0; the partial sums and the
-            // counts, one per tensor, are this kernel's own.
-            unsafe {
-                k.tensor_sum(
-                    k.non_finite_partials,
-                    (grads, start, len),
-                    &self.partials,
-                    (&self.counts, at),
-                )?;
-            }
-        }
-        // SAFETY: finite_fold takes (const float *counts, const u32 *loss, u32 loss_at, u32
-        // tensors, u32 *flag), reads one count per tensor, which this kernel's own counts
-        // hold, and loss[loss_at], which the loss holds (checked above), and writes flag[0];
-        // one thread does the work, and flag, borrowed mutably, is no input.
+        // Skip until the fold says otherwise: the fill is queued after the work already
+        // queued and before the launches below, and the host does not wait for it.
+        flag.fill_words(1, 1)?;
+        // SAFETY: the gradients hold every tensor's values, at most 2³¹ (checked when the
+        // kernel was made and above); the partial counts and the counts, one per chunk and
+        // one per tensor, are this kernel's own; the loss holds word loss_at and the flag,
+        // borrowed mutably and so no input, word 0 (checked above).
         unsafe {
-            k.launch(
-                k.finite_fold,
-                [1, 1],
-                &[
-                    Arg::Buffer(&self.counts),
-                    Arg::Buffer(loss),
-                    Arg::U32(loss_at),
-                    Arg::U32(self.tensors.len() as u32),
-                    Arg::Buffer(flag),
-                ],
+            self.table.run(
+                &self.kernels,
+                self.tensors.len() as u32,
+                grads,
+                (&self.partials, &self.partials, 2),
+                &self.partials,
+                (&self.counts, 0),
+                Some(((loss, loss_at), flag)),
             )
         }
     }
@@ -632,33 +654,21 @@ impl<'c> DeadRelu<'c> {
                 ],
             )?;
         }
-        // SAFETY: the merge takes (const float *partials, float *sums, u32 channels, u32
-        // chunks), reads chunks · channels partial sums and writes one count per channel,
-        // both this kernel's own buffers.
+        // SAFETY: dead_relu_merge_pack takes (const float *partials, float *counts, u32 *bits,
+        // u32 channels, u32 chunks, u32 offset, u32 accumulate); thread w below the words
+        // reads the chunks · channels partial sums of its channels and writes their counts,
+        // both this kernel's own buffers, and reads and writes word offset + w of bits, which
+        // out holds (checked above); out, borrowed mutably, is no input.
         unsafe {
             k.launch(
-                k.merge,
-                [dims.channels.div_ceil(BLOCK), 1],
+                k.dead_relu_merge_pack,
+                [words.div_ceil(BLOCK), 1],
                 &[
                     Arg::Buffer(&self.partials),
                     Arg::Buffer(&self.counts),
-                    Arg::U32(dims.channels),
-                    Arg::U32(chunks),
-                ],
-            )?;
-        }
-        // SAFETY: dead_relu_pack takes (const float *counts, u32 *bits, u32 channels, u32
-        // offset, u32 accumulate), reads one count per channel and reads and writes words
-        // offset..offset + words of bits, which out holds (checked above); out, borrowed
-        // mutably, is no input.
-        unsafe {
-            k.launch(
-                k.dead_relu_pack,
-                [words.div_ceil(BLOCK), 1],
-                &[
-                    Arg::Buffer(&self.counts),
                     Arg::Buffer(out),
                     Arg::U32(dims.channels),
+                    Arg::U32(chunks),
                     Arg::U32(offset),
                     Arg::U32(u32::from(accumulate)),
                 ],
@@ -677,8 +687,11 @@ mod tests {
         assert_eq!(flat("t", &[2, 3, 1]).unwrap(), vec![(0, 2), (2, 3), (5, 1)]);
         assert_eq!(total(&flat("t", &[2, 3, 1]).unwrap()), 6);
         assert_eq!(total(&[]), 0);
-        assert_eq!(most_chunks(&[(0, 1), (1, 4097)]), 2);
-        assert_eq!(most_chunks(&[]), 1);
+        assert_eq!(
+            table_words(&[(0, 1), (1, 4097), (4098, 4096)]),
+            (vec![0, 1, 0, 1, 4097, 1, 4098, 4096, 3], 4)
+        );
+        assert_eq!(table_words(&[]), (vec![], 0));
         assert!(flat("t", &[1 << 30, 1 << 30]).is_ok());
         for (lens, why) in [
             (vec![2, 0], "tensor 1 holds no values"),

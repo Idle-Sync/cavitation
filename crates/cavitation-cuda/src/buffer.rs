@@ -280,6 +280,30 @@ impl DeviceBuffer<'_> {
     }
 }
 
+impl DeviceBuffer<'_> {
+    /// Sets the first `words` four-byte words to `value`, queued on the card after its earlier
+    /// work, without the host waiting for that work as a [`write`](Self::write) does.
+    ///
+    /// # Panics
+    ///
+    /// If the buffer holds fewer than `words` words.
+    pub(crate) fn fill_words(&mut self, value: u32, words: usize) -> Result<(), CudaError> {
+        assert!(
+            words.saturating_mul(4) <= self.bytes,
+            "{words} words do not fit a buffer of {} bytes",
+            self.bytes
+        );
+        if words == 0 {
+            return Ok(());
+        }
+        let _bound = self.cuda.bind()?;
+        // SAFETY: the address was allocated with at least 4 · `words` bytes (checked above)
+        // in this context, current with the lock held.
+        let code = unsafe { (self.cuda.driver.cuMemsetD32_v2)(self.pointer, value, words) };
+        self.cuda.check("cuMemsetD32_v2", code)
+    }
+}
+
 impl Drop for DeviceBuffer<'_> {
     /// Waits for the card's work, which may still use the buffer, and frees it. Errors are
     /// not reported: there is no one to report them to.
