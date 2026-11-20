@@ -194,8 +194,9 @@ pub struct CudaStepProfile {
 /// never applied, so under [`OnNonFinite::Stop`] the parameters, the optimiser's state and the
 /// running statistics stay as they were, and [`OnNonFinite::Warn`] is refused.
 ///
-/// The trainer borrows the [`Cuda`] it was made on, and like it stays on the thread that
-/// opened it.
+/// The trainer borrows the [`Cuda`] it was made on, which threads may share. The trainer itself
+/// is neither `Send` nor `Sync`: it holds its kernels' handles and its buffers, so it is used
+/// on the thread that made it.
 ///
 /// # Examples
 ///

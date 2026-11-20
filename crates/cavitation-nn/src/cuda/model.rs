@@ -57,8 +57,9 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// A batch-norm layer's `num_batches_tracked` stays on the host, since only the host
 /// decides whether a step's running-statistics update ran.
 ///
-/// The model borrows the [`Cuda`] it was compiled on, and like it stays on the thread that
-/// opened it.
+/// The model borrows the [`Cuda`] it was compiled on, which threads may share. The model itself
+/// is neither `Send` nor `Sync`: it holds its kernels' handles and its buffers, so it is used
+/// on the thread that compiled it.
 ///
 /// # Examples
 ///
