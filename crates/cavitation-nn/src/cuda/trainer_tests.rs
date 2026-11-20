@@ -1,10 +1,17 @@
 //! `CudaTrainer` against the CPU: each parameter's gradient after one step against the `f64`
 //! training tape's from the same weights, batch and dropout masks, on the test MLP (with a
 //! neuron mask), a small CNN (convolution, batch norm, max pooling, dropout), `mnist-cnn` and
-//! `cifar-cnn`, with the max-pooling winners that differ from the `f64` tape's listed; the
-//! parameters after one SGD step within the update's bound; two runs giving the same bits; a
-//! step on non-finite inputs leaving the parameters and the optimiser's state as they were;
-//! five steps tracking the CPU `Trainer`; and a profiled step.
+//! `cifar-cnn`; the parameters after one SGD step within the update's bound; two runs giving
+//! the same bits; a step on non-finite inputs leaving the parameters and the optimiser's state
+//! as they were; five steps tracking the CPU `Trainer`; and a profiled step.
+//!
+//! The `f64` reference takes the card's discrete decisions: each ReLU keeps the values whose
+//! input was above 0 on the card, and each max pooling takes the card's winners (as a sum over
+//! a window in which only the winner is kept). A value near 0 or a near tie can go either way
+//! in `f32`, and a decision the reference took the other way would send a gradient where the
+//! card sends none, which no tolerance covers; with the card's decisions every layer is
+//! asserted. The winners are checked first, exactly, against the first largest value of each
+//! window of the card's own `f32` pooling input.
 //!
 //! The gradient check is the wgpu engine's tolerance, not a derived bound: each tensor's
 //! worst difference from the `f64` gradient must be under 2⁻¹² of the tensor's largest `f64`
@@ -17,118 +24,119 @@
 
 use std::time::Duration;
 
-use cavitation_core::{Graph, ParamStore, Reduction, Tensor};
+use cavitation_core::{Graph, ParamStore, Pool2dGeom, Reduction, Tensor};
 
 use super::CudaTrainer;
 use super::test_util::{Data, Twin, cifar_cnn, mlp, mnist_cnn, off, small_cnn, twin, with_cuda};
-use crate::{
-    Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trace, Trainer,
-};
+use crate::{Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Trainer};
 
 /// The unit roundoff of `f32`.
 const U: f64 = 1.0 / (1u64 << 24) as f64;
 
-/// A layer and its input on the `f64` tape.
-type Pooled = (usize, Vec<f64>);
-
-/// Each parameter's gradient on the `f64` training tape (seed 0, step 1, as a trainer's
-/// first step), with cross-entropy, in the `f64` store's parameter order, and each max
-/// pooling's and each ReLU's input, by layer.
-fn tape_gradients(t: &mut Twin, data: &Data) -> (Vec<Vec<f64>>, Vec<Pooled>, Vec<Pooled>) {
-    let x64: Vec<f64> = data.x.iter().map(|&v| f64::from(v)).collect();
-    let input = Tensor::from_vec(x64, &[data.rows, data.x.len() / data.rows]).unwrap();
-    let mut graph = Graph::<f64>::default();
-    let mut pooled = Vec::new();
-    let mut relus = Vec::new();
-    {
-        let mut tape = graph.training_tape(&t.params64.values, 0, 1);
-        let v = tape.input(input.view());
-        let mut trace = Trace::new();
-        let out = t.net64.forward_traced(&mut tape, v, &mut trace);
-        for i in 0..t.net.len() {
-            if matches!(
-                t.net.layer(i).inference(&t.params.values),
-                Some(InferenceLayer::MaxPool2d(_))
-            ) {
-                pooled.push((i, tape.value(trace.input(i)).data().to_vec()));
-            }
-            if t.net.layer(i).name() == "relu" {
-                relus.push((i, tape.value(trace.input(i)).data().to_vec()));
-            }
-        }
-        let loss = tape.softmax_cross_entropy(out, &data.labels, Reduction::Mean);
-        tape.backward(loss, &mut t.params64.grads);
-    }
-    let grads = (t.net64.parameter_names().into_iter())
-        .map(|(_, id)| t.params64.grad(id).data().to_vec())
-        .collect();
-    (grads, pooled, relus)
+/// What the card decided in a step: each ReLU's keep mask and each max pooling's winners as
+/// a keep mask over its input, both one value per input value, by layer.
+#[derive(Debug, Default)]
+struct Decisions {
+    /// Each ReLU layer and 1 where its input was above 0 on the card, 0 elsewhere.
+    relus: Vec<(usize, Vec<f64>)>,
+    /// Each max pooling layer, its shape, and 1 at each output's winner in its input.
+    pools: Vec<(usize, Pool2dGeom, Vec<f64>)>,
 }
 
-/// The max-pooling windows whose winner on the `f64` tape's input differs from the card's:
-/// `(layer, output index)`, with the window's two largest `f64` values.
-fn flipped_winners(
-    t: &Twin,
-    pooled: &[Pooled],
-    card: &[Vec<u32>],
-    rows: usize,
-) -> Vec<(usize, usize, f64, f64)> {
-    let mut flips = Vec::new();
-    for ((layer, input), winners) in pooled.iter().zip(card) {
-        let Some(InferenceLayer::MaxPool2d(g)) = t.net.layer(*layer).inference(&t.params.values)
+/// Each parameter's gradient on the `f64` training tape (seed 0, step 1, as a trainer's
+/// first step), with cross-entropy, in the `f64` store's parameter order, with each ReLU and
+/// max pooling taking the card's `decisions`.
+fn tape_gradients(t: &mut Twin, data: &Data, decisions: &Decisions) -> Vec<Vec<f64>> {
+    let width = data.x.len() / data.rows;
+    let x64: Vec<f64> = data.x.iter().map(|&v| f64::from(v)).collect();
+    let input = Tensor::from_vec(x64, &[data.rows, width]).unwrap();
+    let mut graph = Graph::<f64>::default();
+    {
+        let mut tape = graph.training_tape(&t.params64.values, 0, 1);
+        let mut v = tape.input(input.view());
+        for i in 0..t.net64.len() {
+            let shape = [data.rows, tape.value(v).data().len() / data.rows];
+            let keep_of = |values: &[f64]| Tensor::from_vec(values.to_vec(), &shape).unwrap();
+            let mut y = if let Some((_, keep)) = decisions.relus.iter().find(|r| r.0 == i) {
+                let keep = tape.input(keep_of(keep).view());
+                tape.keep_where(v, keep)
+            } else if let Some((_, geom, keep)) = decisions.pools.iter().find(|p| p.0 == i) {
+                // Only the winner of each window is kept, so the window's sum is its value.
+                let keep = tape.input(keep_of(keep).view());
+                let kept = tape.keep_where(v, keep);
+                tape.avg_pool2d(kept, *geom, true, Some(1))
+            } else {
+                t.net64.layer(i).forward(&mut tape, v)
+            };
+            if let Some(mask) = t.net64.mask(i) {
+                let on: Vec<f64> = (0..mask.width())
+                    .map(|j| f64::from(u8::from(mask.is_on(j))))
+                    .collect();
+                let keep = tape.input(Tensor::from_vec(on, &[mask.width()]).unwrap().view());
+                y = tape.keep_where(y, keep);
+            }
+            v = y;
+        }
+        let loss = tape.softmax_cross_entropy(v, &data.labels, Reduction::Mean);
+        tape.backward(loss, &mut t.params64.grads);
+    }
+    (t.net64.parameter_names().into_iter())
+        .map(|(_, id)| t.params64.grad(id).data().to_vec())
+        .collect()
+}
+
+/// The card's decisions in its last step, after checking each max pooling's winners exactly
+/// against the first largest value of each window of the card's own `f32` input, the taps
+/// in row-major order.
+fn card_decisions(t: &Twin, trainer: &CudaTrainer<'_, '_>, rows: usize, what: &str) -> Decisions {
+    let relus = (trainer.last_relu_inputs().into_iter())
+        .map(|(i, x)| (i, x.iter().map(|&v| f64::from(u8::from(v > 0.0))).collect()))
+        .collect();
+    let mut pools = Vec::new();
+    for ((layer, input), winners) in trainer
+        .last_pool_inputs()
+        .into_iter()
+        .zip(trainer.last_winners())
+    {
+        let Some(InferenceLayer::MaxPool2d(g)) = t.net.layer(layer).inference(&t.params.values)
         else {
             unreachable!("only max pooling layers are listed")
         };
-        let (h, w) = g.input();
-        let (kh, kw) = g.kernel();
-        let (sh, sw) = g.stride();
-        let out_w = (w - kw) / sw + 1;
-        let out_h = (h - kh) / sh + 1;
+        let ((h, w), (kh, kw), (sh, sw)) = (g.input(), g.kernel(), g.stride());
+        let (out_h, out_w) = g.out_size();
+        assert_eq!((g.padding(), g.dilation()), ((0, 0), (1, 1)), "{what}");
+        let mut keep = vec![0.0f64; input.len()];
         for img in 0..rows * g.channels() {
             let plane = &input[img * h * w..(img + 1) * h * w];
             for oy in 0..out_h {
                 for ox in 0..out_w {
-                    let mut best = (f64::NEG_INFINITY, 0usize, f64::NEG_INFINITY);
+                    let mut best = (f32::NEG_INFINITY, usize::MAX);
                     for ky in 0..kh {
                         for kx in 0..kw {
                             let at = (oy * sh + ky) * w + ox * sw + kx;
-                            let v = plane[at];
-                            if v > best.0 {
-                                best = (v, at, best.0);
-                            } else if v > best.2 {
-                                best.2 = v;
+                            if best.1 == usize::MAX || plane[at] > best.0 {
+                                best = (plane[at], at);
                             }
                         }
                     }
                     let o = img * out_h * out_w + oy * out_w + ox;
-                    if winners[o] as usize != best.1 {
-                        flips.push((*layer, o, best.0, best.2));
-                    }
+                    assert_eq!(
+                        winners[o] as usize, best.1,
+                        "{what}: layer {layer}, output {o}: the card's winner"
+                    );
+                    keep[img * h * w + best.1] = 1.0;
                 }
             }
         }
+        pools.push((layer, g, keep));
     }
-    flips
-}
-
-/// The ReLU inputs whose sign on the card differs from the `f64` tape's, `(layer, index)`,
-/// with both values: the ReLU passes a gradient on one side and none on the other.
-fn flipped_relus(tape: &[Pooled], card: &[(usize, Vec<f32>)]) -> Vec<(usize, usize, f64, f32)> {
-    let mut flips = Vec::new();
-    for ((layer, want), (_, got)) in tape.iter().zip(card) {
-        for (k, (&w, &g)) in want.iter().zip(got).enumerate() {
-            if (w > 0.0) != (g > 0.0) {
-                flips.push((*layer, k, w, g));
-            }
-        }
-    }
-    flips
+    Decisions { relus, pools }
 }
 
 /// One trainer step with a learning rate of 0, and each parameter's gradient on the card
-/// against the `f64` tape's, with the flipped max-pooling winners and ReLU signs listed.
+/// against the `f64` tape's with the card's ReLU and max-pooling decisions, every layer
+/// asserted.
 fn check_gradients(mut t: Twin, data: &Data, what: &str) {
-    let (want, pooled, relus) = tape_gradients(&mut t, data);
     let names: Vec<String> = (t.net.parameter_names().into_iter())
         .map(|(n, _)| n)
         .collect();
@@ -149,23 +157,9 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
         .unwrap();
         trainer.step(&t.net, data.view()).unwrap();
         let got = trainer.last_gradients();
-        let winners = trainer.last_winners();
-        let flips = flipped_winners(&t, &pooled, &winners, data.rows);
-        println!(
-            "{what}: {} max-pooling winners differ from the f64 tape's",
-            flips.len()
-        );
-        for (layer, o, a, b) in flips.iter().take(20) {
-            println!("  layer {layer}, output {o}: f64 window's top two {a:e}, {b:e}");
-        }
-        let signs = flipped_relus(&relus, &trainer.last_relu_inputs());
-        println!(
-            "{what}: {} ReLU inputs have another sign than on the f64 tape",
-            signs.len()
-        );
-        for (layer, k, w, g) in signs.iter().take(20) {
-            println!("  layer {layer}, value {k}: f64 {w:e}, card {g:e}");
-        }
+        let decisions = card_decisions(&t, &trainer, data.rows, what);
+        drop(trainer);
+        let want = tape_gradients(&mut t, data, &decisions);
         assert_eq!(
             (names.len(), want.len()),
             (got.len(), got.len()),
@@ -176,13 +170,6 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
             got.iter().map(|(id, _)| *id).eq(ids),
             "{what}: parameter order"
         );
-        // A flipped winner sends a gradient to another input, and a flipped ReLU passes a
-        // gradient the tape stops or stops one it passes, which no tolerance covers, so only
-        // the layers after the last flip are asserted.
-        let after_flips = (flips.iter().map(|f| f.0))
-            .chain(signs.iter().map(|f| f.0))
-            .max()
-            .map_or(0, |layer| layer + 1);
         let mut worst = (0.0f64, String::new());
         let largest = want.iter().flatten().map(|v| v.abs()).fold(0.0, f64::max);
         for ((name, w), (_, g)) in names.iter().zip(&want).zip(&got) {
@@ -192,15 +179,12 @@ fn check_gradients(mut t: Twin, data: &Data, what: &str) {
                 .map(|(&a, &b)| (f64::from(a) - b).abs())
                 .fold(0.0, f64::max);
             let ratio = off / tolerance;
-            let layer: usize = name.split('.').next().and_then(|l| l.parse().ok()).unwrap();
-            if layer >= after_flips {
-                assert!(
-                    ratio <= 1.0,
-                    "{what}: {name}: off by {off:e} of a largest gradient {scale:e}"
-                );
-            }
             println!(
                 "{what} {name}: worst {ratio:.4} of the tolerance (largest gradient {scale:.3e})"
+            );
+            assert!(
+                ratio <= 1.0,
+                "{what}: {name}: off by {off:e} of a largest gradient {scale:e}"
             );
             if ratio > worst.0 {
                 worst = (ratio, name.clone());
@@ -474,9 +458,10 @@ fn a_profile_has_every_layer() {
 }
 
 /// The time of a `cifar-cnn` training step at batch 128 with Adam, as #311 timed it: the
-/// median of 21 steps after 5 warm-up steps, each from the call to its return; then one
-/// profiled step's parts.
-/// A measurement, printed, not asserted. Run with `--ignored`.
+/// median of 21 steps after 5 warm-up steps, each from the call to its return; then the
+/// median of each part over 11 profiled steps. The health checks are the default ones
+/// (`Health::quiet` only drops the warnings). A measurement, printed, not asserted. Run
+/// with `--ignored`.
 #[test]
 #[ignore = "a measurement: run with --ignored"]
 fn cifar_step_time() {
@@ -509,30 +494,40 @@ fn cifar_step_time() {
             "cifar-cnn step at batch 128: median {:.3} ms (min {:.3}, max {:.3})",
             times[10], times[0], times[20]
         );
-        trainer.profile_next_step();
-        trainer.step(&t.net, data.view()).unwrap();
-        let p = trainer.last_profile().unwrap();
-        let ms = |d: Duration| d.as_secs_f64() * 1e3;
+        let mut profiles = Vec::new();
+        for _ in 0..11 {
+            trainer.profile_next_step();
+            trainer.step(&t.net, data.view()).unwrap();
+            profiles.push(trainer.last_profile().unwrap().clone());
+        }
+        let median = |pick: &dyn Fn(&super::CudaStepProfile) -> Duration| {
+            let mut v: Vec<f64> = (profiles.iter())
+                .map(|p| pick(p).as_secs_f64() * 1e3)
+                .collect();
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        println!("medians of 11 profiled steps:");
         for i in 0..t.net.len() {
-            let input = p.backward_input[i].map_or(String::new(), |d| {
-                format!(" (input gradient {:.3} ms)", ms(d))
-            });
+            let input = (profiles[0].backward_input[i].is_some())
+                .then(|| median(&|p| p.backward_input[i].unwrap_or_default()))
+                .map_or(String::new(), |v| format!(" (input gradient {v:.3} ms)"));
             println!(
                 "  {i:>2} {:<12} forward {:.3} ms, backward {:.3} ms{input}",
                 t.net.layer(i).name(),
-                ms(p.forward[i]),
-                ms(p.backward[i]),
+                median(&|p| p.forward[i]),
+                median(&|p| p.backward[i]),
             );
         }
         println!(
             "  loss {:.3} ms, health {:.3} ms, optimizer {:.3} ms, running {:.3} ms, readback \
              {:.3} ms, total {:.3} ms",
-            ms(p.loss),
-            ms(p.health),
-            ms(p.optimizer),
-            ms(p.running),
-            ms(p.readback),
-            ms(p.total)
+            median(&|p| p.loss),
+            median(&|p| p.health),
+            median(&|p| p.optimizer),
+            median(&|p| p.running),
+            median(&|p| p.readback),
+            median(&|p| p.total)
         );
     });
 }

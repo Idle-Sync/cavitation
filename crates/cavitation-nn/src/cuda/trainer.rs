@@ -1363,6 +1363,25 @@ impl<'c, 's> CudaTrainer<'c, 's> {
             .collect()
     }
 
+    /// Reads back each max pooling's input from the last full step, by layer: for the tests.
+    #[cfg(test)]
+    pub(crate) fn last_pool_inputs(&self) -> Vec<(usize, Vec<f32>)> {
+        (self
+            .pass
+            .forward
+            .saved
+            .iter()
+            .zip(&self.model.layers)
+            .enumerate())
+        .filter(|(_, (_, l))| matches!(l.kind, Kind::MaxPool2d(_)))
+        .map(|(i, (saved, l))| {
+            let mut values = vec![0.0f32; self.model.batch * l.inputs];
+            self.model.store.get(saved.input).read(&mut values).unwrap();
+            (i, values)
+        })
+        .collect()
+    }
+
     /// Reads back each ReLU's input from the last full step, by layer: for the tests.
     #[cfg(test)]
     pub(crate) fn last_relu_inputs(&self) -> Vec<(usize, Vec<f32>)> {
