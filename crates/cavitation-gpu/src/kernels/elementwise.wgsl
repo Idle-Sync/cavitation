@@ -47,13 +47,13 @@ fn held(x: f32) -> f32 {
     return bitcast<f32>(bitcast<u32>(x) ^ params.zero);
 }
 
-// x / (3h) for h = 1 or 2, correctly rounded as the CPU divides, for x / (3h) normal: a
-// quotient q0 from WGSL's division (which may be a product by the reciprocal, within a few
-// ulp), and of q0 and the two floats on each side of it, the one whose remainder
-// x - 3h q = (x - 2h q) - h q (held, so it is not regrouped) is smallest. Each step of the remainder is exact (h q is a
-// power-of-two multiple, and each difference is of floats within a factor of 2), so the
-// smallest remainder is the nearest quotient; x / 3 and x / 6 are never halfway between two
-// floats. 0, infinities and NaN give WGSL's quotient.
+// x / (3h) for h = 1 or 2, correctly rounded as the CPU divides, for x / (3h) normal: a quotient q0
+// from WGSL's division (which may be a product by the reciprocal, within a few ulp), and of q0 and
+// the two floats on each side of it, the one whose remainder x - 3h q = (x - 2h q) - h q (held, so
+// it is not regrouped) is smallest. Each step of the remainder is exact (h q is a power-of-two
+// multiple, and each difference is of floats within a factor of 2), so the smallest remainder is
+// the nearest quotient; x / 3 and x / 6 are never halfway between two floats. 0, infinities and NaN
+// give WGSL's quotient.
 fn div_by_3h(x: f32, h: f32) -> f32 {
     let q0 = held(x / (3.0 * h));
     var best = q0;

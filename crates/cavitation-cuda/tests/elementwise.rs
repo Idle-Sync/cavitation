@@ -1,11 +1,11 @@
-//! The element-wise kernels against their CPU twins, as `cavitation-gpu`'s tests check its
-//! WGSL ones. The one-rounding operations (add, multiply, scale, ReLU and leaky ReLU forward
-//! and backward), the clamps (hardtanh and ReLU6, the hard sigmoid, the hard swish) and
-//! softsign, forward and backward, give the CPU's bits, NaN, ±0, ±∞ and subnormals included.
-//! tanh, the sigmoid, GELU's tanh form, ELU, SELU, CELU, SiLU, Mish, softplus and
-//! log-sigmoid give the bits of the CPU's reference kernels (`Level::Reference`) over every
-//! 61st f32 bit pattern. Those and GELU's erf form, forward and backward, are within the
-//! same stated bounds of the f64 tape's values as the WGSL kernels. Each test skips without CUDA, unless
+//! The element-wise kernels against their CPU twins, as `cavitation-gpu`'s tests check its WGSL
+//! ones. The one-rounding operations (add, multiply, scale, ReLU and leaky ReLU forward and
+//! backward), the clamps (hardtanh and ReLU6, the hard sigmoid, the hard swish) and softsign,
+//! forward and backward, give the CPU's bits, ±0, ±∞ and subnormals included, and NaN for NaN.
+//! tanh, the sigmoid, GELU's tanh form, ELU, SELU, CELU, SiLU, Mish, softplus and log-sigmoid give
+//! the bits of the CPU's reference kernels (`Level::Reference`) over every 61st f32 bit pattern.
+//! Those and GELU's erf form, forward and backward, are within the same stated bounds of the f64
+//! tape's values as the WGSL kernels. Each test skips without CUDA, unless
 //! `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
 
 use cavitation_core::{GeluApprox, Graph, ParamStore, Real, Tape, Tensor, Var};
@@ -798,8 +798,8 @@ fn exponential_activations_give_the_reference_bits() {
     }
 }
 
-/// On ±0, ±∞ and NaN the activations built on an exponential or a logarithm give the CPU's
-/// bits, forward and backward: −0 stays −0 where the CPU keeps it, and NaN stays NaN.
+/// On ±0 and ±∞ the activations built on an exponential or a logarithm give the CPU's
+/// bits, forward and backward (−0 stays −0 where the CPU keeps it), and NaN for NaN.
 #[test]
 fn exponential_activations_on_special_values() {
     let Some(cuda) = Cuda::new() else { return };

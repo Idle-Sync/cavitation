@@ -19,15 +19,14 @@ const BLOCK: u32 = 256;
 
 /// One element-wise operation, applied to every element of `a` (and `b`).
 ///
-/// The one-rounding operations (`Add`, `Mul`, `Scale`, the ReLUs forward and backward), the
-/// clamps (hardtanh, the hard sigmoid and hard swish) and softsign, forward and backward, give
-/// the CPU's bits, NaN, ±0, ±∞ and subnormals included. tanh, the sigmoid, GELU's tanh form,
-/// ELU, SELU, CELU, SiLU, Mish, softplus and log-sigmoid give the bits of the CPU's reference
-/// kernels (`Level::Reference`; the CPU's SIMD kernels fuse operations and may differ from
-/// these by an ulp). GELU's erf form uses CUDA's `expf`, and the backward passes the CPU takes
-/// with std's `exp` (ELU, SELU, CELU, SiLU, Mish, softplus, log-sigmoid) use the kernels'
-/// exponential; each is within a stated bound of the f64 tape. `tests/elementwise.rs` checks
-/// each.
+/// The one-rounding operations (`Add`, `Mul`, `Scale`, the ReLUs forward and backward), the clamps
+/// (hardtanh, the hard sigmoid and hard swish) and softsign, forward and backward, give the CPU's
+/// bits, ±0, ±∞ and subnormals included, and NaN for NaN. tanh, the sigmoid, GELU's tanh form, ELU,
+/// SELU, CELU, SiLU, Mish, softplus and log-sigmoid give the bits of the CPU's reference kernels
+/// (`Level::Reference`; the CPU's SIMD kernels fuse operations and may differ from these by an
+/// ulp). GELU's erf form uses CUDA's `expf`, and the backward passes the CPU takes with std's `exp`
+/// (ELU, SELU, CELU, SiLU, Mish, softplus, log-sigmoid) use the kernels' exponential; each is
+/// within a stated bound of the f64 tape. `tests/elementwise.rs` checks each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum ElementwiseOp {
@@ -81,9 +80,11 @@ pub enum ElementwiseOp {
     Mish,
     /// `b · (t + a · σ(a) · (1 − t²))`, `t = tanh(softplus(a))`, with `a` the forward input.
     MishBackward,
-    /// Softplus with `beta` in `alpha` and the threshold in `scale`: `a` where `beta · a` is above the threshold, `ln(1 + e^(beta·a)) / beta` at or below.
+    /// Softplus with `beta` in `alpha` and the threshold in `scale`: `a` where `beta · a` is above
+    /// the threshold, `ln(1 + e^(beta·a)) / beta` at or below.
     Softplus,
-    /// `b · (1 where beta · a is above the threshold, σ(beta · a) at or below)`, with `a` the forward input.
+    /// `b · (1 where beta · a is above the threshold, σ(beta · a) at or below)`, with `a` the
+    /// forward input.
     SoftplusBackward,
     /// Softsign, `a / (1 + |a|)`.
     Softsign,
@@ -266,9 +267,11 @@ impl<'c> Elementwise<'c> {
     }
 
     /// Writes `op` of the first `n` elements of `a` (and `b`) to `out`, with `alpha` for
-    /// `Scale`, the leaky ReLU, ELU and CELU (ignored by the others): [`run_with`] with a
-    /// `scale` of 0. Every one of the `n` outputs is written. `b` must be given exactly when
-    /// [`ElementwiseOp::takes_b`] says so.
+    /// `Scale`, the leaky ReLU, ELU and CELU, as `beta` for softplus and as the lower bound for
+    /// hardtanh (the others ignore it). It is [`run_with`] with a `scale` of 0, which softplus
+    /// reads as its threshold and hardtanh as its upper bound: run those two, forward and
+    /// backward, through [`run_with`]. Every one of the `n` outputs is written. `b` must be
+    /// given exactly when [`ElementwiseOp::takes_b`] says so.
     ///
     /// [`run_with`]: Elementwise::run_with
     ///
@@ -359,9 +362,9 @@ impl<'c> Elementwise<'c> {
         // order, which is the declaration order (a unit test holds it).
         let kernel = unsafe { self.module.kernel_from(self.functions[op as usize]) };
         let blocks = count.div_ceil(BLOCK);
-        // SAFETY: every kernel in the source takes (const float *a, const float *b, float
-        // *out, unsigned n, float alpha, float scale) and touches elements below n only; a, b and out hold
-        // at least n floats (checked above), b is a when the operation does not read it, and
+        // SAFETY: every kernel in the source takes (const float *a, const float *b, float *out,
+        // unsigned n, float alpha, float scale) and touches elements below n only; a, b and out
+        // hold at least n floats (checked above), b is a when the operation does not read it, and
         // out, borrowed mutably, is neither input.
         unsafe {
             kernel.launch(

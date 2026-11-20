@@ -619,7 +619,15 @@ fn kind(
         ActivationKind::Mish => Act::Mish,
         ActivationKind::Softplus { beta, threshold } => Act::Softplus { beta, threshold },
         ActivationKind::Softsign => Act::Softsign,
-        ActivationKind::Hardtanh { min, max } => Act::Hardtanh { min, max },
+        ActivationKind::Hardtanh { min, max } => {
+            // The CPU's `Tape::hardtanh` panics on these, so no device trains them.
+            if min.is_nan() || max.is_nan() || min > max {
+                return refuse(&format!(
+                    "is a hardtanh with min {min} and max {max}; min must not exceed max"
+                ));
+            }
+            Act::Hardtanh { min, max }
+        }
         ActivationKind::Relu6 => Act::Relu6,
         ActivationKind::Hardsigmoid => Act::Hardsigmoid,
         ActivationKind::Hardswish => Act::Hardswish,

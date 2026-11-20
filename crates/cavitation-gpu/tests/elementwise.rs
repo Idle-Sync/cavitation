@@ -1,11 +1,15 @@
-//! The element-wise kernels against their CPU twins on every backend this machine has.
+//! The element-wise kernels against their CPU twins on each backend this machine tries
+//! (`Backend::on_this_platform`: Vulkan and DX12 here, never Metal on this machine). wgpu
+//! compiles Metal shaders with fast math on, so there the flushed subnormals and the
+//! division may differ from what these tests measured elsewhere.
+//!
 //! The one-rounding operations (add, multiply, scale, ReLU and leaky ReLU forward and
 //! backward, dropout) and the clamps (hardtanh and ReLU6, the hard sigmoid and the hard
-//! swish, forward and backward) give the CPU's bits on normal values, NaN, ±0 and ±∞
-//! included. tanh, the sigmoid, GELU (both forms), ELU, SELU, CELU, SiLU, Mish, softplus,
-//! softsign and log-sigmoid, forward and backward, are within their stated bounds of the f64
-//! tape's values, and give the CPU's bits on ±0, ±∞ and NaN. Each test skips without a GPU,
-//! unless `CAVITATION_GPU_REQUIRED=1` makes that a failure.
+//! swish, forward and backward) give the CPU's bits on normal values, ±0 and ±∞ included,
+//! and NaN for NaN. tanh, the sigmoid, GELU (both forms), ELU, SELU, CELU, SiLU, Mish,
+//! softplus, softsign and log-sigmoid, forward and backward, are within their stated bounds
+//! of the f64 tape's values, give the CPU's bits on ±0 and ±∞, and NaN for NaN. Each test
+//! skips without a GPU, unless `CAVITATION_GPU_REQUIRED=1` makes that a failure.
 
 mod common;
 
@@ -819,9 +823,9 @@ fn exponential_activation_twins() {
     });
 }
 
-/// On ±0, ±∞ and NaN the activations built on an exponential, a logarithm or a division
-/// give the CPU's bits, forward and backward: −0 stays −0 where the CPU keeps it, and NaN
-/// stays NaN.
+/// On ±0 and ±∞ the activations built on an exponential, a logarithm or a division give
+/// the CPU's bits, forward and backward (−0 stays −0 where the CPU keeps it), and NaN for
+/// NaN.
 #[test]
 fn exponential_activations_on_special_values() {
     for_each_gpu(|gpu| {

@@ -5,7 +5,9 @@
 //! Their CPU twins are `cavitation-core`'s: the one-rounding operations and the clamps match
 //! it bit for bit on normal values, and the activations built on an exponential or a
 //! logarithm are the CPU kernels' formulas ported operation for operation, within the bounds
-//! their tests state.
+//! their tests state. Those tests ran on Vulkan and DX12, not on Metal, for which wgpu
+//! compiles shaders with fast math on: there the flushed subnormals and the division may
+//! differ.
 
 use std::num::NonZeroU64;
 
@@ -95,9 +97,11 @@ pub enum Elementwise {
     Mish,
     /// `b · (t + a · σ(a) · (1 − t²))`, `t = tanh(softplus(a))`, with `a` the forward input.
     MishBackward,
-    /// Softplus with `beta` in `alpha` and the threshold in `scale`: `a` where `beta · a` is above the threshold, `ln(1 + e^(beta·a)) / beta` at or below.
+    /// Softplus with `beta` in `alpha` and the threshold in `scale`: `a` where `beta · a` is above
+    /// the threshold, `ln(1 + e^(beta·a)) / beta` at or below.
     Softplus,
-    /// `b · (1 where beta · a is above the threshold, σ(beta · a) at or below)`, with `a` the forward input.
+    /// `b · (1 where beta · a is above the threshold, σ(beta · a) at or below)`, with `a` the
+    /// forward input.
     SoftplusBackward,
     /// Softsign, `a / (1 + |a|)`.
     Softsign,

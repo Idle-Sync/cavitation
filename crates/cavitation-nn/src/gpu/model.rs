@@ -40,20 +40,19 @@ pub(crate) struct GpuMask {
 /// as the GPU runs them, with its parameters, batch-norm running statistics and neuron
 /// masks held on the GPU.
 ///
-/// [`compile`](GpuModel::compile) refuses a model with a layer the GPU does not run, naming
-/// the layer's index and name. The layers it runs are [`Linear`](crate::Linear),
-/// [`Conv2d`](crate::Conv2d), [`MaxPool2d`](crate::MaxPool2d),
-/// [`AvgPool2d`](crate::AvgPool2d), [`BatchNorm2d`](crate::BatchNorm2d),
-/// [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten), [`Identity`](crate::Identity)
-/// and every built-in activation: [`Relu`](crate::Relu), [`LeakyRelu`](crate::LeakyRelu),
-/// [`Tanh`](crate::Tanh), [`Sigmoid`](crate::Sigmoid), [`Gelu`](crate::Gelu) (both forms),
-/// [`Elu`](crate::Elu), [`Selu`](crate::Selu), [`Celu`](crate::Celu) (with a positive
-/// `alpha`), [`Silu`](crate::Silu), [`Mish`](crate::Mish), [`Softplus`](crate::Softplus),
-/// [`Softsign`](crate::Softsign), [`Hardtanh`](crate::Hardtanh), [`Relu6`](crate::Relu6),
-/// [`Hardsigmoid`](crate::Hardsigmoid), [`Hardswish`](crate::Hardswish) and
-/// [`LogSigmoid`](crate::LogSigmoid), each as an [`ActivationLayer`](crate::ActivationLayer)
-/// too. Neuron masks set on the model when it is compiled are compiled in; a mask set
-/// later needs a new compile.
+/// [`compile`](GpuModel::compile) refuses a model with a layer the GPU does not run, naming the
+/// layer's index and name. The layers it runs are [`Linear`](crate::Linear),
+/// [`Conv2d`](crate::Conv2d), [`MaxPool2d`](crate::MaxPool2d), [`AvgPool2d`](crate::AvgPool2d),
+/// [`BatchNorm2d`](crate::BatchNorm2d), [`Dropout`](crate::Dropout), [`Flatten`](crate::Flatten),
+/// [`Identity`](crate::Identity) and every built-in activation: [`Relu`](crate::Relu),
+/// [`LeakyRelu`](crate::LeakyRelu), [`Tanh`](crate::Tanh), [`Sigmoid`](crate::Sigmoid),
+/// [`Gelu`](crate::Gelu) (both forms), [`Elu`](crate::Elu), [`Selu`](crate::Selu),
+/// [`Celu`](crate::Celu) (with a positive `alpha`), [`Silu`](crate::Silu), [`Mish`](crate::Mish),
+/// [`Softplus`](crate::Softplus), [`Softsign`](crate::Softsign), [`Hardtanh`](crate::Hardtanh)
+/// (with `min <= max`), [`Relu6`](crate::Relu6), [`Hardsigmoid`](crate::Hardsigmoid),
+/// [`Hardswish`](crate::Hardswish) and [`LogSigmoid`](crate::LogSigmoid), each as an
+/// [`ActivationLayer`](crate::ActivationLayer) too. Neuron masks set on the model when it is
+/// compiled are compiled in; a mask set later needs a new compile.
 ///
 /// A batch-norm layer's `num_batches_tracked` stays on the host, since only the host
 /// decides whether a step's running-statistics update ran.
@@ -413,8 +412,8 @@ mod tests {
 
     use super::{Act, GpuModel, Kind, Plan, pack_rows};
     use crate::{
-        AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Init, Layer, LeakyRelu,
-        Linear, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh,
+        AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Hardtanh, Init, Layer,
+        LeakyRelu, Linear, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh,
     };
 
     /// A layer with no inference form.
@@ -575,6 +574,24 @@ mod tests {
                     .push(linear(&mut params, &mut rng))
                     .push(Celu { alpha: -1.0 }),
                 "unsupported: GpuModel::compile: layer 1 (celu) is a CELU with alpha -1; the GPU runs a positive alpha only",
+            ),
+            (
+                Sequential::new()
+                    .push(linear(&mut params, &mut rng))
+                    .push(Hardtanh {
+                        min: 1.0,
+                        max: -1.0,
+                    }),
+                "unsupported: GpuModel::compile: layer 1 (hardtanh) is a hardtanh with min 1 and max -1; min must not exceed max",
+            ),
+            (
+                Sequential::new()
+                    .push(linear(&mut params, &mut rng))
+                    .push(Hardtanh {
+                        min: f64::NAN,
+                        max: 1.0,
+                    }),
+                "unsupported: GpuModel::compile: layer 1 (hardtanh) is a hardtanh with min NaN and max 1; min must not exceed max",
             ),
             (
                 Sequential::new()

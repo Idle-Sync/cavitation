@@ -14,9 +14,9 @@ use super::CudaModel;
 use super::test_util::{cifar_cnn, classes, mlp, mnist_cnn, off, twin, uniform, with_cuda};
 use crate::plan::{Engine, Plan, pack_rows};
 use crate::{
-    AvgPool2d, BatchNorm2d, Conv2d, Dropout, Flatten, Gelu, InferenceModel, Init, LeakyRelu,
-    Linear, Loss, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh, accuracy,
-    evaluate,
+    AvgPool2d, BatchNorm2d, Celu, Conv2d, Dropout, Flatten, Gelu, Hardtanh, InferenceModel, Init,
+    LeakyRelu, Linear, Loss, MaxPool2d, NeuronMask, Relu, Sequential, Sigmoid, Softmax, Tanh,
+    accuracy, evaluate,
 };
 
 /// A small CNN with every kind of layer the card runs, two of them masked: 1 × 6 × 6 images
@@ -232,5 +232,48 @@ fn evaluate_and_accuracy_match_the_cpu() {
         assert_eq!(model.accuracy(&data), cpu_accuracy);
         let wrong = classes(8, 4, 11, 4);
         assert!(model.evaluate(&t.net, &wrong, Loss::CrossEntropy).is_err());
+    });
+}
+
+/// `CudaModel::compile` refuses, by index and name, a CELU whose `alpha` is not positive and
+/// a hardtanh whose `min` is above its `max` or NaN (the CPU's tape panics on it), before it
+/// touches the card.
+#[test]
+fn compile_refuses_activation_settings_the_kernels_do_not_take() {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(3);
+    let linear = Linear::new(&mut params, 4, 3, &mut rng);
+    let cases: [(Sequential, &str); 3] = [
+        (
+            Sequential::new()
+                .push(linear.clone())
+                .push(Celu { alpha: -1.0 }),
+            "layer 1 (celu) is a CELU with alpha -1; the GPU runs a positive alpha only",
+        ),
+        (
+            Sequential::new().push(linear.clone()).push(Hardtanh {
+                min: 1.0,
+                max: -1.0,
+            }),
+            "layer 1 (hardtanh) is a hardtanh with min 1 and max -1; min must not exceed max",
+        ),
+        (
+            Sequential::new().push(linear.clone()).push(Hardtanh {
+                min: -1.0,
+                max: f64::NAN,
+            }),
+            "layer 1 (hardtanh) is a hardtanh with min -1 and max NaN; min must not exceed max",
+        ),
+    ];
+    with_cuda(|cuda| {
+        for (net, why) in &cases {
+            let Err(err) = CudaModel::compile(net, &params, 8, cuda) else {
+                panic!("{why}: compiled");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!("unsupported: CudaModel::compile: {why}")
+            );
+        }
     });
 }
