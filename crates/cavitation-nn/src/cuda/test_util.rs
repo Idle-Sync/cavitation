@@ -9,7 +9,8 @@ use cavitation_cuda::Cuda;
 
 use crate::{
     ActivationKind, ActivationLayer, BatchNorm2d, BatchView, Conv2d, Dataset, Dropout, Flatten,
-    Init, Linear, LogSoftmax, MaxPool2d, Relu, Sequential, Softmax, Tanh, Targets, TargetsView,
+    Init, Linear, LogSoftmax, MaxPool2d, Prelu, Relu, Sequential, Softmax, Tanh, Targets,
+    TargetsView,
 };
 
 /// Runs `body` on CUDA if it opens, and returns whether it ran.
@@ -62,6 +63,34 @@ pub(super) fn softmax_mlp<T: Real>(
     let net = rows(Sequential::new_generic().push(Linear::new(params, 12, 16, &mut rng)));
     let net = rows(net.push(Linear::new(params, 16, 9, &mut rng)));
     rows(net.push(Linear::new(params, 9, 4, &mut rng)))
+}
+
+/// An MLP 12 → 16 → 9 → 4 with a PReLU before each `Linear`, one slope per column, or one
+/// shared slope if `shared`, in either precision; the slopes are seeded in `[−0.5, 0.75)`.
+pub(super) fn prelu_mlp<T: Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+    shared: bool,
+) -> Sequential<T> {
+    let mut rng = Rng::seed(seed);
+    let mut prelu = |params: &mut ParamStore<T>, width: usize| {
+        let layer = Prelu::new(params, if shared { 1 } else { width });
+        for v in params.value_mut(layer.weight()).data_mut() {
+            *v = T::from_f64(rng.range(-0.5, 0.75));
+        }
+        layer
+    };
+    let first = prelu(params, 12);
+    let second = prelu(params, 16);
+    let third = prelu(params, 9);
+    let mut rng = Rng::seed(seed + 1);
+    Sequential::new_generic()
+        .push(first)
+        .push(Linear::new(params, 12, 16, &mut rng))
+        .push(second)
+        .push(Linear::new(params, 16, 9, &mut rng))
+        .push(third)
+        .push(Linear::new(params, 9, 4, &mut rng))
 }
 
 /// The activations the GPU engines run besides ReLU, leaky ReLU, tanh, the sigmoid and GELU,

@@ -6,7 +6,8 @@ use cavitation_core::{Error, TensorView};
 use cavitation_gpu::kernels::{
     AvgPool2d, BatchNorm2d, BatchNormForward, BatchStats, BiasAdd, BiasAddCall, ChannelDims,
     ConvCall, ConvDims, ConvForward, Elementwise, ElementwiseCall, ElementwiseKernels, Gemm,
-    GemmCall, GemmDims, MaxPool2d, RowSoftmax, RowSoftmaxCall, RowSoftmaxKernels,
+    GemmCall, GemmDims, MaxPool2d, Prelu, PreluCall, PreluKernels, RowSoftmax, RowSoftmaxCall,
+    RowSoftmaxKernels,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, wgpu,
@@ -30,6 +31,8 @@ pub(crate) struct Kernels {
     pub(crate) elementwise: ElementwiseKernels,
     /// Softmax and log-softmax over each row.
     pub(crate) softmax: RowSoftmaxKernels,
+    /// PReLU: forward, the input's gradient and the slopes' gradient.
+    pub(crate) prelu: PreluKernels,
     /// Batch normalisation.
     pub(crate) batch_norm: BatchNorm2d,
 }
@@ -43,6 +46,7 @@ impl Kernels {
             conv: ConvForward::new(gpu, cache)?,
             elementwise: ElementwiseKernels::new(gpu, cache)?,
             softmax: RowSoftmaxKernels::new(gpu, cache)?,
+            prelu: PreluKernels::new(gpu, cache)?,
             batch_norm: BatchNorm2d::new(gpu, cache)?,
         })
     }
@@ -61,6 +65,8 @@ enum Op {
     Elementwise(ElementwiseCall),
     /// A softmax or log-softmax over each row.
     Softmax(RowSoftmaxCall),
+    /// PReLU.
+    Prelu(PreluCall),
     /// Max pooling with its kernel and bind group.
     MaxPool(MaxPool2d, wgpu::BindGroup),
     /// Average pooling with its kernel and bind group.
@@ -116,6 +122,16 @@ fn value_usage() -> wgpu::BufferUsages {
 /// `n` as a `u32`, for a size [`GpuModel::compile`] has checked fits a binding.
 fn u32_of(n: usize) -> u32 {
     u32::try_from(n).expect("GpuModel::compile checks every size against the GPU's bindings")
+}
+
+/// The `(rows, channels)` the PReLU kernels take for `batch` rows of `width` values with
+/// `channels` slopes: each column a channel, or every value a row of one shared slope.
+pub(crate) fn prelu_shape(batch: usize, width: usize, channels: usize) -> (u32, u32) {
+    if channels == 1 {
+        (u32_of(batch * width), 1)
+    } else {
+        (u32_of(batch), u32_of(channels))
+    }
 }
 
 impl Forward {
@@ -241,6 +257,21 @@ impl Forward {
                     ops.push(Op::Softmax(call));
                     out
                 }
+                Kind::Prelu { channels, weight } => {
+                    let out = new(&mut values, pool);
+                    let call = kernels.prelu.call(
+                        steps,
+                        pool,
+                        Prelu::Forward,
+                        prelu_shape(batch, layer.inputs, channels),
+                        &values[x],
+                        &parts.params[weight].buffer,
+                        None,
+                        &values[out],
+                    );
+                    ops.push(Op::Prelu(call));
+                    out
+                }
                 Kind::MaxPool2d(geom) => {
                     let out = new(&mut values, pool);
                     let kernel = MaxPool2d::new(cache, &geom, batch)?;
@@ -353,6 +384,7 @@ impl Forward {
                 Op::Conv(call) => kernels.conv.record(step, call),
                 Op::Elementwise(call) => kernels.elementwise.record(step, call),
                 Op::Softmax(call) => kernels.softmax.record(step, call),
+                Op::Prelu(call) => kernels.prelu.record(step, call),
                 Op::MaxPool(kernel, group) => kernel.forward(step, group),
                 Op::AvgPool(kernel, group) => kernel.forward(step, group),
                 Op::BatchNorm(call) => kernels.batch_norm.record_forward(step, call),

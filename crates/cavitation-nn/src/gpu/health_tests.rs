@@ -17,7 +17,7 @@ use cavitation_core::{Conv2dGeom, Error, ParamStore, Pool2dGeom, Rng, Tensor, Te
 use cavitation_gpu::{Backend, Gpu};
 
 use super::GpuTrainer;
-use super::forward_tests::{mlp, twin};
+use super::forward_tests::{mlp, prelu_mlp, twin};
 use crate::{
     BatchView, Conv2d, Flatten, Health, Init, Linear, Loss, MaxPool2d, OnNonFinite,
     OptimizerConfig, Relu, Relu6, Sequential, TargetsView, Trainer, Warning, WarningKind,
@@ -503,6 +503,56 @@ fn one_parameter_tensor_trains() {
 #[test]
 fn norm_warnings_match_the_cpu() {
     let t = twin(mlp::<f64>, mlp::<f32>, 47);
+    let batches: Vec<Data> = (0..3).map(|s| Data::new(70 + s, 6, 12, 4)).collect();
+    let epoch: Vec<&Data> = batches.iter().collect();
+    let epochs = vec![epoch.clone(), epoch];
+    let params = t.net.parameter_names().len();
+    for (high, low, kind) in [
+        (0.0, 0.0, WarningKind::Exploding),
+        (f64::INFINITY, f64::INFINITY, WarningKind::Vanishing),
+    ] {
+        let health = || Health {
+            grad_norm_high: high,
+            grad_norm_low: low,
+            dead_relu: false,
+            ..Health::quiet()
+        };
+        let cpu = cpu_run(
+            &t.net,
+            &t.params,
+            &adam(),
+            Loss::CrossEntropy,
+            6,
+            health(),
+            &epochs,
+        );
+        assert_eq!(count(&cpu.warnings, kind), 2 * params, "{kind:?}: {cpu:?}");
+        for_each_gpu(|gpu| {
+            let (g, _) = gpu_run(
+                gpu,
+                &t.net,
+                &t.params,
+                &adam(),
+                Loss::CrossEntropy,
+                6,
+                health(),
+                &epochs,
+            );
+            same_warnings(&g.warnings, &cpu.warnings, &format!("{kind:?}"));
+        });
+    }
+}
+
+/// The norm checks of the MLP with a PReLU before each `Linear`, as above: one warning per
+/// parameter per epoch, the slopes among them, as on the CPU, each norm within 2⁻¹⁰ of the
+/// CPU's.
+#[test]
+fn prelu_slope_norms_warn_as_on_the_cpu() {
+    let t = twin(
+        |p, s| prelu_mlp(p, s, false),
+        |p, s| prelu_mlp(p, s, false),
+        47,
+    );
     let batches: Vec<Data> = (0..3).map(|s| Data::new(70 + s, 6, 12, 4)).collect();
     let epoch: Vec<&Data> = batches.iter().collect();
     let epochs = vec![epoch.clone(), epoch];

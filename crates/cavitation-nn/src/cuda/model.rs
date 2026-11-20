@@ -4,7 +4,7 @@
 //! neuron masks.
 
 use cavitation_core::{Error, ParamId, ParamStore};
-use cavitation_cuda::{Cuda, CudaError, Dropout, Elementwise, RowSoftmax};
+use cavitation_cuda::{Cuda, CudaError, Dropout, Elementwise, Prelu, RowSoftmax};
 
 use super::pass::{Forward, Parts, Shared, Store};
 use crate::Sequential;
@@ -50,7 +50,9 @@ pub(crate) fn ran<T>(who: &str, result: Result<T, CudaError>) -> T {
 /// [`Identity`](crate::Identity) and every built-in activation (ReLU, leaky ReLU, tanh, the
 /// sigmoid, GELU in both forms, ELU, SELU, CELU with a positive `alpha`, SiLU, Mish, softplus,
 /// softsign, hardtanh with `min <= max`, ReLU6, the hard sigmoid, the hard swish and log-sigmoid),
-/// and [`Softmax`](crate::Softmax) and [`LogSoftmax`](crate::LogSoftmax) over each row.
+/// [`Softmax`](crate::Softmax) and [`LogSoftmax`](crate::LogSoftmax) over each row, and
+/// [`Prelu`](crate::Prelu) with one slope per column or one shared slope (at most 65,535), its
+/// slopes trained as parameters.
 /// [`compile`](CudaModel::compile) refuses any other layer, naming its index and name. Neuron masks
 /// set on the model when it is compiled are compiled in; a mask set later needs a new compile.
 ///
@@ -134,12 +136,14 @@ impl<'c> CudaModel<'c> {
     ///   card or NVIDIA's libraries refuse a layer's shape or its memory: a size cuDNN's or
     ///   cuBLAS's `int` does not hold, a convolution with no deterministic algorithm that
     ///   uses no tensor cores, a batch norm of more than 65,535 channels, or memory the card
-    ///   does not have.
+    ///   does not have. Also a PReLU of more than 65,535 slopes or
+    ///   of more than 2³¹ values per batch.
     /// - [`Error::InvalidData`] if `batch` is 0, a layer's input width is not the width the
     ///   layer before it outputs, a layer outputs width 0 or another width than it reports,
     ///   a mask is not as wide as its layer's output, a batch count does not hold one value,
-    ///   or a batch norm that keeps no running statistics would see one value per channel;
-    ///   the message names the layer (and both widths, where two differ).
+    ///   a PReLU's weight does not hold one value per slope, or a batch norm that keeps no
+    ///   running statistics would see one value per channel; the message names the layer (and
+    ///   both widths, where two differ).
     ///
     /// # Panics
     ///
@@ -205,6 +209,7 @@ impl<'c> CudaModel<'c> {
             elementwise: Elementwise::new(cuda).map_err(refuse)?,
             dropout: Dropout::new(cuda).map_err(refuse)?,
             softmax: RowSoftmax::new(cuda).map_err(refuse)?,
+            prelu: Prelu::new(cuda).map_err(refuse)?,
         };
         let param_at: Vec<usize> = gpu_params.iter().map(|t| t.at).collect();
         let buffer_at: Vec<usize> = gpu_buffers.iter().map(|t| t.at).collect();

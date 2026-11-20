@@ -48,6 +48,9 @@
 //!   backward, as this crate's own kernels, one thread per row in the CPU's order: the
 //!   softmax's backward pass the CPU's bits, the others within the WGSL kernels' stated
 //!   bounds (`tests/softmax.rs`).
+//! - [`Prelu`] and [`PreluOp`]: PReLU with one slope per column or one shared slope, as this
+//!   crate's own kernels: forward and the input's gradient the CPU's bits, and the slopes'
+//!   gradient in a fixed tree within a stated bound (`tests/prelu.rs`).
 //!
 //! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
 //!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
@@ -126,6 +129,7 @@ mod loss;
 mod module;
 mod optimizer;
 mod pooling;
+mod prelu;
 mod reduce;
 mod softmax;
 mod sys;
@@ -143,5 +147,6 @@ pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AvgPool2d, MaxPool2d, PoolShape};
+pub use prelu::{Prelu, PreluOp};
 pub use reduce::ChannelDims;
 pub use softmax::{RowSoftmax, RowSoftmaxOp};
