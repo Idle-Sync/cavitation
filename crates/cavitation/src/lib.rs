@@ -11,7 +11,10 @@
 //! `inspect` feature, off by default, the inspector crate is re-exported as
 //! `cavitation::cavitation_inspect`: a server on this machine that shows a run in the
 //! browser. With the `gpu` feature, off by default, the GPU crate is re-exported as
-//! `cavitation::cavitation_gpu`: the GPU device through wgpu.
+//! `cavitation::cavitation_gpu`: the GPU device through wgpu. With the `cuda` feature, off
+//! by default, the CUDA crate is re-exported as `cavitation::cavitation_cuda`: NVIDIA's
+//! CUDA, cuDNN and cuBLAS, loaded when the program runs, which `Device::Cuda` trains
+//! through.
 //!
 //! # Three levels of use
 //!
@@ -125,6 +128,19 @@
 //! [`Layer`]: cavitation_nn::Layer
 
 pub use cavitation_core;
+/// NVIDIA's CUDA, cuDNN and cuBLAS, found and loaded when the program runs, for training on
+/// an NVIDIA card with `Device::Cuda`. Present with the `cuda` feature, which is off by
+/// default.
+///
+/// ```
+/// use cavitation::cavitation_cuda::Cuda;
+/// match Cuda::open() {
+///     Ok(cuda) => println!("{}", cuda.info()),
+///     Err(why) => println!("CUDA is not available: {why}"),
+/// }
+/// ```
+#[cfg(feature = "cuda")]
+pub use cavitation_cuda;
 /// GPU access through wgpu (Vulkan, Metal, DX12): choosing a GPU and opening its device.
 /// Present with the `gpu` feature, which is off by default.
 ///
