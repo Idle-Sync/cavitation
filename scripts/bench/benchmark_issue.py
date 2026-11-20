@@ -176,7 +176,7 @@ def render(data):
             for net in NETS:
                 row = next((r for r in rows if (r["machine"], r["device"], r["net"]) == (name, device, net)), None)
                 if row is None:
-                    cells.append("❌" if not DEVICES[device]["torch"] else "⬜")
+                    cells.append("❌ (Cavitation not measured yet)" if not DEVICES[device]["torch"] else "⬜")
                     missing.append(f"{net} on machine {name}, {DEVICE_NAMES[device]}")
                     continue
                 cell = speed(row)
