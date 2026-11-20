@@ -1,12 +1,17 @@
 // The element-wise kernels: one thread per element, each kernel one operation, all with the
-// parameters (a, b, out, n, alpha). Binary operations read a and b; unary ones read a only
-// (b is passed but unused); backward passes take the forward input or output in a and the
-// gradient flowing back in b. A port of cavitation-gpu's elementwise.wgsl, operation for
-// operation, compiled without fused multiply-add.
+// parameters (a, b, out, n, alpha, scale). Binary operations read a and b; unary ones read a
+// only (b is passed but unused); backward passes take the forward input or output in a and
+// the gradient flowing back in b. A port of cavitation-gpu's elementwise.wgsl, operation for
+// operation, compiled without fused multiply-add; NVRTC neither regroups nor simplifies
+// floating-point operations and divides correctly rounded, so the WGSL's guards against
+// those (held, the corrected division by 3 and 6) are plain operations here.
 //
 // NaN is tested by its bits. tanh and the sigmoid are the CPU kernels' formulas: one
 // exponential e^y for y <= 0 from the Cephes polynomial and a 2^n scale, a polynomial for
-// tanh near 0. GELU's erf form uses musl's f32 erf with CUDA's expf.
+// tanh near 0. ELU's e^y - 1 and softplus's ln(1 + t) are the CPU kernels' too, and SELU,
+// CELU, SiLU, Mish, softplus at any beta and log-sigmoid are built on them as the CPU builds
+// them. The backward passes the CPU takes with std's exp use exp_neg. GELU's erf form uses
+// musl's f32 erf with CUDA's expf.
 
 typedef unsigned int u32;
 
@@ -69,6 +74,78 @@ __device__ float sigmoid_one(float x) {
     return x >= 0.0f ? 1.0f / d : e / d;
 }
 
+// e^y - 1 for y <= 0, as the CPU's expm1_neg: y = k ln 2 + r, q = e^r - 1 = r + r^2 P(r)
+// from the Cephes polynomial, and q 2^k + (2^k - 1); -1 below -17.5, NaN for NaN.
+__device__ float expm1_neg(float y) {
+    if (is_nan(y)) {
+        return y;
+    }
+    if (y < -17.5f) {
+        return -1.0f;
+    }
+    float k = floorf(y * 1.44269504f + 0.5f);
+    float r = y - k * 0.693359375f;
+    r = r - k * -2.12194440e-4f;
+    float p = 1.9875691e-4f;
+    p = p * r + 1.3981999e-3f;
+    p = p * r + 8.3334519e-3f;
+    p = p * r + 4.1665796e-2f;
+    p = p * r + 1.6666665e-1f;
+    p = p * r + 0.5f;
+    float q = p * r * r + r;
+    float s = pow2((int)k);
+    return q * s + (s - 1.0f);
+}
+
+// ln(1 + t) for t in [0, 1], as the CPU's log1p_unit: m = 1 + t rounded, its rounding error
+// c = t - (m - 1), m = 2^k f with f in [sqrt(1/2), sqrt 2), ln f from the Cephes logf
+// polynomial, and k ln 2 + ln f + c / m.
+__device__ float log1p_unit(float t) {
+    float m = 1.0f + t;
+    float c = t - (m - 1.0f);
+    bool high = m > 1.41421354f;
+    float f = high ? m * 0.5f : m;
+    float k = high ? 1.0f : 0.0f;
+    float x = f - 1.0f;
+    float z = x * x;
+    float p = 7.0376836e-2f;
+    p = p * x + -1.1514610e-1f;
+    p = p * x + 1.1676999e-1f;
+    p = p * x + -1.2420141e-1f;
+    p = p * x + 1.4249323e-1f;
+    p = p * x + -1.6668058e-1f;
+    p = p * x + 2.0000715e-1f;
+    p = p * x + -2.4999994e-1f;
+    p = p * x + 3.3333330e-1f;
+    float y = x * z * p;
+    y = y + k * -2.12194440e-4f;
+    y = y - 0.5f * z;
+    float r = x + y;
+    r = r + k * 0.693359375f;
+    return r + c / m;
+}
+
+// ln(1 + e^x), as the CPU's softplus kernel: max(x, 0) + ln(1 + e^-|x|); NaN stays NaN.
+__device__ float softplus_one(float x) {
+    if (is_nan(x)) {
+        return x;
+    }
+    float l = log1p_unit(exp_neg(-fabsf(x)));
+    return (x > 0.0f ? x : 0.0f) + l;
+}
+
+// ELU with alpha, as the CPU's kernel: x above 0, alpha · x below 2^-25 in size (which keeps
+// -0), alpha · (e^x - 1) otherwise; NaN stays NaN.
+__device__ float elu_one(float alpha, float x) {
+    if (is_nan(x) || x > 0.0f) {
+        return x;
+    }
+    if (fabsf(x) < 2.98023224e-8f) {
+        return alpha * x;
+    }
+    return alpha * expm1_neg(x);
+}
+
 // musl's f32 erf, with CUDA's expf in its tail.
 __device__ float erf_one(float x) {
     u32 hx = __float_as_uint(x);
@@ -121,6 +198,14 @@ __device__ float erf_one(float x) {
 #define GELU_CUBIC 0.044715f
 #define FRAC_1_SQRT_2 0.70710678f
 #define FRAC_1_SQRT_2PI 0.39894228f
+// SELU's scale and alpha rounded to f32, and their product rounded once, as the CPU has them.
+#define SELU_SCALE 1.05070102f
+#define SELU_ALPHA 1.67326319f
+#define SELU_SCALE_ALPHA 1.75809932f
+// 1/6 rounded to f32, the hard sigmoid's slope.
+#define SIXTH 0.166666672f
+// Mish's softplus threshold.
+#define MISH_THRESHOLD 20.0f
 
 // The element this thread computes; the kernel returns when it is past the end.
 #define ELEMENT                                                   \
@@ -131,7 +216,7 @@ __device__ float erf_one(float x) {
 
 #define KERNEL(name)                                                                  \
     extern "C" __global__ void name(const float *a, const float *b, float *out, u32 n, \
-                                    float alpha)
+                                    float alpha, float scale)
 
 KERNEL(add) { ELEMENT out[i] = a[i] + b[i]; }
 
@@ -224,4 +309,154 @@ KERNEL(gelu_erf_backward) {
         return;
     }
     out[i] = b[i] * (cdf + x * pdf);
+}
+
+// ELU with alpha: x above 0, alpha · (e^x - 1) at or below.
+KERNEL(elu) { ELEMENT out[i] = elu_one(alpha, a[i]); }
+
+// The gradient through ELU from its input x: grad · (1 above 0, alpha · e^x at or below, NaN
+// for NaN).
+KERNEL(elu_backward) {
+    ELEMENT float x = a[i];
+    float d = is_nan(x) ? x : (x > 0.0f ? 1.0f : alpha * exp_neg(x));
+    out[i] = b[i] * d;
+}
+
+// SELU: scale · elu(x) with SELU's alpha.
+KERNEL(selu) { ELEMENT out[i] = SELU_SCALE * elu_one(SELU_ALPHA, a[i]); }
+
+// The gradient through SELU from its input x: grad · (scale above 0, scale · alpha · e^x at
+// or below, NaN for NaN).
+KERNEL(selu_backward) {
+    ELEMENT float x = a[i];
+    float d = is_nan(x) ? x : (x > 0.0f ? SELU_SCALE : SELU_SCALE_ALPHA * exp_neg(x));
+    out[i] = b[i] * d;
+}
+
+// CELU with alpha > 0: x above 0, alpha · (e^(x / alpha) - 1) at or below, taken as the CPU's
+// kernel takes it, as ELU with alpha of x / alpha.
+KERNEL(celu) {
+    ELEMENT float x = a[i];
+    float e = elu_one(alpha, x / alpha);
+    out[i] = (x <= 0.0f || is_nan(x)) ? e : x;
+}
+
+// The gradient through CELU from its input x: grad · (1 above 0, e^(x / alpha) at or below,
+// NaN for NaN).
+KERNEL(celu_backward) {
+    ELEMENT float x = a[i];
+    float d = is_nan(x) ? x : (x > 0.0f ? 1.0f : exp_neg(x / alpha));
+    out[i] = b[i] * d;
+}
+
+// SiLU: x · sigmoid(x).
+KERNEL(silu) {
+    ELEMENT float x = a[i];
+    out[i] = x * sigmoid_one(x);
+}
+
+// The gradient through SiLU from its input x: grad · s · (1 + x · (1 - s)), s = sigmoid(x).
+KERNEL(silu_backward) {
+    ELEMENT float x = a[i];
+    float s = sigmoid_one(x);
+    out[i] = b[i] * (s * (1.0f + x * (1.0f - s)));
+}
+
+// Mish: x · tanh(softplus(x)), softplus at beta 1 and threshold 20 (x itself above 20).
+KERNEL(mish) {
+    ELEMENT float x = a[i];
+    float sp = x > MISH_THRESHOLD ? x : softplus_one(x);
+    out[i] = x * tanh_one(sp);
+}
+
+// The gradient through Mish from its input x: grad · (t + x · sigmoid(x) · (1 - t²)),
+// t = tanh(softplus(x)).
+KERNEL(mish_backward) {
+    ELEMENT float x = a[i];
+    float t = tanh_one(x > MISH_THRESHOLD ? x : softplus_one(x));
+    float s = sigmoid_one(x);
+    out[i] = b[i] * (t + x * s * (1.0f - t * t));
+}
+
+// Softplus with beta (alpha) and threshold (scale): x where beta · x is above the threshold,
+// ln(1 + e^(beta · x)) / beta at or below.
+KERNEL(softplus) {
+    ELEMENT float x = a[i];
+    float z = alpha * x;
+    out[i] = z > scale ? x : softplus_one(z) / alpha;
+}
+
+// The gradient through softplus from its input x: grad · (1 where beta · x is above the
+// threshold, sigmoid(beta · x) at or below).
+KERNEL(softplus_backward) {
+    ELEMENT float x = a[i];
+    float z = alpha * x;
+    out[i] = b[i] * (z > scale ? 1.0f : sigmoid_one(z));
+}
+
+// Softsign: x / (1 + |x|).
+KERNEL(softsign) {
+    ELEMENT float x = a[i];
+    out[i] = x / (1.0f + fabsf(x));
+}
+
+// The gradient through softsign from its input x: grad · 1 / (1 + |x|)².
+KERNEL(softsign_backward) {
+    ELEMENT float x = a[i];
+    float d = 1.0f + fabsf(x);
+    out[i] = b[i] * (1.0f / (d * d));
+}
+
+// Hardtanh: x clamped to [min (alpha), max (scale)]; NaN stays NaN.
+KERNEL(hardtanh) {
+    ELEMENT float x = a[i];
+    out[i] = is_nan(x) ? x : (x < alpha ? alpha : (x > scale ? scale : x));
+}
+
+// The gradient through hardtanh from its input x: grad · (1 strictly inside (min, max), 0 at
+// and beyond the bounds, NaN for NaN).
+KERNEL(hardtanh_backward) {
+    ELEMENT float x = a[i];
+    float d = is_nan(x) ? x : ((x > alpha && x < scale) ? 1.0f : 0.0f);
+    out[i] = b[i] * d;
+}
+
+// The hard sigmoid: 0 up to -3, 1 from 3, x / 6 + 1/2 between; NaN stays NaN.
+KERNEL(hardsigmoid) {
+    ELEMENT float x = a[i];
+    out[i] = is_nan(x) ? x : (x <= -3.0f ? 0.0f : (x >= 3.0f ? 1.0f : x / 6.0f + 0.5f));
+}
+
+// The gradient through the hard sigmoid from its input x: grad · (1/6 strictly inside
+// (-3, 3), 0 elsewhere, NaN for NaN).
+KERNEL(hardsigmoid_backward) {
+    ELEMENT float x = a[i];
+    float d = is_nan(x) ? x : ((x > -3.0f && x < 3.0f) ? SIXTH : 0.0f);
+    out[i] = b[i] * d;
+}
+
+// The hard swish: 0 up to -3, x from 3, x · (x + 3) / 6 between; NaN stays NaN.
+KERNEL(hardswish) {
+    ELEMENT float x = a[i];
+    out[i] = is_nan(x) ? x : (x <= -3.0f ? 0.0f : (x >= 3.0f ? x : x * (x + 3.0f) / 6.0f));
+}
+
+// The gradient through the hard swish from its input x, with PyTorch's boundaries: grad · (0
+// below -3, 1 above 3, x / 3 + 1/2 on [-3, 3], NaN for NaN).
+KERNEL(hardswish_backward) {
+    ELEMENT float x = a[i];
+    float d = is_nan(x) ? x : (x < -3.0f ? 0.0f : (x > 3.0f ? 1.0f : x / 3.0f + 0.5f));
+    out[i] = b[i] * d;
+}
+
+// Log-sigmoid: ln sigmoid(x) = 0 - softplus(-x), as the CPU's kernel takes it.
+KERNEL(log_sigmoid) {
+    ELEMENT float x = a[i];
+    out[i] = 0.0f - softplus_one(-x);
+}
+
+// The gradient through log-sigmoid from its input x: grad · sigmoid(-x).
+KERNEL(log_sigmoid_backward) {
+    ELEMENT float x = a[i];
+    out[i] = b[i] * sigmoid_one(-x);
 }

@@ -1,13 +1,14 @@
 //! The element-wise kernels against their CPU twins, as `cavitation-gpu`'s tests check its
 //! WGSL ones. The one-rounding operations (add, multiply, scale, ReLU and leaky ReLU forward
-//! and backward) give the CPU's bits, NaN, ±0, ±∞ and subnormals included. tanh, the
-//! sigmoid and GELU's tanh form give the bits of the CPU's reference kernels
-//! (`Level::Reference`) over every 61st f32 bit pattern. tanh, the sigmoid and GELU (both
-//! forms), forward and backward, are within the same stated bounds of the f64 tape's values
-//! as the WGSL kernels. Each test skips without CUDA, unless
+//! and backward), the clamps (hardtanh and ReLU6, the hard sigmoid, the hard swish) and
+//! softsign, forward and backward, give the CPU's bits, NaN, ±0, ±∞ and subnormals included.
+//! tanh, the sigmoid, GELU's tanh form, ELU, SELU, CELU, SiLU, Mish, softplus and
+//! log-sigmoid give the bits of the CPU's reference kernels (`Level::Reference`) over every
+//! 61st f32 bit pattern. Those and GELU's erf form, forward and backward, are within the
+//! same stated bounds of the f64 tape's values as the WGSL kernels. Each test skips without CUDA, unless
 //! `CAVITATION_CUDA_REQUIRED=1` makes that a failure.
 
-use cavitation_core::{GeluApprox, Graph, ParamStore, Tape, Tensor, Var};
+use cavitation_core::{GeluApprox, Graph, ParamStore, Real, Tape, Tensor, Var};
 use cavitation_cuda::{Cuda, DeviceBuffer, Elementwise, ElementwiseOp};
 
 /// The unit roundoff of f32, 2⁻²⁴.
@@ -474,4 +475,351 @@ fn misuse_is_refused() {
         text.contains("the first input buffer holds 32 bytes"),
         "{text}"
     );
+}
+
+/// Runs `op` over `a` (and `b`) with `alpha` and `scale`, into a buffer of NaNs, and returns
+/// the result.
+fn run_with(
+    cuda: &Cuda,
+    kernels: &Elementwise<'_>,
+    op: ElementwiseOp,
+    a: &[f32],
+    b: Option<&[f32]>,
+    (alpha, scale): (f32, f32),
+) -> Vec<f32> {
+    let ab = upload(cuda, a);
+    let bb = b.map(|b| upload(cuda, b));
+    let mut out = upload(cuda, &vec![f32::NAN; a.len()]);
+    kernels
+        .run_with(op, &ab, bb.as_ref(), &mut out, a.len(), alpha, scale)
+        .expect("run");
+    let mut got = vec![0.0f32; a.len()];
+    out.read(&mut got).expect("read");
+    got
+}
+
+/// An activation the CPU trains, with its settings, as the tests below run it.
+#[derive(Clone, Copy, Debug)]
+enum Act {
+    /// ELU with `alpha`.
+    Elu(f32),
+    /// SELU.
+    Selu,
+    /// CELU with `alpha`.
+    Celu(f32),
+    /// SiLU.
+    Silu,
+    /// Mish.
+    Mish,
+    /// Softplus with `beta` and the threshold.
+    Softplus(f32, f32),
+    /// Softsign.
+    Softsign,
+    /// Hardtanh with `min` and `max` (ReLU6 is `[0, 6]`).
+    Hardtanh(f32, f32),
+    /// The hard sigmoid.
+    Hardsigmoid,
+    /// The hard swish.
+    Hardswish,
+    /// Log-sigmoid.
+    LogSigmoid,
+}
+
+impl Act {
+    /// The forward and backward operations, with their `alpha` and `scale`.
+    fn ops(self) -> (ElementwiseOp, ElementwiseOp, (f32, f32)) {
+        use ElementwiseOp as E;
+        match self {
+            Act::Elu(alpha) => (E::Elu, E::EluBackward, (alpha, 0.0)),
+            Act::Selu => (E::Selu, E::SeluBackward, (0.0, 0.0)),
+            Act::Celu(alpha) => (E::Celu, E::CeluBackward, (alpha, 0.0)),
+            Act::Silu => (E::Silu, E::SiluBackward, (0.0, 0.0)),
+            Act::Mish => (E::Mish, E::MishBackward, (0.0, 0.0)),
+            Act::Softplus(beta, threshold) => (E::Softplus, E::SoftplusBackward, (beta, threshold)),
+            Act::Softsign => (E::Softsign, E::SoftsignBackward, (0.0, 0.0)),
+            Act::Hardtanh(min, max) => (E::Hardtanh, E::HardtanhBackward, (min, max)),
+            Act::Hardsigmoid => (E::Hardsigmoid, E::HardsigmoidBackward, (0.0, 0.0)),
+            Act::Hardswish => (E::Hardswish, E::HardswishBackward, (0.0, 0.0)),
+            Act::LogSigmoid => (E::LogSigmoid, E::LogSigmoidBackward, (0.0, 0.0)),
+        }
+    }
+
+    /// Records the activation on `tape`, as the CPU's layer does.
+    fn record<T: Real>(self, tape: &mut Tape<'_, T>, x: Var) -> Var {
+        let c = |v: f32| T::from_f64(f64::from(v));
+        match self {
+            Act::Elu(alpha) => tape.elu(x, c(alpha)),
+            Act::Selu => tape.selu(x),
+            Act::Celu(alpha) => tape.celu(x, c(alpha)),
+            Act::Silu => tape.silu(x),
+            Act::Mish => tape.mish(x),
+            Act::Softplus(beta, threshold) => tape.softplus(x, c(beta), c(threshold)),
+            Act::Softsign => tape.softsign(x),
+            Act::Hardtanh(min, max) => tape.hardtanh(x, c(min), c(max)),
+            Act::Hardsigmoid => tape.hardsigmoid(x),
+            Act::Hardswish => tape.hardswish(x),
+            Act::LogSigmoid => tape.log_sigmoid(x),
+        }
+    }
+}
+
+/// The tape's values of `act` at `x` and, with `g` flowing back, its gradient, in `T`: the
+/// CPU's own `f32` arithmetic, or the `f64` reference.
+fn tape_of<T: Real>(act: Act, x: &[f32], g: &[f32]) -> (Vec<T>, Vec<T>) {
+    let n = x.len();
+    let widen = |v: &[f32]| {
+        v.iter()
+            .map(|&v| T::from_f64(f64::from(v)))
+            .collect::<Vec<T>>()
+    };
+    let mut params: ParamStore<T> = ParamStore::default();
+    let id = params.add(Tensor::from_vec(widen(x), &[n]).expect("shape"));
+    let gs = Tensor::from_vec(widen(g), &[n]).expect("shape");
+    let mut graph: Graph<T> = Graph::default();
+    let mut tape = graph.tape(&params.values);
+    let xv = tape.param(id);
+    let gv = tape.input(gs.view());
+    let y = act.record(&mut tape, xv);
+    let values = tape.value(y).data().to_vec();
+    let weighted = tape.mul(y, gv);
+    let loss = tape.sum(weighted);
+    tape.backward(loss, &mut params.grads);
+    drop(tape);
+    (values, params.grad(id).data().to_vec())
+}
+
+/// The special values, the breakpoints of the clamps (±3, ±1, 0, 6, the hardtanh bounds
+/// below) with their neighbours, and the edges of ELU's branches.
+fn special_values() -> Vec<f32> {
+    let mut v = SPECIAL.to_vec();
+    for p in [-6.0f32, -3.0, -2.5, -1.0, 0.5, 1.0, 3.0, 6.0, 20.0, 10.0] {
+        v.extend([p, p.next_up(), p.next_down()]);
+    }
+    v.extend([
+        1e-30, -1e-30, 2.9e-8, -2.9e-8, 3.0e-8, -3.0e-8, -17.5, -17.6,
+    ]);
+    v
+}
+
+/// The clamps (hardtanh with ReLU6's bounds and two others, the hard sigmoid, the hard
+/// swish) and softsign, forward and backward from the input, give the CPU's bits on the
+/// special values, the breakpoints with their neighbours, subnormals, and a sweep between:
+/// each is one correctly rounded step at a time, as on the CPU, CUDA's division included.
+#[test]
+fn clamps_and_softsign_give_the_cpus_bits() {
+    let Some(cuda) = Cuda::new() else { return };
+    let kernels = Elementwise::new(&cuda).expect("compile");
+    let mut x = special_values();
+    x.extend(sweep(9));
+    x.extend((0..20_000).map(|i| -3.0 + 6.0 * i as f32 / 20_000.0));
+    x.extend([1e-40f32, -1e-40, 3e-39, -3e-39]);
+    let g = seeded_values(10, x.len(), -2.0, 2.0);
+    for act in [
+        Act::Hardtanh(-1.0, 1.0),
+        Act::Hardtanh(0.0, 6.0),
+        Act::Hardtanh(-2.5, 0.5),
+        Act::Hardsigmoid,
+        Act::Hardswish,
+        Act::Softsign,
+    ] {
+        let (forward, backward, params) = act.ops();
+        let (want, grad) = tape_of::<f32>(act, &x, &g);
+        let y = run_with(&cuda, &kernels, forward, &x, None, params);
+        assert_exact(&y, &want, &format!("{act:?}"));
+        let d = run_with(&cuda, &kernels, backward, &x, Some(&g), params);
+        assert_exact(&d, &grad, &format!("{act:?} backward"));
+    }
+}
+
+/// The `f64` sigmoid.
+fn sigma(x: f64) -> f64 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
+    }
+}
+
+/// For `act` at `x` with `g` flowing back, the bounds the forward value and the gradient
+/// are held to against the `f64` tape, given its value `y`: each `(c, size)`, the bound being
+/// `c · u · size`. They are the WGSL kernels' bounds (`cavitation-gpu`'s
+/// `tests/elementwise.rs` derives each), less the terms for flushed subnormals, which CUDA
+/// keeps.
+fn bounds(act: Act, x: f64, y: f64, g: f64) -> [(f64, f64); 2] {
+    let g = g.abs();
+    match act {
+        Act::Elu(alpha) => {
+            let d = if x > 0.0 {
+                1.0
+            } else {
+                f64::from(alpha).abs() * x.exp()
+            };
+            [(8.0, y.abs()), (8.0, g * d)]
+        }
+        Act::Selu => {
+            let d = if x > 0.0 { 1.05 } else { 1.76 * x.exp() };
+            [(12.0, y.abs()), (8.0, g * d)]
+        }
+        Act::Celu(alpha) => {
+            let z = x / f64::from(alpha);
+            let d = if x > 0.0 {
+                1.0
+            } else {
+                z.exp() * (1.0 + z.abs())
+            };
+            [(12.0, y.abs()), (8.0, g * d)]
+        }
+        Act::Silu => [(10.0, y.abs()), (12.0, g * sigma(x) * (1.0 + x.abs()))],
+        Act::Mish => {
+            let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
+            let (t, s) = (sp.tanh(), sigma(x));
+            [
+                (16.0, y.abs()),
+                (32.0, g * (t.abs() + x.abs() * s * (1.0 + t * t))),
+            ]
+        }
+        Act::Softplus(beta, threshold) => {
+            let z = f64::from(beta) * x;
+            let s = sigma(z);
+            let above = z > f64::from(threshold);
+            [
+                (12.0, y.abs() + x.abs() * s),
+                (
+                    10.0,
+                    if above {
+                        0.0
+                    } else {
+                        g * s * (1.0 + z.abs() * (1.0 - s))
+                    },
+                ),
+            ]
+        }
+        Act::LogSigmoid => [(8.0, y.abs()), (10.0, g * sigma(-x))],
+        Act::Softsign | Act::Hardtanh(..) | Act::Hardsigmoid | Act::Hardswish => {
+            unreachable!("exact on CUDA")
+        }
+    }
+}
+
+/// The activations built on an exponential or a logarithm, forward and backward from the
+/// input, within the WGSL kernels' bounds of the `f64` tape.
+#[test]
+fn exponential_activation_twins() {
+    let Some(cuda) = Cuda::new() else { return };
+    let kernels = Elementwise::new(&cuda).expect("compile");
+    let mut x = sweep(11);
+    x.extend((-240..=240).map(|i| i as f32 / 8.0));
+    x.extend([
+        1e-30, -1e-30, 2.9e-8, -2.9e-8, 3.0e-8, -3.0e-8, -17.5, -17.6,
+    ]);
+    let g = seeded_values(12, x.len(), -2.0, 2.0);
+    for act in [
+        Act::Elu(1.0),
+        Act::Elu(0.25),
+        Act::Selu,
+        Act::Celu(1.0),
+        Act::Celu(1.5),
+        Act::Silu,
+        Act::Mish,
+        Act::Softplus(1.0, 20.0),
+        Act::Softplus(1.5, 10.0),
+        Act::LogSigmoid,
+    ] {
+        let (forward, backward, params) = act.ops();
+        let (want, grad) = tape_of::<f64>(act, &x, &g);
+        let b: Vec<[(f64, f64); 2]> = (0..x.len())
+            .map(|i| bounds(act, f64::from(x[i]), want[i], f64::from(g[i])))
+            .collect();
+        let y = run_with(&cuda, &kernels, forward, &x, None, params);
+        let worst = assert_within(
+            &y,
+            &want,
+            |i| b[i][0].0 * U * b[i][0].1,
+            &format!("{act:?}"),
+        );
+        println!("{act:?} forward: worst {worst:.3} of its bound");
+        let d = run_with(&cuda, &kernels, backward, &x, Some(&g), params);
+        let worst = assert_within(
+            &d,
+            &grad,
+            |i| b[i][1].0 * U * b[i][1].1,
+            &format!("{act:?} backward"),
+        );
+        println!("{act:?} backward: worst {worst:.3} of its bound");
+    }
+}
+
+/// A CPU kernel over a slice in place, its level and settings chosen.
+type CpuSlice = dyn Fn(&mut [f32]);
+
+/// ELU, SELU, CELU, SiLU, Mish, softplus and log-sigmoid, forward, give the bits of the
+/// CPU's reference kernels on every 61st f32 bit pattern: the same correctly rounded steps in
+/// the same order, CUDA's division and subnormals included. Their backward passes are not
+/// the CPU's steps (the CPU takes std's `exp`, `ln_1p` and `tanh`, the kernels their own
+/// exponential), so they are held to the bounds of `exponential_activation_twins` instead.
+#[test]
+fn exponential_activations_give_the_reference_bits() {
+    use cavitation_core::kernels::Level;
+    use cavitation_core::kernels::activation::{
+        celu_f32_with, elu_f32_with, log_sigmoid_f32_with, mish_f32_with, selu_f32_with,
+        silu_f32_with, softplus_beta_f32_with,
+    };
+    let Some(cuda) = Cuda::new() else { return };
+    let kernels = Elementwise::new(&cuda).expect("compile");
+    let x: Vec<f32> = (0..=u32::MAX).step_by(61).map(f32::from_bits).collect();
+    const R: Level = Level::Reference;
+    let cases: [(Act, &CpuSlice); 10] = [
+        (Act::Elu(1.0), &|v| elu_f32_with(R, 1.0, v)),
+        (Act::Elu(0.25), &|v| elu_f32_with(R, 0.25, v)),
+        (Act::Selu, &|v| selu_f32_with(R, v)),
+        (Act::Celu(1.0), &|v| celu_f32_with(R, 1.0, v)),
+        (Act::Celu(1.5), &|v| celu_f32_with(R, 1.5, v)),
+        (Act::Silu, &|v| silu_f32_with(R, v)),
+        (Act::Mish, &|v| mish_f32_with(R, v)),
+        (Act::Softplus(1.0, 20.0), &|v| {
+            softplus_beta_f32_with(R, 1.0, 20.0, v)
+        }),
+        (Act::Softplus(1.5, 10.0), &|v| {
+            softplus_beta_f32_with(R, 1.5, 10.0, v)
+        }),
+        (Act::LogSigmoid, &|v| log_sigmoid_f32_with(R, v)),
+    ];
+    for (act, cpu) in cases {
+        let (forward, _, params) = act.ops();
+        let got = run_with(&cuda, &kernels, forward, &x, None, params);
+        let mut want = x.clone();
+        cpu(&mut want);
+        assert_exact(
+            &got,
+            &want,
+            &format!("{act:?} against the CPU's reference kernel"),
+        );
+    }
+}
+
+/// On ±0, ±∞ and NaN the activations built on an exponential or a logarithm give the CPU's
+/// bits, forward and backward: −0 stays −0 where the CPU keeps it, and NaN stays NaN.
+#[test]
+fn exponential_activations_on_special_values() {
+    let Some(cuda) = Cuda::new() else { return };
+    let kernels = Elementwise::new(&cuda).expect("compile");
+    let x = [0.0f32, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN];
+    let g = [1.5f32, -0.75, 1.5, -0.75, 1.0];
+    for act in [
+        Act::Elu(1.0),
+        Act::Selu,
+        Act::Celu(1.5),
+        Act::Silu,
+        Act::Mish,
+        Act::Softplus(1.0, 20.0),
+        Act::LogSigmoid,
+    ] {
+        let (forward, backward, params) = act.ops();
+        let (want, grad) = tape_of::<f32>(act, &x, &g);
+        let y = run_with(&cuda, &kernels, forward, &x, None, params);
+        assert_exact(&y, &want, &format!("{act:?}"));
+        let d = run_with(&cuda, &kernels, backward, &x, Some(&g), params);
+        assert_exact(&d, &grad, &format!("{act:?} backward"));
+    }
 }
