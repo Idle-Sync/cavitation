@@ -38,6 +38,10 @@
 //!   leaky ReLU, tanh, the sigmoid, GELU in both forms), forward and backward, as this
 //!   crate's own kernels, each the twin of its CPU code (`tests/elementwise.rs`).
 //!
+//! - [`Dropout`]: dropout and the neuron mask (`Tape::keep_where`) with a bit-packed `u32`
+//!   mask, forward and backward, as this crate's own kernels, each the CPU's bits
+//!   (`tests/dropout.rs`).
+//!
 //! - [`MaxPool2d`], [`AvgPool2d`] and [`PoolShape`]: 2-D max and average pooling, forward and
 //!   backward, as this crate's own kernels, each the CPU's bits (`tests/pooling.rs`).
 //!
@@ -57,8 +61,12 @@
 //!   `f32` expressions, within the WGSL kernels' stated bounds of the CPU optimisers'
 //!   arithmetic (`tests/optimizer.rs`).
 //!
-//! What is not here yet: dropout, and
-//! no part of `cavitation-nn` trains through this crate.
+//! - [`SumSquares`], [`FiniteFlag`] and [`DeadRelu`]: the health values a training step
+//!   reads back, as this crate's own kernels: each gradient's sum of squares in the fixed
+//!   tree, the step's finite flag the optimiser and the running statistics read, and the
+//!   dead-ReLU bits, the flag and the bits exact (`tests/health.rs`).
+//!
+//! Nothing in `cavitation-nn` trains through this crate yet.
 //!
 //! # What must be installed
 //!
@@ -99,9 +107,11 @@ mod batch_norm;
 mod buffer;
 mod conv;
 mod device;
+mod dropout;
 mod elementwise;
 mod error;
 mod find;
+mod health;
 mod library;
 mod linear;
 mod loss;
@@ -115,8 +125,10 @@ pub use batch_norm::{BatchNorm2d, BatchStats, RunningUpdate};
 pub use buffer::{DeviceBuffer, Scalar};
 pub use conv::{Conv2d, ConvAlgorithms, ConvShape, MAX_WORKSPACE};
 pub use device::{Cuda, CudaInfo};
+pub use dropout::Dropout;
 pub use elementwise::{Elementwise, ElementwiseOp};
 pub use error::CudaError;
+pub use health::{DeadRelu, FiniteFlag, SumSquares};
 pub use linear::{Linear, LinearShape};
 pub use loss::{MeanSquaredError, SoftmaxCrossEntropy};
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
