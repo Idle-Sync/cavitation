@@ -13,7 +13,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use cavitation_core::{Conv2dGeom, Error, Gate, ParamStore, Pool2dGeom, Rng, Tensor};
+use cavitation_core::{Conv2dGeom, Error, Gate, Graph, ParamStore, Pool2dGeom, Rng, Tensor};
 use cavitation_cuda::Cuda;
 
 use super::CudaTrainer;
@@ -25,8 +25,8 @@ use crate::train::{Choice, fit_choosing};
 use crate::{
     Batch, BatchNorm2d, Batcher, Conv2d, CudaModel, Dataset, Device, DeviceKind, EarlyStopping,
     Evaluation, FitConfig, Flatten, Health, Hooks, Linear, Loss, LrSchedule, Monitor, OnNonFinite,
-    OptimizerConfig, Sequential, StepControl, Targets, devices, evaluate, fit, fit_controlled,
-    fit_with_hooks,
+    OptimizerConfig, Sequential, StepControl, Targets, TargetsView, devices, evaluate, fit,
+    fit_controlled, fit_with_hooks,
 };
 
 /// `config` on `cuda`.
@@ -663,19 +663,30 @@ fn bad_thresholds() -> [(Loss, &'static str); 6] {
     ]
 }
 
-/// The message of the panic `run` raises.
-fn panic_text(run: impl FnOnce()) -> String {
-    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).expect_err("a panic");
+/// The message of the panic the CPU's tape raises when `loss` is recorded on 8 × 4 outputs.
+fn tape_panic(loss: Loss) -> String {
+    let panic = std::panic::catch_unwind(|| {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let zeros = Tensor::zeros(&[8, 4]);
+        let out = tape.input(zeros.view());
+        loss.record(&mut tape, out, TargetsView::Values(zeros.view()));
+    })
+    .expect_err("the tape panics");
     (panic.downcast_ref::<String>().cloned())
         .or_else(|| panic.downcast_ref::<&str>().map(|m| m.to_string()))
         .unwrap_or_default()
 }
 
-/// A threshold of `bad_thresholds`, which the CPU's `fit` panics on at its first step, is
-/// `Error::InvalidData` with the tape's message (the value as the `f32` the tape takes) on
-/// CUDA before any training, the parameters untouched; a smooth L1 `beta` of 0 or −0 trains.
+/// A threshold of `bad_thresholds`, on which the CPU's tape panics, is `Error::InvalidData`
+/// with the tape's message (the value as the `f32` the tape takes) before any training on
+/// every device: `fit` on the CPU, on CUDA and with `Device::Auto` (which returns the
+/// error itself rather than leaving CUDA for the CPU) gives the same error, and
+/// `CudaTrainer::new` names itself; the parameters are untouched. A smooth L1 `beta` of 0 or
+/// −0 trains.
 #[test]
-fn a_bad_threshold_is_refused_as_the_cpu_refuses_it() {
+fn a_bad_threshold_is_refused_on_every_device() {
     let mut start = ParamStore::new();
     let net = mlp::<f32>(&mut start, 195);
     let data = values(196, 16, 12, 4);
@@ -686,24 +697,49 @@ fn a_bad_threshold_is_refused_as_the_cpu_refuses_it() {
         health: Health::quiet(),
         ..FitConfig::default()
     };
+    let sgd = OptimizerConfig::Sgd {
+        lr: 0.01,
+        momentum: 0.0,
+        weight_decay: 0.0,
+    };
     for (loss, text) in bad_thresholds() {
-        let mut cpu = start.clone();
-        let cpu_text = panic_text(|| {
-            let _ = fit(&net, &mut cpu, &data, config(loss));
-        });
+        let problem = tape_panic(loss);
         assert!(
-            cpu_text.starts_with(text),
-            "{loss:?}: the CPU's panic {cpu_text}"
+            problem.starts_with(text),
+            "{loss:?}: the tape's panic {problem}"
         );
+        let mut cpu = start.clone();
+        let cpu_error = fit(&net, &mut cpu, &data, config(loss)).unwrap_err();
+        assert!(
+            matches!(cpu_error, Error::InvalidData(_)),
+            "{loss:?}: {cpu_error}"
+        );
+        let message = format!("invalid data: Loss: {problem}");
+        assert_eq!(cpu_error.to_string(), message);
+        assert_eq!(bits(&net, &cpu), bits(&net, &start), "{loss:?} on the CPU");
+        let mut auto = start.clone();
+        let auto_config = FitConfig {
+            device: Device::Auto,
+            ..config(loss)
+        };
+        let auto_error = fit_choosing(&net, &mut auto, &data, auto_config, Choice::Best);
+        assert_eq!(
+            auto_error.unwrap_err().to_string(),
+            message,
+            "{loss:?} on Auto"
+        );
+        assert_eq!(bits(&net, &auto), bits(&net, &start), "{loss:?} on Auto");
         with_cuda(|cuda| {
             let mut params = start.clone();
             let error = fit(&net, &mut params, &data, on(cuda, config(loss))).unwrap_err();
-            assert!(matches!(error, Error::InvalidData(_)), "{loss:?}: {error}");
-            assert_eq!(
-                error.to_string(),
-                format!("invalid data: CudaTrainer: {cpu_text}")
-            );
+            assert_eq!(error.to_string(), message, "{loss:?}");
             assert_eq!(bits(&net, &params), bits(&net, &start), "{loss:?}");
+            let made = CudaTrainer::new(&net, &start, &sgd, loss, 8, cuda).unwrap_err();
+            assert!(matches!(made, Error::InvalidData(_)), "{loss:?}: {made}");
+            assert_eq!(
+                made.to_string(),
+                format!("invalid data: CudaTrainer: {problem}")
+            );
         });
     }
     for beta in [0.0, -0.0] {

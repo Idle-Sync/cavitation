@@ -657,3 +657,43 @@ fn cifar_step_time() {
         );
     });
 }
+
+/// A step with `Loss::Nll` whose labels hold one equal to the output width is
+/// `Error::InvalidData` naming the row, before anything runs: the parameters stay as they
+/// were, and the trainer has taken no step.
+#[test]
+fn an_nll_label_past_the_outputs_is_refused() {
+    let t = twin(
+        |p, s| softmax_mlp(p, s, true),
+        |p, s| softmax_mlp(p, s, true),
+        190,
+    );
+    let mut data = Data::within(190, 8, 12, 4, (-2.0, 2.0));
+    data.labels[5] = 4;
+    with_cuda(|cuda| {
+        let sgd = OptimizerConfig::Sgd {
+            lr: 0.1,
+            momentum: 0.0,
+            weight_decay: 0.0,
+        };
+        let mut trainer = CudaTrainer::new(&t.net, &t.params, &sgd, Loss::Nll, 8, cuda).unwrap();
+        let error = trainer.step(&t.net, data.view()).unwrap_err();
+        assert!(
+            matches!(error, cavitation_core::Error::InvalidData(_)),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("the label of row 5 is 4"),
+            "{error}"
+        );
+        assert_eq!(trainer.steps(), 0);
+        let mut after = t.params.clone();
+        trainer.sync_to(&mut after);
+        for (name, id) in t.net.state_names() {
+            let bits = |p: &ParamStore| -> Vec<u32> {
+                p.value(id).data().iter().map(|v| v.to_bits()).collect()
+            };
+            assert_eq!(bits(&after), bits(&t.params), "{name}");
+        }
+    });
+}
