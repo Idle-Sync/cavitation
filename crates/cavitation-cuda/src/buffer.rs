@@ -101,6 +101,9 @@ impl DeviceBuffer<'_> {
     }
 
     /// Copies `data` to the start of the buffer, after the work already given to the card.
+    /// The data is taken from `data` before the call returns, so `data` may change at once,
+    /// but the host does not wait for the card's earlier work: the copy is queued behind it,
+    /// before any work given later.
     ///
     /// # Errors
     ///
@@ -131,11 +134,20 @@ impl DeviceBuffer<'_> {
             return Ok(());
         }
         let _bound = self.cuda.bind()?;
-        // SAFETY: `data` is `bytes` readable bytes, and the buffer holds at least as many.
+        // SAFETY: `data` is `bytes` readable bytes, and the buffer holds at least as many. On
+        // the null stream, from pageable host memory, "host memory is copied to a staging
+        // buffer immediately (no device synchronization is performed)", so `data` is not
+        // read after the call returns
+        // (https://docs.nvidia.com/cuda/cuda-driver-api/api-sync-behavior.html).
         let code = unsafe {
-            (self.cuda.driver.cuMemcpyHtoD_v2)(self.pointer, data.as_ptr().cast::<c_void>(), bytes)
+            (self.cuda.driver.cuMemcpyHtoDAsync_v2)(
+                self.pointer,
+                data.as_ptr().cast::<c_void>(),
+                bytes,
+                std::ptr::null_mut(),
+            )
         };
-        self.cuda.check("cuMemcpyHtoD_v2", code)
+        self.cuda.check("cuMemcpyHtoDAsync_v2", code)
     }
 
     /// Copies the start of the buffer into `out`, after the work already given to the
