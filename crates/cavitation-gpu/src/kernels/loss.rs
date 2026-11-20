@@ -4,6 +4,10 @@
 //! - [`SoftmaxCrossEntropy`]: softmax cross-entropy over integer class labels, the mean over
 //!   the batch.
 //! - [`MeanSquaredError`]: the mean over every value.
+//! - [`NegativeLogLikelihood`]: the negative log-likelihood of log-probabilities over
+//!   integer class labels, the mean over the batch.
+//! - [`RegressionLoss`]: the L1, Huber or smooth L1 loss ([`Regression`]), the mean over
+//!   every value.
 //!
 //! Each writes its loss, one `f32` word, at a word offset of an output buffer, so a step's
 //! results can sit one after another in one small readback. Each also writes the gradient of
@@ -554,6 +558,634 @@ impl MseCall {
     /// See [`MeanSquaredError`].
     pub fn release(self, pool: &mut BufferPool) {
         pool.give(self.uniform);
+        self.sum.release(pool);
+    }
+}
+
+/// The negative log-likelihood, one thread per row: the row's loss `−lp[label]` (its sign
+/// bit flipped, so exactly the CPU's) and its gradient, `−w` at the label and `+0` elsewhere,
+/// all as bits, since WGSL may fold NaN arithmetic away. A row with a NaN gets NaN for its
+/// loss and keeps the CPU's finite gradient; a row whose label is not below the classes gets
+/// NaN for its loss and its whole gradient row.
+const NLL_ROWS: Shader = Shader {
+    name: "negative log-likelihood rows",
+    source: "
+        override WORKGROUP: u32;
+
+        struct Rows { batch: u32, classes: u32, w: f32, pad: u32 }
+
+        @group(0) @binding(0) var<storage, read_write> grad: array<u32>;
+        @group(0) @binding(1) var<uniform> r: Rows;
+        @group(0) @binding(2) var<storage, read> log_probs: array<u32>;
+        @group(0) @binding(3) var<storage, read> labels: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> row_loss: array<u32>;
+
+        const NAN_BITS: u32 = 0x7fc00000u;
+        const INF_BITS: u32 = 0x7f800000u;
+        const SIGN_BIT: u32 = 0x80000000u;
+
+        @compute @workgroup_size(WORKGROUP)
+        fn main(@builtin(global_invocation_id) id: vec3<u32>) {
+            let i = id.x;
+            if (i >= r.batch) { return; }
+            let base = i * r.classes;
+            let label = labels[i];
+            if (label >= r.classes) {
+                row_loss[i] = NAN_BITS;
+                for (var j = 0u; j < r.classes; j = j + 1u) { grad[base + j] = NAN_BITS; }
+                return;
+            }
+            var nan = false;
+            for (var j = 0u; j < r.classes; j = j + 1u) {
+                nan = nan || (log_probs[base + j] & 0x7fffffffu) > INF_BITS;
+            }
+            row_loss[i] = select(log_probs[base + label] ^ SIGN_BIT, NAN_BITS, nan);
+            let minus_w = bitcast<u32>(r.w) ^ SIGN_BIT;
+            for (var j = 0u; j < r.classes; j = j + 1u) {
+                grad[base + j] = select(0u, minus_w, j == label);
+            }
+        }
+    ",
+};
+
+/// The L1, Huber and smooth L1 losses, one thread per value over `dispatch_split`'s grid:
+/// each value's loss into `terms` and the prediction's gradient into `grad`, as bits. `kind`
+/// is 0 for L1, 1 for Huber and 2 for smooth L1, `param` the threshold. The difference's
+/// non-finite cases come from the inputs' bits: NaN (a NaN input, or two infinities of one
+/// sign) gives NaN for the loss and the gradient; ±∞ puts every loss on its linear branch,
+/// where the loss is +∞ (NaN for Huber and smooth L1 with an infinite threshold, as
+/// `∞ − ∞` gives on the CPU) and the gradient `sign(d)·w` (Huber's `sign(d)·delta·w`). A
+/// finite difference runs the CPU's expressions, in its order and without a multiply-add.
+const REGRESSION: Shader = Shader {
+    name: "regression loss terms",
+    source: "
+        override WORKGROUP: u32;
+
+        struct Regression { n: u32, w: f32, kind: u32, param: f32 }
+
+        @group(0) @binding(0) var<storage, read_write> grad: array<u32>;
+        @group(0) @binding(1) var<uniform> r: Regression;
+        @group(0) @binding(2) var<storage, read> pred: array<f32>;
+        @group(0) @binding(3) var<storage, read> wanted: array<f32>;
+        @group(0) @binding(4) var<storage, read_write> terms: array<u32>;
+
+        const NAN_BITS: u32 = 0x7fc00000u;
+        const INF_BITS: u32 = 0x7f800000u;
+        const SIGN_BIT: u32 = 0x80000000u;
+
+        // The bits of pred - wanted, its NaN and infinite cases decided from the inputs' bits.
+        fn difference(i: u32) -> u32 {
+            let pb = bitcast<u32>(pred[i]);
+            let tb = bitcast<u32>(wanted[i]);
+            let pm = pb & 0x7fffffffu;
+            let tm = tb & 0x7fffffffu;
+            if (pm > INF_BITS || tm > INF_BITS) { return NAN_BITS; }
+            if (pm == INF_BITS && tm == INF_BITS) { return select(NAN_BITS, pb, pb != tb); }
+            if (pm == INF_BITS) { return pb; }
+            if (tm == INF_BITS) { return tb ^ SIGN_BIT; }
+            return bitcast<u32>(pred[i] - wanted[i]);
+        }
+
+        @compute @workgroup_size(WORKGROUP)
+        fn main(
+            @builtin(workgroup_id) group: vec3<u32>,
+            @builtin(num_workgroups) groups: vec3<u32>,
+            @builtin(local_invocation_index) lane: u32,
+        ) {
+            let i = (group.x + group.y * groups.x) * WORKGROUP + lane;
+            if (i >= r.n) { return; }
+            let db = difference(i);
+            let magnitude = db & 0x7fffffffu;
+            if (magnitude > INF_BITS) {
+                terms[i] = NAN_BITS;
+                grad[i] = NAN_BITS;
+                return;
+            }
+            let sign = db & SIGN_BIT;
+            let w = bitcast<u32>(r.w);
+            if (magnitude == INF_BITS) {
+                let infinite_param = (bitcast<u32>(r.param) & 0x7fffffffu) == INF_BITS;
+                if (r.kind == 0u) {
+                    terms[i] = INF_BITS;
+                    grad[i] = w ^ sign;
+                } else if (r.kind == 1u) {
+                    terms[i] = select(INF_BITS, NAN_BITS, infinite_param);
+                    grad[i] = select(bitcast<u32>(r.param * r.w), INF_BITS, infinite_param) ^ sign;
+                } else {
+                    terms[i] = select(INF_BITS, NAN_BITS, infinite_param);
+                    grad[i] = w ^ sign;
+                }
+                return;
+            }
+            let d = bitcast<f32>(db);
+            let a = abs(d);
+            // sign(d) · w, with sign(±0) = 0 giving +0, as the CPU's sign.
+            var unit = 0u;
+            if (d > 0.0) { unit = w; }
+            if (d < 0.0) { unit = w ^ SIGN_BIT; }
+            if (r.kind == 0u) {
+                terms[i] = bitcast<u32>(a);
+                grad[i] = unit;
+            } else if (r.kind == 1u) {
+                let delta = r.param;
+                if (a < delta) {
+                    terms[i] = bitcast<u32>(0.5 * d * d);
+                    grad[i] = bitcast<u32>(d * r.w);
+                } else {
+                    terms[i] = bitcast<u32>(delta * (a - 0.5 * delta));
+                    grad[i] = bitcast<u32>(select(-delta, delta, d > 0.0) * r.w);
+                }
+            } else {
+                let beta = r.param;
+                if (a < beta) {
+                    terms[i] = bitcast<u32>(0.5 * d * d / beta);
+                    grad[i] = bitcast<u32>(d / beta * r.w);
+                } else {
+                    terms[i] = bitcast<u32>(a - 0.5 * beta);
+                    grad[i] = unit;
+                }
+            }
+        }
+    ",
+};
+
+/// The negative log-likelihood of log-probabilities `[batch][classes]` (for example a
+/// log-softmax's output) against integer labels, on the GPU, as `Tape::nll` with
+/// `Reduction::Mean` computes it: the loss `Σ −lp[i, label_i] / batch` (one word) and the
+/// log-probabilities' gradient, `−1/batch` at each row's label and 0 elsewhere.
+///
+/// Each row runs in one thread. Its loss is its label's value with the sign bit flipped,
+/// and its gradient the upstream `1/batch` rounded to `f32` as the CPU rounds it, negated:
+/// both are the CPU's bits. A row with a NaN anywhere gets a NaN loss, as on the CPU, and
+/// keeps its finite gradient; ±∞ passes through (a −∞ at the label gives a +∞ loss). A
+/// label not below the classes gives a NaN loss and a NaN gradient row, so the step's
+/// finite flag is set; the CPU panics on it, and `fit` refuses it before training.
+///
+/// The row losses' mean is a per-channel sum in a fixed tree, divided by the batch rounded
+/// to `f32`, as the cross-entropy's: each row loss passes through at most 15 + 8 +
+/// (chunks − 1) additions, so against the exact mean of the same `f32` values the loss is
+/// within `(22 + chunks)·u·Σ|ℓ| / B` plus `5u` of itself for the division, with
+/// `u = 2⁻²⁴`, and `2⁻¹²⁶` per flushed value. Two runs give the same bits.
+///
+/// # Examples
+///
+/// Without a GPU the example does nothing:
+///
+/// ```
+/// use cavitation_gpu::kernels::NegativeLogLikelihood;
+/// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+///
+/// if let Some(gpu) = Gpu::new() {
+///     let nll = NegativeLogLikelihood::new(&gpu, &mut PipelineCache::new(&gpu)).unwrap();
+///     let mut pool = BufferPool::new(&gpu);
+///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+///         | wgpu::BufferUsages::COPY_SRC;
+///     let [log_probs, grad] = [(); 2].map(|_| pool.take(12, usage));
+///     let (labels, out) = (pool.take(4, usage), pool.take(4, usage));
+///     let sizes = StepSizes { upload_bytes: 128, readback_bytes: 32, ..StepSizes::default() };
+///     let mut steps = StepEncoder::new(&gpu, sizes);
+///     let call = nll.call(&mut steps, &mut pool, (1, 3), &log_probs, &labels, &grad, (&out, 0));
+///     let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+///     let mut step = steps.begin();
+///     step.upload(log_probs.buffer(), 0, &bytes(&[-1.0, -2.0, -3.0]));
+///     step.upload(labels.buffer(), 0, &1u32.to_le_bytes());
+///     nll.record(&mut step, &call);
+///     let at = [step.read_back(out.buffer(), 0, 4), step.read_back(grad.buffer(), 0, 12)];
+///     let output = step.finish();
+///     assert_eq!(&output.bytes()[at[0]..at[0] + 4], &bytes(&[2.0])[..]);
+///     assert_eq!(&output.bytes()[at[1]..at[1] + 12], &bytes(&[0.0, -1.0, 0.0])[..]);
+///     call.release(&mut pool);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct NegativeLogLikelihood {
+    /// The rows kernel's layout.
+    rows_group: wgpu::BindGroupLayout,
+    /// The rows kernel.
+    rows: wgpu::ComputePipeline,
+    /// The sum of the row losses.
+    sums: TermSums,
+}
+
+impl NegativeLogLikelihood {
+    /// Builds the kernels on `gpu`, through `cache`.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if a kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`NegativeLogLikelihood`].
+    pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<NegativeLogLikelihood, GpuError> {
+        use Kind::{Read, Uniform, Write};
+        let (rows_group, rows_layout) = layout(
+            gpu,
+            "negative log-likelihood rows",
+            &[Write, Uniform(UNIFORM_BYTES), Read, Read, Write],
+        );
+        let workgroup = [("WORKGROUP", f64::from(WORKGROUP))];
+        Ok(NegativeLogLikelihood {
+            rows: cache.get_with_layout(NLL_ROWS, "main", &workgroup, &rows_layout)?,
+            rows_group,
+            sums: TermSums::new(gpu, cache, CHANNEL_PARTIALS, 0)?,
+        })
+    }
+
+    /// Prepares the loss of `log_probs` (`batch × classes` row-major `f32`s) against
+    /// `labels` (`batch` `u32`s, each below `classes`) into word `out.1` of `out.0` (one
+    /// word, overwritten), and its gradient into `grad` (as long as the log-probabilities,
+    /// overwritten). Made once, when a model is compiled.
+    ///
+    /// # Panics
+    ///
+    /// If `batch` or `classes` is 0, the batch is more than 65,535 · 256 rows or the values
+    /// more than 268,431,360, a buffer is shorter than its values, or an output is a buffer
+    /// the kernels read (or the gradient is the loss's buffer).
+    ///
+    /// # Examples
+    ///
+    /// See [`NegativeLogLikelihood`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn call(
+        &self,
+        steps: &mut StepEncoder,
+        pool: &mut BufferPool,
+        (batch, classes): (u32, u32),
+        log_probs: &PooledBuffer,
+        labels: &PooledBuffer,
+        grad: &PooledBuffer,
+        (out, offset): (&PooledBuffer, u32),
+    ) -> NllCall {
+        let what = "negative log-likelihood";
+        let values = u64::from(batch) * u64::from(classes);
+        assert!(
+            batch > 0 && classes > 0,
+            "{what}: the batch and the classes must be above 0, got {batch} × {classes}"
+        );
+        assert!(
+            values <= MAX_VALUES
+                && batch.div_ceil(WORKGROUP) <= crate::MAX_WORKGROUPS_PER_DIMENSION,
+            "{what}: {batch} × {classes} log-probabilities are more than the kernels take"
+        );
+        check_len(what, "log-probabilities", log_probs, values);
+        check_len(what, "labels", labels, u64::from(batch));
+        check_len(what, "gradient", grad, values);
+        check_len(what, "loss output", out, u64::from(offset) + 1);
+        check_distinct(
+            what,
+            ("gradient", grad),
+            &[
+                ("log-probabilities", log_probs),
+                ("labels", labels),
+                ("loss output", out),
+            ],
+        );
+        check_distinct(
+            what,
+            ("loss output", out),
+            &[("log-probabilities", log_probs), ("labels", labels)],
+        );
+        let uniform = upload_uniform(
+            steps,
+            pool,
+            &word_bytes([batch, classes, reciprocal(u64::from(batch)).to_bits(), 0]),
+        );
+        let row_loss = pool.take(4 * u64::from(batch), wgpu::BufferUsages::STORAGE);
+        let group = bind(
+            steps,
+            &self.rows_group,
+            &[grad, &uniform, log_probs, labels, &row_loss],
+        );
+        let to = SumsTo {
+            offset,
+            divisor: Some(batch as f32),
+            ..SumsTo::new(out)
+        };
+        let dims = ChannelDims::new(1, 1, batch);
+        let sum = self
+            .sums
+            .call(steps, pool, what, dims, (&row_loss, 0), &[], to);
+        NllCall {
+            batch,
+            uniform,
+            row_loss,
+            group,
+            sum,
+        }
+    }
+
+    /// Adds the loss `call` to `step`: the rows, then the mean of their losses.
+    ///
+    /// # Examples
+    ///
+    /// See [`NegativeLogLikelihood`].
+    pub fn record(&self, step: &mut Step<'_>, call: &NllCall) {
+        step.dispatch(&self.rows, &call.group, call.batch.div_ceil(WORKGROUP));
+        self.sums.record(step, &call.sum);
+    }
+}
+
+/// One prepared negative log-likelihood, from [`NegativeLogLikelihood::call`].
+///
+/// # Examples
+///
+/// See [`NegativeLogLikelihood`].
+#[derive(Debug)]
+pub struct NllCall {
+    /// The rows.
+    batch: u32,
+    /// The rows kernel's uniform.
+    uniform: PooledBuffer,
+    /// Each row's loss.
+    row_loss: PooledBuffer,
+    /// The rows kernel's bind group.
+    group: wgpu::BindGroup,
+    /// The mean of the row losses.
+    sum: ChannelSumsCall,
+}
+
+impl NllCall {
+    /// Gives this call's buffers back to `pool`, once it is no longer recorded.
+    ///
+    /// # Examples
+    ///
+    /// See [`NegativeLogLikelihood`].
+    pub fn release(self, pool: &mut BufferPool) {
+        pool.give(self.uniform);
+        pool.give(self.row_loss);
+        self.sum.release(pool);
+    }
+}
+
+/// Which elementwise loss [`RegressionLoss`] computes, with its threshold as the `f32` the
+/// CPU's tape takes (`Loss::Huber { delta }` records `delta as f32`). With `d = p − t`:
+///
+/// - `L1`: `|d|`, gradient `sign(d)` (0 at `d = 0`), as `Tape::l1`.
+/// - `Huber { delta }`: `0.5·d²` when `|d| < delta`, else `delta·(|d| − 0.5·delta)`;
+///   gradient `d`, else `delta·sign(d)`, as `Tape::huber`. `delta` must be above 0 (+∞
+///   included).
+/// - `SmoothL1 { beta }`: `0.5·d² / beta` when `|d| < beta`, else `|d| − 0.5·beta`;
+///   gradient `d / beta`, else `sign(d)`, as `Tape::smooth_l1`. `beta` must not be negative
+///   or NaN; 0 is the L1 loss.
+///
+/// At `|d|` equal to the threshold both take the linear branch, as the CPU does.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_gpu::kernels::Regression;
+///
+/// let huber = Regression::Huber { delta: 1.0 };
+/// assert_ne!(huber, Regression::SmoothL1 { beta: 1.0 });
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Regression {
+    /// The absolute error.
+    L1,
+    /// The Huber loss.
+    Huber {
+        /// Where the loss turns from quadratic to linear; above 0.
+        delta: f32,
+    },
+    /// The smooth L1 loss.
+    SmoothL1 {
+        /// Where the loss turns from quadratic to linear; 0 or above.
+        beta: f32,
+    },
+}
+
+impl Regression {
+    /// The kernel's `kind` and `param` words, after the CPU tape's checks on the threshold
+    /// (its panic message, after `what`, if they fail).
+    fn words(self, what: &str) -> (u32, f32) {
+        match self {
+            Regression::L1 => (0, 0.0),
+            Regression::Huber { delta } => {
+                assert!(
+                    delta > 0.0,
+                    "{what}: huber: delta must be positive, but it is {delta:?}"
+                );
+                (1, delta)
+            }
+            Regression::SmoothL1 { beta } => {
+                assert!(
+                    beta >= 0.0,
+                    "{what}: smooth_l1: beta must not be negative, but it is {beta:?}"
+                );
+                (2, beta)
+            }
+        }
+    }
+}
+
+/// The L1, Huber or smooth L1 loss of a prediction against a target, on the GPU, as
+/// `Tape::l1`, `Tape::huber` and `Tape::smooth_l1` with `Reduction::Mean` compute it: the
+/// loss `Σ ℓ(p − t) / n` (one word) and the prediction's gradient `ℓ'(p − t) · (1/n)`, for
+/// the [`Regression`] the call names.
+///
+/// One kernel writes each value's loss and gradient; the mean of the losses is a
+/// per-channel sum in a fixed tree, divided by `n` rounded to `f32`, as the mean squared
+/// error's. Each value runs the CPU's `f32` expressions in its order with no multiply-add,
+/// so on normal values the gradient and each value's loss are the CPU's bits, except on
+/// smooth L1's quadratic branch, whose divisions by `beta` WGSL gives within 2.5 ulp: there
+/// each is within `8u` of the CPU's, relative (`u = 2⁻²⁴`). Against the exact mean of the
+/// same `f32` values the loss is within `(22 + chunks + c)·u·Σ ℓ / n` plus `5u` of itself
+/// for the division and `2⁻¹²⁶` per flushed value, where `chunks = ⌈n / 4096⌉` and `c`, a
+/// term's own error, is 1 for L1, 4 for Huber and 8 for smooth L1 (`tests/loss.rs` derives
+/// it).
+///
+/// NaN and ±∞ follow the CPU, decided from the bits: a NaN difference gives NaN for that
+/// value's loss and gradient; an infinite one an infinite loss (NaN when the threshold is
+/// also infinite) and the linear branch's gradient. A finite difference whose loss overflows
+/// gives an infinite loss. The finite flag tests the loss, so it catches each.
+///
+/// # Examples
+///
+/// Without a GPU the example does nothing:
+///
+/// ```
+/// use cavitation_gpu::kernels::{Regression, RegressionLoss};
+/// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+///
+/// if let Some(gpu) = Gpu::new() {
+///     let loss = RegressionLoss::new(&gpu, &mut PipelineCache::new(&gpu)).unwrap();
+///     let mut pool = BufferPool::new(&gpu);
+///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+///         | wgpu::BufferUsages::COPY_SRC;
+///     let [pred, target, grad] = [(); 3].map(|_| pool.take(8, usage));
+///     let out = pool.take(4, usage);
+///     let sizes = StepSizes { upload_bytes: 128, readback_bytes: 16, ..StepSizes::default() };
+///     let mut steps = StepEncoder::new(&gpu, sizes);
+///     let huber = Regression::Huber { delta: 1.0 };
+///     let call = loss.call(&mut steps, &mut pool, huber, 2, &pred, &target, &grad, (&out, 0));
+///     let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+///     let mut step = steps.begin();
+///     step.upload(pred.buffer(), 0, &bytes(&[0.5, 3.0]));
+///     step.upload(target.buffer(), 0, &bytes(&[0.0, 0.0]));
+///     loss.record(&mut step, &call);
+///     let at = [step.read_back(out.buffer(), 0, 4), step.read_back(grad.buffer(), 0, 8)];
+///     let output = step.finish();
+///     // (0.125 + 2.5) / 2, and the gradients 0.5 / 2 and 1 / 2.
+///     assert_eq!(&output.bytes()[at[0]..at[0] + 4], &bytes(&[1.3125])[..]);
+///     assert_eq!(&output.bytes()[at[1]..at[1] + 8], &bytes(&[0.25, 0.5])[..]);
+///     call.release(&mut pool);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct RegressionLoss {
+    /// The terms kernel's layout.
+    terms_group: wgpu::BindGroupLayout,
+    /// The terms kernel: each value's loss and gradient.
+    terms: wgpu::ComputePipeline,
+    /// The sum of the terms.
+    sums: TermSums,
+}
+
+impl RegressionLoss {
+    /// Builds the kernels on `gpu`, through `cache`.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if a kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`RegressionLoss`].
+    pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<RegressionLoss, GpuError> {
+        use Kind::{Read, Uniform, Write};
+        let (terms_group, terms_layout) = layout(
+            gpu,
+            "regression loss terms",
+            &[Write, Uniform(UNIFORM_BYTES), Read, Read, Write],
+        );
+        let workgroup = [("WORKGROUP", f64::from(WORKGROUP))];
+        Ok(RegressionLoss {
+            terms: cache.get_with_layout(REGRESSION, "main", &workgroup, &terms_layout)?,
+            terms_group,
+            sums: TermSums::new(gpu, cache, CHANNEL_PARTIALS, 0)?,
+        })
+    }
+
+    /// Prepares the loss `kind` of `pred` against `target` (`n` `f32`s each) into word
+    /// `out.1` of `out.0` (one word, overwritten), and the prediction's gradient into `grad`
+    /// (`n` values, overwritten). Made once, when a model is compiled.
+    ///
+    /// # Panics
+    ///
+    /// With the CPU tape's message if Huber's `delta` is not above 0 or smooth L1's `beta`
+    /// is below 0 or NaN; if `n` is 0 or more than 268,431,360, a buffer is shorter than its
+    /// values, or an output is a buffer the kernels read (or the gradient is the loss's
+    /// buffer).
+    ///
+    /// # Examples
+    ///
+    /// See [`RegressionLoss`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn call(
+        &self,
+        steps: &mut StepEncoder,
+        pool: &mut BufferPool,
+        kind: Regression,
+        n: u32,
+        pred: &PooledBuffer,
+        target: &PooledBuffer,
+        grad: &PooledBuffer,
+        (out, offset): (&PooledBuffer, u32),
+    ) -> RegressionCall {
+        let what = "regression loss";
+        let (kind, param) = kind.words(what);
+        assert!(
+            n > 0 && u64::from(n) <= MAX_VALUES,
+            "{what}: {n} values, where the kernels take 1 to {MAX_VALUES}"
+        );
+        let len = u64::from(n);
+        check_len(what, "prediction", pred, len);
+        check_len(what, "target", target, len);
+        check_len(what, "gradient", grad, len);
+        check_len(what, "loss output", out, u64::from(offset) + 1);
+        check_distinct(
+            what,
+            ("gradient", grad),
+            &[
+                ("prediction", pred),
+                ("target", target),
+                ("loss output", out),
+            ],
+        );
+        check_distinct(
+            what,
+            ("loss output", out),
+            &[("prediction", pred), ("target", target)],
+        );
+        let uniform = upload_uniform(
+            steps,
+            pool,
+            &word_bytes([n, reciprocal(len).to_bits(), kind, param.to_bits()]),
+        );
+        let terms = pool.take(4 * len, wgpu::BufferUsages::STORAGE);
+        let group = bind(
+            steps,
+            &self.terms_group,
+            &[grad, &uniform, pred, target, &terms],
+        );
+        let to = SumsTo {
+            offset,
+            divisor: Some(n as f32),
+            ..SumsTo::new(out)
+        };
+        let dims = ChannelDims::new(1, 1, n);
+        let sum = self
+            .sums
+            .call(steps, pool, what, dims, (&terms, 0), &[], to);
+        RegressionCall {
+            n,
+            uniform,
+            terms,
+            group,
+            sum,
+        }
+    }
+
+    /// Adds the loss `call` to `step`: each value's loss and gradient, then their mean.
+    ///
+    /// # Examples
+    ///
+    /// See [`RegressionLoss`].
+    pub fn record(&self, step: &mut Step<'_>, call: &RegressionCall) {
+        step.dispatch_split(&self.terms, &call.group, call.n.div_ceil(WORKGROUP));
+        self.sums.record(step, &call.sum);
+    }
+}
+
+/// One prepared regression loss, from [`RegressionLoss::call`].
+///
+/// # Examples
+///
+/// See [`RegressionLoss`].
+#[derive(Debug)]
+pub struct RegressionCall {
+    /// The values.
+    n: u32,
+    /// The terms kernel's uniform.
+    uniform: PooledBuffer,
+    /// Each value's loss.
+    terms: PooledBuffer,
+    /// The terms kernel's bind group.
+    group: wgpu::BindGroup,
+    /// The mean of the terms.
+    sum: ChannelSumsCall,
+}
+
+impl RegressionCall {
+    /// Gives this call's buffers back to `pool`, once it is no longer recorded.
+    ///
+    /// # Examples
+    ///
+    /// See [`RegressionLoss`].
+    pub fn release(self, pool: &mut BufferPool) {
+        pool.give(self.uniform);
+        pool.give(self.terms);
         self.sum.release(pool);
     }
 }
