@@ -414,7 +414,8 @@ fn grow(mut workers: MutexGuard<'static, Vec<&'static Worker>>, wanted: usize) -
         // worker started below lives for the rest of the process); it is freed only when
         // the spawn fails, after every reference made from it is gone.
         let worker: &'static Worker = unsafe { &*raw };
-        match spawn_worker(worker, last_call) {
+        // The call starting this worker runs on `wanted + 1` threads, the caller included.
+        match spawn_worker(worker, last_call, wanted + 1) {
             Ok(handle) => {
                 let _ = worker.thread.set(handle.thread().clone());
                 workers.push(worker);
@@ -453,10 +454,12 @@ fn init_done_signal() {
 #[cfg(test)]
 static FAIL_SPAWN: AtomicBool = AtomicBool::new(false);
 
-/// Starts the thread for `worker`, created after call number `last_call`.
+/// Starts the thread for `worker`, created after call number `last_call` by a call on
+/// `threads` threads.
 fn spawn_worker(
     worker: &'static Worker,
     last_call: usize,
+    threads: usize,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     #[cfg(test)]
     if FAIL_SPAWN.load(Ordering::Relaxed) {
@@ -464,7 +467,7 @@ fn spawn_worker(
     }
     thread::Builder::new()
         .name(format!("cavitation-pool-{}", worker.id))
-        .spawn(move || worker_main(worker, last_call))
+        .spawn(move || worker_main(worker, last_call, threads))
 }
 
 /// The first `len` workers, with the list kept locked.
@@ -561,10 +564,10 @@ fn wait_for_workers() {
 /// A worker thread's loop: wait for a job, help run its tasks, report that it is done.
 /// `seen` is the call number the worker was created after; it may start running after the
 /// next call has already been posted to it.
-fn worker_main(me: &'static Worker, mut seen: usize) {
+fn worker_main(me: &'static Worker, mut seen: usize, threads: usize) {
     IS_WORKER.set(true);
     // A GEMM inside one of this worker's tasks must not allocate whenever it first comes.
-    super::gemm::reserve_for_worker();
+    super::gemm::reserve_for_worker(threads);
     loop {
         seen = wait_for_job(me, seen);
         // SAFETY: we saw `posted` change to this call (acquire), which the caller stored

@@ -403,7 +403,8 @@ fn pool_wait_steady_state() -> usize {
 
 /// A GEMM run inside a pool task, as a convolution's backward pass runs one per image: each of
 /// the 4 threads takes one task (each task waits until all four have started) and calls the
-/// GEMM there, the first GEMM any worker has run. Tasks are claimed as threads arrive, so a
+/// GEMM there with the current thread count, as a convolution does: the first GEMM any worker
+/// has run. Tasks are claimed as threads arrive, so a
 /// worker can meet its first such task in any epoch of a training run; its packing buffers are
 /// reserved when it starts, so that first call allocates nothing. Returns the allocations made
 /// during one such run after a warm-up of instant jobs, on any thread.
@@ -418,6 +419,8 @@ fn nested_gemm_first_use() -> usize {
     let started = AtomicUsize::new(0);
     let gemm_now = AtomicBool::new(false);
     let level = level();
+    // The thread count a convolution's GEMM asks for.
+    let threads = cavitation_core::kernels::threads();
     let job = |t: Task| {
         if !gemm_now.load(Ordering::Relaxed) {
             return;
@@ -430,7 +433,7 @@ fn nested_gemm_first_use() -> usize {
         let mut c = outs[t.index].lock().unwrap();
         gemm_f32_with(
             level,
-            4,
+            threads,
             1.0,
             MatRef::new(&a, 64, 288, 288, 1).unwrap(),
             MatRef::new(&b, 288, 256, 256, 1).unwrap(),
@@ -441,6 +444,17 @@ fn nested_gemm_first_use() -> usize {
     for _ in 0..100 {
         pool::run(4, 4, &job);
     }
+    // The calling thread has run a GEMM before, as it has in a training run's warm-up.
+    let mut warm = vec![0.0f32; 64 * 256];
+    gemm_f32_with(
+        level,
+        threads,
+        1.0,
+        MatRef::new(&a, 64, 288, 288, 1).unwrap(),
+        MatRef::new(&b, 288, 256, 256, 1).unwrap(),
+        0.0,
+        MatMut::new(&mut warm, 64, 256, 256, 1).unwrap(),
+    );
     gemm_now.store(true, Ordering::Relaxed);
     let before = allocations();
     pool::run(4, 4, &job);

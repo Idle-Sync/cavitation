@@ -458,13 +458,18 @@ fn largest_blocks<K: Kernel>() -> (usize, usize) {
 }
 
 /// Reserves room, without filling it, in this thread's packing buffers for the largest blocks
-/// any packed kernel of this build packs, with one `A` slot per thread of the current thread
-/// count. The pool calls it when a worker starts, so the first GEMM a worker runs inside a
+/// any packed kernel of this build packs, with one `A` slot per thread of the larger of the
+/// current thread count ([`super::threads`], which a convolution's GEMM asks for) and
+/// `threads`, the thread count of the pool call that starts the worker. The pool calls it
+/// when a worker starts, so the first GEMM a worker runs inside a
 /// task (a convolution's per-image GEMM can run on any worker, and which worker takes which
 /// task depends on timing) only fills room it already has, and allocates nothing: a training
 /// run's warm-up epoch need not have sent such a task to every worker. The room is reserved,
-/// not written, so a worker that never runs a GEMM never touches it.
-pub(super) fn reserve_for_worker() {
+/// not written, so a worker that never runs a GEMM never touches it. A GEMM inside a task that
+/// asks for more threads than both (an explicit count to [`gemm_f32_with`], or a thread count
+/// raised by [`super::set_threads`] after the workers started) grows the `A` buffer on its
+/// worker's first such call, as on any thread.
+pub(super) fn reserve_for_worker(threads: usize) {
     #[cfg(target_arch = "x86_64")]
     let (b, a) = {
         let (sse, avx) = (
@@ -477,7 +482,7 @@ pub(super) fn reserve_for_worker() {
     let (b, a) = largest_blocks::<super::aarch64::Neon>();
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let (b, a) = (0, 0);
-    let slots = super::threads().min(pool::MAX_THREADS);
+    let slots = super::threads().max(threads).min(pool::MAX_THREADS);
     SCRATCH.with_borrow_mut(|scratch| {
         scratch.b.reserve_exact(b.saturating_sub(scratch.b.len()));
         scratch
