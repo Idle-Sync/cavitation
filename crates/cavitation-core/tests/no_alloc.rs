@@ -444,6 +444,11 @@ fn nested_gemm_first_use() -> usize {
     for _ in 0..100 {
         pool::run(4, 4, &job);
     }
+    // Each output's lock has been taken once: on Apple targets a standard `Mutex` is a
+    // pthread mutex that allocates on its first lock.
+    for out in &outs {
+        drop(out.lock().unwrap());
+    }
     // The calling thread has run a GEMM before, as it has in a training run's warm-up.
     let mut warm = vec![0.0f32; 64 * 256];
     gemm_f32_with(
