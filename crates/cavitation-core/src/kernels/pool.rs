@@ -563,6 +563,8 @@ fn wait_for_workers() {
 /// next call has already been posted to it.
 fn worker_main(me: &'static Worker, mut seen: usize) {
     IS_WORKER.set(true);
+    // A GEMM inside one of this worker's tasks must not allocate whenever it first comes.
+    super::gemm::reserve_for_worker();
     loop {
         seen = wait_for_job(me, seen);
         // SAFETY: we saw `posted` change to this call (acquire), which the caller stored
