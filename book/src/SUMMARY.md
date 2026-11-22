@@ -11,3 +11,4 @@
 - [Measuring a classifier](metrics.md)
 - [Coming from PyTorch](from-pytorch.md)
 - [Image models](image-models.md)
+- [Training on a GPU](gpu.md)
