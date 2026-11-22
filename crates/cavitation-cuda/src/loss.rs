@@ -156,8 +156,8 @@ impl<'c> Kernels<'c> {
 /// Each row runs in one thread. It takes the row's maximum, then `ln Σ e^(z − max)` as
 /// `ln(1 + e)` with `e` the sum without the first maximum's term, then its loss and gradient.
 /// For `e ≤ 1` the logarithm comes from the series of `2·atanh(e / (2 + e))`, so a confident
-/// row's small loss keeps its relative accuracy; the CPU rounds `1 + e` to `f32` first, so on
-/// such rows it can sit below the exact loss where this kernel does not. For `e > 1` it is
+/// row's small loss keeps its relative accuracy, as the CPU's `ln_1p` of the same sum does.
+/// For `e > 1` it is
 /// CUDA's `logf(1 + e)`. The row losses' mean is a channel sum in `reduce.cu`'s fixed tree,
 /// divided by the batch rounded to `f32`. A row with a NaN or infinite logit, or a label not
 /// below the classes, gives a NaN loss and a NaN gradient row. The CPU would give a finite
