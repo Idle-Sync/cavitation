@@ -250,6 +250,7 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
             num(p, "end") as usize,
         ),
         "concat" => tape.concat(v, num(p, "axis") as usize),
+        "index_select" => tape.index_select(v[0], num(p, "axis") as usize, &usizes(p, "indices")),
         "sum_axis" => tape.sum_axis(v[0], num(p, "axis") as usize, p["keep_dim"] == true),
         "mean_axis" => tape.mean_axis(v[0], num(p, "axis") as usize, p["keep_dim"] == true),
         "relu" => tape.relu(v[0]),
@@ -827,7 +828,8 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         | "permute"
         | "transpose"
         | "slice"
-        | "concat" => all_elementwise(),
+        | "concat"
+        | "index_select" => all_elementwise(),
         "prelu" => {
             // The slope's gradient sums over every position of its channel.
             let (x, slope) = (&f.inputs[0], &f.inputs[1]);
@@ -938,7 +940,14 @@ const POOL: &[&str] = &["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
 /// Batch normalisation with batch statistics.
 const BATCH_NORM: &[&str] = &["batch_norm2d"];
 /// The operations that move values without arithmetic.
-const STRUCTURE: &[&str] = &["reshape", "permute", "transpose", "slice", "concat"];
+const STRUCTURE: &[&str] = &[
+    "reshape",
+    "permute",
+    "transpose",
+    "slice",
+    "concat",
+    "index_select",
+];
 /// The reductions.
 const REDUCTIONS: &[&str] = &["sum", "mean", "sum_axis", "mean_axis"];
 /// The activations, `prelu` and `glu`.
@@ -1077,8 +1086,8 @@ comparison_tests! {
     /// `batch_norm2d` with batch statistics, with and without γ and β, matches PyTorch's
     /// training-mode `batch_norm`, output and gradients.
     batch_norm_matches_torch => BATCH_NORM,
-    /// `reshape`, `permute`, `transpose`, `slice` and `concat` match PyTorch's, output and
-    /// gradient.
+    /// `reshape`, `permute`, `transpose`, `slice`, `concat` and `index_select` match
+    /// PyTorch's, output and gradient.
     structure_matches_torch => STRUCTURE,
     /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
     reductions_match_torch => REDUCTIONS,

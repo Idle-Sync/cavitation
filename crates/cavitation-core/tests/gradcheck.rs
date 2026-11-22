@@ -268,6 +268,30 @@ fn gradcheck_slice_and_concat() {
     gradcheck(&[a], |t, v| t.concat(&[v[0], v[0]], 0)).assert_passed();
 }
 
+/// `index_select` has the right gradient along every axis of a rank-3 value, with repeated
+/// indices, a slice no index chooses, and no indices at all.
+#[test]
+fn gradcheck_index_select() {
+    let a = Tensor::from_vec(
+        (0..24).map(|i| (i as f64 * 0.53).sin()).collect(),
+        &[2, 3, 4],
+    )
+    .unwrap();
+    let x = [a];
+    for (axis, indices) in [
+        (0, vec![1, 0, 1]),
+        (1, vec![2, 2, 0]),
+        (2, vec![3, 1]),
+        (1, vec![]),
+    ] {
+        let report = gradcheck(&x, |t, v| t.index_select(v[0], axis, &indices));
+        assert!(
+            report.passed(),
+            "index_select {axis} {indices:?}: {report:?}"
+        );
+    }
+}
+
 /// A reduction over the middle axis of a rank-3 value has the right gradient.
 #[test]
 fn gradcheck_reduction_middle_axis() {
