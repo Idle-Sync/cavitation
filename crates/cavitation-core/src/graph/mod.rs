@@ -56,6 +56,20 @@ impl Var {
         self.index as usize
     }
 
+    /// `self` as two label words, the index then the tape's id, for an operation that keeps
+    /// a list of inputs in the graph's label buffer.
+    pub(crate) fn to_words(self) -> [usize; 2] {
+        [self.index as usize, self.tape as usize]
+    }
+
+    /// The `Var` that [`Var::to_words`] gave `words` for.
+    pub(crate) fn from_words(words: &[usize]) -> Var {
+        Var {
+            index: words[0] as u32,
+            tape: words[1] as u32,
+        }
+    }
+
     /// Fills the unused input slots of a custom operation; never read.
     pub(crate) const UNUSED: Var = Var {
         index: u32::MAX,

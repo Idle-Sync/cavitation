@@ -243,6 +243,13 @@ fn record(tape: &mut Tape<'_, f32>, f: &Fixture, v: &[Var]) -> Var {
         "reshape" => tape.reshape(v[0], &usizes(p, "shape")),
         "permute" => tape.permute(v[0], &usizes(p, "axes")),
         "transpose" => tape.transpose(v[0], num(p, "a") as usize, num(p, "b") as usize),
+        "slice" => tape.slice(
+            v[0],
+            num(p, "axis") as usize,
+            num(p, "start") as usize,
+            num(p, "end") as usize,
+        ),
+        "concat" => tape.concat(v, num(p, "axis") as usize),
         "sum_axis" => tape.sum_axis(v[0], num(p, "axis") as usize, p["keep_dim"] == true),
         "mean_axis" => tape.mean_axis(v[0], num(p, "axis") as usize, p["keep_dim"] == true),
         "relu" => tape.relu(v[0]),
@@ -818,7 +825,9 @@ fn bounds(f: &Fixture) -> (Bound, Vec<Bound>) {
         | "batch_norm2d"
         | "reshape"
         | "permute"
-        | "transpose" => all_elementwise(),
+        | "transpose"
+        | "slice"
+        | "concat" => all_elementwise(),
         "prelu" => {
             // The slope's gradient sums over every position of its channel.
             let (x, slope) = (&f.inputs[0], &f.inputs[1]);
@@ -929,7 +938,7 @@ const POOL: &[&str] = &["max_pool2d", "avg_pool2d", "adaptive_avg_pool2d"];
 /// Batch normalisation with batch statistics.
 const BATCH_NORM: &[&str] = &["batch_norm2d"];
 /// The operations that move values without arithmetic.
-const STRUCTURE: &[&str] = &["reshape", "permute", "transpose"];
+const STRUCTURE: &[&str] = &["reshape", "permute", "transpose", "slice", "concat"];
 /// The reductions.
 const REDUCTIONS: &[&str] = &["sum", "mean", "sum_axis", "mean_axis"];
 /// The activations, `prelu` and `glu`.
@@ -1068,7 +1077,8 @@ comparison_tests! {
     /// `batch_norm2d` with batch statistics, with and without γ and β, matches PyTorch's
     /// training-mode `batch_norm`, output and gradients.
     batch_norm_matches_torch => BATCH_NORM,
-    /// `reshape`, `permute` and `transpose` match PyTorch's, output and gradient.
+    /// `reshape`, `permute`, `transpose`, `slice` and `concat` match PyTorch's, output and
+    /// gradient.
     structure_matches_torch => STRUCTURE,
     /// `sum`, `mean`, `sum_axis` and `mean_axis` match PyTorch's float64 result.
     reductions_match_torch => REDUCTIONS,
