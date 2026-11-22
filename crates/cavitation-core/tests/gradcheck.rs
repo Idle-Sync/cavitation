@@ -197,6 +197,41 @@ fn gradcheck_axis_reductions() {
     }
 }
 
+/// `reshape`, `permute` and `transpose` have the right gradient on a rank-4 value, with every
+/// ordering of three of its axes and a reshape that splits and merges dimensions.
+#[test]
+fn gradcheck_structure() {
+    let data = (0..120).map(|i| (i as f64 * 0.37).sin()).collect();
+    let x = [Tensor::from_vec(data, &[2, 3, 4, 5]).unwrap()];
+    gradcheck(&x, |t, v| t.reshape(v[0], &[6, 20])).assert_passed();
+    gradcheck(&x, |t, v| t.reshape(v[0], &[5, 2, 12])).assert_passed();
+    for axes in [
+        [0, 1, 2, 3],
+        [3, 2, 1, 0],
+        [1, 3, 0, 2],
+        [0, 2, 3, 1],
+        [2, 0, 1, 3],
+    ] {
+        let report = gradcheck(&x, |t, v| t.permute(v[0], &axes));
+        assert!(report.passed(), "permute {axes:?}: {report:?}");
+    }
+    for (a, b) in [(0, 3), (1, 2), (2, 2)] {
+        let report = gradcheck(&x, |t, v| t.transpose(v[0], a, b));
+        assert!(report.passed(), "transpose {a} {b}: {report:?}");
+    }
+    // Through a product, so the gradient reaching the structural op is not uniform.
+    let y = [
+        Tensor::from_vec((0..12).map(|i| (i as f64 * 0.9).cos()).collect(), &[3, 4]).unwrap(),
+        Tensor::from_vec((0..12).map(|i| (i as f64 * 0.5).sin()).collect(), &[3, 4]).unwrap(),
+    ];
+    gradcheck(&y, |t, v| {
+        let w = t.transpose(v[1], 0, 1);
+        let r = t.reshape(v[0], &[3, 4]);
+        t.matmul(r, w)
+    })
+    .assert_passed();
+}
+
 /// A reduction over the middle axis of a rank-3 value has the right gradient.
 #[test]
 fn gradcheck_reduction_middle_axis() {

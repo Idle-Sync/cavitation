@@ -17,6 +17,7 @@ mod loss;
 mod matmul;
 mod pooling;
 mod reduce;
+mod structure;
 #[cfg(test)]
 mod wrong;
 
@@ -81,6 +82,10 @@ pub(crate) enum Op<T: Real> {
     Sum(Var),
     /// The mean of every element, a rank-0 value.
     Mean(Var),
+    /// The same values with another shape.
+    Reshape(Var),
+    /// The values with the axes reordered, and where the axes start in the label buffer.
+    Permute(Var, usize),
     /// The sum along an axis.
     SumAxis(Var, usize),
     /// The mean along an axis.
@@ -186,6 +191,8 @@ impl<T: Real> Op<T> {
             Op::KeepWhere(x, keep) => elementwise::keep_where_backward(x, keep, out_grad, ctx),
             Op::Sum(a) => reduce::full_backward(a, false, out_grad, ctx),
             Op::Mean(a) => reduce::full_backward(a, true, out_grad, ctx),
+            Op::Reshape(a) => structure::reshape_backward(a, out_grad, ctx),
+            Op::Permute(a, start) => structure::permute_backward(a, start, out_grad, ctx),
             Op::SumAxis(a, axis) => reduce::axis_backward(a, axis, false, out_grad, ctx),
             Op::MeanAxis(a, axis) => reduce::axis_backward(a, axis, true, out_grad, ctx),
             Op::Relu(a) => activation::relu_backward(a, out_grad, ctx),

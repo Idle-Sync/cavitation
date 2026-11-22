@@ -15,6 +15,7 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ### Tensors and autograd (`cavitation-core`)
 
+- `Tape::reshape(x, dims)`, `Tape::permute(x, axes)` and `Tape::transpose(x, a, b)` record a value with another shape, with its axes reordered, and with two axes swapped, as PyTorch's `reshape`, `permute` and `transpose` give them. The values are moved, not computed, so the outputs and gradients are exact on every kernel level. Each passes the gradient check in `f64`, matches PyTorch fixtures written by `scripts/fixtures/make_fixtures.py` (ranks 2 to 4), and allocates nothing on a warm step. A wrong count of values, a repeated or missing axis, or an axis past the rank panics, naming the operation and the shape (#336, part 1).
 - `Tape::softmax_cross_entropy`, `log_softmax` and `log_softmax_row` take `ln Σ e^(z − max)` as `ln_1p` of the sum without the first maximum's term, so a confident row's small loss keeps its relative accuracy: on rows `[0, −a, −a − 2, −a − 4]` labelled 0, for `a` from 8 to 20, the `f32` loss is within 2.1u of the `f64` one (`u = 2⁻²⁴`), where rounding `1 + e` to `f32` first gave a loss of exactly 0 once `e` fell below `u`. On 4,096 × 10 logits with the label's raised by 12, the mean relative error of the loss over 20 batches is +3.3u instead of −166u (Intel Celeron N5105). Losses, log-probabilities and the cross-entropy's gradient change in their low bits on such rows. A +∞ or NaN logit still gives a NaN row (#321).
 
 ### Layers, training and inference (`cavitation-nn`)

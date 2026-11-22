@@ -736,6 +736,24 @@ def make_batch_norm():
         add_case(f"batch-norm2d-{name}", "batch_norm2d", params, inputs, bn)
 
 
+def make_structure():
+    """reshape, permute and transpose: values moved without arithmetic. Built after every
+    other case, so its draws shift none of their inputs.
+    """
+    for shape, to in [((3, 5), (5, 3)), ((2, 3, 4), (6, 4)), ((2, 3, 4, 5), (4, 30))]:
+        params = {"shape": list(to)}
+        name = f"reshape-{shape_name(shape)}-to-{shape_name(to)}"
+        add_case(name, "reshape", params, [rnd(*shape)], lambda x, t=to: x.reshape(t))
+    for shape, axes in [((3, 5), (1, 0)), ((2, 3, 4), (2, 0, 1)), ((2, 3, 4, 5), (1, 3, 0, 2))]:
+        params = {"axes": list(axes)}
+        name = f"permute-{shape_name(shape)}-{''.join(str(a) for a in axes)}"
+        add_case(name, "permute", params, [rnd(*shape)], lambda x, a=axes: x.permute(a))
+    for shape, (a, b) in [((4, 6), (0, 1)), ((2, 3, 4, 5), (1, 3))]:
+        params = {"a": a, "b": b}
+        name = f"transpose-{shape_name(shape)}-{a}{b}"
+        add_case(name, "transpose", params, [rnd(*shape)], lambda x, a=a, b=b: x.transpose(a, b))
+
+
 def write_state_dict(crates_dir):
     """Saves a seeded `Linear(4, 8), ReLU(), Linear(8, 3)` and its outputs for five inputs."""
     out_dir = os.path.join(crates_dir, "cavitation-nn", "tests", "fixtures", "state-dict")
@@ -1041,6 +1059,7 @@ def main():
     make_conv()
     make_pool()
     make_batch_norm()
+    make_structure()
     out_dir = os.path.join(args.out, "cavitation-core", "tests", "fixtures", "ops")
     os.makedirs(out_dir, exist_ok=True)
     for old in os.listdir(out_dir):
