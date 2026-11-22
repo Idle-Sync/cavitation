@@ -738,8 +738,7 @@ def make_batch_norm():
 
 def make_structure():
     """reshape, permute, transpose, slice, concat and index_select: values moved without
-    arithmetic. Built after every
-    other case, so its draws shift none of their inputs.
+    arithmetic. Built after every other case, so its draws shift none of their inputs.
     """
     for shape, to in [((3, 5), (5, 3)), ((2, 3, 4), (6, 4)), ((2, 3, 4, 5), (4, 30))]:
         params = {"shape": list(to)}
