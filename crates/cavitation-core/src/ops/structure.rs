@@ -9,7 +9,8 @@ use crate::{Real, Shape, Tape};
 impl<T: Real> Tape<'_, T> {
     /// Records `x` with the new shape `dims`: the same values in the same row-major order,
     /// like PyTorch's `reshape` on a contiguous tensor. The gradient is the output's
-    /// gradient with `x`'s shape. The value is copied, so it never aliases `x`.
+    /// gradient with `x`'s shape. The value is copied, so it never aliases `x`. Every length
+    /// is given: there is no `-1` to infer one.
     ///
     /// # Panics
     ///
@@ -34,10 +35,13 @@ impl<T: Real> Tape<'_, T> {
             "reshape: {dims:?} has more than {} dimensions",
             Shape::MAX_RANK
         );
-        let wanted = dims
-            .iter()
-            .try_fold(1usize, |n, &d| n.checked_mul(d))
-            .filter(|&n| n == shape.len());
+        // Any length of 0 makes the count 0, however large the others.
+        let count = if dims.contains(&0) {
+            Some(0)
+        } else {
+            dims.iter().try_fold(1usize, |n, &d| n.checked_mul(d))
+        };
+        let wanted = count.filter(|&n| n == shape.len());
         if wanted.is_none() {
             panic!(
                 "reshape: shape {:?} holds {} values, {dims:?} does not",
@@ -52,7 +56,7 @@ impl<T: Real> Tape<'_, T> {
 
     /// Records `x` with its axes reordered: output axis `i` is input axis `axes[i]`, like
     /// PyTorch's `permute`. The gradient moves the output's gradient back to each value's
-    /// place in `x`.
+    /// place in `x`. Axes count from 0; there are no negative axes.
     ///
     /// # Panics
     ///
@@ -95,12 +99,14 @@ impl<T: Real> Tape<'_, T> {
     }
 
     /// Records `x` with axes `a` and `b` swapped, like PyTorch's `transpose`: a
-    /// [`permute`](Tape::permute) that exchanges two axes and keeps the rest in place.
+    /// [`permute`](Tape::permute) that exchanges two axes and keeps the rest in place. Axes
+    /// count from 0; there are no negative axes. As in PyTorch, a rank-0 value takes
+    /// `transpose(x, 0, 0)`, which changes nothing.
     ///
     /// # Panics
     ///
     /// Panics, naming `transpose`, the axes and the shape, if `a` or `b` is not an axis of
-    /// `x`, or if `x` was not recorded on this tape.
+    /// `x` (or, for a rank-0 value, is not 0), or if `x` was not recorded on this tape.
     ///
     /// ```
     /// use cavitation_core::{Graph, ParamStore, Tensor};
@@ -115,7 +121,7 @@ impl<T: Real> Tape<'_, T> {
     pub fn transpose(&mut self, x: Var, a: usize, b: usize) -> Var {
         let shape = self.shape(x);
         let rank = shape.rank();
-        if a >= rank || b >= rank {
+        if a >= rank.max(1) || b >= rank.max(1) {
             panic!(
                 "transpose: axes {a} and {b} are not both axes of shape {:?}",
                 shape.dims()
@@ -125,14 +131,16 @@ impl<T: Real> Tape<'_, T> {
         for (i, v) in axes.iter_mut().enumerate().take(rank) {
             *v = i;
         }
-        axes.swap(a, b);
+        if rank > 0 {
+            axes.swap(a, b);
+        }
         self.permute(x, &axes[..rank])
     }
 }
 
 /// Moves the values of `src` (shape `shape`) to `dst` with the axes reordered by `axes`, as
 /// [`Tape::permute`] records it. With `back`, `src` is in the permuted order and the values
-/// go to their places in `shape`'s order instead; `add` adds into `dst` rather than writing.
+/// go to their places in `shape`'s order instead.
 fn permute_into<T: Real>(src: &[T], shape: &Shape, axes: &[usize], dst: &mut [T], back: bool) {
     permute_with(src, shape, axes, dst, back, |d, s| *d = s);
 }
@@ -316,6 +324,36 @@ mod tests {
         let mut tape = graph.tape(&store.values);
         let x = tape.input(Tensor::from_vec(vec![0.0f32; 6], &[2, 3]).unwrap().view());
         tape.transpose(x, 0, 2);
+    }
+
+    /// A rank-0 value permutes with no axes, transposes with axes 0 and 0, and reshapes to
+    /// and from one value, its gradient passing through each.
+    #[test]
+    fn rank_zero_values_pass_through() {
+        let mut params = ParamStore::new();
+        let p = params.add(Tensor::from_vec(vec![3.0f32], &[]).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let x = tape.param(p);
+        let y = tape.permute(x, &[]);
+        let z = tape.transpose(y, 0, 0);
+        let one = tape.reshape(z, &[1, 1]);
+        let back = tape.reshape(one, &[]);
+        assert_eq!(tape.shape(back).rank(), 0);
+        assert_eq!(tape.value(back).data(), &[3.0]);
+        tape.backward(back, &mut params.grads);
+        assert_eq!(params.grad(p).data(), &[1.0]);
+    }
+
+    /// A shape with a zero length holds no values, so it takes an empty value.
+    #[test]
+    fn a_zero_length_counts_no_values() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.input(Tensor::from_vec(Vec::<f32>::new(), &[0]).unwrap().view());
+        let y = tape.reshape(x, &[0, 7]);
+        assert_eq!(tape.shape(y).dims(), &[0, 7]);
     }
 
     /// Empty values pass through, with the new shape.
