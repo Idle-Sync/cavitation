@@ -141,6 +141,7 @@ impl std::error::Error for CudaError {}
 
 #[cfg(test)]
 mod tests {
+    //! The errors' messages: a missing library says what to install, and a failed call names its function.
     use super::*;
 
     /// A missing library's message names the file, what to install, the variable to set

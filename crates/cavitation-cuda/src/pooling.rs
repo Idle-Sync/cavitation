@@ -795,6 +795,7 @@ impl<'c> AdaptiveAvgPool2d<'c> {
 
 #[cfg(test)]
 mod tests {
+    //! Pooling shapes, without a card: they are refused as the CPU refuses them.
     use super::*;
     use cavitation_core::Pool2dGeom;
 
