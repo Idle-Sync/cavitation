@@ -737,8 +737,8 @@ def make_batch_norm():
 
 
 def make_structure():
-    """reshape, permute and transpose: values moved without arithmetic. Built after every
-    other case, so its draws shift none of their inputs.
+    """reshape, permute, transpose, slice, concat and index_select: values moved without
+    arithmetic. Built after every other case, so its draws shift none of their inputs.
     """
     for shape, to in [((3, 5), (5, 3)), ((2, 3, 4), (6, 4)), ((2, 3, 4, 5), (4, 30))]:
         params = {"shape": list(to)}
@@ -752,6 +752,23 @@ def make_structure():
         params = {"a": a, "b": b}
         name = f"transpose-{shape_name(shape)}-{a}{b}"
         add_case(name, "transpose", params, [rnd(*shape)], lambda x, a=a, b=b: x.transpose(a, b))
+    for shape, axis, start, end in [((5, 6), 1, 2, 5), ((4, 3, 5), 0, 1, 3), ((2, 3, 4, 5), 2, 0, 1)]:
+        params = {"axis": axis, "start": start, "end": end}
+        name = f"slice-{shape_name(shape)}-axis{axis}-{start}to{end}"
+        add_case(
+            name, "slice", params, [rnd(*shape)], lambda x, a=axis, s=start, e=end: x.narrow(a, s, e - s)
+        )
+    for shapes, axis in [([(3, 2), (3, 4)], 1), ([(1, 5), (2, 5), (3, 5)], 0), ([(2, 3, 4), (2, 1, 4)], 1)]:
+        params = {"axis": axis}
+        name = f"concat-{'-'.join(shape_name(s) for s in shapes)}-axis{axis}"
+        add_case(name, "concat", params, [rnd(*s) for s in shapes], lambda *xs, a=axis: torch.cat(xs, a))
+    for shape, axis, indices in [((5, 3), 0, [4, 0, 4, 2]), ((3, 6), 1, [5, 5, 1]), ((2, 4, 3), 1, [3, 0])]:
+        params = {"axis": axis, "indices": indices}
+        name = f"index-select-{shape_name(shape)}-axis{axis}-{len(indices)}"
+        index = torch.tensor(indices)
+        add_case(
+            name, "index_select", params, [rnd(*shape)], lambda x, a=axis, i=index: torch.index_select(x, a, i)
+        )
 
 
 def write_state_dict(crates_dir):

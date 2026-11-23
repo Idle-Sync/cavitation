@@ -62,7 +62,7 @@ fn allocations() -> usize {
 }
 
 /// Builds the same small graphs 12 times, with backward passes (`keep_where`, `reshape`,
-/// `permute` and `transpose` among them), a
+/// `permute`, `transpose`, `slice`, `concat` and `index_select` among them), a
 /// forward-only tape of larger tensors and `zero_grad` each step. Returns the allocations made
 /// during steps 3 to 12.
 fn tape_steady_state() -> usize {
@@ -158,13 +158,19 @@ fn tape_steady_state() -> usize {
         }
         {
             // reshape, permute and transpose, forward and backward: the [3, 4] parameter
-            // reshaped to [2, 6], permuted to [6, 2], transposed back to [2, 6], summed.
+            // reshaped to [2, 6], permuted to [6, 2], transposed back to [2, 6].
             let mut tape = graph.tape(&store.values);
             let p = tape.param(big);
             let r = tape.reshape(p, &[2, 6]);
             let q = tape.permute(r, &[1, 0]);
             let t = tape.transpose(q, 0, 1);
-            let loss = tape.sum(t);
+            // slice and concat: the two halves of the columns joined back in reverse.
+            let left = tape.slice(t, 1, 0, 3);
+            let right = tape.slice(t, 1, 3, 6);
+            let joined = tape.concat(&[right, left], 1);
+            // index_select with a repeated row, as an embedding lookup reads its table.
+            let rows = tape.index_select(joined, 0, &[1, 0, 1]);
+            let loss = tape.sum(rows);
             tape.backward(loss, &mut store.grads);
             sink += tape.value(loss).data()[0];
         }

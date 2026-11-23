@@ -1,4 +1,5 @@
-//! Operations that move values without arithmetic: `reshape`, `permute` and `transpose`.
+//! Operations that move values without arithmetic: `reshape`, `permute`, `transpose`,
+//! `slice`, `concat` and `index_select`.
 //! Each output holds exactly its input's values, so the forward pass and the backward pass
 //! are exact, the same bits on every kernel level.
 
@@ -138,6 +139,198 @@ impl<T: Real> Tape<'_, T> {
     }
 }
 
+impl<T: Real> Tape<'_, T> {
+    /// Records the part of `x` from `start` up to (not including) `end` along `axis`, like
+    /// PyTorch's `x.narrow(axis, start, end - start)` or `x[..., start:end, ...]`. The
+    /// gradient of `x` is the output's gradient in that range and 0 elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming `slice`, the range and the shape, if `axis` is not an axis of `x` or the
+    /// range is not within it (`start <= end <= len`), or if `x` was not recorded on this
+    /// tape.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let x = tape.input(Tensor::from_vec((0..12).map(|v| v as f32).collect(), &[3, 4]).unwrap().view());
+    /// let y = tape.slice(x, 1, 1, 3);
+    /// assert_eq!(tape.shape(y).dims(), &[3, 2]);
+    /// assert_eq!(tape.value(y).data(), &[1.0, 2.0, 5.0, 6.0, 9.0, 10.0]);
+    /// ```
+    pub fn slice(&mut self, x: Var, axis: usize, start: usize, end: usize) -> Var {
+        let shape = self.shape(x);
+        if axis >= shape.rank() || start > end || end > shape.dims()[axis] {
+            panic!(
+                "slice: {start}..{end} along axis {axis} is not within shape {:?}",
+                shape.dims()
+            );
+        }
+        let (outer, n, inner) = around(&shape, axis);
+        let m = end - start;
+        let mut dims = [0usize; Shape::MAX_RANK];
+        dims[..shape.rank()].copy_from_slice(shape.dims());
+        dims[axis] = m;
+        let out_shape = Shape::new(&dims[..shape.rank()]);
+        let mut out = self.take_buffer(out_shape.len());
+        let src = self.data(x);
+        for o in 0..outer {
+            out[o * m * inner..][..m * inner]
+                .copy_from_slice(&src[(o * n + start) * inner..][..m * inner]);
+        }
+        self.push(Op::Slice(x, axis, start), out_shape, out)
+    }
+
+    /// Records the values of `xs` joined along `axis`, in order, like PyTorch's
+    /// `torch.cat(xs, axis)`. Every value has the same rank and the same lengths on every
+    /// other axis. Each input's gradient is its part of the output's gradient. One value may
+    /// appear more than once; its gradient then adds each part.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming `concat`, the axis and the shapes, if `xs` is empty, if `axis` is not
+    /// an axis of the values, or if the values differ in rank or on another axis; or if one of
+    /// them was not recorded on this tape.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let a = tape.input(Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0], &[2, 2]).unwrap().view());
+    /// let b = tape.input(Tensor::from_vec(vec![5.0f32, 6.0], &[2, 1]).unwrap().view());
+    /// let y = tape.concat(&[a, b], 1);
+    /// assert_eq!(tape.shape(y).dims(), &[2, 3]);
+    /// assert_eq!(tape.value(y).data(), &[1.0, 2.0, 5.0, 3.0, 4.0, 6.0]);
+    /// ```
+    pub fn concat(&mut self, xs: &[Var], axis: usize) -> Var {
+        let Some(&first) = xs.first() else {
+            panic!("concat: no values to join along axis {axis}");
+        };
+        let shape = self.shape(first);
+        let rank = shape.rank();
+        if axis >= rank {
+            panic!(
+                "concat: axis {axis} is not an axis of shape {:?}",
+                shape.dims()
+            );
+        }
+        let mut total = 0usize;
+        for &x in xs {
+            let other = self.shape(x);
+            let fits = other.rank() == rank
+                && (0..rank).all(|d| d == axis || other.dims()[d] == shape.dims()[d]);
+            if !fits {
+                panic!(
+                    "concat: shape {:?} does not join shape {:?} along axis {axis}",
+                    other.dims(),
+                    shape.dims()
+                );
+            }
+            total = total
+                .checked_add(other.dims()[axis])
+                .unwrap_or_else(|| panic!("concat: the joined axis {axis} overflows"));
+        }
+        let mut dims = [0usize; Shape::MAX_RANK];
+        dims[..rank].copy_from_slice(shape.dims());
+        dims[axis] = total;
+        let out_shape = Shape::new(&dims[..rank]);
+        let (outer, _, inner) = around(&out_shape, axis);
+        let mut out = self.take_buffer(out_shape.len());
+        let mut at = 0;
+        for &x in xs {
+            let n = self.shape(x).dims()[axis];
+            let src = self.data(x);
+            for o in 0..outer {
+                out[(o * total + at) * inner..][..n * inner]
+                    .copy_from_slice(&src[o * n * inner..][..n * inner]);
+            }
+            at += n;
+        }
+        let start = self.push_labels(&[axis, xs.len()]);
+        for &x in xs {
+            self.push_labels(&x.to_words());
+        }
+        self.push(Op::Concat(start), out_shape, out)
+    }
+}
+
+impl<T: Real> Tape<'_, T> {
+    /// Records the slices of `x` along `axis` at `indices`, in their order, like PyTorch's
+    /// `torch.index_select(x, axis, indices)`: output position `i` along `axis` is `x`'s
+    /// position `indices[i]`. An index may repeat. The gradient adds each output slice's
+    /// gradient into the slice it came from, in the order of `indices`, so a repeated index
+    /// gets the same bits on every run. With `axis` 0 and a `[vocabulary, width]` weight this
+    /// is an embedding lookup.
+    ///
+    /// (PyTorch's `torch.gather` is another operation, which picks one value per output
+    /// element.)
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming `index_select`, the index and the shape, if `axis` is not an axis of
+    /// `x` or an index is not below the axis's length, or if `x` was not recorded on this
+    /// tape.
+    ///
+    /// ```
+    /// use cavitation_core::{Graph, ParamStore, Tensor};
+    /// let store = ParamStore::new();
+    /// let mut graph = Graph::new();
+    /// let mut tape = graph.tape(&store.values);
+    /// let table = Tensor::from_vec(vec![0.0f32, 0.5, 1.0, 1.5, 2.0, 2.5], &[3, 2]).unwrap();
+    /// let x = tape.input(table.view());
+    /// let rows = tape.index_select(x, 0, &[2, 0, 2]);
+    /// assert_eq!(tape.shape(rows).dims(), &[3, 2]);
+    /// assert_eq!(tape.value(rows).data(), &[2.0, 2.5, 0.0, 0.5, 2.0, 2.5]);
+    /// ```
+    pub fn index_select(&mut self, x: Var, axis: usize, indices: &[usize]) -> Var {
+        let shape = self.shape(x);
+        if axis >= shape.rank() {
+            panic!(
+                "index_select: axis {axis} is not an axis of shape {:?}",
+                shape.dims()
+            );
+        }
+        let (outer, n, inner) = around(&shape, axis);
+        if let Some(&bad) = indices.iter().find(|&&i| i >= n) {
+            panic!(
+                "index_select: index {bad} is not below the length {n} of axis {axis} of shape \
+                 {:?}",
+                shape.dims()
+            );
+        }
+        let m = indices.len();
+        let mut dims = [0usize; Shape::MAX_RANK];
+        dims[..shape.rank()].copy_from_slice(shape.dims());
+        dims[axis] = m;
+        let out_shape = Shape::new(&dims[..shape.rank()]);
+        let mut out = self.take_buffer(out_shape.len());
+        let src = self.data(x);
+        for o in 0..outer {
+            for (i, &k) in indices.iter().enumerate() {
+                out[(o * m + i) * inner..][..inner]
+                    .copy_from_slice(&src[(o * n + k) * inner..][..inner]);
+            }
+        }
+        let start = self.push_labels(&[axis, m]);
+        self.push_labels(indices);
+        self.push(Op::IndexSelect(x, start), out_shape, out)
+    }
+}
+
+/// Splits `shape` around `axis` into `(outer, n, inner)`: the product of the lengths before
+/// the axis, its length, and the product of the lengths after it.
+fn around(shape: &Shape, axis: usize) -> (usize, usize, usize) {
+    let dims = shape.dims();
+    (
+        dims[..axis].iter().product(),
+        dims[axis],
+        dims[axis + 1..].iter().product(),
+    )
+}
+
 /// Moves the values of `src` (shape `shape`) to `dst` with the axes reordered by `axes`, as
 /// [`Tape::permute`] records it. With `back`, `src` is in the permuted order and the values
 /// go to their places in `shape`'s order instead.
@@ -224,6 +417,100 @@ pub(super) fn permute_backward<T: Real>(
                 permute_into(out_grad, &shape, axes, buf, true);
             } else {
                 permute_with(out_grad, &shape, axes, buf, true, |d, g| *d += g);
+            }
+        });
+    }
+}
+
+/// Backward of `slice`: the output's gradient into its range of `x`'s, 0 elsewhere.
+pub(super) fn slice_backward<T: Real>(
+    x: Var,
+    axis: usize,
+    start: usize,
+    out_grad: &[T],
+    ctx: &mut BackwardCtx<'_, T>,
+) {
+    let shape = ctx.shape(x);
+    let (outer, n, inner) = around(&shape, axis);
+    let m = out_grad.len().checked_div(outer * inner).unwrap_or(0);
+    if let Some(slot) = ctx.slot(x) {
+        slot.update_with(|buf, beta| {
+            if beta == T::ZERO {
+                buf.fill(T::ZERO);
+            }
+            for o in 0..outer {
+                let dst = &mut buf[(o * n + start) * inner..][..m * inner];
+                for (d, &g) in dst.iter_mut().zip(&out_grad[o * m * inner..][..m * inner]) {
+                    *d += g;
+                }
+            }
+        });
+    }
+}
+
+/// Backward of `concat`: each input's part of the output's gradient, through the axis and
+/// the inputs kept in the labels from `start`.
+pub(super) fn concat_backward<T: Real>(start: usize, out_grad: &[T], ctx: &mut BackwardCtx<'_, T>) {
+    let labels = ctx.labels();
+    let (axis, count) = (labels[start], labels[start + 1]);
+    let inputs = &labels[start + 2..][..2 * count];
+    let mut total = 0;
+    for pair in inputs.as_chunks::<2>().0 {
+        total += ctx.shape(Var::from_words(pair)).dims()[axis];
+    }
+    let mut at = 0;
+    for pair in inputs.as_chunks::<2>().0 {
+        let x = Var::from_words(pair);
+        let shape = ctx.shape(x);
+        let (outer, n, inner) = around(&shape, axis);
+        if let Some(slot) = ctx.slot(x) {
+            slot.update_with(|buf, beta| {
+                for o in 0..outer {
+                    let src = &out_grad[(o * total + at) * inner..][..n * inner];
+                    let dst = &mut buf[o * n * inner..][..n * inner];
+                    if beta == T::ZERO {
+                        dst.copy_from_slice(src);
+                    } else {
+                        for (d, &g) in dst.iter_mut().zip(src) {
+                            *d += g;
+                        }
+                    }
+                }
+            });
+        }
+        at += n;
+    }
+}
+
+/// Backward of `index_select`: each output slice's gradient added into the slice of `x` it
+/// came from, in the order of the indices kept in the labels from `start`; 0 for a slice no
+/// index chose.
+pub(super) fn index_select_backward<T: Real>(
+    x: Var,
+    start: usize,
+    out_grad: &[T],
+    ctx: &mut BackwardCtx<'_, T>,
+) {
+    let labels = ctx.labels();
+    let (axis, m) = (labels[start], labels[start + 1]);
+    let indices = &labels[start + 2..][..m];
+    let shape = ctx.shape(x);
+    let (outer, n, inner) = around(&shape, axis);
+    if let Some(slot) = ctx.slot(x) {
+        slot.update_with(|buf, beta| {
+            if beta == T::ZERO {
+                buf.fill(T::ZERO);
+            }
+            for o in 0..outer {
+                for (i, &k) in indices.iter().enumerate() {
+                    let dst = &mut buf[(o * n + k) * inner..][..inner];
+                    for (d, &g) in dst
+                        .iter_mut()
+                        .zip(&out_grad[(o * m + i) * inner..][..inner])
+                    {
+                        *d += g;
+                    }
+                }
             }
         });
     }
@@ -354,6 +641,160 @@ mod tests {
         let x = tape.input(Tensor::from_vec(Vec::<f32>::new(), &[0]).unwrap().view());
         let y = tape.reshape(x, &[0, 7]);
         assert_eq!(tape.shape(y).dims(), &[0, 7]);
+    }
+
+    /// A slice of the middle axis keeps its range, and its gradient is the output's there and
+    /// 0 elsewhere: two backward passes without `zero_grad` add 1 twice inside the range and
+    /// leave 0 outside it.
+    #[test]
+    fn slice_takes_its_range_and_zeroes_the_rest() {
+        let mut params = ParamStore::new();
+        let p =
+            params.add(Tensor::from_vec((0..24).map(|v| v as f32).collect(), &[2, 3, 4]).unwrap());
+        let mut graph = Graph::new();
+        for _ in 0..2 {
+            let mut tape = graph.tape(&params.values);
+            let x = tape.param(p);
+            let y = tape.slice(x, 1, 1, 3);
+            assert_eq!(tape.shape(y).dims(), &[2, 2, 4]);
+            let want: Vec<f32> = [4, 5, 6, 7, 8, 9, 10, 11, 16, 17, 18, 19, 20, 21, 22, 23]
+                .map(|v| v as f32)
+                .to_vec();
+            assert_eq!(tape.value(y).data(), &want[..]);
+            let loss = tape.sum(y);
+            tape.backward(loss, &mut params.grads);
+        }
+        let g = params.grad(p).data();
+        for (i, &v) in g.iter().enumerate() {
+            let inside = (i / 4) % 3 != 0;
+            assert_eq!(v, if inside { 2.0 } else { 0.0 }, "element {i}");
+        }
+    }
+
+    /// Joining a value with itself and another adds both parts into its gradient.
+    #[test]
+    fn concat_adds_a_repeated_input() {
+        let mut params = ParamStore::new();
+        let a = params.add(Tensor::from_vec(vec![1.0f32, 2.0], &[2, 1]).unwrap());
+        let b = params.add(Tensor::from_vec(vec![3.0f32, 4.0, 5.0, 6.0], &[2, 2]).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let (xa, xb) = (tape.param(a), tape.param(b));
+        let y = tape.concat(&[xa, xb, xa], 1);
+        assert_eq!(tape.shape(y).dims(), &[2, 4]);
+        assert_eq!(
+            tape.value(y).data(),
+            &[1.0, 3.0, 4.0, 1.0, 2.0, 5.0, 6.0, 2.0]
+        );
+        let w = tape.input(
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4])
+                .unwrap()
+                .view(),
+        );
+        let weighted = tape.mul(y, w);
+        let loss = tape.sum(weighted);
+        tape.backward(loss, &mut params.grads);
+        assert_eq!(params.grad(a).data(), &[1.0 + 4.0, 5.0 + 8.0]);
+        assert_eq!(params.grad(b).data(), &[2.0, 3.0, 6.0, 7.0]);
+    }
+
+    /// A range past the axis is refused.
+    #[test]
+    #[should_panic(expected = "slice: 2..5 along axis 1 is not within shape [2, 3]")]
+    fn slice_refuses_a_range_past_the_axis() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.input(Tensor::from_vec(vec![0.0f32; 6], &[2, 3]).unwrap().view());
+        tape.slice(x, 1, 2, 5);
+    }
+
+    /// Values that differ off the joined axis are refused.
+    #[test]
+    #[should_panic(expected = "concat: shape [3, 2] does not join shape [2, 2] along axis 1")]
+    fn concat_refuses_another_length() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let a = tape.input(Tensor::from_vec(vec![0.0f32; 4], &[2, 2]).unwrap().view());
+        let b = tape.input(Tensor::from_vec(vec![0.0f32; 6], &[3, 2]).unwrap().view());
+        tape.concat(&[a, b], 1);
+    }
+
+    /// An empty list is refused.
+    #[test]
+    #[should_panic(expected = "concat: no values to join along axis 0")]
+    fn concat_refuses_no_values() {
+        let store = ParamStore::<f32>::new_generic();
+        let mut graph = Graph::new_generic();
+        let mut tape = graph.tape(&store.values);
+        tape.concat(&[], 0);
+    }
+
+    /// Repeated indices add their gradients into one row, in index order; a row no index
+    /// chose gets 0.
+    #[test]
+    fn index_select_adds_repeated_rows() {
+        let mut params = ParamStore::new();
+        let p = params.add(Tensor::from_vec((0..8).map(|v| v as f32).collect(), &[4, 2]).unwrap());
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&params.values);
+        let x = tape.param(p);
+        let y = tape.index_select(x, 0, &[3, 1, 3, 3]);
+        assert_eq!(
+            tape.value(y).data(),
+            &[6.0, 7.0, 2.0, 3.0, 6.0, 7.0, 6.0, 7.0]
+        );
+        let w = tape.input(
+            Tensor::from_vec(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[4, 2])
+                .unwrap()
+                .view(),
+        );
+        let weighted = tape.mul(y, w);
+        let loss = tape.sum(weighted);
+        tape.backward(loss, &mut params.grads);
+        assert_eq!(
+            params.grad(p).data(),
+            &[
+                0.0,
+                0.0,
+                3.0,
+                4.0,
+                0.0,
+                0.0,
+                1.0 + 5.0 + 7.0,
+                2.0 + 6.0 + 8.0
+            ]
+        );
+    }
+
+    /// Selection along an inner axis takes columns.
+    #[test]
+    fn index_select_takes_columns() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.input(
+            Tensor::from_vec((0..6).map(|v| v as f32).collect(), &[2, 3])
+                .unwrap()
+                .view(),
+        );
+        let y = tape.index_select(x, 1, &[2, 0]);
+        assert_eq!(tape.shape(y).dims(), &[2, 2]);
+        assert_eq!(tape.value(y).data(), &[2.0, 0.0, 5.0, 3.0]);
+        let none = tape.index_select(x, 1, &[]);
+        assert_eq!(tape.shape(none).dims(), &[2, 0]);
+    }
+
+    /// An index past the axis is refused.
+    #[test]
+    #[should_panic(expected = "index_select: index 3 is not below the length 3 of axis 1")]
+    fn index_select_refuses_an_index_past_the_axis() {
+        let store = ParamStore::new();
+        let mut graph = Graph::new();
+        let mut tape = graph.tape(&store.values);
+        let x = tape.input(Tensor::from_vec(vec![0.0f32; 6], &[2, 3]).unwrap().view());
+        tape.index_select(x, 1, &[0, 3]);
     }
 
     /// Empty values pass through, with the new shape.
