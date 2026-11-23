@@ -5,6 +5,7 @@
 
 use cavitation_cuda::Cuda;
 
+/// Prints the card and the libraries loaded, or what is missing and what to install.
 fn main() {
     match Cuda::open() {
         Ok(cuda) => {

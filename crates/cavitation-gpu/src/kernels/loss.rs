@@ -163,8 +163,8 @@ fn reciprocal(n: u64) -> f32 {
 /// Each row runs in one thread. It takes the row's maximum, then `ln Σ e^(z − max)` as
 /// `ln(1 + e)` with `e` the sum without the first maximum's term, then its loss and gradient.
 /// For `e ≤ 1` the logarithm comes from the series of `2·atanh(e / (2 + e))`, so a confident
-/// row's small loss keeps its relative accuracy; the CPU rounds `1 + e` to `f32` first, so
-/// on such rows it can sit below the exact loss where this kernel does not. The row losses' mean is a per-channel sum in a fixed tree, divided by
+/// row's small loss keeps its relative accuracy, as the CPU's `ln_1p` of the same sum does.
+/// The row losses' mean is a per-channel sum in a fixed tree, divided by
 /// the batch rounded to `f32`. A row with a NaN or infinite logit, or a label not below the
 /// classes, gives a NaN loss and a NaN gradient row, so the step's finite flag is set. The
 /// CPU would give a finite loss for a −∞ logit off the label, and panics on a bad label;

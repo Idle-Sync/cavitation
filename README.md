@@ -4,7 +4,7 @@ A fast, glass-box neural network library in Rust. Every value, local derivative 
 
 ## What it is
 
-Cavitation trains and runs small and medium neural networks on the CPU, inside a Rust program, with no Python and one direct runtime dependency (`safetensors`, for saving and loading weights).
+Cavitation trains and runs small and medium neural networks inside a Rust program, with no Python. It runs on the CPU with one direct runtime dependency (`safetensors`, for saving and loading weights), and with the `gpu` or `cuda` feature the same `fit` trains on a GPU (see [Choosing a device](#choosing-a-device)).
 
 - **Glass box.** A training step is a tape of recorded operations you can read. Hooks on any layer show its input z, its output a, the local derivative f′(z), and the gradients ∂L/∂a and ∂L/∂z. Neuron masks turn single neurons off in both the forward and the backward pass.
 - **Checked.** Every operation passes a numerical gradient check (central differences in `f64`) and a comparison with PyTorch on stored fixtures. Every fast kernel has a plain reference version, and tests check that the two agree. Known-result tests train real networks with fixed seeds and check the accuracy.
@@ -37,15 +37,19 @@ cavitation = { git = "https://github.com/Idle-Sync/cavitation" }
 
 It needs Rust 1.99 or newer.
 
-Two features choose the optional parts:
+Four features choose the optional parts:
 
 - `ml` (on by default) adds `cavitation::cavitation_ml`: least squares, `LinearRegression` and `LogisticRegression`.
 - `inspect` (off by default) adds `cavitation::cavitation_inspect`: the inspector.
+- `gpu` (off by default) adds `cavitation::cavitation_gpu` and `Device::Gpu`: training and inference on a GPU through Vulkan, DX12 or Metal (wgpu).
+- `cuda` (off by default) adds `cavitation::cavitation_cuda` and `Device::Cuda`: training and inference on an NVIDIA card through CUDA, cuDNN and cuBLAS, loaded when the program runs.
 
 ```toml
 [dependencies]
 # With the inspector:
 cavitation = { git = "https://github.com/Idle-Sync/cavitation", features = ["inspect"] }
+# Or with training on a GPU:
+# cavitation = { git = "https://github.com/Idle-Sync/cavitation", features = ["gpu"] }
 # Or only the neural network parts, without the classic models:
 # cavitation = { git = "https://github.com/Idle-Sync/cavitation", default-features = false }
 ```
@@ -265,6 +269,7 @@ cargo run --release --example mnist -p cavitation    # fit on MNIST with Adam an
 cargo run --release --example mnist_cnn -p cavitation      # a LeNet-5-style CNN on MNIST
 cargo run --release --example load_torch_cnn -p cavitation # load a PyTorch CNN with batch norm, compare outputs
 cargo run --release --example steering_cnn -p cavitation   # read a road edge's angle from synthetic images
+cargo run --release --example gpu_digits -p cavitation --features gpu  # the digits on the CPU, then on a GPU
 ```
 
 The digits, Concrete and Breast Cancer data ship in the repository. MNIST is downloaded by its script, and CIFAR-10 (binary version, 50,000 training and 10,000 test images of 32 by 32 pixels in three colours) by `scripts/data/get-cifar10.sh` into `data/cifar10/`; `cavitation_datasets::cifar10::load` reads it, for the benchmark below.
@@ -324,14 +329,16 @@ This runs the gradient checks, the PyTorch fixture comparisons on every kernel l
 
 ## Guide
 
-The guide is in `book/`, in six chapters:
+The guide is in `book/`, in eight chapters:
 
 - "Backprop by hand" works through the XOR network's forward pass, local derivatives and gradients and reads each of them through hooks.
 - "Shrinking a network" finds how many neurons the digits network can do without and removes them.
 - "Watching a network train" runs the inspector on the digits network, reads each panel of the page, and measures what watching costs.
 - "Regression, exactly and by gradient" fits linear and logistic regression both ways and shows why the two meet.
+- "Measuring a classifier" trains a digits classifier, reads its confusion matrix and classification report, then asks one class as a yes-or-no question and compares the result with the baseline that accuracy flatters.
 - "Coming from PyTorch" lists what matches PyTorch, so a model moved between the two gives the same outputs, and where a PyTorch habit gives a different answer or none.
 - "Image models" covers the row layout of images, a CNN on MNIST, dropout and batch norm in training and evaluation, loading a CNN with batch norm from PyTorch, and a steering model trained on synthetic road images.
+- "Training on a GPU" chooses a device for `fit`, says what a GPU run gives back and how close it is to the CPU's, what a GPU does not train yet, and when a GPU is not worth it.
 
 Build it with [mdBook](https://rust-lang.github.io/mdBook/):
 

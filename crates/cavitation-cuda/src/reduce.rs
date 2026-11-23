@@ -114,6 +114,7 @@ impl ChannelDims {
 
 #[cfg(test)]
 mod tests {
+    //! The per-channel shape's checks, without a card.
     use super::*;
 
     /// The shapes the kernels take, and the three refusals.

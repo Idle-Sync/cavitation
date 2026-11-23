@@ -795,6 +795,7 @@ impl<'c> DeadRelu<'c> {
 
 #[cfg(test)]
 mod tests {
+    //! The health kernels' host-side checks, without a card.
     use super::*;
 
     /// Tensors one after another: their starts, and the two refusals.

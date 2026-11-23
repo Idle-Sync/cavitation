@@ -288,6 +288,7 @@ fn check_buffers(buffers: &[(&DeviceBuffer<'_>, &str, usize)]) {
 
 #[cfg(test)]
 mod tests {
+    //! The gates' list, without a card.
     use super::*;
 
     /// `ALL` lists every gate and every pass once, in declaration order, so `as usize`
