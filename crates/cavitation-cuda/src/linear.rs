@@ -379,6 +379,7 @@ impl<'c> Linear<'c> {
 
 #[cfg(test)]
 mod tests {
+    //! The fully connected layer's buffer lengths, without a card.
     use super::*;
 
     /// The lengths are the row-major matrices' element counts.

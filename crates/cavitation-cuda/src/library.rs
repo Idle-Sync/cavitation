@@ -239,6 +239,7 @@ mod os {
 
 #[cfg(test)]
 mod tests {
+    //! Opening a library: a relative path is refused, and a missing file is an error.
     use super::*;
 
     /// A relative path is refused before the loader sees it, so the folder the program

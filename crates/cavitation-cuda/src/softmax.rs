@@ -225,6 +225,7 @@ impl<'c> RowSoftmax<'c> {
 
 #[cfg(test)]
 mod tests {
+    //! The row operations' list, without a card.
     use super::*;
 
     /// `ALL` lists every operation once, in declaration order, so `op as usize` indexes it.

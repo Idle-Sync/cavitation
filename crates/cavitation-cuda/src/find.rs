@@ -233,6 +233,7 @@ pub(crate) fn cudnn_parts(platform: Platform, cudnn: &Path) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    //! Where the libraries are looked for and what their files are called, on temporary folders.
     use super::*;
 
     /// A new, empty folder under the system's temporary one, removed when dropped.

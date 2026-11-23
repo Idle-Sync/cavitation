@@ -394,6 +394,7 @@ pub fn devices() -> Result<Vec<DeviceEntry>, Error> {
 
 #[cfg(test)]
 mod tests {
+    //! Choosing a device: `CAVITATION_DEVICE` and the order `Device::Auto` tries the devices in.
     use super::*;
 
     /// An entry of `kind`, available or not.

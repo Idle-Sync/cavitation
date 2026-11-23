@@ -762,6 +762,7 @@ impl<'c> OptimizerKernel<'c> {
 
 #[cfg(test)]
 mod tests {
+    //! The optimiser's constants, without a card: a beta that rounds to 1 in `f32` is refused, and a moment of a constant input settles on it.
     use super::{OptimizerRule, shared_constants};
     use crate::error::CudaError;
 

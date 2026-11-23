@@ -449,6 +449,48 @@ thread_local! {
     };
 }
 
+/// The lines of the largest block of `B`, and of one slot's largest block of `A`, that kernel
+/// `K` packs: what [`packed`] reserves on a thread's first call.
+fn largest_blocks<K: Kernel>() -> (usize, usize) {
+    let b = (K::KC * K::NC.next_multiple_of(K::NR)).div_ceil(16);
+    let a = (K::MC.div_ceil(K::MR) * K::MR * K::KC * K::A_REP).div_ceil(16);
+    (b, a)
+}
+
+/// Reserves room, without filling it, in this thread's packing buffers for the largest blocks
+/// any packed kernel of this build packs, with one `A` slot per thread of the larger of the
+/// current thread count ([`super::threads`], which a convolution's GEMM asks for) and
+/// `threads`, the thread count of the pool call that starts the worker. The pool calls it
+/// when a worker starts, so the first GEMM a worker runs inside a
+/// task (a convolution's per-image GEMM can run on any worker, and which worker takes which
+/// task depends on timing) only fills room it already has, and allocates nothing: a training
+/// run's warm-up epoch need not have sent such a task to every worker. The room is reserved,
+/// not written, so a worker that never runs a GEMM never touches it. A GEMM inside a task that
+/// asks for more threads than both (an explicit count to [`gemm_f32_with`], or a thread count
+/// raised by [`super::set_threads`] after the workers started) grows the `A` buffer on its
+/// worker's first such call, as on any thread.
+pub(super) fn reserve_for_worker(threads: usize) {
+    #[cfg(target_arch = "x86_64")]
+    let (b, a) = {
+        let (sse, avx) = (
+            largest_blocks::<super::x86::Sse>(),
+            largest_blocks::<super::x86::Avx2>(),
+        );
+        (sse.0.max(avx.0), sse.1.max(avx.1))
+    };
+    #[cfg(target_arch = "aarch64")]
+    let (b, a) = largest_blocks::<super::aarch64::Neon>();
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let (b, a) = (0, 0);
+    let slots = super::threads().max(threads).min(pool::MAX_THREADS);
+    SCRATCH.with_borrow_mut(|scratch| {
+        scratch.b.reserve_exact(b.saturating_sub(scratch.b.len()));
+        scratch
+            .a
+            .reserve_exact((slots * a).saturating_sub(scratch.a.len()));
+    });
+}
+
 /// Grows `v` to hold at least `lines` lines; never shrinks it.
 fn reserve(v: &mut Vec<Line>, lines: usize) {
     if v.len() < lines {
@@ -689,7 +731,8 @@ unsafe fn packed<K: Kernel>(
         // block the kernel ever packs (`KC` by `NC` of `B`; `MC` by `KC` of `A` for each
         // slot of the thread count asked for), not just this call's, so a thread that meets
         // a larger product later (a convolution group's GEMM can run on any worker) never
-        // grows them: only its first call at a thread count allocates. (`nc` is rounded up
+        // grows them: only its first call at a thread count allocates, and on a pool worker
+        // not even that, since [`reserve_for_worker`] made the room when it started. (`nc` is rounded up
         // to whole `NR` panels, so `NC` is too.) This costs each thread that runs a GEMM
         // about 2 MB for `B` and, per slot, 98 KB (AVX2) to 393 KB (SSE4.2) for `A`.
         let slots = launch(threads, full.tasks().max(last.tasks()));
