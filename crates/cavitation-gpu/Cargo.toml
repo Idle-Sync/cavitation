@@ -24,7 +24,7 @@ pollster = "1.0.1"
 # Pool2dGeom, the geometry the pooling kernels take; the tests also use its f64 tape as the
 # reference for the activation twins (tanh, the sigmoid and GELU) and their gradients, and
 # for the bias add (tests/reduce.rs).
-cavitation-core = { path = "../cavitation-core", version = "0.4.1" }
+cavitation-core = { path = "../cavitation-core", version = "0.5.0" }
 
 # On macOS, Apple's Metal Performance Shaders run on wgpu's own Metal device and queue, on
 # the same buffers: the Objective-C runtime, Metal's types (the versions wgpu's Metal

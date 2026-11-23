@@ -4,11 +4,15 @@ Notable changes by release. Releases are git tags `vX.Y.Z`. New work goes under 
 
 ## Unreleased
 
+## v0.5.0 (2026-11-23)
+
+Training on NVIDIA cards arrives behind a new `cuda` feature: `cavitation-cuda` runs the layers, losses and optimisers through cuDNN, cuBLAS and kernels compiled by NVRTC, `fit` trains with `Device::Cuda` through `CudaTrainer`, and `CudaModel` runs a compiled model. `Device::Auto` and `devices()` pick the best device the machine and the build can train on (CUDA, then the wgpu GPU, then the CPU), and `CAVITATION_DEVICE` restricts the choice. Both GPU engines now train every built-in activation, PReLU, GLU, row softmax, adaptive average pooling and the NLL, L1, Huber and smooth L1 losses, and on Metal the convolutions run through Metal Performance Shaders. On the CPU, the tape gains `reshape`, `permute` and `transpose`, cross-entropy keeps its relative accuracy on confident rows, and pool workers reserve the GEMM's packing buffers when they start, so a training step no longer allocates after warm-up (#373). A new guide chapter covers training on a GPU. Three changes are breaking: the `Cuda` variant of `DeviceKind`, `History`'s new `device` and `device_note` fields, and `GpuStepProfile`'s new field (the struct is now `#[non_exhaustive]`); each entry below says what to change.
+
 ### Breaking changes
 
 - `DeviceKind` has a new variant, `Cuda`. The enum is `#[non_exhaustive]`, so a `match` with a `_` arm compiles unchanged; such an arm now also sees `Cuda`. `"cuda".parse::<DeviceKind>()` and `CAVITATION_DEVICE=cuda` are accepted where they were errors, and the error for an unknown value now lists `auto, cuda, gpu or cpu`.
-- `History::device_note` also carries, under `Device::Auto`, why CUDA was left when the run trained on the wgpu GPU or the CPU instead (CUDA's reason when both GPUs were left).
 - `History` has two new public fields: `device` (a `DeviceKind`: the device the run trained on) and `device_note` (under `Device::Auto`, why a GPU that opened was left for the CPU). A `History { .. }` that names every field no longer compiles: add `device: Default::default(), device_note: None`, or end the literal with `..History::default()`.
+- `History::device_note` also carries, under `Device::Auto`, why CUDA was left when the run trained on the wgpu GPU or the CPU instead (CUDA's reason when both GPUs were left).
 - `GpuStepProfile` has a new public field, `backward_input`, and is now `#[non_exhaustive]`, so a later field is not a breaking change. Outside `cavitation-nn`, a `GpuStepProfile { .. }` literal no longer compiles and a pattern that destructures one needs `..`. Reading its fields is unchanged, and a profile still comes from `GpuTrainer::last_profile`.
 
 ### Tensors and autograd (`cavitation-core`)
