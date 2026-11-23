@@ -43,6 +43,8 @@ fn filled(cuda: &Cuda, n: usize) -> DeviceBuffer<'_> {
     buffer
 }
 
+/// Opens CUDA, times each pass as the file's first lines describe and prints the medians;
+/// when CUDA is not available, says so and points to `--example cuda_info` for the reason.
 fn main() {
     let Some(cuda) = Cuda::new() else {
         println!("CUDA is not available: run `--example cuda_info` for the reason");

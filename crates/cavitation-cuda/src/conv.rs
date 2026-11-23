@@ -1181,6 +1181,7 @@ impl<'c> Conv2d<'c> {
 
 #[cfg(test)]
 mod tests {
+    //! Host-side checks of the convolution's shapes: lengths that would overflow are refused, and output sizes match the CPU's.
     use super::*;
 
     /// A length too large for a `usize` saturates instead of wrapping, and is refused by

@@ -89,6 +89,8 @@ fn evaluation_bits(e: &Evaluation) -> (u64, Option<u64>, Option<u64>) {
 /// host saw them, all by their bits.
 type Epochs = Vec<(u64, (u64, Option<u64>, Option<u64>), Vec<u32>)>;
 
+/// The schedule of the run [`settings`] makes: three warm-up steps, then cosine decay to
+/// 1e-4, so the rate changes every step.
 const WARMUP_COSINE: LrSchedule = LrSchedule::WarmupCosine {
     warmup_steps: 3,
     min_lr: 1e-4,

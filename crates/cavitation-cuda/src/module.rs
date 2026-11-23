@@ -8,7 +8,8 @@ use crate::device::Cuda;
 use crate::error::CudaError;
 use crate::sys::{CuFunction, CuModule, Nvrtc};
 
-// A kernel's four-byte arguments are passed as the low bytes of eight-byte slots.
+/// A build-time check that the target is little-endian: a kernel's four-byte arguments are
+/// passed as the low bytes of eight-byte slots.
 const _: () = assert!(cfg!(target_endian = "little"));
 
 /// The most arguments [`Kernel::launch`] passes.

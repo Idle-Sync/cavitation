@@ -1004,6 +1004,7 @@ fn load_versioned(
 
 #[cfg(test)]
 mod tests {
+    //! Opening CUDA without a card: only one of the required libraries is reported, a missing library names the files tried, and the compile target is the card's architecture or an older one.
     use super::*;
 
     /// Only `1` makes CUDA required.
