@@ -91,6 +91,9 @@ pub(crate) enum Op<T: Real> {
     /// Values joined along an axis: where the axis, the count and each input (two words
     /// each) start in the label buffer.
     Concat(usize),
+    /// Slices chosen along an axis by index: where the axis, the count and the indices start
+    /// in the label buffer.
+    IndexSelect(Var, usize),
     /// The sum along an axis.
     SumAxis(Var, usize),
     /// The mean along an axis.
@@ -200,6 +203,7 @@ impl<T: Real> Op<T> {
             Op::Permute(a, start) => structure::permute_backward(a, start, out_grad, ctx),
             Op::Slice(a, axis, from) => structure::slice_backward(a, axis, from, out_grad, ctx),
             Op::Concat(start) => structure::concat_backward(start, out_grad, ctx),
+            Op::IndexSelect(a, start) => structure::index_select_backward(a, start, out_grad, ctx),
             Op::SumAxis(a, axis) => reduce::axis_backward(a, axis, false, out_grad, ctx),
             Op::MeanAxis(a, axis) => reduce::axis_backward(a, axis, true, out_grad, ctx),
             Op::Relu(a) => activation::relu_backward(a, out_grad, ctx),

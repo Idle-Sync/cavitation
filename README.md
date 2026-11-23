@@ -14,7 +14,7 @@ Cavitation trains and runs small and medium neural networks inside a Rust progra
 What it contains:
 
 - An f32 tensor and reverse-mode autograd over a recorded tape.
-- Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, reshape, permute, transpose, slice and concat, 17 activations plus the learnable PReLU layer (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
+- Operations: matmul, add, subtract, multiply (with broadcasting), sum and mean, reshape, permute, transpose, slice, concat and index_select, 17 activations plus the learnable PReLU layer (ReLU, tanh, sigmoid, GELU, SiLU, Mish and the rest of PyTorch's common set), the gated units GLU, GeGLU, ReGLU and SwiGLU, softmax and log-softmax, and nine losses, each with mean, sum, none and batch-mean reductions.
 - Image layers on rows of channel-by-channel pixels: `Conv2d` (stride, padding, dilation), `MaxPool2d`, `AvgPool2d`, `AdaptiveAvgPool2d`, `BatchNorm2d` with its running statistics, `Dropout`, and `Flatten`, each following PyTorch's layer of the same name.
 - `Linear`, activation layers and `Sequential`; Xavier and He initialisation; SGD (with momentum and weight decay), Adam, AdamW, RMSprop and Adagrad; cosine learning-rate decay.
 - `fit`, a step-by-step `Trainer`, and the manual loop.
