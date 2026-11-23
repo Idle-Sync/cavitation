@@ -53,3 +53,7 @@ required-features = ["ml"]
 [[example]]
 name = "inspect_digits"
 required-features = ["inspect"]
+
+[[example]]
+name = "gpu_digits"
+required-features = ["gpu"]
