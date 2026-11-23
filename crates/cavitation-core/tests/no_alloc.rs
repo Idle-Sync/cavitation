@@ -61,7 +61,8 @@ fn allocations() -> usize {
     ALLOCATIONS.load(Ordering::Relaxed)
 }
 
-/// Builds the same small graphs 12 times, with backward passes (`keep_where` among them), a
+/// Builds the same small graphs 12 times, with backward passes (`keep_where`, `reshape`,
+/// `permute` and `transpose` among them), a
 /// forward-only tape of larger tensors and `zero_grad` each step. Returns the allocations made
 /// during steps 3 to 12.
 fn tape_steady_state() -> usize {
@@ -152,6 +153,18 @@ fn tape_steady_state() -> usize {
             let k = tape.input(keep.view());
             let masked = tape.keep_where(p, k);
             let loss = tape.sum(masked);
+            tape.backward(loss, &mut store.grads);
+            sink += tape.value(loss).data()[0];
+        }
+        {
+            // reshape, permute and transpose, forward and backward: the [3, 4] parameter
+            // reshaped to [2, 6], permuted to [6, 2], transposed back to [2, 6], summed.
+            let mut tape = graph.tape(&store.values);
+            let p = tape.param(big);
+            let r = tape.reshape(p, &[2, 6]);
+            let q = tape.permute(r, &[1, 0]);
+            let t = tape.transpose(q, 0, 1);
+            let loss = tape.sum(t);
             tape.backward(loss, &mut store.grads);
             sink += tape.value(loss).data()[0];
         }
