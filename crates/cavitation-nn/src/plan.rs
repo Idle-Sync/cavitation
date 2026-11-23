@@ -886,6 +886,7 @@ pub(crate) fn pack_rows(on: &[bool], rows: usize) -> Vec<u32> {
 
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
+    //! The plan's rows: what each layer compiles to, checked against the kernels' lists, without a GPU.
     /// The plan's row limit for a softmax is the one the wgpu kernels state.
     #[test]
     fn softmax_rows_match_the_kernels() {

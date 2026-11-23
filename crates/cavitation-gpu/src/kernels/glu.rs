@@ -432,6 +432,7 @@ impl GluCall {
 
 #[cfg(test)]
 mod tests {
+    //! The gates' indices, without a GPU.
     use super::*;
 
     /// `GATES` lists every gate once, at its `GATE` value.

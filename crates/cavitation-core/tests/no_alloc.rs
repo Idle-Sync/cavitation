@@ -414,6 +414,74 @@ fn pool_wait_steady_state() -> usize {
     allocations() - before
 }
 
+/// A GEMM run inside a pool task, as a convolution's backward pass runs one per image: each of
+/// the 4 threads takes one task (each task waits until all four have started) and calls the
+/// GEMM there with the current thread count, as a convolution does: the first GEMM any worker
+/// has run. Tasks are claimed as threads arrive, so a
+/// worker can meet its first such task in any epoch of a training run; its packing buffers are
+/// reserved when it starts, so that first call allocates nothing. Returns the allocations made
+/// during one such run after a warm-up of instant jobs, on any thread.
+fn nested_gemm_first_use() -> usize {
+    let a = vec![0.25f32; 64 * 288];
+    let b = vec![0.5f32; 288 * 256];
+    let mut out = vec![vec![0.0f32; 64 * 256]; 4];
+    let outs: Vec<std::sync::Mutex<&mut [f32]>> = out
+        .iter_mut()
+        .map(|o| std::sync::Mutex::new(o.as_mut_slice()))
+        .collect();
+    let started = AtomicUsize::new(0);
+    let gemm_now = AtomicBool::new(false);
+    let level = level();
+    // The thread count a convolution's GEMM asks for.
+    let threads = cavitation_core::kernels::threads();
+    let job = |t: Task| {
+        if !gemm_now.load(Ordering::Relaxed) {
+            return;
+        }
+        started.fetch_add(1, Ordering::AcqRel);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while started.load(Ordering::Acquire) < 4 && std::time::Instant::now() < deadline {
+            std::hint::spin_loop();
+        }
+        let mut c = outs[t.index].lock().unwrap();
+        gemm_f32_with(
+            level,
+            threads,
+            1.0,
+            MatRef::new(&a, 64, 288, 288, 1).unwrap(),
+            MatRef::new(&b, 288, 256, 256, 1).unwrap(),
+            0.0,
+            MatMut::new(&mut c, 64, 256, 256, 1).unwrap(),
+        );
+    };
+    for _ in 0..100 {
+        pool::run(4, 4, &job);
+    }
+    // Each output's lock has been taken once: on Apple targets a standard `Mutex` is a
+    // pthread mutex that allocates on its first lock.
+    for out in &outs {
+        drop(out.lock().unwrap());
+    }
+    // The calling thread has run a GEMM before, as it has in a training run's warm-up.
+    let mut warm = vec![0.0f32; 64 * 256];
+    gemm_f32_with(
+        level,
+        threads,
+        1.0,
+        MatRef::new(&a, 64, 288, 288, 1).unwrap(),
+        MatRef::new(&b, 288, 256, 256, 1).unwrap(),
+        0.0,
+        MatMut::new(&mut warm, 64, 256, 256, 1).unwrap(),
+    );
+    gemm_now.store(true, Ordering::Relaxed);
+    let before = allocations();
+    pool::run(4, 4, &job);
+    let made = allocations() - before;
+    drop(outs);
+    assert!(out.iter().all(|o| o[0] == 0.25 * 0.5 * 288.0));
+    made
+}
+
 /// The f32 GEMM on 4 threads at the current kernel level, alternating a large forward-pass
 /// product (128 x 1024 x 784, B transposed) and a small one (32 x 10 x 256): 3 warm-up rounds
 /// (which size the packing buffers), then 10 counted rounds. Returns the allocations made
@@ -463,7 +531,7 @@ type Scenario = (&'static str, fn() -> usize);
 
 /// Runs every scenario in order and fails if any of them allocated after warm-up.
 fn main() -> ExitCode {
-    let scenarios: [Scenario; 8] = [
+    let scenarios: [Scenario; 9] = [
         ("pool_wait_steady_state", pool_wait_steady_state),
         ("tape_steady_state", tape_steady_state),
         ("bias_relu_sum_steady_state", bias_relu_sum_steady_state),
@@ -471,6 +539,7 @@ fn main() -> ExitCode {
         ("bce_and_nll_steady_state", bce_and_nll_steady_state),
         ("custom_op_steady_state", custom_op_steady_state),
         ("pool_steady_state", pool_steady_state),
+        ("nested_gemm_first_use", nested_gemm_first_use),
         ("gemm_steady_state", gemm_steady_state),
     ];
     let mut failed = false;
