@@ -1,5 +1,5 @@
 //! The training losses on the GPU, as `cavitation_core`'s tape computes them with
-//! `Reduction::Mean`:
+//! `Reduction::Mean` (and, for binary cross-entropy, `Reduction::Sum`):
 //!
 //! - [`SoftmaxCrossEntropy`]: softmax cross-entropy over integer class labels, the mean over
 //!   the batch.
@@ -8,6 +8,9 @@
 //!   integer class labels, the mean over the batch.
 //! - [`RegressionLoss`]: the L1, Huber or smooth L1 loss ([`Regression`]), the mean over
 //!   every value.
+//! - [`BinaryCrossEntropy`]: binary cross-entropy of probabilities or of logits
+//!   ([`BinaryInput`]), the mean or the sum over every value ([`LossReduction`]), followed
+//!   by the count of logarithms the tape clamps.
 //!
 //! Each writes its loss, one `f32` word, at a word offset of an output buffer, so a step's
 //! results can sit one after another in one small readback. Each also writes the gradient of
@@ -1187,5 +1190,485 @@ impl RegressionCall {
         pool.give(self.uniform);
         pool.give(self.terms);
         self.sum.release(pool);
+    }
+}
+
+/// Binary cross-entropy, one thread per value over `dispatch_split`'s grid: each value's loss
+/// into `terms`, the prediction's gradient into `grad` (both as bits) and `1.0` into `clamps`
+/// where the CPU's tape counts a clamped logarithm. `logits` is 0 for probabilities and 1 for
+/// logits. The non-finite cases are decided from the inputs' bits, as the CPU's arithmetic
+/// gives them, since WGSL may fold NaN and infinite arithmetic away; the rest runs the CPU's
+/// `f32` expressions in its order.
+///
+/// Probabilities: `ln x` is computed from the bits, subnormals included, as
+/// `k·ln 2 + 2·atanh(y)` with `y = (f − 1)/(f + 1)` for `x = f·2^k` and `f` within `[√½, √2]`,
+/// so `ln p` near 1 keeps its relative accuracy, which WGSL's `log` (2⁻²¹ absolute near 1)
+/// does not. A logarithm is clamped to −100 where the CPU's is: `p` of ±0 or of at most
+/// 26·2⁻¹⁴⁹ (`ln` −100.02; 27·2⁻¹⁴⁹ gives −99.98), and `1 − p` of 0. Where `|p| < 2⁻⁶²` the
+/// gradient's quotient is taken on `p` and `t` scaled by 2³² from their bits, the same
+/// quotient, since a GPU may flush a subnormal `p` to 0.
+///
+/// Logits: `max(z, 0) − z·t + ln(1 + e)` with `e = e^(−|z|)` and `ln(1 + e)` from the series
+/// of `2·atanh(e / (2 + e))`, as the cross-entropy's, and the gradient `σ(z) − t` with the
+/// CPU's stable sigmoid on the same `e`.
+const BINARY: Shader = Shader {
+    name: "binary cross-entropy terms",
+    source: "
+        override WORKGROUP: u32;
+
+        struct Binary { n: u32, w: f32, logits: u32, pad: u32 }
+
+        @group(0) @binding(0) var<storage, read_write> grad: array<u32>;
+        @group(0) @binding(1) var<uniform> r: Binary;
+        @group(0) @binding(2) var<storage, read> pred: array<u32>;
+        @group(0) @binding(3) var<storage, read> wanted: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> terms: array<u32>;
+        @group(0) @binding(5) var<storage, read_write> clamps: array<f32>;
+
+        const NAN_BITS: u32 = 0x7fc00000u;
+        const INF_BITS: u32 = 0x7f800000u;
+        const SIGN_BIT: u32 = 0x80000000u;
+        const MAGNITUDE: u32 = 0x7fffffffu;
+        const ONE_BITS: u32 = 0x3f800000u;
+        const LN2_HI: f32 = 0.693145751953125;
+        const LN2_LO: f32 = 1.4286068203094172e-6;
+
+        // 2·atanh(y), from its series to y^15.
+        fn atanh2(y: f32) -> f32 {
+            let q = y * y;
+            var t = 1.0 / 15.0;
+            t = 1.0 / 13.0 + q * t;
+            t = 1.0 / 11.0 + q * t;
+            t = 1.0 / 9.0 + q * t;
+            t = 1.0 / 7.0 + q * t;
+            t = 1.0 / 5.0 + q * t;
+            t = 1.0 / 3.0 + q * t;
+            t = 1.0 + q * t;
+            return 2.0 * y * t;
+        }
+
+        // ln x for the positive finite x whose bits are b, subnormals included.
+        fn ln_bits(b: u32) -> f32 {
+            var e: i32;
+            var m: u32;
+            let field = b >> 23u;
+            if (field == 0u) {
+                let s = countLeadingZeros(b) - 8u;
+                m = (b << s) & 0x7fffffu;
+                e = -126 - i32(s);
+            } else {
+                m = b & 0x7fffffu;
+                e = i32(field) - 127;
+            }
+            var f = bitcast<f32>(ONE_BITS | m);
+            if (f > 1.41421356) {
+                f = 0.5 * f;
+                e = e + 1;
+            }
+            let k = f32(e);
+            return k * LN2_HI + (k * LN2_LO + atanh2((f - 1.0) / (f + 1.0)));
+        }
+
+        // The value whose bits are b times 2^32, exactly (infinite past the largest float).
+        fn scaled(b: u32) -> f32 {
+            let sign = b & SIGN_BIT;
+            let field = (b >> 23u) & 0xffu;
+            if (field == 0u) {
+                let v = f32(b & 0x7fffffu) * bitcast<f32>(10u << 23u);
+                return bitcast<f32>(bitcast<u32>(v) | sign);
+            }
+            if (field >= 223u) { return bitcast<f32>(INF_BITS | sign); }
+            return bitcast<f32>(b + (32u << 23u));
+        }
+
+        fn probabilities(i: u32, pb: u32, tb: u32) {
+            let pm = pb & MAGNITUDE;
+            let tm = tb & MAGNITUDE;
+            let p_clamped = pm == 0u || pb <= 26u;
+            let q_clamped = pb == ONE_BITS;
+            var count = 0.0;
+            if ((p_clamped && tm != 0u) || (q_clamped && tb != ONE_BITS)) { count = 1.0; }
+            clamps[i] = count;
+            let p = bitcast<f32>(pb);
+            let t = bitcast<f32>(tb);
+            // ln p or ln(1 - p) is NaN outside [-0, 1], and an infinite target meets a zero
+            // logarithm or two of one sign with weights of opposite signs.
+            if ((pb <= ONE_BITS || pb == SIGN_BIT) && tm != INF_BITS) {
+                var lp = -100.0;
+                if (!p_clamped) { lp = ln_bits(pb); }
+                var lq = -100.0;
+                if (!q_clamped) { lq = ln_bits(bitcast<u32>(1.0 - p)); }
+                terms[i] = bitcast<u32>(-(t * lp + (1.0 - t) * lq));
+            } else {
+                terms[i] = NAN_BITS;
+            }
+            if (pm == INF_BITS) {
+                grad[i] = NAN_BITS;
+            } else if (tm == INF_BITS) {
+                // -t times infinity over 1, or over p (1 - p), negative for p below 0 or
+                // above 1.
+                let negative = !p_clamped && !q_clamped
+                    && ((pb & SIGN_BIT) != 0u || pb > ONE_BITS);
+                grad[i] = INF_BITS
+                    | (((tb ^ SIGN_BIT) & SIGN_BIT) ^ select(0u, SIGN_BIT, negative));
+            } else if (p_clamped) {
+                grad[i] = bitcast<u32>((1.0 - t) * r.w);
+            } else if (q_clamped) {
+                grad[i] = bitcast<u32>(-t * r.w);
+            } else if (pm < (65u << 23u)) {
+                let ps = scaled(pb);
+                grad[i] = bitcast<u32>((ps - scaled(tb)) / ps * r.w);
+            } else {
+                grad[i] = bitcast<u32>((p - t) / (p * (1.0 - p)) * r.w);
+            }
+        }
+
+        fn logits(i: u32, zb: u32, tb: u32) {
+            clamps[i] = 0.0;
+            let zm = zb & MAGNITUDE;
+            let tm = tb & MAGNITUDE;
+            let t = bitcast<f32>(tb);
+            if (zm == INF_BITS || tm == INF_BITS) {
+                // max(z, 0) - z t with an infinite z or t: infinity times 0 is NaN, as is
+                // infinity minus infinity.
+                if (zb == INF_BITS) {
+                    terms[i] = select(NAN_BITS, INF_BITS, (tb & SIGN_BIT) != 0u && tm != 0u);
+                } else if (zm == INF_BITS) {
+                    terms[i] = select(INF_BITS | (tb & SIGN_BIT), NAN_BITS, tm == 0u);
+                } else {
+                    terms[i] = select(
+                        INF_BITS | ((zb ^ tb ^ SIGN_BIT) & SIGN_BIT),
+                        NAN_BITS,
+                        zm == 0u,
+                    );
+                }
+                if (tm == INF_BITS) {
+                    grad[i] = INF_BITS | ((tb ^ SIGN_BIT) & SIGN_BIT);
+                } else {
+                    grad[i] = bitcast<u32>((select(0.0, 1.0, zb == INF_BITS) - t) * r.w);
+                }
+                return;
+            }
+            let z = bitcast<f32>(zb);
+            let e = exp(-abs(z));
+            let positive = select(0.0, z, z > 0.0);
+            terms[i] = bitcast<u32>(positive - z * t + atanh2(e / (2.0 + e)));
+            var sigma: f32;
+            if (z >= 0.0) {
+                sigma = 1.0 / (1.0 + e);
+            } else {
+                sigma = e / (1.0 + e);
+            }
+            grad[i] = bitcast<u32>((sigma - t) * r.w);
+        }
+
+        @compute @workgroup_size(WORKGROUP)
+        fn main(
+            @builtin(workgroup_id) group: vec3<u32>,
+            @builtin(num_workgroups) groups: vec3<u32>,
+            @builtin(local_invocation_index) lane: u32,
+        ) {
+            let i = (group.x + group.y * groups.x) * WORKGROUP + lane;
+            if (i >= r.n) { return; }
+            let pb = pred[i];
+            let tb = wanted[i];
+            if ((pb & MAGNITUDE) > INF_BITS || (tb & MAGNITUDE) > INF_BITS) {
+                terms[i] = NAN_BITS;
+                grad[i] = NAN_BITS;
+                clamps[i] = 0.0;
+                return;
+            }
+            if (r.logits == 0u) {
+                probabilities(i, pb, tb);
+            } else {
+                logits(i, pb, tb);
+            }
+        }
+    ",
+};
+
+/// What [`BinaryCrossEntropy`] reads as its prediction.
+///
+/// - `Probabilities`: probabilities `p`, as `Tape::binary_cross_entropy`: the loss
+///   `−[t·ln p + (1 − t)·ln(1 − p)]` with each logarithm clamped to at least −100, and the
+///   gradient `(p − t) / (p·(1 − p))`, or only the unclamped term's derivative where a
+///   logarithm was clamped.
+/// - `Logits`: raw scores `z`, as `Tape::binary_cross_entropy_with_logits`: the loss
+///   `max(z, 0) − z·t + ln(1 + e^(−|z|))`, which never overflows, and the gradient `σ(z) − t`.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_gpu::kernels::BinaryInput;
+///
+/// assert_ne!(BinaryInput::Probabilities, BinaryInput::Logits);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryInput {
+    /// Probabilities, for example a sigmoid's output.
+    Probabilities,
+    /// Raw scores, the sigmoid fused into the loss.
+    Logits,
+}
+
+/// How [`BinaryCrossEntropy`] reduces its values' losses to one word, as the tape's
+/// `Reduction::Mean` and `Reduction::Sum`.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_gpu::kernels::LossReduction;
+///
+/// assert_ne!(LossReduction::Mean, LossReduction::Sum);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossReduction {
+    /// The sum divided by the number of values; each gradient is scaled by `1/n` rounded to
+    /// `f32`, as the CPU's upstream gradient.
+    Mean,
+    /// The sum; each gradient is scaled by 1.
+    Sum,
+}
+
+/// Binary cross-entropy of a prediction against a target, on the GPU, as
+/// `Tape::binary_cross_entropy` and `Tape::binary_cross_entropy_with_logits` with
+/// `Reduction::Mean` or `Reduction::Sum` compute it: the loss (one word), then how many
+/// logarithms the tape would clamp and count in `Tape::clamped_logs` (one word, a whole
+/// number, 0 for logits), and the prediction's gradient. See [`BinaryInput`] for each form.
+///
+/// One kernel writes each value's loss, clamp count and gradient; the losses' sum and the
+/// counts' sum are per-channel sums in a fixed tree, the loss's divided by `n` rounded to
+/// `f32` for the mean. The count is exact up to 2²⁴ clamps. NaN in either input gives NaN for
+/// that value's loss and gradient, and the other non-finite cases are the CPU's, decided from
+/// the bits: a probability outside `[−0, 1]` or an infinite target gives a NaN loss (with the
+/// CPU's finite gradient, or an infinite one for an infinite target), an infinite logit or
+/// target gives the CPU's infinite or NaN loss. The finite flag tests the loss, so it catches
+/// each.
+///
+/// The bounds, with `u = 2⁻²⁴`, `chunks = ⌈n / 4096⌉` and the exact values of the same `f32`
+/// inputs (`tests/loss.rs` derives them). WGSL gives `exp` within `3 + 2|x|` ulp and
+/// division within 2.5 ulp:
+///
+/// - **A probability's loss:** within `15u·(|t·ln p| + |(1 − t)·ln(1 − p)|)` of the CPU's
+///   expression on the same `p`, `fl(1 − p)` and `fl(1 − t)` evaluated exactly, the clamped
+///   logarithms −100: each logarithm within `13u` of its own, then two products and a sum.
+/// - **A logit's loss:** within `u·(|z·t| + |a| + |ℓ|) + 10u·L + (6 + 4|z|)·u·e`, where
+///   `a = max(z, 0) − z·t`, `e = e^(−|z|)`, `L = ln(1 + e)` and `ℓ = a + L`.
+/// - **The loss:** the values' bounds summed, plus `(22 + chunks)·u·Σ|ℓ|` for the sum, then
+///   for the mean divided by `n` and `5u` of itself for the division.
+/// - **A probability's gradient:** the CPU's bits where a logarithm was clamped; elsewhere its
+///   one division WGSL gives within 2.5 ulp, so within `8u` of the CPU's, relative to it, as
+///   smooth L1's.
+/// - **A logit's gradient:** within `w·(Δσ + u·|σ(z) − t|) + u·|g|` of `g = (σ(z) − t)·w`,
+///   with `w` the `f32` scale and `Δσ = 13u·σ(z)` for `z ≥ 0`, `(18 + 8|z|)·u·σ(z)` below.
+///
+/// Each bound adds `2⁻¹²⁶·(2 + |t|)` per value for flushed subnormals. Two runs give the same
+/// bits.
+///
+/// # Examples
+///
+/// Without a GPU the example does nothing:
+///
+/// ```
+/// use cavitation_gpu::kernels::{BinaryCrossEntropy, BinaryInput, LossReduction};
+/// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+///
+/// if let Some(gpu) = Gpu::new() {
+///     let bce = BinaryCrossEntropy::new(&gpu, &mut PipelineCache::new(&gpu)).unwrap();
+///     let mut pool = BufferPool::new(&gpu);
+///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+///         | wgpu::BufferUsages::COPY_SRC;
+///     let [pred, target, grad, out] = [(); 4].map(|_| pool.take(8, usage));
+///     let sizes = StepSizes { upload_bytes: 128, readback_bytes: 16, ..StepSizes::default() };
+///     let mut steps = StepEncoder::new(&gpu, sizes);
+///     let form = (BinaryInput::Probabilities, LossReduction::Mean);
+///     let call = bce.call(&mut steps, &mut pool, form, 2, &pred, &target, &grad, (&out, 0));
+///     let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+///     let mut step = steps.begin();
+///     step.upload(pred.buffer(), 0, &bytes(&[0.5, 0.0]));
+///     step.upload(target.buffer(), 0, &bytes(&[1.0, 1.0]));
+///     bce.record(&mut step, &call);
+///     let at = [step.read_back(out.buffer(), 0, 8), step.read_back(grad.buffer(), 0, 8)];
+///     let output = step.finish();
+///     let word = |at: usize| f32::from_le_bytes(output.bytes()[at..at + 4].try_into().unwrap());
+///     // (ln 2 + 100) / 2, one clamped logarithm, and the gradients -2 / 2 and 0 / 2.
+///     assert!((word(at[0]) - 50.346_574).abs() < 1e-4);
+///     assert_eq!(word(at[0] + 4), 1.0);
+///     assert_eq!((word(at[1]), word(at[1] + 4)), (-1.0, 0.0));
+///     call.release(&mut pool);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct BinaryCrossEntropy {
+    /// The terms kernel's layout.
+    terms_group: wgpu::BindGroupLayout,
+    /// The terms kernel: each value's loss, clamp count and gradient.
+    terms: wgpu::ComputePipeline,
+    /// The sums of the terms and of the counts.
+    sums: TermSums,
+}
+
+impl BinaryCrossEntropy {
+    /// Builds the kernels on `gpu`, through `cache`.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if a kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`BinaryCrossEntropy`].
+    pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<BinaryCrossEntropy, GpuError> {
+        use Kind::{Read, Uniform, Write};
+        let (terms_group, terms_layout) = layout(
+            gpu,
+            "binary cross-entropy terms",
+            &[Write, Uniform(UNIFORM_BYTES), Read, Read, Write, Write],
+        );
+        let workgroup = [("WORKGROUP", f64::from(WORKGROUP))];
+        Ok(BinaryCrossEntropy {
+            terms: cache.get_with_layout(BINARY, "main", &workgroup, &terms_layout)?,
+            terms_group,
+            sums: TermSums::new(gpu, cache, CHANNEL_PARTIALS, 0)?,
+        })
+    }
+
+    /// Prepares the loss `form` of `pred` against `target` (`n` `f32`s each) into word
+    /// `out.1` of `out.0` and the clamp count into word `out.1 + 1` (both overwritten), and
+    /// the prediction's gradient into `grad` (`n` values, overwritten). Made once, when a
+    /// model is compiled.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is 0 or more than 268,431,360, a buffer is shorter than its values, or an
+    /// output is a buffer the kernels read (or the gradient is the loss's buffer).
+    ///
+    /// # Examples
+    ///
+    /// See [`BinaryCrossEntropy`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn call(
+        &self,
+        steps: &mut StepEncoder,
+        pool: &mut BufferPool,
+        (input, reduction): (BinaryInput, LossReduction),
+        n: u32,
+        pred: &PooledBuffer,
+        target: &PooledBuffer,
+        grad: &PooledBuffer,
+        (out, offset): (&PooledBuffer, u32),
+    ) -> BinaryCall {
+        let what = "binary cross-entropy";
+        assert!(
+            n > 0 && u64::from(n) <= MAX_VALUES,
+            "{what}: {n} values, where the kernels take 1 to {MAX_VALUES}"
+        );
+        let len = u64::from(n);
+        check_len(what, "prediction", pred, len);
+        check_len(what, "target", target, len);
+        check_len(what, "gradient", grad, len);
+        check_len(what, "loss output", out, u64::from(offset) + 2);
+        check_distinct(
+            what,
+            ("gradient", grad),
+            &[
+                ("prediction", pred),
+                ("target", target),
+                ("loss output", out),
+            ],
+        );
+        check_distinct(
+            what,
+            ("loss output", out),
+            &[("prediction", pred), ("target", target)],
+        );
+        let (w, divisor) = match reduction {
+            LossReduction::Mean => (reciprocal(len), Some(n as f32)),
+            LossReduction::Sum => (1.0, None),
+        };
+        let logits = u32::from(input == BinaryInput::Logits);
+        let uniform = upload_uniform(steps, pool, &word_bytes([n, w.to_bits(), logits, 0]));
+        let terms = pool.take(4 * len, wgpu::BufferUsages::STORAGE);
+        let clamps = pool.take(4 * len, wgpu::BufferUsages::STORAGE);
+        let group = bind(
+            steps,
+            &self.terms_group,
+            &[grad, &uniform, pred, target, &terms, &clamps],
+        );
+        let dims = ChannelDims::new(1, 1, n);
+        let to = SumsTo {
+            offset,
+            divisor,
+            ..SumsTo::new(out)
+        };
+        let sum = self
+            .sums
+            .call(steps, pool, what, dims, (&terms, 0), &[], to);
+        let to = SumsTo {
+            offset: offset + 1,
+            ..SumsTo::new(out)
+        };
+        let count = self
+            .sums
+            .call(steps, pool, what, dims, (&clamps, 0), &[], to);
+        BinaryCall {
+            n,
+            uniform,
+            terms,
+            clamps,
+            group,
+            sum,
+            count,
+        }
+    }
+
+    /// Adds the loss `call` to `step`: each value's loss, count and gradient, then the
+    /// losses' reduction and the counts' sum.
+    ///
+    /// # Examples
+    ///
+    /// See [`BinaryCrossEntropy`].
+    pub fn record(&self, step: &mut Step<'_>, call: &BinaryCall) {
+        step.dispatch_split(&self.terms, &call.group, call.n.div_ceil(WORKGROUP));
+        self.sums.record(step, &call.sum);
+        self.sums.record(step, &call.count);
+    }
+}
+
+/// One prepared binary cross-entropy, from [`BinaryCrossEntropy::call`].
+///
+/// # Examples
+///
+/// See [`BinaryCrossEntropy`].
+#[derive(Debug)]
+pub struct BinaryCall {
+    /// The values.
+    n: u32,
+    /// The terms kernel's uniform.
+    uniform: PooledBuffer,
+    /// Each value's loss.
+    terms: PooledBuffer,
+    /// Each value's clamp count.
+    clamps: PooledBuffer,
+    /// The terms kernel's bind group.
+    group: wgpu::BindGroup,
+    /// The reduction of the losses.
+    sum: ChannelSumsCall,
+    /// The sum of the clamp counts.
+    count: ChannelSumsCall,
+}
+
+impl BinaryCall {
+    /// Gives this call's buffers back to `pool`, once it is no longer recorded.
+    ///
+    /// # Examples
+    ///
+    /// See [`BinaryCrossEntropy`].
+    pub fn release(self, pool: &mut BufferPool) {
+        pool.give(self.uniform);
+        pool.give(self.terms);
+        pool.give(self.clamps);
+        self.sum.release(pool);
+        self.count.release(pool);
     }
 }

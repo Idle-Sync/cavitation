@@ -57,6 +57,9 @@
 //!   [`kernels::NegativeLogLikelihood`] and [`kernels::RegressionLoss`] (L1, Huber and smooth
 //!   L1): the training losses as the tape's `Reduction::Mean` computes them, with their
 //!   gradients.
+//! - [`kernels::BinaryCrossEntropy`]: binary cross-entropy of probabilities or of logits, as
+//!   the tape's `Reduction::Mean` or `Reduction::Sum` computes it, with its gradient and the
+//!   count of logarithms the tape clamps.
 //! - [`kernels::SumSquares`], [`kernels::FiniteFlag`] and [`kernels::DeadRelu`]: the health
 //!   values a step reads back: each gradient's sum of squares, the finite flag (tested by
 //!   bits) and the dead-ReLU bits.
