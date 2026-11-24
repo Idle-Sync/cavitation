@@ -27,7 +27,15 @@
 //!   over the kernel's terms; the logits' gradient, and every loss, within the WGSL kernel's
 //!   bounds of the exact values; the clamp count `Tape::clamped_logs`, up to 2²⁴ + 1,000
 //!   values; each value at the edges (0 and 1, the clamp's threshold, subnormals, ±100 and
-//!   larger logits, values outside `[0, 1]`, NaN and ±∞) as the `f32` tape gives it.
+//!   larger logits, values outside `[0, 1]`, NaN and ±∞) as the `f32` tape gives it; the
+//!   batch mean against `Reduction::BatchMean`.
+//! - **KL divergence:** with the mean, the sum and the batch mean: the gradient bit for bit
+//!   against `Tape::kl_div` on an `f32` store, subnormals included; the loss the bits of the
+//!   fixed tree evaluated on the host over the kernel's terms and within the WGSL kernel's
+//!   bound of the exact loss, up to 2²⁴ + 1,000 values; each value at the edges (targets of
+//!   ±0, subnormals, 1 and one ulp either side, above 1, negative, NaN and ±∞;
+//!   log-probabilities of ±0 to ±`f32::MAX`, NaN and ±∞) as the `f32` tape gives it; the
+//!   refusals.
 //!
 //! Every output starts as NaN, every loss is written at word 1 between two sentinels, and two
 //! runs give the same bits. Each test skips without CUDA, unless `CAVITATION_CUDA_REQUIRED=1`
@@ -37,7 +45,7 @@ mod common;
 
 use cavitation_core::{Graph, ParamStore, Real, Reduction, Tensor};
 use cavitation_cuda::{
-    BinaryCrossEntropy, BinaryInput, Cuda, CudaError, DeviceBuffer, LossReduction,
+    BinaryCrossEntropy, BinaryInput, Cuda, CudaError, DeviceBuffer, KlDivergence, LossReduction,
     MeanSquaredError, NegativeLogLikelihood, Regression, RegressionLoss, SoftmaxCrossEntropy,
 };
 use common::{
@@ -1110,15 +1118,16 @@ fn tape_bce<T: Real>(form: Form, pred: &[f32], target: &[f32]) -> (T, Vec<T>, us
             .collect::<Vec<T>>()
     };
     let mut store = ParamStore::<T>::new_generic();
-    let id = store.add(Tensor::from_vec(wide(pred), &[n]).unwrap());
+    let dims = match form.1 {
+        LossReduction::BatchMean { batch } => vec![batch as usize, n / batch as usize],
+        _ => vec![n],
+    };
+    let id = store.add(Tensor::from_vec(wide(pred), &dims).unwrap());
     let mut graph = Graph::<T>::new_generic();
     let mut tape = graph.tape(&store.values);
     let p = tape.param(id);
-    let t = tape.input(Tensor::from_vec(wide(target), &[n]).unwrap().view());
-    let reduction = match form.1 {
-        LossReduction::Mean => Reduction::Mean,
-        LossReduction::Sum => Reduction::Sum,
-    };
+    let t = tape.input(Tensor::from_vec(wide(target), &dims).unwrap().view());
+    let reduction = tape_reduction(form.1);
     let l = match form.0 {
         BinaryInput::Probabilities => tape.binary_cross_entropy(p, t, reduction),
         BinaryInput::Logits => tape.binary_cross_entropy_with_logits(p, t, reduction),
@@ -1223,25 +1232,41 @@ fn bce_loss(form: Form, pred: &[f32], target: &[f32]) -> (f64, f64) {
         bounds += b;
     }
     let tree = depth(pred.len()) * U * abs;
-    match form.1 {
-        LossReduction::Mean => {
-            let n = pred.len() as f64;
-            let mean = sum / n;
+    match divisor(form.1, pred.len()) {
+        Some(d) => {
+            let mean = sum / d;
             (
                 mean,
-                second((bounds + tree) / n + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
+                second((bounds + tree) / d + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
             )
         }
-        LossReduction::Sum => (sum, second(bounds + tree) + 3.0 * FLOOR),
+        None => (sum, second(bounds + tree) + 3.0 * FLOOR),
     }
 }
 
-/// The scale of each gradient, `1/n` rounded to `f32` for the mean, as the CPU's upstream.
-fn bce_scale(form: Form, n: usize) -> f32 {
-    match form.1 {
-        LossReduction::Mean => (1.0 / n as f64) as f32,
-        LossReduction::Sum => 1.0,
+/// The tape's reduction for `reduction`.
+fn tape_reduction(reduction: LossReduction) -> Reduction {
+    match reduction {
+        LossReduction::Mean => Reduction::Mean,
+        LossReduction::Sum => Reduction::Sum,
+        LossReduction::BatchMean { .. } => Reduction::BatchMean,
     }
+}
+
+/// What `reduction` divides the sum of `n` values by: `n` for the mean, the batch for the
+/// batch mean, nothing for the sum.
+fn divisor(reduction: LossReduction, n: usize) -> Option<f64> {
+    match reduction {
+        LossReduction::Mean => Some(n as f64),
+        LossReduction::Sum => None,
+        LossReduction::BatchMean { batch } => Some(f64::from(batch)),
+    }
+}
+
+/// The scale of each gradient, the reciprocal of the divisor rounded to `f32` from `f64`
+/// (1 for the sum), as the CPU's upstream.
+fn bce_scale(form: Form, n: usize) -> f32 {
+    divisor(form.1, n).map_or(1.0, |d| (1.0 / d) as f32)
 }
 
 /// A logit's exact gradient `g = (σ(z) − t)·w` and the WGSL kernel's bound
@@ -1371,9 +1396,9 @@ fn binary_cross_entropy_twin() {
                 let terms: Vec<f32> = (pred.iter().zip(&target))
                     .map(|(&p, &t)| probability_term(p, t))
                     .collect();
-                let host = match form.1 {
-                    LossReduction::Mean => tree(&terms) / n as f32,
-                    LossReduction::Sum => tree(&terms),
+                let host = match divisor(form.1, n) {
+                    Some(d) => tree(&terms) / d as f32,
+                    None => tree(&terms),
                 };
                 assert_eq!(
                     value.to_bits(),
@@ -1606,6 +1631,423 @@ fn binary_cross_entropy_refusals() {
         let _ = bce.run(&p, &t, &mut grad, (&mut loss, 15));
     });
     assert!(m.contains("the loss output buffer holds 64 bytes"), "{m}");
+    assert!(
+        read(&grad, 16).iter().all(|v| v.is_nan()),
+        "a refused call wrote the gradient"
+    );
+}
+
+/// Binary cross-entropy's batch mean on 37 rows of 12 values, of probabilities and of
+/// logits, against the tape's `Reduction::BatchMean` on `[37, 12]`: the gradient as
+/// [`check_bce_grad`] checks it with the scale `1/37`, the probabilities' loss the host's
+/// tree over the kernel's terms divided by 37, every loss within [`bce_loss`]'s bound, the
+/// clamp count the tape's.
+#[test]
+fn binary_cross_entropy_batch_mean() {
+    let Some(cuda) = Cuda::new() else { return };
+    let (batch, width) = (37usize, 12usize);
+    let n = batch * width;
+    for input in [BinaryInput::Probabilities, BinaryInput::Logits] {
+        let form = (
+            input,
+            LossReduction::BatchMean {
+                batch: batch as u32,
+            },
+        );
+        let bce = BinaryCrossEntropy::new(&cuda, n as u32, form).expect("binary loss");
+        let what = format!("{form:?} of {n} values");
+        let pred = match input {
+            BinaryInput::Probabilities => probabilities(41, n),
+            BinaryInput::Logits => logits(41, n),
+        };
+        let target = targets(42, n);
+        let (value, count, grad) = cuda_bce(&cuda, &bce, &pred, &target);
+        let (_, want_grad, clamped) = tape_bce::<f32>(form, &pred, &target);
+        check_bce_grad(
+            form,
+            (&pred, &target),
+            &grad,
+            &want_grad,
+            &format!("the gradient, {what}"),
+        );
+        assert_eq!(count, clamped as f32, "the clamp count, {what}");
+        if input == BinaryInput::Probabilities {
+            let terms: Vec<f32> = (pred.iter().zip(&target))
+                .map(|(&p, &t)| probability_term(p, t))
+                .collect();
+            let host = tree(&terms) / batch as f32;
+            assert_exact(&[value], &[host], &format!("the host's tree, {what}"));
+        }
+        let (want, bound) = bce_loss(form, &pred, &target);
+        assert_within(&[value], &[want], |_| bound, &format!("the loss, {what}"));
+    }
+    for batch in [0, 5] {
+        let form = (BinaryInput::Logits, LossReduction::BatchMean { batch });
+        match BinaryCrossEntropy::new(&cuda, 12, form) {
+            Err(CudaError::Invalid(m)) => assert!(m.contains("does not divide 12 values"), "{m}"),
+            other => panic!("a batch of {batch} accepted: {other:?}"),
+        }
+    }
+}
+
+/// The card's KL divergence: the loss, written at word 1 (NaN before) between two
+/// sentinels, and the log-probabilities' gradient.
+fn cuda_kl(
+    cuda: &Cuda,
+    kl: &KlDivergence<'_>,
+    log_probs: &[f32],
+    target: &[f32],
+) -> (f32, Vec<f32>) {
+    let (x, t) = (upload(cuda, log_probs), upload(cuda, target));
+    let mut grad = nans(cuda, log_probs.len());
+    let mut out = upload(cuda, &[SENTINEL, f32::NAN, SENTINEL]);
+    kl.run(&x, &t, &mut grad, (&mut out, 1)).expect("run");
+    let words = read(&out, 3);
+    assert_eq!(words[0], SENTINEL, "the word before the loss changed");
+    assert_eq!(words[2], SENTINEL, "the word after the loss changed");
+    (words[1], read(&grad, log_probs.len()))
+}
+
+/// What `Tape::kl_div` gives for `reduction` on a store of `T` from the same `f32` values,
+/// the values shaped `[batch, n / batch]` for the batch mean and `[n]` otherwise: the loss
+/// and the log-probabilities' gradient.
+fn tape_kl<T: Real>(reduction: LossReduction, log_probs: &[f32], target: &[f32]) -> (T, Vec<T>) {
+    let n = log_probs.len();
+    let dims = match reduction {
+        LossReduction::BatchMean { batch } => vec![batch as usize, n / batch as usize],
+        _ => vec![n],
+    };
+    let wide = |v: &[f32]| {
+        v.iter()
+            .map(|&x| T::from_f64(f64::from(x)))
+            .collect::<Vec<T>>()
+    };
+    let mut store = ParamStore::<T>::new_generic();
+    let id = store.add(Tensor::from_vec(wide(log_probs), &dims).unwrap());
+    let mut graph = Graph::<T>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let x = tape.param(id);
+    let t = tape.input(Tensor::from_vec(wide(target), &dims).unwrap().view());
+    let l = tape.kl_div(x, t, tape_reduction(reduction));
+    let value = tape.value(l).data()[0];
+    tape.backward(l, &mut store.grads);
+    drop(tape);
+    (value, store.grad(id).data().to_vec())
+}
+
+/// A value's KL divergence as the kernel computes it, for finite `x` and `t` with `t` not
+/// negative: `ln t` from the bits and a subnormal target's product on `t·2³²` scaled back
+/// by 2⁻³². Nothing is fused and every operation is correctly rounded on the card, so these
+/// are its bits.
+fn kl_host_term(x: f32, t: f32) -> f32 {
+    if t == 0.0 {
+        return 0.0;
+    }
+    let d = ln_bits(t) - x;
+    if t.is_subnormal() {
+        let scaled = (t.to_bits() & 0x7f_ffff) as f32 * f32::from_bits(10 << 23);
+        scaled * d * f32::from_bits(95 << 23)
+    } else {
+        t * d
+    }
+}
+
+/// One value's exact loss `ℓ = t·(ln t − x)` (0 where `t` is ±0) and the WGSL kernel's
+/// bound `15u·|t·ln t| + 3u·|ℓ| + 2⁻¹²⁶·(1 + |t|)`, derived in `cavitation-gpu`'s
+/// `tests/loss.rs`, for finite values with `t` not negative.
+fn kl_term(x: f32, t: f32) -> (f64, f64) {
+    if t == 0.0 {
+        return (0.0, 0.0);
+    }
+    let (x, t) = (f64::from(x), f64::from(t));
+    let l = t.ln();
+    let loss = t * (l - x);
+    (
+        loss,
+        15.0 * U * (t * l).abs() + 3.0 * U * loss.abs() + (1.0 + t.abs()) * FLOOR,
+    )
+}
+
+/// The exact loss of `reduction` on these values and its stated bound: the values' bounds
+/// summed, `(22 + chunks)·u·Σ|ℓ|` for the fixed tree, and for a mean the division by its
+/// divisor and `5u` of the mean for it.
+fn kl_loss(reduction: LossReduction, log_probs: &[f32], target: &[f32]) -> (f64, f64) {
+    let (mut sum, mut abs, mut bounds) = (0.0, 0.0, 0.0);
+    for (&x, &t) in log_probs.iter().zip(target) {
+        let (v, b) = kl_term(x, t);
+        sum += v;
+        abs += v.abs();
+        bounds += b;
+    }
+    let tree = depth(log_probs.len()) * U * abs;
+    match divisor(reduction, log_probs.len()) {
+        Some(d) => {
+            let mean = sum / d;
+            (
+                mean,
+                second((bounds + tree) / d + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
+            )
+        }
+        None => (sum, second(bounds + tree) + 3.0 * FLOOR),
+    }
+}
+
+/// `n` log-probabilities: the logarithm of a value in `[10⁻⁶, 1)` from `seed`, every 17th
+/// five times further below 0 and every 23rd above 0, so some are not log-probabilities.
+fn kl_inputs(seed: u64, n: usize) -> Vec<f32> {
+    let mut x: Vec<f32> = (seeded_values(seed, n, 1e-6, 1.0).into_iter())
+        .map(f32::ln)
+        .collect();
+    for (i, v) in x.iter_mut().enumerate() {
+        if i % 17 == 2 {
+            *v *= 5.0;
+        } else if i % 23 == 4 {
+            *v = -*v;
+        }
+    }
+    x
+}
+
+/// `n` targets in `[0, 1)` from `seed`, every 5th exactly 0, every 13th 1, every 31st a
+/// subnormal and every 37th below 10⁻²⁰.
+fn kl_targets(seed: u64, n: usize) -> Vec<f32> {
+    let mut t = seeded_values(seed, n, 0.0, 1.0);
+    for (i, v) in t.iter_mut().enumerate() {
+        if i % 5 == 1 {
+            *v = 0.0;
+        } else if i % 13 == 3 {
+            *v = 1.0;
+        } else if i % 31 == 7 {
+            *v *= 1e-38;
+        } else if i % 37 == 9 {
+            *v *= 1e-20;
+        }
+    }
+    t
+}
+
+/// The reductions the KL divergence's twin test runs on `n` values: the mean, the sum and
+/// the batch mean over the largest batch up to 1,000 that divides `n`.
+fn kl_reductions(n: usize) -> [LossReduction; 3] {
+    let batch = (1..=n.min(1000))
+        .rev()
+        .find(|&b| n.is_multiple_of(b))
+        .unwrap_or(1) as u32;
+    [
+        LossReduction::Mean,
+        LossReduction::Sum,
+        LossReduction::BatchMean { batch },
+    ]
+}
+
+/// Each reduction against the tape on 1, 37, 4,097 and 100,000 values (and the batch mean
+/// on 2²⁴ + 1,000 values over 8 rows), as `cavitation-gpu`'s twin test checks the WGSL
+/// kernel: the gradient the `f32` tape's bits, subnormals included; the loss the bits of the
+/// fixed tree evaluated on the host over the kernel's terms (divided by the divisor for a
+/// mean) and within [`kl_loss`]'s bound of the exact loss; a second run's bits the first's.
+#[test]
+fn kl_div_twin() {
+    let Some(cuda) = Cuda::new() else { return };
+    let mut runs: Vec<(usize, LossReduction)> = Vec::new();
+    for n in [1, 37, 4097, 100_000] {
+        runs.extend(kl_reductions(n).into_iter().map(|r| (n, r)));
+    }
+    runs.push(((1 << 24) + 1000, LossReduction::BatchMean { batch: 8 }));
+    for (k, &(n, reduction)) in runs.iter().enumerate() {
+        let kl = KlDivergence::new(&cuda, n as u32, reduction).expect("KL divergence");
+        assert_eq!((kl.len() as usize, kl.reduction()), (n, reduction));
+        let what = format!("{reduction:?} of {n} values");
+        let x = kl_inputs(500 + k as u64, n);
+        let t = kl_targets(700 + k as u64, n);
+        let (value, grad) = cuda_kl(&cuda, &kl, &x, &t);
+        let (_, want_grad) = tape_kl::<f32>(reduction, &x, &t);
+        assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+        let terms: Vec<f32> = (x.iter().zip(&t))
+            .map(|(&x, &t)| kl_host_term(x, t))
+            .collect();
+        let host = match divisor(reduction, n) {
+            Some(d) => tree(&terms) / d as f32,
+            None => tree(&terms),
+        };
+        assert_exact(&[value], &[host], &format!("the host's tree, {what}"));
+        let (want, bound) = kl_loss(reduction, &x, &t);
+        let worst = assert_within(&[value], &[want], |_| bound, &format!("the loss, {what}"));
+        println!("{what}: loss worst {:.3} of its bound", worst.ratio());
+        let (again, again_grad) = cuda_kl(&cuda, &kl, &x, &t);
+        assert_exact(&[again], &[value], &format!("a second run, {what}"));
+        assert_exact(
+            &again_grad,
+            &grad,
+            &format!("a second run's gradient, {what}"),
+        );
+    }
+}
+
+/// Each value on its own (`n = 1`) at the edges, against the tape, with the WGSL test's
+/// values: where the `f32` tape's loss is NaN or infinite the card's is the same, elsewhere
+/// the kernel's term evaluated on the host bit for bit and within [`kl_term`]'s bound of the
+/// exact loss; the gradient the `f32` tape's bits, subnormals included.
+#[test]
+fn kl_div_edges_match_the_tape() {
+    let Some(cuda) = Cuda::new() else { return };
+    let below = |x: f32| f32::from_bits(x.to_bits() - 1);
+    let above = |x: f32| f32::from_bits(x.to_bits() + 1);
+    let (inf, nan) = (f32::INFINITY, f32::NAN);
+    let inputs = [
+        0.0,
+        -0.0,
+        -1e-40,
+        -1.0,
+        0.5f32.ln(),
+        -20.0,
+        -88.0,
+        -104.0,
+        -1e30,
+        1.0,
+        3.0,
+        f32::MAX,
+        -f32::MAX,
+        nan,
+        inf,
+        -inf,
+    ];
+    let targets = [
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        1e-40,
+        f32::MIN_POSITIVE,
+        1e-30,
+        0.25,
+        0.5,
+        below(1.0),
+        1.0,
+        above(1.0),
+        2.0,
+        -0.25,
+        nan,
+        inf,
+        -inf,
+    ];
+    let mut worst: f64 = 0.0;
+    for reduction in [
+        LossReduction::Mean,
+        LossReduction::Sum,
+        LossReduction::BatchMean { batch: 1 },
+    ] {
+        let kl = KlDivergence::new(&cuda, 1, reduction).expect("KL divergence");
+        for &x in &inputs {
+            for &t in &targets {
+                let what = format!("{reduction:?} at {x:e}, target {t:e}");
+                let (value, grad) = cuda_kl(&cuda, &kl, &[x], &[t]);
+                let (want, want_grad) = tape_kl::<f32>(reduction, &[x], &[t]);
+                if want.is_finite() {
+                    let (exact, bound) = kl_term(x, t);
+                    let w = assert_within(&[value], &[exact], |_| second(bound), &what);
+                    worst = worst.max(w.ratio());
+                    let host = tree(&[kl_host_term(x, t)]);
+                    assert_exact(&[value], &[host], &format!("the host's term, {what}"));
+                } else {
+                    assert_exact(&[value], &[want], &format!("the loss, {what}"));
+                }
+                assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+            }
+        }
+    }
+    println!("edges: loss worst {worst:.3} of its bound");
+}
+
+/// A NaN or out-of-range value in a batch of 8,192: a NaN log-probability (where the target
+/// is 0 too), a NaN target, a negative target, an infinite target and a log-probability of
+/// +∞ give a NaN or infinite loss and leave every other value's gradient the clean run's
+/// bits.
+#[test]
+fn kl_div_non_finite_reaches_the_loss() {
+    let Some(cuda) = Cuda::new() else { return };
+    let n = 8192;
+    let kl = KlDivergence::new(&cuda, n as u32, LossReduction::BatchMean { batch: 64 })
+        .expect("KL divergence");
+    let x = kl_inputs(3, n);
+    let t = kl_targets(4, n);
+    // Value 5,001 has a target of 0.
+    assert_eq!(t[5001], 0.0);
+    let (_, clean) = cuda_kl(&cuda, &kl, &x, &t);
+    for (name, at, on_input, value) in [
+        ("a NaN log-probability", 5000, true, f32::NAN),
+        ("a NaN log-probability against 0", 5001, true, f32::NAN),
+        ("a NaN target", 5000, false, f32::NAN),
+        ("a negative target", 5000, false, -0.5),
+        ("an infinite target", 5000, false, f32::INFINITY),
+        ("a log-probability of +inf", 5000, true, f32::INFINITY),
+    ] {
+        let (mut xs, mut ts) = (x.clone(), t.clone());
+        if on_input {
+            xs[at] = value;
+        } else {
+            ts[at] = value;
+        }
+        let (loss, grad) = cuda_kl(&cuda, &kl, &xs, &ts);
+        assert!(!loss.is_finite(), "{name}: the loss is {loss}");
+        let rest: Vec<f32> = grad[..at].iter().chain(&grad[at + 1..]).copied().collect();
+        let want: Vec<f32> = clean[..at]
+            .iter()
+            .chain(&clean[at + 1..])
+            .copied()
+            .collect();
+        assert_exact(&rest, &want, &format!("{name}: the other values"));
+    }
+}
+
+/// The documented refusals of KL divergence: no values or more than 2³¹, a batch mean whose
+/// batch is 0 or does not divide the values, and buffers too short, with nothing written.
+#[test]
+fn kl_div_refusals() {
+    let Some(cuda) = Cuda::new() else { return };
+    for n in [0, u32::MAX] {
+        match KlDivergence::new(&cuda, n, LossReduction::Mean) {
+            Err(CudaError::Invalid(_)) => {}
+            other => panic!("{n} values accepted: {other:?}"),
+        }
+    }
+    for batch in [0, 3, 32] {
+        match KlDivergence::new(&cuda, 16, LossReduction::BatchMean { batch }) {
+            Err(CudaError::Invalid(m)) => assert!(
+                m.contains(&format!(
+                    "a batch of {batch} rows does not divide 16 values"
+                )),
+                "{m}"
+            ),
+            other => panic!("a batch of {batch} accepted: {other:?}"),
+        }
+    }
+    let kl = KlDivergence::new(&cuda, 16, LossReduction::Mean).expect("KL divergence");
+    let (x, t) = (nans(&cuda, 16), nans(&cuda, 16));
+    let one = nans(&cuda, 1);
+    let mut short_grad = nans(&cuda, 15);
+    let mut grad = nans(&cuda, 16);
+    let mut loss = nans(&cuda, 16);
+    let m = panic_message(|| {
+        let _ = kl.run(&one, &t, &mut grad, (&mut loss, 0));
+    });
+    assert!(
+        m.contains("the log-probabilities buffer holds 4 bytes, and 16 values need 64"),
+        "{m}"
+    );
+    let m = panic_message(|| {
+        let _ = kl.run(&x, &one, &mut grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the target buffer holds 4 bytes"), "{m}");
+    let m = panic_message(|| {
+        let _ = kl.run(&x, &t, &mut short_grad, (&mut loss, 0));
+    });
+    assert!(m.contains("the gradient buffer holds 60 bytes"), "{m}");
+    let m = panic_message(|| {
+        let _ = kl.run(&x, &t, &mut grad, (&mut loss, 16));
+    });
+    assert!(
+        m.contains("the loss output buffer holds 64 bytes, and 17 values need 68"),
+        "{m}"
+    );
     assert!(
         read(&grad, 16).iter().all(|v| v.is_nan()),
         "a refused call wrote the gradient"

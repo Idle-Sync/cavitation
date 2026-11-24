@@ -75,10 +75,14 @@
 //!   and the mean the fixed tree's (`tests/loss.rs`).
 //!
 //! - [`BinaryCrossEntropy`] with a [`BinaryInput`] and a [`LossReduction`]: binary
-//!   cross-entropy of probabilities or of logits with `Reduction::Mean` or `Reduction::Sum`,
-//!   ported from the WGSL kernel: a probability's gradient the CPU's bits, the loss and the
-//!   logits' gradient within the WGSL kernel's stated bounds, and the count of logarithms the
-//!   tape clamps (`tests/loss.rs`).
+//!   cross-entropy of probabilities or of logits with `Reduction::Mean`, `Reduction::Sum` or
+//!   `Reduction::BatchMean`, ported from the WGSL kernel: a probability's gradient the CPU's
+//!   bits, the loss and the logits' gradient within the WGSL kernel's stated bounds, and the
+//!   count of logarithms the tape clamps (`tests/loss.rs`).
+//!
+//! - [`KlDivergence`] with a [`LossReduction`]: the KL divergence of a target distribution
+//!   from log-probabilities, as `Tape::kl_div`, ported from the WGSL kernel: the gradient the
+//!   CPU's bits and the loss within the WGSL kernel's stated bound (`tests/loss.rs`).
 //!
 //! - [`OptimizerKernel`] and [`OptimizerRule`]: SGD (with momentum and weight decay), Adam
 //!   and AdamW over a model's parameters in flat buffers, one launch per step, skipped when
@@ -161,8 +165,8 @@ pub use glu::{Glu, GluGate, GluOp};
 pub use health::{DeadRelu, FiniteFlag, SumSquares};
 pub use linear::{Linear, LinearShape};
 pub use loss::{
-    BinaryCrossEntropy, BinaryInput, LossReduction, MeanSquaredError, NegativeLogLikelihood,
-    Regression, RegressionLoss, SoftmaxCrossEntropy,
+    BinaryCrossEntropy, BinaryInput, KlDivergence, LossReduction, MeanSquaredError,
+    NegativeLogLikelihood, Regression, RegressionLoss, SoftmaxCrossEntropy,
 };
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use optimizer::{OptimizerKernel, OptimizerRule};
