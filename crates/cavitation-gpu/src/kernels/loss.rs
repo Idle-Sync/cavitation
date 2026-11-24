@@ -1,5 +1,6 @@
 //! The training losses on the GPU, as `cavitation_core`'s tape computes them with
-//! `Reduction::Mean` (and, for binary cross-entropy, `Reduction::Sum`):
+//! `Reduction::Mean` (and, for binary cross-entropy and KL divergence, `Reduction::Sum` and
+//! `Reduction::BatchMean`):
 //!
 //! - [`SoftmaxCrossEntropy`]: softmax cross-entropy over integer class labels, the mean over
 //!   the batch.
@@ -9,8 +10,10 @@
 //! - [`RegressionLoss`]: the L1, Huber or smooth L1 loss ([`Regression`]), the mean over
 //!   every value.
 //! - [`BinaryCrossEntropy`]: binary cross-entropy of probabilities or of logits
-//!   ([`BinaryInput`]), the mean or the sum over every value ([`LossReduction`]), followed
-//!   by the count of logarithms the tape clamps.
+//!   ([`BinaryInput`]), the mean, the sum or the batch mean over every value
+//!   ([`LossReduction`]), followed by the count of logarithms the tape clamps.
+//! - [`KlDivergence`]: the KL divergence of a target distribution from log-probabilities,
+//!   reduced as a [`LossReduction`] says.
 //!
 //! Each writes its loss, one `f32` word, at a word offset of an output buffer, so a step's
 //! results can sit one after another in one small readback. Each also writes the gradient of
@@ -1193,49 +1196,20 @@ impl RegressionCall {
     }
 }
 
-/// Binary cross-entropy, one thread per value over `dispatch_split`'s grid: each value's loss
-/// into `terms`, the prediction's gradient into `grad` (both as bits) and `1.0` into `clamps`
-/// where the CPU's tape counts a clamped logarithm. `logits` is 0 for probabilities and 1 for
-/// logits. The non-finite cases are decided from the inputs' bits, as the CPU's arithmetic
-/// gives them, since WGSL may fold NaN and infinite arithmetic away; the rest runs the CPU's
-/// `f32` expressions in its order.
-///
-/// Probabilities: `ln x` is computed from the bits, subnormals included, as
-/// `k·ln 2 + 2·atanh(y)` with `y = (f − 1)/(f + 1)` for `x = f·2^k` and `f` within `[√½, √2]`,
-/// so `ln p` near 1 keeps its relative accuracy, which WGSL's `log` (2⁻²¹ absolute near 1)
-/// does not. A logarithm is clamped to −100 where the CPU's is: `p` of ±0 or of at most
-/// 26·2⁻¹⁴⁹ (`ln` −100.02; 27·2⁻¹⁴⁹ gives −99.98), and `1 − p` of 0. Where `|p| < 2⁻⁶²` the
-/// gradient's quotient is taken on `p` and `t` scaled by 2³² from their bits, the same
-/// quotient, since a GPU may flush a subnormal `p` to 0; where `|p·(1 − p)| ≥ 2⁶⁴` both sides
-/// of the quotient are scaled by 2⁻⁶⁴, since a division through the reciprocal of a
-/// denominator near the largest float flushes to 0.
-///
-/// Logits: `max(z, 0) − z·t + ln(1 + e)` with `e = e^(−|z|)` and `ln(1 + e)` from the series
-/// of `2·atanh(e / (2 + e))`, as the cross-entropy's, and the gradient `σ(z) − t` with the
-/// CPU's stable sigmoid on the same `e`.
-const BINARY: Shader = Shader {
-    name: "binary cross-entropy terms",
-    source: "
-        override WORKGROUP: u32;
-
-        struct Binary { n: u32, w: f32, logits: u32, pad: u32 }
-
-        @group(0) @binding(0) var<storage, read_write> grad: array<u32>;
-        @group(0) @binding(1) var<uniform> r: Binary;
-        @group(0) @binding(2) var<storage, read> pred: array<u32>;
-        @group(0) @binding(3) var<storage, read> wanted: array<u32>;
-        @group(0) @binding(4) var<storage, read_write> terms: array<u32>;
-        @group(0) @binding(5) var<storage, read_write> clamps: array<f32>;
-
+/// The WGSL shared by binary cross-entropy and KL divergence: the bit constants, `atanh2(y)`
+/// (`2·atanh(y)` from its series to `y¹⁵`), `ln_bits(b)` (`ln x` of the positive finite `x`
+/// whose bits are `b`, subnormals included, as `k·ln 2 + 2·atanh((f − 1)/(f + 1))` for
+/// `x = f·2^k` and `f` within `[√½, √2]`, `ln 2` split so that `k·ln2_hi` is exact) and
+/// `scaled(b)` (the value whose bits are `b` times 2³², exactly, infinite past the largest
+/// float). WGSL's `log` is 2⁻²¹ absolute near 1; `ln_bits` keeps the relative accuracy there.
+macro_rules! log_bits {
+    () => {
+        "
         const NAN_BITS: u32 = 0x7fc00000u;
         const INF_BITS: u32 = 0x7f800000u;
         const SIGN_BIT: u32 = 0x80000000u;
         const MAGNITUDE: u32 = 0x7fffffffu;
         const ONE_BITS: u32 = 0x3f800000u;
-        // The magnitude bits of 2^64: from there on p (1 - p) rounds to -infinity in f32,
-        // since 1 - p rounds to -p and p^2 reaches 2^128; just below, p^2 rounds to a finite
-        // float.
-        const PRODUCT_OVERFLOWS: u32 = 0x5f800000u;
         const LN2_HI: f32 = 0.693145751953125;
         const LN2_LO: f32 = 1.4286068203094172e-6;
 
@@ -1286,6 +1260,52 @@ const BINARY: Shader = Shader {
             if (field >= 223u) { return bitcast<f32>(INF_BITS | sign); }
             return bitcast<f32>(b + (32u << 23u));
         }
+        "
+    };
+}
+
+/// Binary cross-entropy, one thread per value over `dispatch_split`'s grid: each value's loss
+/// into `terms`, the prediction's gradient into `grad` (both as bits) and `1.0` into `clamps`
+/// where the CPU's tape counts a clamped logarithm. `logits` is 0 for probabilities and 1 for
+/// logits. The non-finite cases are decided from the inputs' bits, as the CPU's arithmetic
+/// gives them, since WGSL may fold NaN and infinite arithmetic away; the rest runs the CPU's
+/// `f32` expressions in its order.
+///
+/// Probabilities: `ln x` is computed from the bits, subnormals included, as
+/// `k·ln 2 + 2·atanh(y)` with `y = (f − 1)/(f + 1)` for `x = f·2^k` and `f` within `[√½, √2]`,
+/// so `ln p` near 1 keeps its relative accuracy, which WGSL's `log` (2⁻²¹ absolute near 1)
+/// does not. A logarithm is clamped to −100 where the CPU's is: `p` of ±0 or of at most
+/// 26·2⁻¹⁴⁹ (`ln` −100.02; 27·2⁻¹⁴⁹ gives −99.98), and `1 − p` of 0. Where `|p| < 2⁻⁶²` the
+/// gradient's quotient is taken on `p` and `t` scaled by 2³² from their bits, the same
+/// quotient, since a GPU may flush a subnormal `p` to 0; where `|p·(1 − p)| ≥ 2⁶⁴` both sides
+/// of the quotient are scaled by 2⁻⁶⁴, since a division through the reciprocal of a
+/// denominator near the largest float flushes to 0.
+///
+/// Logits: `max(z, 0) − z·t + ln(1 + e)` with `e = e^(−|z|)` and `ln(1 + e)` from the series
+/// of `2·atanh(e / (2 + e))`, as the cross-entropy's, and the gradient `σ(z) − t` with the
+/// CPU's stable sigmoid on the same `e`.
+const BINARY: Shader = Shader {
+    name: "binary cross-entropy terms",
+    source: concat!(
+        "
+        override WORKGROUP: u32;
+
+        struct Binary { n: u32, w: f32, logits: u32, pad: u32 }
+
+        @group(0) @binding(0) var<storage, read_write> grad: array<u32>;
+        @group(0) @binding(1) var<uniform> r: Binary;
+        @group(0) @binding(2) var<storage, read> pred: array<u32>;
+        @group(0) @binding(3) var<storage, read> wanted: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> terms: array<u32>;
+        @group(0) @binding(5) var<storage, read_write> clamps: array<f32>;
+
+        ",
+        log_bits!(),
+        "
+        // The magnitude bits of 2^64: from there on p (1 - p) rounds to -infinity in f32,
+        // since 1 - p rounds to -p and p^2 reaches 2^128; just below, p^2 rounds to a finite
+        // float.
+        const PRODUCT_OVERFLOWS: u32 = 0x5f800000u;
 
         fn probabilities(i: u32, pb: u32, tb: u32) {
             let pm = pb & MAGNITUDE;
@@ -1402,7 +1422,8 @@ const BINARY: Shader = Shader {
                 logits(i, pb, tb);
             }
         }
-    ",
+        "
+    ),
 };
 
 /// What [`BinaryCrossEntropy`] reads as its prediction.
@@ -1429,8 +1450,8 @@ pub enum BinaryInput {
     Logits,
 }
 
-/// How [`BinaryCrossEntropy`] reduces its values' losses to one word, as the tape's
-/// `Reduction::Mean` and `Reduction::Sum`.
+/// How [`BinaryCrossEntropy`] and [`KlDivergence`] reduce their values' losses to one word,
+/// as the tape's `Reduction::Mean`, `Reduction::Sum` and `Reduction::BatchMean`.
 ///
 /// # Examples
 ///
@@ -1438,6 +1459,7 @@ pub enum BinaryInput {
 /// use cavitation_gpu::kernels::LossReduction;
 ///
 /// assert_ne!(LossReduction::Mean, LossReduction::Sum);
+/// assert_ne!(LossReduction::Mean, LossReduction::BatchMean { batch: 4 });
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LossReduction {
@@ -1446,19 +1468,44 @@ pub enum LossReduction {
     Mean,
     /// The sum; each gradient is scaled by 1.
     Sum,
+    /// The sum divided by the batch, the first dimension of the values; each gradient is
+    /// scaled by `1/batch` rounded to `f32`. The batch must be above 0 and divide the values.
+    BatchMean {
+        /// The rows of the values.
+        batch: u32,
+    },
+}
+
+impl LossReduction {
+    /// Each gradient's scale and the sum's divisor (`None` for the sum) over `n` values,
+    /// after checking a batch mean's batch (the panic message after `what` if it fails).
+    fn scale(self, what: &str, n: u32) -> (f32, Option<f32>) {
+        match self {
+            LossReduction::Mean => (reciprocal(u64::from(n)), Some(n as f32)),
+            LossReduction::Sum => (1.0, None),
+            LossReduction::BatchMean { batch } => {
+                assert!(
+                    batch > 0 && n.is_multiple_of(batch),
+                    "{what}: a batch of {batch} rows does not divide {n} values"
+                );
+                (reciprocal(u64::from(batch)), Some(batch as f32))
+            }
+        }
+    }
 }
 
 /// Binary cross-entropy of a prediction against a target, on the GPU, as
 /// `Tape::binary_cross_entropy` and `Tape::binary_cross_entropy_with_logits` with
-/// `Reduction::Mean` or `Reduction::Sum` compute it: the loss (one word), then how many
-/// logarithms the tape would clamp and count in `Tape::clamped_logs` (one word, a whole
-/// number, 0 for logits), and the prediction's gradient. See [`BinaryInput`] for each form.
+/// `Reduction::Mean`, `Reduction::Sum` or `Reduction::BatchMean` compute it: the loss (one
+/// word), then how many logarithms the tape would clamp and count in `Tape::clamped_logs`
+/// (one word, a whole number, 0 for logits), and the prediction's gradient. See
+/// [`BinaryInput`] for each form.
 ///
 /// One kernel writes each value's loss, clamp count and gradient; the losses' sum and the
-/// counts' sum are per-channel sums in a fixed tree, the loss's divided by `n` rounded to
-/// `f32` for the mean. The count is exact up to 2²⁴ clamps. NaN in either input gives NaN for
-/// that value's loss and gradient, and the other non-finite cases are the CPU's, decided from
-/// the bits: a probability outside `[−0, 1]` or an infinite target gives a NaN loss (with the
+/// counts' sum are per-channel sums in a fixed tree, the loss's divided by `n` (the batch for
+/// the batch mean) rounded to `f32`. The count is exact up to 2²⁴ clamps. NaN in either
+/// input gives NaN for that value's loss and gradient, and the other non-finite cases are the
+/// CPU's, decided from the bits: a probability outside `[−0, 1]` or an infinite target gives a NaN loss (with the
 /// CPU's finite gradient, or an infinite one for an infinite target, NaN where the CPU's
 /// `p·(1 − p)` overflows, from `|p| = 2⁶⁴`), an infinite logit or target gives the CPU's
 /// infinite or NaN loss. The finite flag tests the loss, so it catches
@@ -1474,7 +1521,7 @@ pub enum LossReduction {
 /// - **A logit's loss:** within `u·(|z·t| + |a| + |ℓ|) + 10u·L + (6 + 4|z|)·u·e`, where
 ///   `a = max(z, 0) − z·t`, `e = e^(−|z|)`, `L = ln(1 + e)` and `ℓ = a + L`.
 /// - **The loss:** the values' bounds summed, plus `(22 + chunks)·u·Σ|ℓ|` for the sum, then
-///   for the mean divided by `n` and `5u` of itself for the division.
+///   for a mean divided by its divisor and `5u` of itself for the division.
 /// - **A probability's gradient:** the CPU's bits where a logarithm was clamped; elsewhere its
 ///   one division WGSL gives within 2.5 ulp, so within `8u` of the CPU's, relative to it, as
 ///   smooth L1's.
@@ -1559,8 +1606,9 @@ impl BinaryCrossEntropy {
     ///
     /// # Panics
     ///
-    /// If `n` is 0 or more than 268,431,360, a buffer is shorter than its values, or an
-    /// output is a buffer the kernels read (or the gradient is the loss's buffer).
+    /// If `n` is 0 or more than 268,431,360, a batch mean's batch is 0 or does not divide
+    /// `n`, a buffer is shorter than its values, or an output is a buffer the kernels read (or
+    /// the gradient is the loss's buffer).
     ///
     /// # Examples
     ///
@@ -1601,10 +1649,7 @@ impl BinaryCrossEntropy {
             ("loss output", out),
             &[("prediction", pred), ("target", target)],
         );
-        let (w, divisor) = match reduction {
-            LossReduction::Mean => (reciprocal(len), Some(n as f32)),
-            LossReduction::Sum => (1.0, None),
-        };
+        let (w, divisor) = reduction.scale(what, n);
         let logits = u32::from(input == BinaryInput::Logits);
         let uniform = upload_uniform(steps, pool, &word_bytes([n, w.to_bits(), logits, 0]));
         let terms = pool.take(4 * len, wgpu::BufferUsages::STORAGE);
@@ -1689,5 +1734,294 @@ impl BinaryCall {
         pool.give(self.clamps);
         self.sum.release(pool);
         self.count.release(pool);
+    }
+}
+
+/// KL divergence, one thread per value over `dispatch_split`'s grid: each value's loss
+/// `t·(ln t − x)` into `terms` and the log-probabilities' gradient `−t·w` into `grad`, both
+/// as bits, `x` being the log-probability and `t` the target. A target of ±0 gives a loss of
+/// 0 (NaN for a NaN `x`) and a gradient of +0. The non-finite cases are decided from the
+/// inputs' bits, as the CPU's arithmetic gives them, since WGSL may fold NaN and infinite
+/// arithmetic away: NaN in either input gives a NaN loss, a negative target (its logarithm
+/// NaN) a NaN loss, a target of +∞ a loss of +∞ (NaN for `x = +∞`), an infinite `x` against
+/// a positive finite target a loss of the other sign's infinity. `ln t` comes from its bits;
+/// a subnormal target's product is taken on `t·2³²`, exactly, and scaled back by 2⁻³², since
+/// a GPU may flush a subnormal operand to 0.
+const KL_DIV: Shader = Shader {
+    name: "KL divergence terms",
+    source: concat!(
+        "
+        override WORKGROUP: u32;
+
+        struct Kl { n: u32, w: f32, pad0: u32, pad1: u32 }
+
+        @group(0) @binding(0) var<storage, read_write> grad: array<u32>;
+        @group(0) @binding(1) var<uniform> r: Kl;
+        @group(0) @binding(2) var<storage, read> log_probs: array<u32>;
+        @group(0) @binding(3) var<storage, read> wanted: array<u32>;
+        @group(0) @binding(4) var<storage, read_write> terms: array<u32>;
+        ",
+        log_bits!(),
+        "
+        // 2^-32, which undoes scaled().
+        const UNSCALE: f32 = 2.3283064365386963e-10;
+
+        // t (ln t - x) for the bits of x and t, both not NaN.
+        fn term(xb: u32, tb: u32) -> u32 {
+            if ((tb & MAGNITUDE) == 0u) { return 0u; }
+            if ((tb & SIGN_BIT) != 0u) { return NAN_BITS; }
+            if (tb == INF_BITS) { return select(INF_BITS, NAN_BITS, xb == INF_BITS); }
+            if ((xb & MAGNITUDE) == INF_BITS) { return INF_BITS | ((xb ^ SIGN_BIT) & SIGN_BIT); }
+            let d = ln_bits(tb) - bitcast<f32>(xb);
+            if ((tb >> 23u) == 0u) { return bitcast<u32>(scaled(tb) * d * UNSCALE); }
+            return bitcast<u32>(bitcast<f32>(tb) * d);
+        }
+
+        @compute @workgroup_size(WORKGROUP)
+        fn main(
+            @builtin(workgroup_id) group: vec3<u32>,
+            @builtin(num_workgroups) groups: vec3<u32>,
+            @builtin(local_invocation_index) lane: u32,
+        ) {
+            let i = (group.x + group.y * groups.x) * WORKGROUP + lane;
+            if (i >= r.n) { return; }
+            let xb = log_probs[i];
+            let tb = wanted[i];
+            let tm = tb & MAGNITUDE;
+            if (tm == 0u) {
+                grad[i] = 0u;
+            } else if (tm > INF_BITS) {
+                grad[i] = NAN_BITS;
+            } else if (tm == INF_BITS) {
+                grad[i] = INF_BITS | ((tb ^ SIGN_BIT) & SIGN_BIT);
+            } else {
+                grad[i] = bitcast<u32>(bitcast<f32>(tb) * r.w) ^ SIGN_BIT;
+            }
+            if ((xb & MAGNITUDE) > INF_BITS || tm > INF_BITS) {
+                terms[i] = NAN_BITS;
+            } else {
+                terms[i] = term(xb, tb);
+            }
+        }
+        "
+    ),
+};
+
+/// The KL divergence of a target distribution from log-probabilities, on the GPU, as
+/// `Tape::kl_div` with `Reduction::Mean`, `Reduction::Sum` or `Reduction::BatchMean`
+/// computes it, in PyTorch's `kl_div` convention: the input `x` holds log-probabilities (for
+/// example a log-softmax's output) and the target `t` probabilities, and each value's loss
+/// is `t·(ln t − x)`, 0 where `t` is ±0 (`0·ln 0 = 0`). The output is the loss (one word);
+/// the log-probabilities' gradient is `−t·w`, +0 where `t` is ±0, with `w` the reduction's
+/// scale rounded to `f32` as the CPU's upstream gradient. `Loss::KlDiv` trains with the batch
+/// mean.
+///
+/// One kernel writes each value's loss and gradient; the losses' sum is a per-channel sum in
+/// a fixed tree, divided by `n` for the mean and by the batch for the batch mean, rounded to
+/// `f32`. The gradient is one product, so it is the CPU's bits wherever the CPU's is 0, not
+/// finite or normal; where it is subnormal it is within 2⁻¹²⁶ of it, as a GPU may flush.
+/// NaN and ±∞ follow the CPU, decided from the bits: NaN in either input gives a NaN loss
+/// (also where `t` is 0), a negative target (the caller's error) a NaN loss, a target of +∞
+/// a loss of +∞ (NaN for `x = +∞`) and an infinite `x` an infinite loss; the gradient
+/// stays the CPU's `−t·w`. A finite value whose loss overflows gives an infinite loss. The
+/// finite flag tests the loss, so it catches each.
+///
+/// The bounds, with `u = 2⁻²⁴`, `chunks = ⌈n / 4096⌉` and the exact values of the same `f32`
+/// inputs (`tests/loss.rs` derives them):
+///
+/// - **A value's loss:** within `15u·|t·ln t| + 3u·|ℓ|` of `ℓ = t·(ln t − x)`, plus
+///   `2⁻¹²⁶·(1 + |t|)` for flushed subnormals. `ln t` comes from the bits as binary
+///   cross-entropy's logarithm does, within `13u` of its own, so it keeps its relative
+///   accuracy near `t = 1`; the subtraction and the product round once each.
+/// - **The loss:** the values' bounds summed, plus `(22 + chunks)·u·Σ|ℓ|` for the sum, then
+///   for a mean divided by its divisor and `5u` of itself for the division.
+///
+/// Two runs give the same bits.
+///
+/// # Examples
+///
+/// Without a GPU the example does nothing:
+///
+/// ```
+/// use cavitation_gpu::kernels::{KlDivergence, LossReduction};
+/// use cavitation_gpu::{BufferPool, Gpu, PipelineCache, StepEncoder, StepSizes, wgpu};
+///
+/// if let Some(gpu) = Gpu::new() {
+///     let kl = KlDivergence::new(&gpu, &mut PipelineCache::new(&gpu)).unwrap();
+///     let mut pool = BufferPool::new(&gpu);
+///     let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST
+///         | wgpu::BufferUsages::COPY_SRC;
+///     let [log_probs, target, grad] = [(); 3].map(|_| pool.take(8, usage));
+///     let out = pool.take(4, usage);
+///     let sizes = StepSizes { upload_bytes: 128, readback_bytes: 16, ..StepSizes::default() };
+///     let mut steps = StepEncoder::new(&gpu, sizes);
+///     let mean = LossReduction::BatchMean { batch: 1 };
+///     let call = kl.call(&mut steps, &mut pool, mean, 2, &log_probs, &target, &grad, (&out, 0));
+///     let bytes = |v: &[f32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+///     let mut step = steps.begin();
+///     let half = 0.5f32.ln();
+///     step.upload(log_probs.buffer(), 0, &bytes(&[half, half]));
+///     step.upload(target.buffer(), 0, &bytes(&[0.25, 0.75]));
+///     kl.record(&mut step, &call);
+///     let at = [step.read_back(out.buffer(), 0, 4), step.read_back(grad.buffer(), 0, 8)];
+///     let output = step.finish();
+///     let word = |at: usize| f32::from_le_bytes(output.bytes()[at..at + 4].try_into().unwrap());
+///     // 0.25 ln 0.5 + 0.75 ln 1.5, and the gradients -0.25 and -0.75.
+///     assert!((word(at[0]) - 0.130_812).abs() < 1e-5);
+///     assert_eq!((word(at[1]), word(at[1] + 4)), (-0.25, -0.75));
+///     call.release(&mut pool);
+/// }
+/// ```
+#[derive(Debug)]
+pub struct KlDivergence {
+    /// The terms kernel's layout.
+    terms_group: wgpu::BindGroupLayout,
+    /// The terms kernel: each value's loss and gradient.
+    terms: wgpu::ComputePipeline,
+    /// The sum of the terms.
+    sums: TermSums,
+}
+
+impl KlDivergence {
+    /// Builds the kernels on `gpu`, through `cache`.
+    ///
+    /// # Errors
+    ///
+    /// [`GpuError::Shader`] if a kernel does not build on this GPU.
+    ///
+    /// # Examples
+    ///
+    /// See [`KlDivergence`].
+    pub fn new(gpu: &Gpu, cache: &mut PipelineCache) -> Result<KlDivergence, GpuError> {
+        use Kind::{Read, Uniform, Write};
+        let (terms_group, terms_layout) = layout(
+            gpu,
+            "KL divergence terms",
+            &[Write, Uniform(UNIFORM_BYTES), Read, Read, Write],
+        );
+        let workgroup = [("WORKGROUP", f64::from(WORKGROUP))];
+        Ok(KlDivergence {
+            terms: cache.get_with_layout(KL_DIV, "main", &workgroup, &terms_layout)?,
+            terms_group,
+            sums: TermSums::new(gpu, cache, CHANNEL_PARTIALS, 0)?,
+        })
+    }
+
+    /// Prepares the loss of `log_probs` against `target` (`n` `f32`s each), reduced by
+    /// `reduction`, into word `out.1` of `out.0` (one word, overwritten), and the
+    /// log-probabilities' gradient into `grad` (`n` values, overwritten). Made once, when a
+    /// model is compiled.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is 0 or more than 268,431,360, a batch mean's batch is 0 or does not divide
+    /// `n`, a buffer is shorter than its values, or an output is a buffer the kernels read (or
+    /// the gradient is the loss's buffer).
+    ///
+    /// # Examples
+    ///
+    /// See [`KlDivergence`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn call(
+        &self,
+        steps: &mut StepEncoder,
+        pool: &mut BufferPool,
+        reduction: LossReduction,
+        n: u32,
+        log_probs: &PooledBuffer,
+        target: &PooledBuffer,
+        grad: &PooledBuffer,
+        (out, offset): (&PooledBuffer, u32),
+    ) -> KlDivCall {
+        let what = "KL divergence";
+        assert!(
+            n > 0 && u64::from(n) <= MAX_VALUES,
+            "{what}: {n} values, where the kernels take 1 to {MAX_VALUES}"
+        );
+        let len = u64::from(n);
+        check_len(what, "log-probabilities", log_probs, len);
+        check_len(what, "target", target, len);
+        check_len(what, "gradient", grad, len);
+        check_len(what, "loss output", out, u64::from(offset) + 1);
+        check_distinct(
+            what,
+            ("gradient", grad),
+            &[
+                ("log-probabilities", log_probs),
+                ("target", target),
+                ("loss output", out),
+            ],
+        );
+        check_distinct(
+            what,
+            ("loss output", out),
+            &[("log-probabilities", log_probs), ("target", target)],
+        );
+        let (w, divisor) = reduction.scale(what, n);
+        let uniform = upload_uniform(steps, pool, &word_bytes([n, w.to_bits(), 0, 0]));
+        let terms = pool.take(4 * len, wgpu::BufferUsages::STORAGE);
+        let group = bind(
+            steps,
+            &self.terms_group,
+            &[grad, &uniform, log_probs, target, &terms],
+        );
+        let to = SumsTo {
+            offset,
+            divisor,
+            ..SumsTo::new(out)
+        };
+        let dims = ChannelDims::new(1, 1, n);
+        let sum = self
+            .sums
+            .call(steps, pool, what, dims, (&terms, 0), &[], to);
+        KlDivCall {
+            n,
+            uniform,
+            terms,
+            group,
+            sum,
+        }
+    }
+
+    /// Adds the loss `call` to `step`: each value's loss and gradient, then their reduction.
+    ///
+    /// # Examples
+    ///
+    /// See [`KlDivergence`].
+    pub fn record(&self, step: &mut Step<'_>, call: &KlDivCall) {
+        step.dispatch_split(&self.terms, &call.group, call.n.div_ceil(WORKGROUP));
+        self.sums.record(step, &call.sum);
+    }
+}
+
+/// One prepared KL divergence, from [`KlDivergence::call`].
+///
+/// # Examples
+///
+/// See [`KlDivergence`].
+#[derive(Debug)]
+pub struct KlDivCall {
+    /// The values.
+    n: u32,
+    /// The terms kernel's uniform.
+    uniform: PooledBuffer,
+    /// Each value's loss.
+    terms: PooledBuffer,
+    /// The terms kernel's bind group.
+    group: wgpu::BindGroup,
+    /// The reduction of the losses.
+    sum: ChannelSumsCall,
+}
+
+impl KlDivCall {
+    /// Gives this call's buffers back to `pool`, once it is no longer recorded.
+    ///
+    /// # Examples
+    ///
+    /// See [`KlDivergence`].
+    pub fn release(self, pool: &mut BufferPool) {
+        pool.give(self.uniform);
+        pool.give(self.terms);
+        self.sum.release(pool);
     }
 }
