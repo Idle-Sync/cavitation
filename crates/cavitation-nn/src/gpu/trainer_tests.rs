@@ -3,7 +3,8 @@
 //! CNN (convolution, batch norm, max pooling, dropout), a CNN through average and adaptive
 //! average pooling, `mnist-cnn` and `cifar-cnn`, with the max-pooling winners that differ from
 //! the `f64` tape's listed, and every loss besides cross-entropy on an MLP (binary
-//! cross-entropy after a sigmoid, and on logits); the parameters
+//! cross-entropy after a sigmoid, and on logits; KL divergence after a log-softmax, on
+//! target distributions); the parameters
 //! after one SGD step within the update's bound; two runs giving the same bits; and a step
 //! on non-finite inputs leaving the parameters and the optimiser's state as they were.
 //!
@@ -28,8 +29,8 @@ use super::forward_tests::{
     prelu_mlp, softmax_mlp, twin,
 };
 use crate::{
-    BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, Loss,
-    MaxPool2d, NeuronMask, OptimizerConfig, Relu, Sequential, Sigmoid, TargetsView, Trace,
+    BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, LogSoftmax,
+    Loss, MaxPool2d, NeuronMask, OptimizerConfig, Relu, Sequential, Sigmoid, TargetsView, Trace,
 };
 
 /// The unit roundoff of `f32`.
@@ -151,12 +152,15 @@ impl Data {
     }
 
     /// The batch for `loss`: for a loss on values, with `outputs` targets per row in
-    /// `[−1, 1)` from `seed`, or for binary cross-entropy in `[0, 1)` with every fifth 0 or 1.
+    /// `[−1, 1)` from `seed`, for binary cross-entropy in `[0, 1)` with every fifth 0 or 1,
+    /// or for KL divergence a distribution per row.
     fn for_loss(self, loss: Loss, outputs: usize, seed: u64) -> Data {
         let values = if loss.needs_classes() {
             Vec::new()
         } else if is_binary(loss) {
             binary_targets(seed, self.rows * outputs)
+        } else if loss == Loss::KlDiv {
+            distributions(seed, self.rows, outputs)
         } else {
             uniform(seed, self.rows * outputs, -1.0, 1.0)
         };
@@ -511,6 +515,45 @@ fn binary_losses_match_the_tape() {
         let t = twin(mlp::<f64>, mlp::<f32>, seed + 1);
         let loss = Loss::BinaryCrossEntropyWithLogits;
         let data = Data::new(seed + 1, rows, 12, 4, (-2.0, 2.0)).for_loss(loss, 4, seed + 101);
+        check_gradients(t, &data, &format!("{loss:?}, {rows} rows"));
+    }
+}
+
+/// `rows` target distributions over `outputs` values from `seed`, as KL divergence takes
+/// them: values in `[0, 1)` with every third exactly 0, each row divided by its sum.
+fn distributions(seed: u64, rows: usize, outputs: usize) -> Vec<f32> {
+    let mut t = uniform(seed, rows * outputs, 0.0, 1.0);
+    for v in t.iter_mut().skip(1).step_by(3) {
+        *v = 0.0;
+    }
+    for row in t.chunks_mut(outputs) {
+        let sum: f32 = row.iter().sum();
+        if sum > 0.0 {
+            row.iter_mut().for_each(|v| *v /= sum);
+        } else {
+            row[0] = 1.0;
+        }
+    }
+    t
+}
+
+/// The test MLP with a log-softmax after its last `Linear`, in either precision: the
+/// log-probabilities KL divergence takes.
+fn log_softmax_mlp<T: Real>(params: &mut ParamStore<T>, seed: u64) -> Sequential<T> {
+    mlp(params, seed).push(LogSoftmax)
+}
+
+/// KL divergence after the test MLP with a log-softmax, on target distributions with every
+/// third value 0, at a batch of 24 and of 37 (no multiple of the workgroup, nor of 4), so the
+/// batch mean divides by each: the GPU's gradients against the `f64` tape's, within the
+/// tolerance above.
+#[test]
+fn kl_div_matches_the_tape() {
+    for (k, rows) in [24usize, 37].into_iter().enumerate() {
+        let seed = 230 + 10 * k as u64;
+        let t = twin(log_softmax_mlp::<f64>, log_softmax_mlp::<f32>, seed);
+        let loss = Loss::KlDiv;
+        let data = Data::new(seed, rows, 12, 4, (-2.0, 2.0)).for_loss(loss, 4, seed + 100);
         check_gradients(t, &data, &format!("{loss:?}, {rows} rows"));
     }
 }

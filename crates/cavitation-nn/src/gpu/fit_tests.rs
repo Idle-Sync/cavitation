@@ -25,9 +25,9 @@ use super::health_tests::for_each_gpu;
 use crate::train::{Choice, fit_choosing};
 use crate::{
     Batch, BatchNorm2d, Batcher, Conv2d, Dataset, Device, DeviceKind, Dropout, EarlyStopping,
-    Evaluation, FitConfig, Flatten, GpuModel, Health, Hooks, Linear, Loss, LrSchedule, MaxPool2d,
-    Monitor, OnNonFinite, OptimizerConfig, Relu, Sequential, Sigmoid, StepControl, Targets,
-    TargetsView, evaluate, fit, fit_controlled, fit_with_hooks,
+    Evaluation, FitConfig, Flatten, GpuModel, Health, Hooks, Linear, LogSoftmax, Loss, LrSchedule,
+    MaxPool2d, Monitor, OnNonFinite, OptimizerConfig, Relu, Sequential, Sigmoid, StepControl,
+    Targets, TargetsView, evaluate, fit, fit_controlled, fit_with_hooks,
 };
 
 /// A CNN on 2 × 8 × 8 images: a convolution, batch norm with running statistics, ReLU, max
@@ -622,11 +622,32 @@ fn binary_values(seed: u64, rows: usize, width: usize, outputs: usize) -> Datase
     data
 }
 
+/// `values` with each row's targets a distribution, as KL divergence takes them: the
+/// magnitudes, every third 0, each row divided by its sum.
+fn distribution_values(seed: u64, rows: usize, width: usize, outputs: usize) -> Dataset {
+    let mut data = values(seed, rows, width, outputs);
+    if let Targets::Values(t) = &mut data.targets {
+        for (i, v) in t.data_mut().iter_mut().enumerate() {
+            *v = if i % 3 == 1 { 0.0 } else { v.abs() };
+        }
+        for row in t.data_mut().chunks_mut(outputs) {
+            let sum: f32 = row.iter().sum();
+            if sum > 0.0 {
+                row.iter_mut().for_each(|v| *v /= sum);
+            } else {
+                row[0] = 1.0;
+            }
+        }
+    }
+    data
+}
+
 /// The losses besides cross-entropy, each with the network and data it trains: the negative
 /// log-likelihood after an MLP whose every `Linear` ends in a log-softmax, on labels; MSE, L1,
 /// Huber (`delta` 0.5) and smooth L1 (`beta` 0.5 and 0) after the test MLP, on targets in
 /// `[−1, 1)`; binary cross-entropy after the test MLP with a sigmoid, and on its logits, on
-/// targets in `[0, 1)` with every fifth 0 or 1.
+/// targets in `[0, 1)` with every fifth 0 or 1; KL divergence after the test MLP with a
+/// log-softmax, on target distributions with every third value 0.
 fn other_losses() -> Vec<(Loss, bool)> {
     vec![
         (Loss::Nll, true),
@@ -637,6 +658,7 @@ fn other_losses() -> Vec<(Loss, bool)> {
         (Loss::SmoothL1 { beta: 0.0 }, false),
         (Loss::BinaryCrossEntropy, false),
         (Loss::BinaryCrossEntropyWithLogits, false),
+        (Loss::KlDiv, false),
     ]
 }
 
@@ -660,6 +682,11 @@ fn every_loss_tracks_the_cpu_fit() {
                 binary_values(seed, 50, 12, 4),
                 binary_values(seed + 1, 20, 12, 4),
             )
+        } else if loss == Loss::KlDiv {
+            (
+                distribution_values(seed, 50, 12, 4),
+                distribution_values(seed + 1, 20, 12, 4),
+            )
         } else {
             (values(seed, 50, 12, 4), values(seed + 1, 20, 12, 4))
         };
@@ -682,6 +709,8 @@ fn every_loss_tracks_the_cpu_fit() {
             softmax_mlp::<f32>(&mut start, seed + 2, true)
         } else if loss == Loss::BinaryCrossEntropy {
             mlp::<f32>(&mut start, seed + 2).push(Sigmoid)
+        } else if loss == Loss::KlDiv {
+            mlp::<f32>(&mut start, seed + 2).push(LogSoftmax)
         } else {
             mlp::<f32>(&mut start, seed + 2)
         };
@@ -1173,8 +1202,8 @@ struct NoControl;
 impl StepControl for NoControl {}
 
 /// What the GPU does not run is refused with `Error::Unsupported` before any training, with
-/// the parameters untouched: `fit_controlled`, a registered hook, an optimiser or loss
-/// without a GPU kernel, and `OnNonFinite::Warn`. A validation set whose last batch a
+/// the parameters untouched: `fit_controlled`, a registered hook, an optimiser without a GPU
+/// kernel, and `OnNonFinite::Warn`. A validation set whose last batch a
 /// batch-norm layer without running statistics could not normalise is `InvalidData`.
 #[test]
 fn what_the_gpu_does_not_run_is_refused() {
@@ -1232,20 +1261,6 @@ fn what_the_gpu_does_not_run_is_refused() {
             },
         );
         refused(r, "OnNonFinite::Warn", &params);
-        let values = Dataset {
-            x: train.x.clone(),
-            targets: Targets::Values(Tensor::zeros(&[16, 4])),
-        };
-        let r = fit(
-            &net,
-            &mut params,
-            &values,
-            FitConfig {
-                loss: Loss::KlDiv,
-                ..config()
-            },
-        );
-        refused(r, "Loss::KlDiv", &params);
         // No hook: `fit_with_hooks` trains.
         let r = fit_with_hooks(&net, &mut params, &train, config(), &mut Hooks::new());
         assert_eq!(r.unwrap().epochs.len(), 1);

@@ -2,8 +2,9 @@
 //! training tape's from the same weights, batch and dropout masks, on the test MLP (with a
 //! neuron mask), a small CNN (convolution, batch norm, max pooling, dropout), a CNN through
 //! average and adaptive average pooling, `mnist-cnn` and `cifar-cnn`, and every loss besides
-//! cross-entropy on an MLP (binary cross-entropy after a sigmoid, and on logits); the
-//! parameters after one SGD step within the update's bound; two
+//! cross-entropy on an MLP (binary cross-entropy after a sigmoid, and on logits; KL
+//! divergence after a log-softmax, on target distributions); the parameters after one SGD
+//! step within the update's bound; two
 //! runs giving the same bits; a step on non-finite inputs leaving the parameters and the
 //! optimiser's state as they were; five steps tracking the CPU `Trainer`; and a profiled
 //! step.
@@ -35,8 +36,8 @@ use super::test_util::{
     more_activations, off, pool_cnn, prelu_mlp, small_cnn, softmax_mlp, twin, uniform, with_cuda,
 };
 use crate::{
-    Health, InferenceLayer, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Sequential, Sigmoid,
-    Trainer,
+    Health, InferenceLayer, LogSoftmax, Loss, NeuronMask, OnNonFinite, OptimizerConfig, Sequential,
+    Sigmoid, Trainer,
 };
 
 /// The unit roundoff of `f32`.
@@ -353,6 +354,51 @@ fn binary_targets(seed: u64, n: usize) -> Vec<f32> {
 /// probabilities binary cross-entropy takes.
 fn sigmoid_mlp<T: cavitation_core::Real>(params: &mut ParamStore<T>, seed: u64) -> Sequential<T> {
     mlp(params, seed).push(Sigmoid)
+}
+
+/// `rows` target distributions over `outputs` values from `seed`, as KL divergence takes
+/// them: values in `[0, 1)` with every third exactly 0, each row divided by its sum.
+fn distributions(seed: u64, rows: usize, outputs: usize) -> Vec<f32> {
+    let mut t = uniform(seed, rows * outputs, 0.0, 1.0);
+    for v in t.iter_mut().skip(1).step_by(3) {
+        *v = 0.0;
+    }
+    for row in t.chunks_mut(outputs) {
+        let sum: f32 = row.iter().sum();
+        if sum > 0.0 {
+            row.iter_mut().for_each(|v| *v /= sum);
+        } else {
+            row[0] = 1.0;
+        }
+    }
+    t
+}
+
+/// The test MLP with a log-softmax after its last `Linear`, in either precision: the
+/// log-probabilities KL divergence takes.
+fn log_softmax_mlp<T: cavitation_core::Real>(
+    params: &mut ParamStore<T>,
+    seed: u64,
+) -> Sequential<T> {
+    mlp(params, seed).push(LogSoftmax)
+}
+
+/// KL divergence after the test MLP with a log-softmax, on target distributions with every
+/// third value 0, at a batch of 24 and of 37 (no multiple of a block, nor of 4), so the
+/// batch mean divides by each: the card's gradients against the `f64` tape's, within the
+/// tolerance above.
+#[test]
+fn kl_div_matches_the_tape() {
+    for (k, rows) in [24usize, 37].into_iter().enumerate() {
+        let seed = 230 + 10 * k as u64;
+        let t = twin(log_softmax_mlp::<f64>, log_softmax_mlp::<f32>, seed);
+        let data = Data {
+            values: Some(distributions(seed + 100, rows, 4)),
+            ..Data::within(seed, rows, 12, 4, (-2.0, 2.0))
+        };
+        let loss = Loss::KlDiv;
+        check_loss_gradients(t, &data, loss, &format!("{loss:?}, {rows} rows"));
+    }
 }
 
 /// Binary cross-entropy after the test MLP with a sigmoid, and on the test MLP's logits, on

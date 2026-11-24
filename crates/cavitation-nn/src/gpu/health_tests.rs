@@ -5,8 +5,9 @@
 //! skipped steps refused as on the CPU, and the warnings of seeded runs (the norm checks on
 //! every parameter, and dead ReLU and ReLU6 neurons after a `Linear` and after a convolution)
 //! matching the CPU's kind for kind, step for step and name for name, with each norm within
-//! 2⁻¹⁰ of the CPU's; and binary cross-entropy's clamped logarithms warned of as on the CPU,
-//! with the CPU's count.
+//! 2⁻¹⁰ of the CPU's; binary cross-entropy's clamped logarithms warned of as on the CPU,
+//! with the CPU's count; and KL divergence on a model of six parameter tensors and two ReLU
+//! layers with every check on, its losses and warnings the CPU's.
 //!
 //! Each comparison first checks that the CPU run sent the warnings it is about, so two empty
 //! lists never pass. Without a GPU every test says so and checks nothing;
@@ -20,7 +21,7 @@ use cavitation_gpu::{Backend, Gpu};
 use super::GpuTrainer;
 use super::forward_tests::{mlp, prelu_mlp, twin};
 use crate::{
-    BatchView, Conv2d, Flatten, Health, Init, Linear, Loss, MaxPool2d, OnNonFinite,
+    BatchView, Conv2d, Flatten, Health, Init, Linear, LogSoftmax, Loss, MaxPool2d, OnNonFinite,
     OptimizerConfig, Relu, Relu6, Sequential, Sigmoid, TargetsView, Trainer, Warning, WarningKind,
 };
 
@@ -394,6 +395,93 @@ fn clamped_logs_warn_as_on_the_cpu() {
         let (g, _) = gpu_run(gpu, &net, &params, &adam(), loss, 6, health(), &epochs);
         assert_eq!(g.counts, cpu.counts, "the steps taken and left out");
         same_warnings(&g.warnings, &cpu.warnings, "clamped logarithms");
+    });
+}
+
+/// Two ReLU layers, the first 40 wide (two words of dead-ReLU bits) and the second 9 (one
+/// more), with neurons 3 and 35 of the first and 2 of the second pushed far below 0 by their
+/// biases, then a log-softmax: six parameter tensors and three words of bits read back after
+/// the loss. Two batches of 6 rows with a target distribution per row from `seed`, every
+/// third value 0.
+fn deep_log_softmax(seed: u64) -> (Sequential, ParamStore, Vec<Data>) {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(seed);
+    let net = Sequential::new()
+        .push(Linear::new(&mut params, 12, 40, &mut rng))
+        .push(Relu)
+        .push(Linear::new(&mut params, 40, 9, &mut rng))
+        .push(Relu)
+        .push(Linear::new(&mut params, 9, 4, &mut rng))
+        .push(LogSoftmax);
+    for (layer, killed) in [(0, &[3usize, 35][..]), (2, &[2][..])] {
+        let bias = net.layer(layer).as_linear().unwrap().bias().unwrap();
+        let mut b = params.value(bias).data().to_vec();
+        for &k in killed {
+            b[k] = -100.0;
+        }
+        let n = b.len();
+        *params.value_mut(bias) = Tensor::from_vec(b, &[n]).unwrap();
+    }
+    let batches = (0..2)
+        .map(|b| {
+            let mut data = Data::new(seed + 1 + b, 6, 12, 4);
+            let mut t: Vec<f32> = (0..24)
+                .map(|i| {
+                    let v = rng.range(0.0, 1.0) as f32;
+                    if i % 3 == 1 { 0.0 } else { v }
+                })
+                .collect();
+            for row in t.chunks_mut(4) {
+                let sum: f32 = row.iter().sum();
+                row.iter_mut().for_each(|v| *v /= sum);
+            }
+            data.values = Some(t);
+            data
+        })
+        .collect();
+    (net, params, batches)
+}
+
+/// Each step's loss of `run` within 2⁻¹⁰ of the CPU's, relative, with the same steps failing.
+fn same_losses(run: &[Result<u32, String>], cpu: &[Result<u32, String>], what: &str) {
+    assert_eq!(run.len(), cpu.len(), "{what}: the steps");
+    for (k, (g, c)) in run.iter().zip(cpu).enumerate() {
+        let (g, c) = (
+            f32::from_bits(*g.as_ref().unwrap()),
+            f32::from_bits(*c.as_ref().unwrap()),
+        );
+        assert!(
+            (g - c).abs() <= c.abs() / 1024.0,
+            "{what}: step {k}'s loss {g}, the CPU's {c}"
+        );
+    }
+}
+
+/// KL divergence on [`deep_log_softmax`] with every norm check out of bounds (a high bound
+/// of 0) and the dead-ReLU check on, over two epochs: each step's loss within 2⁻¹⁰ of the
+/// CPU's, the steps the CPU's, and the warnings (one `Exploding` per parameter per epoch,
+/// each norm within 2⁻¹⁰, and the dead neurons of both ReLU layers) the CPU's, so the norms
+/// of six parameters and three words of bits are read back from the right offsets.
+#[test]
+fn kl_div_on_a_deep_model_checks_health_as_on_the_cpu() {
+    let (net, params, batches) = deep_log_softmax(97);
+    let epoch: Vec<&Data> = batches.iter().collect();
+    let epochs = vec![epoch.clone(), epoch];
+    let loss = Loss::KlDiv;
+    let health = || Health {
+        grad_norm_high: 0.0,
+        grad_norm_low: 0.0,
+        dead_relu: true,
+        ..Health::quiet()
+    };
+    let cpu = cpu_run(&net, &params, &adam(), loss, 6, health(), &epochs);
+    assert_eq!(count(&cpu.warnings, WarningKind::Exploding), 12, "{cpu:?}");
+    assert_eq!(count(&cpu.warnings, WarningKind::DeadNeurons), 4, "{cpu:?}");
+    for_each_gpu(|gpu| {
+        let (g, _) = gpu_run(gpu, &net, &params, &adam(), loss, 6, health(), &epochs);
+        assert_eq!(g.counts, cpu.counts, "the steps taken and left out");
+        same_losses(&g.steps, &cpu.steps, "KL divergence");
+        same_warnings(&g.warnings, &cpu.warnings, "KL divergence");
     });
 }
 
