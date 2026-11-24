@@ -2,7 +2,8 @@
 //! training tape's from the same weights, batch and dropout masks, on the test MLP, a small
 //! CNN (convolution, batch norm, max pooling, dropout), a CNN through average and adaptive
 //! average pooling, `mnist-cnn` and `cifar-cnn`, with the max-pooling winners that differ from
-//! the `f64` tape's listed, and every loss besides cross-entropy on an MLP; the parameters
+//! the `f64` tape's listed, and every loss besides cross-entropy on an MLP (binary
+//! cross-entropy after a sigmoid, and on logits); the parameters
 //! after one SGD step within the update's bound; two runs giving the same bits; and a step
 //! on non-finite inputs leaving the parameters and the optimiser's state as they were.
 //!
@@ -28,7 +29,7 @@ use super::forward_tests::{
 };
 use crate::{
     BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, InferenceLayer, Init, Linear, Loss,
-    MaxPool2d, NeuronMask, OptimizerConfig, Relu, Sequential, TargetsView, Trace,
+    MaxPool2d, NeuronMask, OptimizerConfig, Relu, Sequential, Sigmoid, TargetsView, Trace,
 };
 
 /// The unit roundoff of `f32`.
@@ -150,10 +151,12 @@ impl Data {
     }
 
     /// The batch for `loss`: for a loss on values, with `outputs` targets per row in
-    /// `[−1, 1)` from `seed`.
+    /// `[−1, 1)` from `seed`, or for binary cross-entropy in `[0, 1)` with every fifth 0 or 1.
     fn for_loss(self, loss: Loss, outputs: usize, seed: u64) -> Data {
         let values = if loss.needs_classes() {
             Vec::new()
+        } else if is_binary(loss) {
+            binary_targets(seed, self.rows * outputs)
         } else {
             uniform(seed, self.rows * outputs, -1.0, 1.0)
         };
@@ -467,6 +470,48 @@ fn every_loss_matches_the_tape() {
         let t = twin(mlp::<f64>, mlp::<f32>, seed);
         let data = Data::new(seed, 24, 12, 4, (-2.0, 2.0)).for_loss(loss, 4, seed + 100);
         check_gradients(t, &data, &format!("{loss:?}"));
+    }
+}
+
+/// Whether `loss` is binary cross-entropy, with or without logits.
+fn is_binary(loss: Loss) -> bool {
+    matches!(
+        loss,
+        Loss::BinaryCrossEntropy | Loss::BinaryCrossEntropyWithLogits
+    )
+}
+
+/// `n` targets in `[0, 1)` from `seed`, every fifth rounded to 0 or 1.
+fn binary_targets(seed: u64, n: usize) -> Vec<f32> {
+    let mut t = uniform(seed, n, 0.0, 1.0);
+    for v in t.iter_mut().step_by(5) {
+        *v = v.round();
+    }
+    t
+}
+
+/// The test MLP with a sigmoid after its last `Linear`, in either precision: the
+/// probabilities binary cross-entropy takes.
+fn sigmoid_mlp<T: Real>(params: &mut ParamStore<T>, seed: u64) -> Sequential<T> {
+    mlp(params, seed).push(Sigmoid)
+}
+
+/// Binary cross-entropy after the test MLP with a sigmoid, and on the test MLP's logits, on
+/// targets in `[0, 1)` with every fifth 0 or 1, at a batch of 24 and of 37 (no multiple of
+/// the workgroup, nor of 4): the GPU's gradients against the `f64` tape's, within the
+/// tolerance above.
+#[test]
+fn binary_losses_match_the_tape() {
+    for (k, rows) in [24usize, 37].into_iter().enumerate() {
+        let seed = 200 + 10 * k as u64;
+        let t = twin(sigmoid_mlp::<f64>, sigmoid_mlp::<f32>, seed);
+        let loss = Loss::BinaryCrossEntropy;
+        let data = Data::new(seed, rows, 12, 4, (-2.0, 2.0)).for_loss(loss, 4, seed + 100);
+        check_gradients(t, &data, &format!("{loss:?}, {rows} rows"));
+        let t = twin(mlp::<f64>, mlp::<f32>, seed + 1);
+        let loss = Loss::BinaryCrossEntropyWithLogits;
+        let data = Data::new(seed + 1, rows, 12, 4, (-2.0, 2.0)).for_loss(loss, 4, seed + 101);
+        check_gradients(t, &data, &format!("{loss:?}, {rows} rows"));
     }
 }
 

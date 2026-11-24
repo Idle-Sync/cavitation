@@ -16,6 +16,14 @@
 //!   tape, up to more values than one grid row of workgroups holds; each value at the edges
 //!   (±0, the threshold and one ulp either side, a threshold of 0 or +∞, NaN, ±∞ and
 //!   overflow) the `f32` tape's bits; the tape's refusal of a bad threshold.
+//! - **Binary cross-entropy:** of probabilities and of logits, with the mean and the sum: the
+//!   loss within the bound derived at `bce_term` of the exact loss, the gradient against
+//!   `Tape::binary_cross_entropy` and `Tape::binary_cross_entropy_with_logits` on an `f32`
+//!   store (bit for bit where a logarithm was clamped, within `8u` where the probabilities'
+//!   gradient divides, within the bound at `logit_grad` for logits), and the clamp count
+//!   `Tape::clamped_logs`, up to more values than one grid row of workgroups holds; each value
+//!   at the edges (0 and 1, the clamp's threshold, subnormals, ±100 and larger logits, values
+//!   outside `[0, 1]`, NaN and ±∞) as the `f32` tape gives it; a NaN reaching the loss.
 //!
 //! Every loss is written at word 1 of a buffer of sentinels, to show nothing else changes. The
 //! tests skip without a GPU, unless `CAVITATION_GPU_REQUIRED=1`.
@@ -24,8 +32,8 @@ mod common;
 
 use cavitation_core::{Graph, ParamStore, Real, Reduction, Tensor};
 use cavitation_gpu::kernels::{
-    FiniteFlag, MeanSquaredError, NegativeLogLikelihood, Regression, RegressionLoss,
-    SoftmaxCrossEntropy,
+    BinaryCrossEntropy, BinaryInput, FiniteFlag, LossReduction, MeanSquaredError,
+    NegativeLogLikelihood, Regression, RegressionLoss, SoftmaxCrossEntropy,
 };
 use cavitation_gpu::{Gpu, PooledBuffer};
 use common::{FLOOR, Kit, U, assert_exact, assert_within, for_each_gpu, seeded_values, sum_bound};
@@ -1032,6 +1040,564 @@ fn nll_and_regression_refusals() {
         );
         assert!(
             regression(l1, 16, &z, &g, (&z, 0))
+                .contains("the loss output and the prediction must be different")
+        );
+    });
+}
+
+/// A binary cross-entropy's form: what it reads, and how it reduces.
+type Form = (BinaryInput, LossReduction);
+
+/// Every form.
+const FORMS: [Form; 4] = [
+    (BinaryInput::Probabilities, LossReduction::Mean),
+    (BinaryInput::Logits, LossReduction::Mean),
+    (BinaryInput::Probabilities, LossReduction::Sum),
+    (BinaryInput::Logits, LossReduction::Sum),
+];
+
+/// The GPU's binary cross-entropy `form`: the loss, the clamp count and the gradient, the
+/// loss and the count at words 1 and 2 between two sentinels.
+fn gpu_bce(
+    kit: &mut Kit,
+    bce: &BinaryCrossEntropy,
+    form: Form,
+    pred: &[f32],
+    target: &[f32],
+) -> (f32, f32, Vec<f32>) {
+    let (p, t) = (kit.upload(pred), kit.upload(target));
+    let grad = kit.upload(&vec![SENTINEL; pred.len()]);
+    let out = kit.upload(&[SENTINEL; 4]);
+    let call = bce.call(
+        &mut kit.steps,
+        &mut kit.pool,
+        form,
+        pred.len() as u32,
+        &p,
+        &t,
+        &grad,
+        (&out, 1),
+    );
+    let mut step = kit.steps.begin();
+    bce.record(&mut step, &call);
+    let _ = step.finish();
+    let words = kit.read(&out);
+    assert_eq!(words[0], SENTINEL, "the word before the loss changed");
+    assert_eq!(words[3], SENTINEL, "the word after the count changed");
+    let g = kit.read(&grad);
+    call.release(&mut kit.pool);
+    (words[1], words[2], g)
+}
+
+/// What the tape gives for `form` on a store of `T` from the same `f32` values: the loss,
+/// the prediction's gradient and `Tape::clamped_logs`.
+fn tape_bce<T: Real>(form: Form, pred: &[f32], target: &[f32]) -> (T, Vec<T>, usize) {
+    let n = pred.len();
+    let wide = |v: &[f32]| {
+        v.iter()
+            .map(|&x| T::from_f64(f64::from(x)))
+            .collect::<Vec<T>>()
+    };
+    let mut store = ParamStore::<T>::new_generic();
+    let id = store.add(Tensor::from_vec(wide(pred), &[n]).unwrap());
+    let mut graph = Graph::<T>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let p = tape.param(id);
+    let t = tape.input(Tensor::from_vec(wide(target), &[n]).unwrap().view());
+    let reduction = match form.1 {
+        LossReduction::Mean => Reduction::Mean,
+        LossReduction::Sum => Reduction::Sum,
+    };
+    let l = match form.0 {
+        BinaryInput::Probabilities => tape.binary_cross_entropy(p, t, reduction),
+        BinaryInput::Logits => tape.binary_cross_entropy_with_logits(p, t, reduction),
+    };
+    let value = tape.value(l).data()[0];
+    let clamped = tape.clamped_logs();
+    tape.backward(l, &mut store.grads);
+    drop(tape);
+    (value, store.grad(id).data().to_vec(), clamped)
+}
+
+/// Whether the `f32` tape clamps `ln x`.
+fn clamps(x: f32) -> bool {
+    x.ln() < -100.0
+}
+
+/// One value's exact loss and its stated bound, from the tape's expression on the same `f32`
+/// values.
+///
+/// - **Probabilities:** `−(t·ln p + c·ln q)` with `q = fl(1 − p)` and `c = fl(1 − t)`, the
+///   CPU's own subtractions, each logarithm −100 where the tape clamps it. Each logarithm is
+///   within `13u` of the exact one: `y = (f − 1)/(f + 1)` has `f − 1` exact (`f` within
+///   `[√½, √2]`), `f + 1` rounded once and the division within 2.5 ulp, `6u` together; the
+///   series `T` within `1.2u` (its terms past 1 are at most 0.03 of it, its truncation below
+///   `10⁻¹²`); the product `2y·T` `u`: `9u` of `r = 2·atanh(y)`. Then `k·ln2_hi` is exact
+///   (`|k| ≤ 150`, `ln2_hi` of 15 significant bits), `k·ln2_lo + r` and the last sum round
+///   once each, and `|r|` is at most the result for `k ≠ 0` (the result is at least `ln √2`
+///   in magnitude, `|r|` at most that): `9u + u + u` and `ln2_lo`'s own error, below
+///   `10⁻⁵u`, under `13u`. The two products and the sum add `u` each of
+///   `A = |t·ln p| + |c·ln q|`, so the term is within `15u·A`.
+/// - **Logits:** `a + L` with `a = max(z, 0) − z·t` and `L = ln(1 + e)`, `e = e^(−|z|)`. The
+///   product `z·t`, the difference and the last sum round once each: `u·(|z·t| + |a| + |ℓ|)`.
+///   `e` is within `(6 + 4|z|)·u·e` (WGSL's `exp`, `3 + 2|x|` ulp), which moves `L` by at most
+///   that, and the series is within `10u·L` of `ln(1 + e)` for the computed `e`, as the
+///   cross-entropy's.
+///
+/// Both add `2⁻¹²⁶·(2 + |t|)` for flushed subnormals (a product with a subnormal target, and
+/// an `e` or a `z` below the smallest normal).
+fn bce_term(input: BinaryInput, p: f32, t: f32) -> (f64, f64) {
+    let t64 = f64::from(t);
+    let floor = (2.0 + t64.abs()) * FLOOR;
+    match input {
+        BinaryInput::Probabilities => {
+            let log = |x: f32| {
+                if clamps(x) { -100.0 } else { f64::from(x).ln() }
+            };
+            let a = t64 * log(p);
+            let b = f64::from(1.0 - t) * log(1.0 - p);
+            (-(a + b), 15.0 * U * (a.abs() + b.abs()) + floor)
+        }
+        BinaryInput::Logits => {
+            let z = f64::from(p);
+            let e = (-z.abs()).exp();
+            let l = e.ln_1p();
+            let a = z.max(0.0) - z * t64;
+            let loss = a + l;
+            let rounding = U * ((z * t64).abs() + a.abs() + loss.abs());
+            (
+                loss,
+                rounding + 10.0 * U * l + (6.0 + 4.0 * z.abs()) * U * e + floor,
+            )
+        }
+    }
+}
+
+/// The exact loss of `form` on these values and its stated bound: the values' bounds summed,
+/// `(22 + chunks)·u·Σ|ℓ|` for the fixed tree, and for the mean the division by `n` and `5u`
+/// of the mean for it.
+fn bce_loss(form: Form, pred: &[f32], target: &[f32]) -> (f64, f64) {
+    let (mut sum, mut abs, mut bounds) = (0.0, 0.0, 0.0);
+    for (&p, &t) in pred.iter().zip(target) {
+        let (v, b) = bce_term(form.0, p, t);
+        sum += v;
+        abs += v.abs();
+        bounds += b;
+    }
+    let tree = depth(pred.len()) * U * abs;
+    match form.1 {
+        LossReduction::Mean => {
+            let n = pred.len() as f64;
+            let mean = sum / n;
+            (
+                mean,
+                second((bounds + tree) / n + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
+            )
+        }
+        LossReduction::Sum => (sum, second(bounds + tree) + 3.0 * FLOOR),
+    }
+}
+
+/// The scale of each gradient, `1/n` rounded to `f32` for the mean, as the CPU's upstream.
+fn bce_scale(form: Form, n: usize) -> f32 {
+    match form.1 {
+        LossReduction::Mean => (1.0 / n as f64) as f32,
+        LossReduction::Sum => 1.0,
+    }
+}
+
+/// A logit's exact gradient `g = (σ(z) − t)·w` and its stated bound
+/// `w·(Δσ + u·|σ − t|) + u·|g|`. For `z ≥ 0`, `σ = 1/(1 + e)`: `e` within `(6 + 4z)·u·e`
+/// moves `1 + e` by at most `6u` of it (`(6 + 4z)·e^(−z)` is largest at 0), the sum rounds
+/// once and the division is within 2.5 ulp: `Δσ = 13u·σ`. For `z < 0`, `σ = e/(1 + e)`: `e`'s
+/// error twice, the sum and the division, `Δσ = (18 + 8|z|)·u·σ`. For `z = ±∞` it is 1 or 0
+/// exactly. The subtraction and the product round once each.
+fn logit_grad(z: f32, t: f32, w: f32) -> (f64, f64) {
+    let (z, t, w) = (f64::from(z), f64::from(t), f64::from(w));
+    let sigma = if z >= 0.0 {
+        1.0 / (1.0 + (-z).exp())
+    } else {
+        z.exp() / (1.0 + z.exp())
+    };
+    let d_sigma = if z.is_infinite() {
+        // σ(±∞) is 1 or 0 exactly.
+        0.0
+    } else if z >= 0.0 {
+        13.0 * U * sigma
+    } else {
+        (18.0 + 8.0 * z.abs()) * U * sigma
+    };
+    let g = (sigma - t) * w;
+    (
+        g,
+        second(w * (d_sigma + U * (sigma - t).abs()) + U * g.abs()),
+    )
+}
+
+/// Whether the probability gradient at `(p, t)` divides: not clamped, both finite.
+fn bce_divides(input: BinaryInput, p: f32, t: f32) -> bool {
+    input == BinaryInput::Probabilities
+        && p.is_finite()
+        && t.is_finite()
+        && !clamps(p)
+        && !clamps(1.0 - p)
+}
+
+/// The gradient of `form` against the tape. Probabilities: the `f32` tape's bits where a
+/// logarithm was clamped or an input is not finite, and within `8u` of it, relative, where
+/// the gradient divides: `fl(fl(A / B)·w)` with the division within 2.5 ulp (`5u`) and the
+/// product `u` against the CPU's two roundings (`2u`), as smooth L1's. Logits: the `f32`
+/// tape's bits where it is not finite, else within [`logit_grad`]'s bound of the exact
+/// gradient. Returns the worst share of a bound.
+fn check_bce_grad(
+    form: Form,
+    (pred, target): (&[f32], &[f32]),
+    grad: &[f32],
+    want: &[f32],
+    what: &str,
+) -> f64 {
+    let w = bce_scale(form, pred.len());
+    let exact = |i: usize| match form.0 {
+        BinaryInput::Probabilities => !bce_divides(form.0, pred[i], target[i]),
+        BinaryInput::Logits => !want[i].is_finite(),
+    };
+    let pick = |v: &[f32], keep: bool| -> Vec<f32> {
+        (0..v.len())
+            .filter(|&i| exact(i) == keep)
+            .map(|i| v[i])
+            .collect()
+    };
+    assert_exact(&pick(grad, true), &pick(want, true), what);
+    let rest: Vec<usize> = (0..grad.len()).filter(|&i| !exact(i)).collect();
+    let got: Vec<f32> = rest.iter().map(|&i| grad[i]).collect();
+    let (reference, bounds): (Vec<f64>, Vec<f64>) = match form.0 {
+        BinaryInput::Probabilities => rest
+            .iter()
+            .map(|&i| {
+                let r = f64::from(want[i]);
+                (r, second(8.0 * U * r.abs()))
+            })
+            .unzip(),
+        BinaryInput::Logits => rest
+            .iter()
+            .map(|&i| logit_grad(pred[i], target[i], w))
+            .unzip(),
+    };
+    assert_within(&got, &reference, |i| bounds[i], what).ratio()
+}
+
+/// `n` probabilities: the sigmoid of `[−12, 12)` from `seed`, with every 97th value 0 and
+/// every 89th 1, so some logarithms clamp.
+fn probabilities(seed: u64, n: usize) -> Vec<f32> {
+    let mut p: Vec<f32> = (seeded_values(seed, n, -12.0, 12.0).into_iter())
+        .map(|z| 1.0 / (1.0 + (-z).exp()))
+        .collect();
+    for (i, v) in p.iter_mut().enumerate() {
+        if i % 97 == 3 {
+            *v = 0.0;
+        } else if i % 89 == 5 {
+            *v = 1.0;
+        }
+    }
+    p
+}
+
+/// `n` logits in `[−20, 20)` from `seed`, every 101st five times larger.
+fn logits(seed: u64, n: usize) -> Vec<f32> {
+    let mut z = seeded_values(seed, n, -20.0, 20.0);
+    for v in z.iter_mut().step_by(101) {
+        *v *= 5.0;
+    }
+    z
+}
+
+/// `n` targets in `[0, 1)` from `seed`, every 7th rounded to 0 or 1.
+fn targets(seed: u64, n: usize) -> Vec<f32> {
+    let mut t = seeded_values(seed, n, 0.0, 1.0);
+    for v in t.iter_mut().step_by(7) {
+        *v = v.round();
+    }
+    t
+}
+
+/// Each form against the tape on 1, 37, 4,097 and 100,000 values (and probabilities' mean on
+/// 2²⁴ + 1,000, more than one grid row of workgroups), the batch sizes no multiple of the
+/// workgroup: the loss within [`bce_loss`]'s bound of the exact loss, the gradient as
+/// [`check_bce_grad`] checks it, the clamp count the tape's, and a second run's bits the
+/// first's.
+#[test]
+fn binary_cross_entropy_twin() {
+    for_each_gpu(|gpu| {
+        for (k, form) in FORMS.into_iter().enumerate() {
+            let large = k == 0;
+            let sizes: &[usize] = if large {
+                &[1, 37, 4097, 100_000, (1 << 24) + 1000]
+            } else {
+                &[1, 37, 4097, 100_000]
+            };
+            for (s, &n) in sizes.iter().enumerate() {
+                let mut kit = kit(gpu, n);
+                let bce = BinaryCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+                let what = format!("{form:?} of {n} values");
+                let seed = 300 + 10 * k as u64 + s as u64;
+                let pred = match form.0 {
+                    BinaryInput::Probabilities => probabilities(seed, n),
+                    BinaryInput::Logits => logits(seed, n),
+                };
+                let target = targets(seed + 1000, n);
+                let (value, count, grad) = gpu_bce(&mut kit, &bce, form, &pred, &target);
+                let (_, want_grad, clamped) = tape_bce::<f32>(form, &pred, &target);
+                let ratio = check_bce_grad(
+                    form,
+                    (&pred, &target),
+                    &grad,
+                    &want_grad,
+                    &format!("the gradient, {what}"),
+                );
+                assert_eq!(count, clamped as f32, "the clamp count, {what}");
+                let (want, bound) = bce_loss(form, &pred, &target);
+                let worst =
+                    assert_within(&[value], &[want], |_| bound, &format!("the loss, {what}"));
+                println!(
+                    "{what}: loss worst {:.3} of its bound, gradient {ratio:.3}, {clamped} clamped",
+                    worst.ratio()
+                );
+                let (again, again_count, again_grad) =
+                    gpu_bce(&mut kit, &bce, form, &pred, &target);
+                assert_exact(
+                    &[again, again_count],
+                    &[value, count],
+                    &format!("a second run, {what}"),
+                );
+                assert_exact(
+                    &again_grad,
+                    &grad,
+                    &format!("a second run's gradient, {what}"),
+                );
+            }
+        }
+    });
+}
+
+/// Each value on its own (`n = 1`, so the mean's division is by 1) at the edges, against
+/// the tape: where the `f32` tape's loss is NaN or infinite the GPU's is the same, elsewhere
+/// within [`bce_term`]'s bound of the exact loss; the gradient as [`check_bce_grad`] checks
+/// it, so ±∞ and NaN the tape's; the clamp count the tape's.
+///
+/// Probabilities: ±0 and 1 (clamped), 26·2⁻¹⁴⁹ (clamped) and 27·2⁻¹⁴⁹ (not), other
+/// subnormals, 2⁻⁶² and one ulp either side (where the gradient's scaling starts), values
+/// near 0 and 1, and outside `[0, 1]` (a NaN loss with the CPU's finite gradient), among them
+/// ±1e20 and ±2⁶⁴ and one ulp below it (from 2⁶⁴ the CPU's `p·(1 − p)` overflows, so an
+/// infinite target gives a NaN gradient), and NaN or ±∞; against targets of ±0, 1, ¼, a subnormal, NaN and ±∞. Logits: ±0, a subnormal, ±1,
+/// ±20, ±88 and ±89 (where `e^(−|z|)` turns subnormal), ±100, ±104, ±1e30, NaN and ±∞; against
+/// targets of ±0, 1, ½, 2, NaN and ±∞.
+#[test]
+fn binary_cross_entropy_edges_match_the_tape() {
+    let below = |x: f32| f32::from_bits(x.to_bits() - 1);
+    let above = |x: f32| f32::from_bits(x.to_bits() + 1);
+    let (inf, nan) = (f32::INFINITY, f32::NAN);
+    let tiny = 2.0f32.powi(-62);
+    // From 2^64 on, the CPU's p (1 - p) overflows to -infinity.
+    let huge = 2.0f32.powi(64);
+    let probabilities = [
+        0.0,
+        -0.0,
+        1.0,
+        f32::from_bits(1),
+        f32::from_bits(26),
+        f32::from_bits(27),
+        1e-40,
+        f32::MIN_POSITIVE,
+        below(tiny),
+        tiny,
+        above(tiny),
+        1e-30,
+        1e-7,
+        0.25,
+        0.5,
+        below(1.0),
+        1.0 - 1.0 / 16_777_216.0,
+        above(1.0),
+        1.5,
+        -1e-3,
+        -1e-30,
+        1e20,
+        -1e20,
+        below(huge),
+        huge,
+        -below(huge),
+        -huge,
+        nan,
+        inf,
+        -inf,
+    ];
+    let probability_targets = [0.0, -0.0, 1.0, 0.25, 1e-40, nan, inf, -inf];
+    let logits = [
+        0.0, -0.0, 1e-40, 1.0, -1.0, 20.0, -20.0, 88.0, -88.0, 89.0, -89.0, 100.0, -100.0, 104.0,
+        -104.0, 1e30, -1e30, nan, inf, -inf,
+    ];
+    let logit_targets = [0.0, -0.0, 1.0, 0.5, 2.0, nan, inf, -inf];
+    for_each_gpu(|gpu| {
+        let mut kit = kit(gpu, 64);
+        let bce = BinaryCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+        for (input, preds, wanted) in [
+            (
+                BinaryInput::Probabilities,
+                &probabilities[..],
+                &probability_targets[..],
+            ),
+            (BinaryInput::Logits, &logits[..], &logit_targets[..]),
+        ] {
+            let form = (input, LossReduction::Mean);
+            for &p in preds {
+                for &t in wanted {
+                    let what = format!("{input:?} at {p:e}, target {t:e}");
+                    let (value, count, grad) = gpu_bce(&mut kit, &bce, form, &[p], &[t]);
+                    let (want, want_grad, clamped) = tape_bce::<f32>(form, &[p], &[t]);
+                    if want.is_finite() {
+                        let (exact, bound) = bce_term(input, p, t);
+                        assert_within(&[value], &[exact], |_| second(bound), &what);
+                    } else {
+                        assert_exact(&[value], &[want], &format!("the loss, {what}"));
+                    }
+                    check_bce_grad(
+                        form,
+                        (&[p], &[t]),
+                        &grad,
+                        &want_grad,
+                        &format!("the gradient, {what}"),
+                    );
+                    assert_eq!(count, clamped as f32, "the clamp count, {what}");
+                }
+            }
+        }
+    });
+}
+
+/// A NaN or out-of-range value in a batch of 8,192: a NaN probability, a NaN target, a
+/// probability of 1.5, an infinite target and an infinite logit give a NaN or infinite loss,
+/// which the finite flag catches, and leave every other value's gradient the clean run's
+/// bits.
+#[test]
+fn binary_cross_entropy_non_finite_reaches_the_loss() {
+    for_each_gpu(|gpu| {
+        let n = 8192;
+        let mut kit = kit(gpu, n);
+        let bce = BinaryCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+        let flag = FiniteFlag::new(gpu, &mut kit.cache).unwrap();
+        let target = targets(1, n);
+        for (name, input, at_pred, value) in [
+            (
+                "a NaN probability",
+                BinaryInput::Probabilities,
+                true,
+                f32::NAN,
+            ),
+            ("a NaN target", BinaryInput::Probabilities, false, f32::NAN),
+            (
+                "a probability of 1.5",
+                BinaryInput::Probabilities,
+                true,
+                1.5,
+            ),
+            (
+                "an infinite target",
+                BinaryInput::Probabilities,
+                false,
+                f32::INFINITY,
+            ),
+            ("a NaN logit", BinaryInput::Logits, true, f32::NAN),
+            ("a NaN target", BinaryInput::Logits, false, f32::NAN),
+            (
+                "an infinite logit",
+                BinaryInput::Logits,
+                true,
+                f32::INFINITY,
+            ),
+        ] {
+            let form = (input, LossReduction::Mean);
+            let pred = match input {
+                BinaryInput::Probabilities => probabilities(2, n),
+                BinaryInput::Logits => logits(2, n),
+            };
+            let (_, _, clean) = gpu_bce(&mut kit, &bce, form, &pred, &target);
+            let (mut p, mut t) = (pred.clone(), target.clone());
+            if at_pred {
+                p[5000] = value;
+            } else {
+                t[5000] = value;
+            }
+            let (loss, _, grad) = gpu_bce(&mut kit, &bce, form, &p, &t);
+            assert!(!loss.is_finite(), "{input:?}, {name}: the loss is {loss}");
+            let rest: Vec<f32> = grad[..5000].iter().chain(&grad[5001..]).copied().collect();
+            let want: Vec<f32> = clean[..5000]
+                .iter()
+                .chain(&clean[5001..])
+                .copied()
+                .collect();
+            assert_exact(
+                &rest,
+                &want,
+                &format!("{input:?}, {name}: the other values"),
+            );
+            let losses = kit.upload(&[loss]);
+            let flags = kit.zeros(1);
+            let check = flag.call(&mut kit.steps, &mut kit.pool, (&losses, 0), &[], &flags);
+            let mut step = kit.steps.begin();
+            flag.record(&mut step, &check);
+            let _ = step.finish();
+            assert_eq!(
+                kit.read(&flags)[0].to_bits(),
+                1,
+                "{input:?}, {name}: the finite flag"
+            );
+            check.release(&mut kit.pool);
+        }
+    });
+}
+
+/// The documented refusals of binary cross-entropy: no values, buffers too short (the output
+/// needs the loss's word and the count's), and an output that is a buffer the kernels read.
+#[test]
+fn binary_cross_entropy_refusals() {
+    for_each_gpu(|gpu| {
+        let message = |f: &mut dyn FnMut()| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("refused");
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|m| m.to_string()))
+                .unwrap_or_default()
+        };
+        let mut kit = kit(gpu, 64);
+        let bce = BinaryCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+        let [p, t, g, out] = [(); 4].map(|_| kit.zeros(16));
+        let one = kit.zeros(1);
+        let form = (BinaryInput::Probabilities, LossReduction::Mean);
+        let mut binary = |n: u32,
+                          p: &PooledBuffer,
+                          t: &PooledBuffer,
+                          g: &PooledBuffer,
+                          out: (&PooledBuffer, u32)| {
+            message(&mut || {
+                let _ = bce.call(&mut kit.steps, &mut kit.pool, form, n, p, t, g, out);
+            })
+        };
+        assert!(binary(0, &p, &t, &g, (&out, 0)).contains("where the kernels take 1 to"));
+        assert!(binary(17, &p, &t, &g, (&out, 0)).contains("the prediction needs 17 values"));
+        assert!(binary(16, &p, &one, &g, (&out, 0)).contains("the target needs 16 values"));
+        assert!(binary(16, &p, &t, &one, (&out, 0)).contains("the gradient needs 16 values"));
+        assert!(binary(16, &p, &t, &g, (&out, 15)).contains("the loss output needs 17 values"));
+        assert!(binary(16, &p, &t, &g, (&one, 0)).contains("the loss output needs 2 values"));
+        assert!(
+            binary(16, &p, &t, &t, (&out, 0))
+                .contains("the gradient and the target must be different")
+        );
+        assert!(
+            binary(16, &p, &t, &g, (&g, 0))
+                .contains("the gradient and the loss output must be different")
+        );
+        assert!(
+            binary(16, &p, &t, &g, (&p, 0))
                 .contains("the loss output and the prediction must be different")
         );
     });

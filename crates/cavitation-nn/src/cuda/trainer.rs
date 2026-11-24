@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_cuda::{
-    ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, GluOp, MeanSquaredError,
-    NegativeLogLikelihood, OptimizerKernel, OptimizerRule, PreluOp, Regression, RegressionLoss,
-    RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy, SumSquares,
+    BinaryCrossEntropy, BinaryInput, ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, GluOp,
+    LossReduction, MeanSquaredError, NegativeLogLikelihood, OptimizerKernel, OptimizerRule,
+    PreluOp, Regression, RegressionLoss, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy,
+    SumSquares,
 };
 
 use super::model::{CudaModel, ran, refused};
@@ -41,6 +42,18 @@ enum LossKernel<'c> {
     Nll(NegativeLogLikelihood<'c>),
     /// L1, Huber or smooth L1 on target values.
     Regression(RegressionLoss<'c>),
+    /// Binary cross-entropy, of probabilities or of logits, on target values.
+    Binary(BinaryCrossEntropy<'c>),
+}
+
+/// What the binary cross-entropy kernel reads for `loss`, or `None` for a loss that is not
+/// binary cross-entropy.
+fn binary(loss: Loss) -> Option<BinaryInput> {
+    match loss {
+        Loss::BinaryCrossEntropy => Some(BinaryInput::Probabilities),
+        Loss::BinaryCrossEntropyWithLogits => Some(BinaryInput::Logits),
+        _ => None,
+    }
 }
 
 /// The regression kernel's form of `loss`, with its threshold as the `f32` the tape takes,
@@ -203,9 +216,12 @@ pub struct CudaStepProfile {
 /// [`dropout_mask`] with the trainer's seed and the step's number), the same order of work,
 /// and an epoch's shorter last batch through a step set up for its rows. The model's layers
 /// must be ones [`CudaModel::compile`] takes; the losses are [`Loss::CrossEntropy`],
-/// [`Loss::Nll`], [`Loss::Mse`], [`Loss::L1`], [`Loss::Huber`] and [`Loss::SmoothL1`], and the
+/// [`Loss::Nll`], [`Loss::Mse`], [`Loss::L1`], [`Loss::Huber`], [`Loss::SmoothL1`],
+/// [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`], and the
 /// optimisers SGD (with or without momentum), Adam and AdamW. A parameter used by two layers
-/// is refused.
+/// is refused. Binary cross-entropy's clamped logarithms are counted on the card and read back
+/// with the loss, so the health checks send
+/// [`Warning::ClampedLogs`](crate::Warning::ClampedLogs) as on the CPU.
 ///
 /// The convolution's passes run through cuDNN and `Linear`'s through cuBLAS, which publish no
 /// error bounds; their distance from the CPU is measured in `cavitation-cuda`'s tests and in
@@ -323,6 +339,8 @@ struct HealthRead {
     counts: Vec<f32>,
     /// The ReLU layers' bits.
     bits: Vec<u32>,
+    /// How many logarithms binary cross-entropy clamped; 0 for the other losses.
+    clamped: usize,
 }
 
 impl std::fmt::Debug for CudaTrainer<'_, '_> {
@@ -366,13 +384,13 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for binary cross-entropy (with
-    /// or without logits) and KL divergence, for a parameter used by two layers, for an
-    /// optimiser setting that is not finite as an `f32`, and as [`CudaModel::compile`]
-    /// returns; [`Error::InvalidData`] as `compile` returns, for a Huber `delta` not above 0
-    /// or a smooth L1 `beta` below 0 (NaN either way, as `f32`s; the CPU's tape panics on
-    /// them), if the model has no parameters or one that holds no values, and if a batch
-    /// norm would normalise a training batch over one value per channel.
+    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for KL divergence, for a parameter
+    /// used by two layers, for an optimiser setting that is not finite as an `f32`, and as
+    /// [`CudaModel::compile`] returns; [`Error::InvalidData`] as `compile` returns, for a
+    /// Huber `delta` not above 0 or a smooth L1 `beta` below 0 (NaN either way, as `f32`s;
+    /// the CPU's tape panics on them), if the model has no parameters or one that holds no
+    /// values, and if a batch norm would normalise a training batch over one value per
+    /// channel.
     ///
     /// # Examples
     ///
@@ -392,6 +410,9 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     ///     assert!(CudaTrainer::new(&net, &params, &adam, huber, 16, &cuda).is_ok());
     ///     let flat = Loss::Huber { delta: 0.0 };
     ///     assert!(CudaTrainer::new(&net, &params, &adam, flat, 16, &cuda).is_err());
+    ///     let bce = Loss::BinaryCrossEntropyWithLogits;
+    ///     assert!(CudaTrainer::new(&net, &params, &adam, bce, 16, &cuda).is_ok());
+    ///     assert!(CudaTrainer::new(&net, &params, &adam, Loss::KlDiv, 16, &cuda).is_err());
     /// }
     /// ```
     pub fn new(
@@ -421,11 +442,13 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                 )));
             }
         };
-        if !matches!(loss, Loss::CrossEntropy | Loss::Nll | Loss::Mse) && regression(loss).is_none()
+        if !matches!(loss, Loss::CrossEntropy | Loss::Nll | Loss::Mse)
+            && regression(loss).is_none()
+            && binary(loss).is_none()
         {
             return Err(Error::Unsupported(format!(
-                "{WHO}: CUDA has no Loss::{loss:?}; it runs CrossEntropy, Nll, Mse, L1, Huber and \
-                 SmoothL1"
+                "{WHO}: CUDA has no Loss::{loss:?}; it runs CrossEntropy, Nll, Mse, L1, Huber, \
+                 SmoothL1, BinaryCrossEntropy and BinaryCrossEntropyWithLogits"
             )));
         }
         loss.check_threshold(WHO)?;
@@ -478,13 +501,13 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         let checks = Checks {
             finite: FiniteFlag::with_starts(cuda, &lens, &offsets).map_err(refuse)?,
             squares: SumSquares::with_starts(cuda, &lens, &offsets).map_err(refuse)?,
-            loss: new(1)?,
+            loss: new(2)?,
             flag: new(1)?,
             sums: new(n)?,
             bits: new(words.max(1))?,
             words,
-            gathered: new(2 + 2 * n + words)?,
-            host: vec![0; 2 + 2 * n + words],
+            gathered: new(3 + 2 * n + words)?,
+            host: vec![0; 3 + 2 * n + words],
         };
         // The flat values start as the parameters, and the state at 0. Then each parameter's
         // buffer becomes its place in the flat values, and each gradient its place in the
@@ -728,6 +751,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                     LossKernel::Mse(mse) => mse.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                     LossKernel::Nll(nll) => nll.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                     LossKernel::Regression(r) => r.run(&y, &t, &mut grad, (&mut loss_out, 0)),
+                    LossKernel::Binary(bce) => bce.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                 },
             );
         }
@@ -859,7 +883,8 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         if let Some(p) = profile.as_mut() {
             p.running = clock.lap();
         }
-        // One readback: the loss, the flag, the sums, the counts and the bits.
+        // One readback: the loss, the flag, the sums, the counts, the bits and binary
+        // cross-entropy's clamp count.
         let n = self.param_grads.len();
         let words = if dead_relu { checks.words } else { 0 };
         let g = checks.gathered;
@@ -874,7 +899,11 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         if words > 0 {
             ran(STEP, s.copy((g, 2 + 2 * n), (checks.bits, 0), words));
         }
-        let host = &mut checks.host[..2 + 2 * n + words];
+        let counts_clamps = binary(self.loss) == Some(BinaryInput::Probabilities);
+        if counts_clamps {
+            ran(STEP, s.copy((g, 2 + 2 * n + words), (checks.loss, 1), 1));
+        }
+        let host = &mut checks.host[..2 + 2 * n + words + usize::from(counts_clamps)];
         ran(STEP, s.get(g).read(host));
         let value = f32::from_bits(host[0]);
         let flag = host[1];
@@ -886,7 +915,13 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         read.counts
             .extend(host[2 + n..2 + 2 * n].iter().map(|&w| f32::from_bits(w)));
         read.bits.clear();
-        read.bits.extend_from_slice(&host[2 + 2 * n..]);
+        read.bits
+            .extend_from_slice(&host[2 + 2 * n..2 + 2 * n + words]);
+        read.clamped = if counts_clamps {
+            f32::from_bits(host[2 + 2 * n + words]) as usize
+        } else {
+            0
+        };
         let ran_update = ran(STEP, flat.kernel.commit());
         assert_eq!(
             ran_update,
@@ -994,10 +1029,10 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         self.profile.as_ref()
     }
 
-    /// The health checks of step `step` with loss `value`, on the values read back: the
-    /// loss, the dead-ReLU bits, the gradients' finiteness (under [`OnNonFinite::Skip`]) and
-    /// their norms, in the CPU trainer's order. `Ok(true)` when the step trained, `Ok(false)`
-    /// when it was left out.
+    /// The health checks of step `step` with loss `value`, on the values read back: binary
+    /// cross-entropy's clamped logarithms, the loss, the dead-ReLU bits, the gradients'
+    /// finiteness (under [`OnNonFinite::Skip`]) and their norms, in the CPU trainer's order.
+    /// `Ok(true)` when the step trained, `Ok(false)` when it was left out.
     fn check(
         &mut self,
         model: &Sequential,
@@ -1005,6 +1040,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
         value: f32,
         inputs: StepInputs<'_>,
     ) -> Result<bool, Error> {
+        self.health.check_clamped(step, self.read.clamped);
         self.health.check_loss(step, value, inputs)?;
         if self.health.health().dead_relu && !self.health.left_out(value) {
             let (layers, relus, bits) = (&self.model.layers, &self.relu_words, &self.read.bits);
@@ -1558,6 +1594,14 @@ impl<'c> TrainPass<'c> {
                 cuda,
                 (u32_of(rows), u32_of(out_width)),
             )?),
+            Loss::BinaryCrossEntropy | Loss::BinaryCrossEntropyWithLogits => {
+                let input = binary(loss).expect("a binary cross-entropy");
+                LossKernel::Binary(BinaryCrossEntropy::new(
+                    cuda,
+                    u32_of(rows * out_width),
+                    (input, LossReduction::Mean),
+                )?)
+            }
             _ => match regression(loss) {
                 Some(kind) => LossKernel::Regression(RegressionLoss::new(
                     cuda,
