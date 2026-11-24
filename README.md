@@ -172,7 +172,7 @@ In a program, `devices()` returns the same list, and `FitConfig::device` chooses
 - `Device::Cpu`, the default: the CPU.
 - `Device::Gpu(&gpu)`: a GPU you opened with `cavitation_gpu::Gpu`.
 - `Device::Cuda(&cuda)`: an NVIDIA card you opened with `cavitation_cuda::Cuda`.
-- `Device::Auto`: CUDA when it opens and can train the run, then the GPU, then the CPU. A run with hooks or a `StepControl`, or with a layer, loss or optimiser a GPU has no kernel for, trains on the CPU. `History::device` says where the run trained, and `History::device_note` why a device was left.
+- `Device::Auto`: CUDA when it opens and can train the run, then the GPU, then the CPU. A run with hooks or a `StepControl`, or with a layer or optimiser a GPU has no kernel for, trains on the CPU. `History::device` says where the run trained, and `History::device_note` why a device was left.
 
 The environment variable `CAVITATION_DEVICE` (`auto`, `cuda`, `gpu` or `cpu`) restricts what `Device::Auto` picks. A GPU run agrees with the CPU run within the GPU kernels' stated error bounds, not bit for bit, so a run that must give the same bits on every machine names its device.
 
