@@ -5,7 +5,8 @@
 //! skipped steps refused as on the CPU, and the warnings of seeded runs (the norm checks on
 //! every parameter, and dead ReLU and ReLU6 neurons after a `Linear` and after a convolution)
 //! matching the CPU's kind for kind, step for step and name for name, with each norm within
-//! 2⁻¹⁰ of the CPU's.
+//! 2⁻¹⁰ of the CPU's; and binary cross-entropy's clamped logarithms warned of as on the CPU,
+//! with the CPU's count.
 //!
 //! Each comparison first checks that the CPU run sent the warnings it is about, so two empty
 //! lists never pass. Without a GPU every test says so and checks nothing;
@@ -20,7 +21,7 @@ use super::GpuTrainer;
 use super::forward_tests::{mlp, prelu_mlp, twin};
 use crate::{
     BatchView, Conv2d, Flatten, Health, Init, Linear, Loss, MaxPool2d, OnNonFinite,
-    OptimizerConfig, Relu, Relu6, Sequential, TargetsView, Trainer, Warning, WarningKind,
+    OptimizerConfig, Relu, Relu6, Sequential, Sigmoid, TargetsView, Trainer, Warning, WarningKind,
 };
 
 /// Runs `body` on each GPU this platform has, one per backend, and returns how many ran.
@@ -347,6 +348,52 @@ fn an_epoch_of_skipped_steps_ends_as_on_the_cpu() {
         assert_eq!(g.counts, cpu.counts);
         same_warnings(&g.warnings, &cpu.warnings, "skipped epoch");
         assert_eq!(updates, vec![0; updates.len()]);
+    });
+}
+
+/// A `Linear` 12 → 4 with no weights and biases of ±300, then a sigmoid: every output is
+/// exactly 1 or 0 on both devices, so binary cross-entropy clamps a logarithm wherever the
+/// target is not the output. Two epochs of two batches of 6 rows, with targets of 0, ½ and 1
+/// from `seed`.
+fn saturated(seed: u64) -> (Sequential, ParamStore, Vec<Data>) {
+    let mut params = ParamStore::new();
+    let mut rng = Rng::seed(seed);
+    let net = Sequential::new()
+        .push(Linear::new(&mut params, 12, 4, &mut rng))
+        .push(Sigmoid);
+    let l = net.layer(0).as_linear().unwrap();
+    *params.value_mut(l.weight()) = Tensor::zeros(&[4, 12]);
+    *params.value_mut(l.bias().unwrap()) =
+        Tensor::from_vec(vec![300.0, -300.0, 300.0, -300.0], &[4]).unwrap();
+    let batches = (0..2)
+        .map(|b| {
+            let mut data = Data::new(seed + b, 6, 12, 4);
+            let targets = (0..24).map(|_| (rng.range(0.0, 3.0) as usize).min(2) as f32 / 2.0);
+            data.values = Some(targets.collect());
+            data
+        })
+        .collect();
+    (net, params, batches)
+}
+
+/// Binary cross-entropy on outputs of exactly 0 and 1 sends `Warning::ClampedLogs` as on the
+/// CPU: once per epoch, at the epoch's first step, with the CPU's count of clamped logarithms.
+#[test]
+fn clamped_logs_warn_as_on_the_cpu() {
+    let (net, params, batches) = saturated(91);
+    let epoch: Vec<&Data> = batches.iter().collect();
+    let epochs = vec![epoch.clone(), epoch];
+    let loss = Loss::BinaryCrossEntropy;
+    let health = || Health {
+        dead_relu: false,
+        ..Health::quiet()
+    };
+    let cpu = cpu_run(&net, &params, &adam(), loss, 6, health(), &epochs);
+    assert_eq!(count(&cpu.warnings, WarningKind::ClampedLogs), 2, "{cpu:?}");
+    for_each_gpu(|gpu| {
+        let (g, _) = gpu_run(gpu, &net, &params, &adam(), loss, 6, health(), &epochs);
+        assert_eq!(g.counts, cpu.counts, "the steps taken and left out");
+        same_warnings(&g.warnings, &cpu.warnings, "clamped logarithms");
     });
 }
 

@@ -1072,7 +1072,19 @@ impl<'s> HealthMonitor<'s> {
         model: &Sequential,
         inputs: StepInputs<'_>,
     ) -> Result<(), Error> {
-        let clamped = tape.clamped_logs();
+        self.check_clamped(step, tape.clamped_logs());
+        self.check_loss(step, loss, inputs)?;
+        if self.health.dead_relu && !self.left_out(loss) {
+            self.track_relu_outputs(tape, trace, model);
+        }
+        Ok(())
+    }
+
+    /// The clamped-logarithm check of [`after_backward`](Self::after_backward), without the
+    /// tape: `clamped` logarithms of binary cross-entropy at step `step`, as
+    /// [`Tape::clamped_logs`] counts them, send [`Warning::ClampedLogs`] when there are any,
+    /// at most once per epoch.
+    pub(crate) fn check_clamped(&mut self, step: u64, clamped: usize) {
         if clamped > 0 && !self.clamped_warned {
             self.clamped_warned = true;
             self.emit(Warning::ClampedLogs {
@@ -1080,11 +1092,6 @@ impl<'s> HealthMonitor<'s> {
                 count: clamped,
             });
         }
-        self.check_loss(step, loss, inputs)?;
-        if self.health.dead_relu && !self.left_out(loss) {
-            self.track_relu_outputs(tape, trace, model);
-        }
-        Ok(())
     }
 
     /// The loss checks of [`after_backward`](Self::after_backward), without the tape: `loss`

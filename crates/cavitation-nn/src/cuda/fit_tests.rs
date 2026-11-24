@@ -25,8 +25,8 @@ use crate::train::{Choice, fit_choosing};
 use crate::{
     Batch, BatchNorm2d, Batcher, Conv2d, CudaModel, Dataset, Device, DeviceKind, EarlyStopping,
     Evaluation, FitConfig, Flatten, Health, Hooks, Linear, Loss, LrSchedule, Monitor, OnNonFinite,
-    OptimizerConfig, Sequential, StepControl, Targets, TargetsView, devices, evaluate, fit,
-    fit_controlled, fit_with_hooks,
+    OptimizerConfig, Sequential, Sigmoid, StepControl, Targets, TargetsView, devices, evaluate,
+    fit, fit_controlled, fit_with_hooks,
 };
 
 /// `config` on `cuda`.
@@ -543,10 +543,26 @@ fn values(seed: u64, rows: usize, width: usize, outputs: usize) -> Dataset {
     }
 }
 
+/// `values` with its targets in `[0, 1)` and every fifth rounded to 0 or 1, as binary
+/// cross-entropy takes them.
+fn binary_values(seed: u64, rows: usize, width: usize, outputs: usize) -> Dataset {
+    let mut data = values(seed, rows, width, outputs);
+    if let Targets::Values(t) = &mut data.targets {
+        for (i, v) in t.data_mut().iter_mut().enumerate() {
+            *v = (*v + 1.0) / 2.0;
+            if i % 5 == 0 {
+                *v = v.round();
+            }
+        }
+    }
+    data
+}
+
 /// The losses besides cross-entropy, each with whether it trains on labels: the negative
 /// log-likelihood after an MLP whose every `Linear` ends in a log-softmax, on labels; MSE, L1,
 /// Huber (`delta` 0.5) and smooth L1 (`beta` 0.5 and 0) after the test MLP, on targets in
-/// `[−1, 1)`.
+/// `[−1, 1)`; binary cross-entropy after the test MLP with a sigmoid, and on its logits, on
+/// targets in `[0, 1)` with every fifth 0 or 1.
 fn other_losses() -> Vec<(Loss, bool)> {
     vec![
         (Loss::Nll, true),
@@ -555,6 +571,8 @@ fn other_losses() -> Vec<(Loss, bool)> {
         (Loss::Huber { delta: 0.5 }, false),
         (Loss::SmoothL1 { beta: 0.5 }, false),
         (Loss::SmoothL1 { beta: 0.0 }, false),
+        (Loss::BinaryCrossEntropy, false),
+        (Loss::BinaryCrossEntropyWithLogits, false),
     ]
 }
 
@@ -568,8 +586,17 @@ fn other_losses() -> Vec<(Loss, bool)> {
 fn every_loss_tracks_the_cpu_fit() {
     for (k, (loss, classes_in)) in other_losses().into_iter().enumerate() {
         let seed = 180 + 3 * k as u64;
+        let binary = matches!(
+            loss,
+            Loss::BinaryCrossEntropy | Loss::BinaryCrossEntropyWithLogits
+        );
         let (train, held_out) = if classes_in {
             (classes(seed, 50, 12, 4), classes(seed + 1, 20, 12, 4))
+        } else if binary {
+            (
+                binary_values(seed, 50, 12, 4),
+                binary_values(seed + 1, 20, 12, 4),
+            )
         } else {
             (values(seed, 50, 12, 4), values(seed + 1, 20, 12, 4))
         };
@@ -590,6 +617,8 @@ fn every_loss_tracks_the_cpu_fit() {
         let mut start = ParamStore::new();
         let net = if classes_in {
             softmax_mlp::<f32>(&mut start, seed + 2, true)
+        } else if loss == Loss::BinaryCrossEntropy {
+            mlp::<f32>(&mut start, seed + 2).push(Sigmoid)
         } else {
             mlp::<f32>(&mut start, seed + 2)
         };
@@ -1108,11 +1137,11 @@ fn what_cuda_does_not_run_is_refused() {
             &mut params,
             &values,
             FitConfig {
-                loss: Loss::BinaryCrossEntropy,
+                loss: Loss::KlDiv,
                 ..config()
             },
         );
-        refused(r, "Loss::BinaryCrossEntropy", &params);
+        refused(r, "Loss::KlDiv", &params);
         let r = fit_with_hooks(&net, &mut params, &train, config(), &mut Hooks::new());
         assert_eq!(r.unwrap().epochs.len(), 1);
         let before = bits(&net, &start);

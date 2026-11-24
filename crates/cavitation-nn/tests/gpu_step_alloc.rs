@@ -1,5 +1,6 @@
 //! Counts host allocations and live host bytes across warm `GpuTrainer` epochs, on full,
-//! short, skipped and profiled steps. wgpu allocates on the host for each encoder, pass,
+//! short, skipped and profiled steps, with cross-entropy and with binary cross-entropy of
+//! probabilities and of logits. wgpu allocates on the host for each encoder, pass,
 //! submission and poll, so a step is not free of allocations; but after warm-up, the live
 //! bytes must be the same at the start of every epoch of the same batches, or memory would
 //! grow, and each step must make the same number of allocations in every epoch, give or take
@@ -19,7 +20,7 @@ use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng, TensorView};
 use cavitation_gpu::Gpu;
 use cavitation_nn::{
     BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, GpuTrainer, Health, Linear, Loss, MaxPool2d,
-    OnNonFinite, OptimizerConfig, Relu, Sequential, TargetsView, Warning,
+    OnNonFinite, OptimizerConfig, Relu, Sequential, Sigmoid, TargetsView, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -82,17 +83,20 @@ const BAD: usize = 2;
 /// The batches profiled in every epoch: a full one and the short one.
 const PROFILED: [usize; 2] = [1, 3];
 
-/// One batch: its inputs and class labels.
+/// One batch: its inputs, class labels, and target values for a loss on values.
 struct Data {
     /// The inputs, row after row.
     x: Vec<f32>,
     /// The class labels, one per row.
     labels: Vec<usize>,
+    /// For a loss on values, `classes` targets in `[0, 1)` per row; empty otherwise.
+    values: Vec<f32>,
 }
 
 impl Data {
-    /// `rows` rows of `width` inputs in `[-1, 1)` and labels below `classes`, from `seed`.
-    fn new(seed: u64, rows: usize, width: usize, classes: usize) -> Data {
+    /// `rows` rows of `width` inputs in `[-1, 1)`, labels below `classes` and, for a loss on
+    /// values, `classes` targets in `[0, 1)` per row, from `seed`.
+    fn new(seed: u64, rows: usize, width: usize, classes: usize, on_values: bool) -> Data {
         let mut rng = Rng::seed(seed);
         Data {
             x: (0..rows * width)
@@ -101,15 +105,28 @@ impl Data {
             labels: (0..rows)
                 .map(|_| (rng.range(0.0, classes as f64) as usize).min(classes - 1))
                 .collect(),
+            values: if on_values {
+                (0..rows * classes)
+                    .map(|_| rng.range(0.0, 1.0) as f32)
+                    .collect()
+            } else {
+                Vec::new()
+            },
         }
     }
 
     /// The batch as a trainer takes it.
     fn view(&self) -> BatchView<'_, f32> {
         let rows = self.labels.len();
+        let targets = if self.values.is_empty() {
+            TargetsView::Classes(&self.labels)
+        } else {
+            let width = self.values.len() / rows;
+            TargetsView::Values(TensorView::from_slice(&self.values, &[rows, width]).unwrap())
+        };
         BatchView {
             x: TensorView::from_slice(&self.x, &[rows, self.x.len() / rows]).unwrap(),
-            targets: TargetsView::Classes(&self.labels),
+            targets,
         }
     }
 }
@@ -137,20 +154,25 @@ struct Counts {
     live: Vec<isize>,
 }
 
-/// Trains the CNN with `config` at batch 6 on 22 rows (6, 6, 6 with a NaN and a short 4),
-/// every health check on and the NaN batch left out under `Skip`, profiling the batches in
-/// [`PROFILED`], for [`WARM_UP`] epochs, then counts [`COUNTED`] epochs.
-fn count_epochs(gpu: &Gpu, config: &OptimizerConfig) -> Counts {
+/// Trains the CNN (with a sigmoid after it for binary cross-entropy of probabilities) with
+/// `config` and `loss` at batch 6 on 22 rows (6, 6, 6 with a NaN and a short 4), every health
+/// check on and the NaN batch left out under `Skip`, profiling the batches in [`PROFILED`],
+/// for [`WARM_UP`] epochs, then counts [`COUNTED`] epochs.
+fn count_epochs(gpu: &Gpu, config: &OptimizerConfig, loss: Loss) -> Counts {
     let mut params = ParamStore::new();
-    let net = cnn(&mut params);
+    let mut net = cnn(&mut params);
+    if loss == Loss::BinaryCrossEntropy {
+        net = net.push(Sigmoid);
+    }
+    let on_values = loss != Loss::CrossEntropy;
     let mut batches: Vec<Data> = [6, 6, 6, 4]
         .iter()
         .enumerate()
-        .map(|(s, &rows)| Data::new(400 + s as u64, rows, 2 * 64, 5))
+        .map(|(s, &rows)| Data::new(400 + s as u64, rows, 2 * 64, 5, on_values))
         .collect();
     batches[BAD].x[5] = f32::NAN;
     let warnings = AtomicUsize::new(0);
-    let mut t = GpuTrainer::new(&net, &params, config, Loss::CrossEntropy, 6, gpu).unwrap();
+    let mut t = GpuTrainer::new(&net, &params, config, loss, 6, gpu).unwrap();
     t.set_health(Health {
         on_non_finite: OnNonFinite::Skip,
         sink: Some(Box::new(|_: &Warning| {
@@ -204,7 +226,8 @@ fn count_epochs(gpu: &Gpu, config: &OptimizerConfig) -> Counts {
     counts
 }
 
-/// Counts SGD with momentum and Adam, and fails if the live bytes at the start of a counted
+/// Counts SGD with momentum and Adam with cross-entropy, and Adam with binary cross-entropy
+/// of probabilities and of logits, and fails if the live bytes at the start of a counted
 /// epoch, or after the last, differ from the first counted epoch's, or if a step's
 /// allocations differ by more than one between counted epochs.
 fn main() -> ExitCode {
@@ -217,6 +240,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     };
     println!("on {}", gpu.info().name);
+    let adam = OptimizerConfig::Adam {
+        lr: 1e-3,
+        weight_decay: 0.0,
+    };
     let configs = [
         (
             "sgd",
@@ -225,18 +252,19 @@ fn main() -> ExitCode {
                 momentum: 0.9,
                 weight_decay: 1e-4,
             },
+            Loss::CrossEntropy,
         ),
+        ("adam", adam, Loss::CrossEntropy),
+        ("adam, binary cross-entropy", adam, Loss::BinaryCrossEntropy),
         (
-            "adam",
-            OptimizerConfig::Adam {
-                lr: 1e-3,
-                weight_decay: 0.0,
-            },
+            "adam, binary cross-entropy with logits",
+            adam,
+            Loss::BinaryCrossEntropyWithLogits,
         ),
     ];
     let mut ok = true;
-    for (name, config) in &configs {
-        let counts = count_epochs(&gpu, config);
+    for (name, config, loss) in &configs {
+        let counts = count_epochs(&gpu, config, *loss);
         let steps = counts.allocations[0].len();
         let spread = |i: usize| {
             let at = counts.allocations.iter().map(|e| e[i]);

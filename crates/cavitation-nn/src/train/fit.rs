@@ -205,6 +205,10 @@ impl Loss {
                     Loss::L1 => tape.l1(out, t, mean),
                     Loss::Huber { delta } => tape.huber(out, t, f64::from(delta as f32), mean),
                     Loss::SmoothL1 { beta } => tape.smooth_l1(out, t, f64::from(beta as f32), mean),
+                    Loss::BinaryCrossEntropy => tape.binary_cross_entropy(out, t, mean),
+                    Loss::BinaryCrossEntropyWithLogits => {
+                        tape.binary_cross_entropy_with_logits(out, t, mean)
+                    }
                     other => unimplemented!("Loss::{other:?} on an f64 tape"),
                 }
             }

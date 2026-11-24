@@ -84,7 +84,7 @@ For a hand-written loop, `GpuTrainer` (and `CudaTrainer`) are the step-by-step t
 
 A GPU run is refused with `Error::Unsupported`, before any training, for what its trainer has no kernel for:
 
-- the losses `BinaryCrossEntropy`, `BinaryCrossEntropyWithLogits` and `KlDiv`;
+- the loss `KlDiv`;
 - the optimisers `RmsProp` and `Adagrad`;
 - `OnNonFinite::Warn`;
 - hooks registered with `fit_with_hooks`, and `fit_controlled`;
