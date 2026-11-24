@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use cavitation_core::{Error, ParamId, ParamStore, dropout_mask};
 use cavitation_cuda::{
     BinaryCrossEntropy, BinaryInput, ChannelDims, Cuda, CudaError, DeadRelu, FiniteFlag, GluOp,
-    LossReduction, MeanSquaredError, NegativeLogLikelihood, OptimizerKernel, OptimizerRule,
-    PreluOp, Regression, RegressionLoss, RowSoftmaxOp, RunningUpdate, SoftmaxCrossEntropy,
-    SumSquares,
+    KlDivergence, LossReduction, MeanSquaredError, NegativeLogLikelihood, OptimizerKernel,
+    OptimizerRule, PreluOp, Regression, RegressionLoss, RowSoftmaxOp, RunningUpdate,
+    SoftmaxCrossEntropy, SumSquares,
 };
 
 use super::model::{CudaModel, ran, refused};
@@ -44,6 +44,8 @@ enum LossKernel<'c> {
     Regression(RegressionLoss<'c>),
     /// Binary cross-entropy, of probabilities or of logits, on target values.
     Binary(BinaryCrossEntropy<'c>),
+    /// KL divergence of target distributions from log-probabilities.
+    KlDiv(KlDivergence<'c>),
 }
 
 /// What the binary cross-entropy kernel reads for `loss`, or `None` for a loss that is not
@@ -217,8 +219,8 @@ pub struct CudaStepProfile {
 /// and an epoch's shorter last batch through a step set up for its rows. The model's layers
 /// must be ones [`CudaModel::compile`] takes; the losses are [`Loss::CrossEntropy`],
 /// [`Loss::Nll`], [`Loss::Mse`], [`Loss::L1`], [`Loss::Huber`], [`Loss::SmoothL1`],
-/// [`Loss::BinaryCrossEntropy`] and [`Loss::BinaryCrossEntropyWithLogits`], and the
-/// optimisers SGD (with or without momentum), Adam and AdamW. A parameter used by two layers
+/// [`Loss::BinaryCrossEntropy`], [`Loss::BinaryCrossEntropyWithLogits`] and [`Loss::KlDiv`]
+/// (every loss), and the optimisers SGD (with or without momentum), Adam and AdamW. A parameter used by two layers
 /// is refused. Binary cross-entropy's clamped logarithms are counted on the card and read back
 /// with the loss, so the health checks send
 /// [`Warning::ClampedLogs`](crate::Warning::ClampedLogs) as on the CPU.
@@ -384,8 +386,8 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for KL divergence, for a parameter
-    /// used by two layers, for an optimiser setting that is not finite as an `f32`, and as
+    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for a parameter used by two layers,
+    /// for an optimiser setting that is not finite as an `f32`, and as
     /// [`CudaModel::compile`] returns; [`Error::InvalidData`] as `compile` returns, for a
     /// Huber `delta` not above 0 or a smooth L1 `beta` below 0 (NaN either way, as `f32`s;
     /// the CPU's tape panics on them), if the model has no parameters or one that holds no
@@ -412,7 +414,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
     ///     assert!(CudaTrainer::new(&net, &params, &adam, flat, 16, &cuda).is_err());
     ///     let bce = Loss::BinaryCrossEntropyWithLogits;
     ///     assert!(CudaTrainer::new(&net, &params, &adam, bce, 16, &cuda).is_ok());
-    ///     assert!(CudaTrainer::new(&net, &params, &adam, Loss::KlDiv, 16, &cuda).is_err());
+    ///     assert!(CudaTrainer::new(&net, &params, &adam, Loss::KlDiv, 16, &cuda).is_ok());
     /// }
     /// ```
     pub fn new(
@@ -442,15 +444,6 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                 )));
             }
         };
-        if !matches!(loss, Loss::CrossEntropy | Loss::Nll | Loss::Mse)
-            && regression(loss).is_none()
-            && binary(loss).is_none()
-        {
-            return Err(Error::Unsupported(format!(
-                "{WHO}: CUDA has no Loss::{loss:?}; it runs CrossEntropy, Nll, Mse, L1, Huber, \
-                 SmoothL1, BinaryCrossEntropy and BinaryCrossEntropyWithLogits"
-            )));
-        }
         loss.check_threshold(WHO)?;
         let mut m = CudaModel::compile(model, params, batch_size, cuda)?;
         if m.params.is_empty() {
@@ -752,6 +745,7 @@ impl<'c, 's> CudaTrainer<'c, 's> {
                     LossKernel::Nll(nll) => nll.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                     LossKernel::Regression(r) => r.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                     LossKernel::Binary(bce) => bce.run(&y, &t, &mut grad, (&mut loss_out, 0)),
+                    LossKernel::KlDiv(kl) => kl.run(&y, &t, &mut grad, (&mut loss_out, 0)),
                 },
             );
         }
@@ -1602,6 +1596,13 @@ impl<'c> TrainPass<'c> {
                     (input, LossReduction::Mean),
                 )?)
             }
+            Loss::KlDiv => LossKernel::KlDiv(KlDivergence::new(
+                cuda,
+                u32_of(rows * out_width),
+                LossReduction::BatchMean {
+                    batch: u32_of(rows),
+                },
+            )?),
             _ => match regression(loss) {
                 Some(kind) => LossKernel::Regression(RegressionLoss::new(
                     cuda,

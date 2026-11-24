@@ -27,9 +27,9 @@ pub use gemm::{Gemm, GemmCall, GemmDims};
 pub use glu::{Glu, GluCall, GluKernels};
 pub use health::{DeadRelu, DeadReluCall, FiniteFlag, FiniteFlagCall, SumSquares, SumSquaresCall};
 pub use loss::{
-    BinaryCall, BinaryCrossEntropy, BinaryInput, CrossEntropyCall, LossReduction, MeanSquaredError,
-    MseCall, NegativeLogLikelihood, NllCall, Regression, RegressionCall, RegressionLoss,
-    SoftmaxCrossEntropy,
+    BinaryCall, BinaryCrossEntropy, BinaryInput, CrossEntropyCall, KlDivCall, KlDivergence,
+    LossReduction, MeanSquaredError, MseCall, NegativeLogLikelihood, NllCall, Regression,
+    RegressionCall, RegressionLoss, SoftmaxCrossEntropy,
 };
 pub use optimizer::{OptimizerKernel, OptimizerRule};
 pub use pooling::{AdaptiveAvgPool2d, AvgPool2d, MaxPool2d};

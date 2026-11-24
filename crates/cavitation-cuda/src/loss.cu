@@ -1,7 +1,7 @@
 // The training losses: a port of the kernels in cavitation-gpu's kernels/loss.rs, operation
 // for operation, written after reduce.cu's text and compiled with it, without fused
 // multiply-add. Each loss's mean is a channel sum of one channel in reduce.cu's fixed tree,
-// divided by the count rounded to f32.
+// divided by the count (or, for a batch mean, the batch) rounded to f32.
 
 // The bits of the NaN a bad cross-entropy row gets.
 #define NAN_BITS 0x7fc00000u
@@ -386,4 +386,56 @@ extern "C" __global__ void bce_terms(const u32 *pred, const u32 *target, u32 *gr
         clamps[i] = 0.0f;
         bce_logits(pb, tb, w, &terms[i], &grad[i]);
     }
+}
+
+// 2^-32, which undoes scaled().
+#define UNSCALE 2.3283064365386963e-10f
+
+// The KL divergence t (ln t - x) of one value for the bits of x and t, both not NaN: 0 for a
+// target of +-0, NaN for a negative target, +inf for a target of +inf (NaN against x = +inf),
+// the other sign's infinity for an infinite x. ln t comes from the bits, and a subnormal
+// target's product is taken on t 2^32 and scaled back, as the WGSL kernel does.
+__device__ u32 kl_term(u32 xb, u32 tb) {
+    if ((tb & MAGNITUDE) == 0u) {
+        return 0u;
+    }
+    if ((tb & SIGN_BIT) != 0u) {
+        return NAN_BITS;
+    }
+    if (tb == INF_BITS) {
+        return xb == INF_BITS ? NAN_BITS : INF_BITS;
+    }
+    if ((xb & MAGNITUDE) == INF_BITS) {
+        return INF_BITS | ((xb ^ SIGN_BIT) & SIGN_BIT);
+    }
+    float d = ln_bits(tb) - __uint_as_float(xb);
+    if ((tb >> 23u) == 0u) {
+        return __float_as_uint(scaled(tb) * d * UNSCALE);
+    }
+    return __float_as_uint(__uint_as_float(tb) * d);
+}
+
+// KL divergence, one thread per value: each value's loss t (ln t - x) into terms and the
+// log-probabilities' gradient -t w into grad, both as bits, +0 where t is +-0, the gradient's
+// NaN and infinities taken from the target's bits. NaN in either input gives a NaN loss, also
+// where t is 0.
+extern "C" __global__ void kl_terms(const u32 *log_probs, const u32 *target, u32 *grad,
+                                    u32 *terms, u32 n, float w) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    u32 xb = log_probs[i];
+    u32 tb = target[i];
+    u32 tm = tb & MAGNITUDE;
+    if (tm == 0u) {
+        grad[i] = 0u;
+    } else if (tm > INF_BITS) {
+        grad[i] = NAN_BITS;
+    } else if (tm == INF_BITS) {
+        grad[i] = INF_BITS | ((tb ^ SIGN_BIT) & SIGN_BIT);
+    } else {
+        grad[i] = __float_as_uint(__uint_as_float(tb) * w) ^ SIGN_BIT;
+    }
+    terms[i] = (xb & MAGNITUDE) > INF_BITS || tm > INF_BITS ? NAN_BITS : kl_term(xb, tb);
 }

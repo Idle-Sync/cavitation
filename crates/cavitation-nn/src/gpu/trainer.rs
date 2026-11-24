@@ -12,10 +12,10 @@ use cavitation_gpu::kernels::{
     BinaryCall, BinaryCrossEntropy, BinaryInput, ChannelDims, ChannelSums, ChannelSumsCall,
     ConvCall, ConvDims, ConvInputGrad, ConvWeightGrad, ConvWeightGradCall, CrossEntropyCall,
     DeadRelu, DeadReluCall, Elementwise, ElementwiseCall, FiniteFlag, FiniteFlagCall, GemmCall,
-    GemmDims, Glu, GluCall, LossReduction, MaxPool2d, MeanSquaredError, MseCall,
-    NegativeLogLikelihood, NllCall, OptimizerKernel, OptimizerRule, Prelu, PreluCall, Regression,
-    RegressionCall, RegressionLoss, RowSoftmax, RowSoftmaxCall, RunningUpdate, SoftmaxCrossEntropy,
-    SumSquares, SumSquaresCall,
+    GemmDims, Glu, GluCall, KlDivCall, KlDivergence, LossReduction, MaxPool2d, MeanSquaredError,
+    MseCall, NegativeLogLikelihood, NllCall, OptimizerKernel, OptimizerRule, Prelu, PreluCall,
+    Regression, RegressionCall, RegressionLoss, RowSoftmax, RowSoftmaxCall, RunningUpdate,
+    SoftmaxCrossEntropy, SumSquares, SumSquaresCall,
 };
 use cavitation_gpu::{
     BufferPool, Gpu, GpuError, PipelineCache, PooledBuffer, Step, StepEncoder, StepOutput,
@@ -60,6 +60,8 @@ struct TrainKernels {
     regression: RegressionLoss,
     /// Binary cross-entropy, of probabilities or of logits, and its gradient.
     binary: BinaryCrossEntropy,
+    /// KL divergence and its gradient.
+    kl_div: KlDivergence,
     /// The finite flag over the loss and every gradient.
     finite: FiniteFlag,
     /// Each parameter gradient's sum of squares, for the gradient-norm checks.
@@ -128,6 +130,8 @@ enum LossCall {
     Regression(RegressionCall),
     /// Binary cross-entropy, of probabilities or of logits, on target values.
     Binary(BinaryCall),
+    /// KL divergence of target distributions from log-probabilities.
+    KlDiv(KlDivCall),
 }
 
 /// What the binary cross-entropy kernel reads for `loss`, or `None` for a loss that is not
@@ -284,9 +288,9 @@ pub struct GpuOptimizerState {
 /// dropout masks (from [`dropout_mask`] with the trainer's seed and the step's number) and
 /// the same order of work. The model's layers must be ones [`GpuModel::compile`] takes; the
 /// losses are [`Loss::CrossEntropy`], [`Loss::Nll`], [`Loss::Mse`], [`Loss::L1`],
-/// [`Loss::Huber`], [`Loss::SmoothL1`], [`Loss::BinaryCrossEntropy`] and
-/// [`Loss::BinaryCrossEntropyWithLogits`], and the optimisers SGD (with or without momentum),
-/// Adam and AdamW. A parameter used by two layers is refused. Binary cross-entropy's clamped
+/// [`Loss::Huber`], [`Loss::SmoothL1`], [`Loss::BinaryCrossEntropy`],
+/// [`Loss::BinaryCrossEntropyWithLogits`] and [`Loss::KlDiv`] (every loss), and the
+/// optimisers SGD (with or without momentum), Adam and AdamW. A parameter used by two layers is refused. Binary cross-entropy's clamped
 /// logarithms are counted on the GPU and read back with the loss, so the health checks send
 /// [`Warning::ClampedLogs`](crate::Warning::ClampedLogs) as on the CPU.
 ///
@@ -584,9 +588,9 @@ impl<'s> GpuTrainer<'s> {
     ///
     /// # Errors
     ///
-    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for KL divergence, for a
-    /// parameter used by two layers, and as [`GpuModel::compile`] returns;
-    /// [`Error::InvalidData`] as `compile` returns, for a Huber `delta` not above 0 or a
+    /// [`Error::Unsupported`] for `RmsProp` and `Adagrad`, for a parameter used by two
+    /// layers, and as [`GpuModel::compile`] returns; [`Error::InvalidData`] as `compile`
+    /// returns, for a Huber `delta` not above 0 or a
     /// smooth L1 `beta` below 0 (NaN either way, as `f32`s; the CPU's tape panics on them),
     /// if the model has no parameters or one that holds no values, and if a batch norm would
     /// normalise a training batch over one value per channel.
@@ -611,7 +615,7 @@ impl<'s> GpuTrainer<'s> {
     ///     assert!(GpuTrainer::new(&net, &params, &adam, flat, 16, &gpu).is_err());
     ///     let bce = Loss::BinaryCrossEntropyWithLogits;
     ///     assert!(GpuTrainer::new(&net, &params, &adam, bce, 16, &gpu).is_ok());
-    ///     assert!(GpuTrainer::new(&net, &params, &adam, Loss::KlDiv, 16, &gpu).is_err());
+    ///     assert!(GpuTrainer::new(&net, &params, &adam, Loss::KlDiv, 16, &gpu).is_ok());
     /// }
     /// ```
     pub fn new(
@@ -640,15 +644,6 @@ impl<'s> GpuTrainer<'s> {
                 )));
             }
         };
-        if !matches!(loss, Loss::CrossEntropy | Loss::Nll | Loss::Mse)
-            && regression(loss).is_none()
-            && binary(loss).is_none()
-        {
-            return Err(Error::Unsupported(format!(
-                "GpuTrainer: the GPU has no Loss::{loss:?}; it runs CrossEntropy, Nll, Mse, L1, \
-                 Huber, SmoothL1, BinaryCrossEntropy and BinaryCrossEntropyWithLogits"
-            )));
-        }
         loss.check_threshold("GpuTrainer")?;
         let mut gpu_model = GpuModel::compile(model, params, batch_size, gpu)?;
         if gpu_model.params.is_empty() {
@@ -687,6 +682,7 @@ impl<'s> GpuTrainer<'s> {
             nll: NegativeLogLikelihood::new(gpu, &mut m.cache).map_err(shader)?,
             regression: RegressionLoss::new(gpu, &mut m.cache).map_err(shader)?,
             binary: BinaryCrossEntropy::new(gpu, &mut m.cache).map_err(shader)?,
+            kl_div: KlDivergence::new(gpu, &mut m.cache).map_err(shader)?,
             finite: FiniteFlag::new(gpu, &mut m.cache).map_err(shader)?,
             squares: SumSquares::new(gpu, &mut m.cache).map_err(shader)?,
             dead_relu: DeadRelu::new(gpu, &mut m.cache).map_err(shader)?,
@@ -1003,6 +999,7 @@ impl<'s> GpuTrainer<'s> {
             LossCall::Nll(call) => self.kernels.nll.record(&mut step, call),
             LossCall::Regression(call) => self.kernels.regression.record(&mut step, call),
             LossCall::Binary(call) => self.kernels.binary.record(&mut step, call),
+            LossCall::KlDiv(call) => self.kernels.kl_div.record(&mut step, call),
         }
         if profiling {
             let mut start = 0;
@@ -2152,6 +2149,18 @@ impl TrainPass {
                     (&loss_value, 0),
                 ))
             }
+            Loss::KlDiv => LossCall::KlDiv(train.kl_div.call(
+                steps,
+                pool,
+                LossReduction::BatchMean {
+                    batch: u32_of(batch),
+                },
+                u32_of(batch * out_width),
+                &values[x],
+                &targets,
+                &grads[g],
+                (&loss_value, 0),
+            )),
             _ => match regression(loss) {
                 Some(kind) => LossCall::Regression(train.regression.call(
                     steps,

@@ -209,7 +209,8 @@ impl Loss {
                     Loss::BinaryCrossEntropyWithLogits => {
                         tape.binary_cross_entropy_with_logits(out, t, mean)
                     }
-                    other => unimplemented!("Loss::{other:?} on an f64 tape"),
+                    Loss::KlDiv => tape.kl_div(out, t, Reduction::BatchMean),
+                    Loss::CrossEntropy | Loss::Nll => unreachable!("matched above"),
                 }
             }
             (loss, None) => panic!("Loss::{loss:?} needs target values"),
@@ -2330,8 +2331,8 @@ fn check_finite(data: &Dataset) -> Result<(), Error> {
 /// A run with neither a callback nor a best epoch to keep copies them back once.
 ///
 /// The GPU run returns, before any training:
-/// - [`Error::Unsupported`] for what `GpuTrainer` does not run: a layer, loss or optimiser
-///   it has no kernel for, and [`OnNonFinite::Warn`](crate::OnNonFinite). [`fit_with_hooks`]
+/// - [`Error::Unsupported`] for what `GpuTrainer` does not run: a layer or optimiser it has
+///   no kernel for, and [`OnNonFinite::Warn`](crate::OnNonFinite). [`fit_with_hooks`]
 ///   with a hook registered and [`fit_controlled`] are refused the same way.
 /// - [`Error::InvalidData`] as `GpuTrainer::new` returns it (a model with no parameters, a
 ///   batch norm that would normalise a batch over one value per channel), and, starting

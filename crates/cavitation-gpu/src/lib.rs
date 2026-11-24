@@ -58,8 +58,11 @@
 //!   L1): the training losses as the tape's `Reduction::Mean` computes them, with their
 //!   gradients.
 //! - [`kernels::BinaryCrossEntropy`]: binary cross-entropy of probabilities or of logits, as
-//!   the tape's `Reduction::Mean` or `Reduction::Sum` computes it, with its gradient and the
-//!   count of logarithms the tape clamps.
+//!   the tape's `Reduction::Mean`, `Reduction::Sum` or `Reduction::BatchMean` computes it,
+//!   with its gradient and the count of logarithms the tape clamps.
+//! - [`kernels::KlDivergence`]: the KL divergence of a target distribution from
+//!   log-probabilities, as the tape's `kl_div` computes it with any of those reductions, with
+//!   its gradient.
 //! - [`kernels::SumSquares`], [`kernels::FiniteFlag`] and [`kernels::DeadRelu`]: the health
 //!   values a step reads back: each gradient's sum of squares, the finite flag (tested by
 //!   bits) and the dead-ReLU bits.

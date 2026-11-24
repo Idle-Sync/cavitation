@@ -23,7 +23,15 @@
 //!   gradient divides, within the bound at `logit_grad` for logits), and the clamp count
 //!   `Tape::clamped_logs`, up to more values than one grid row of workgroups holds; each value
 //!   at the edges (0 and 1, the clamp's threshold, subnormals, ±100 and larger logits, values
-//!   outside `[0, 1]`, NaN and ±∞) as the `f32` tape gives it; a NaN reaching the loss.
+//!   outside `[0, 1]`, NaN and ±∞) as the `f32` tape gives it; a NaN reaching the loss; the
+//!   batch mean against `Reduction::BatchMean`.
+//! - **KL divergence:** with the mean, the sum and the batch mean: the gradient bit for bit
+//!   against `Tape::kl_div` on an `f32` store, and the loss within the bound derived at
+//!   `kl_term` of the exact loss, up to more values than one grid row of workgroups holds;
+//!   each value at the edges (targets of ±0, subnormals, 1 and one ulp either side, above 1,
+//!   negative, NaN and ±∞; log-probabilities of ±0 to ±`f32::MAX`, NaN and ±∞, and an
+//!   overflowing loss) as the `f32` tape gives it; a NaN or bad value reaching the loss and
+//!   the finite flag; the refusals.
 //!
 //! Every loss is written at word 1 of a buffer of sentinels, to show nothing else changes. The
 //! tests skip without a GPU, unless `CAVITATION_GPU_REQUIRED=1`.
@@ -32,7 +40,7 @@ mod common;
 
 use cavitation_core::{Graph, ParamStore, Real, Reduction, Tensor};
 use cavitation_gpu::kernels::{
-    BinaryCrossEntropy, BinaryInput, FiniteFlag, LossReduction, MeanSquaredError,
+    BinaryCrossEntropy, BinaryInput, FiniteFlag, KlDivergence, LossReduction, MeanSquaredError,
     NegativeLogLikelihood, Regression, RegressionLoss, SoftmaxCrossEntropy,
 };
 use cavitation_gpu::{Gpu, PooledBuffer};
@@ -1099,15 +1107,16 @@ fn tape_bce<T: Real>(form: Form, pred: &[f32], target: &[f32]) -> (T, Vec<T>, us
             .collect::<Vec<T>>()
     };
     let mut store = ParamStore::<T>::new_generic();
-    let id = store.add(Tensor::from_vec(wide(pred), &[n]).unwrap());
+    let dims = match form.1 {
+        LossReduction::BatchMean { batch } => vec![batch as usize, n / batch as usize],
+        _ => vec![n],
+    };
+    let id = store.add(Tensor::from_vec(wide(pred), &dims).unwrap());
     let mut graph = Graph::<T>::new_generic();
     let mut tape = graph.tape(&store.values);
     let p = tape.param(id);
-    let t = tape.input(Tensor::from_vec(wide(target), &[n]).unwrap().view());
-    let reduction = match form.1 {
-        LossReduction::Mean => Reduction::Mean,
-        LossReduction::Sum => Reduction::Sum,
-    };
+    let t = tape.input(Tensor::from_vec(wide(target), &dims).unwrap().view());
+    let reduction = tape_reduction(form.1);
     let l = match form.0 {
         BinaryInput::Probabilities => tape.binary_cross_entropy(p, t, reduction),
         BinaryInput::Logits => tape.binary_cross_entropy_with_logits(p, t, reduction),
@@ -1185,25 +1194,41 @@ fn bce_loss(form: Form, pred: &[f32], target: &[f32]) -> (f64, f64) {
         bounds += b;
     }
     let tree = depth(pred.len()) * U * abs;
-    match form.1 {
-        LossReduction::Mean => {
-            let n = pred.len() as f64;
-            let mean = sum / n;
+    match divisor(form.1, pred.len()) {
+        Some(d) => {
+            let mean = sum / d;
             (
                 mean,
-                second((bounds + tree) / n + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
+                second((bounds + tree) / d + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
             )
         }
-        LossReduction::Sum => (sum, second(bounds + tree) + 3.0 * FLOOR),
+        None => (sum, second(bounds + tree) + 3.0 * FLOOR),
     }
 }
 
-/// The scale of each gradient, `1/n` rounded to `f32` for the mean, as the CPU's upstream.
-fn bce_scale(form: Form, n: usize) -> f32 {
-    match form.1 {
-        LossReduction::Mean => (1.0 / n as f64) as f32,
-        LossReduction::Sum => 1.0,
+/// The tape's reduction for `reduction`.
+fn tape_reduction(reduction: LossReduction) -> Reduction {
+    match reduction {
+        LossReduction::Mean => Reduction::Mean,
+        LossReduction::Sum => Reduction::Sum,
+        LossReduction::BatchMean { .. } => Reduction::BatchMean,
     }
+}
+
+/// What `reduction` divides the sum of `n` values by: `n` for the mean, the batch for the
+/// batch mean, nothing for the sum.
+fn divisor(reduction: LossReduction, n: usize) -> Option<f64> {
+    match reduction {
+        LossReduction::Mean => Some(n as f64),
+        LossReduction::Sum => None,
+        LossReduction::BatchMean { batch } => Some(f64::from(batch)),
+    }
+}
+
+/// The scale of each gradient, the reciprocal of the divisor rounded to `f32` from `f64`
+/// (1 for the sum), as the CPU's upstream.
+fn bce_scale(form: Form, n: usize) -> f32 {
+    divisor(form.1, n).map_or(1.0, |d| (1.0 / d) as f32)
 }
 
 /// A logit's exact gradient `g = (σ(z) − t)·w` and its stated bound
@@ -1599,6 +1624,434 @@ fn binary_cross_entropy_refusals() {
         assert!(
             binary(16, &p, &t, &g, (&p, 0))
                 .contains("the loss output and the prediction must be different")
+        );
+    });
+}
+
+/// Binary cross-entropy's batch mean on 37 rows of 12 values, of probabilities and of
+/// logits, against the tape's `Reduction::BatchMean` on `[37, 12]`: the loss within
+/// [`bce_loss`]'s bound of the exact loss divided by the batch, the gradient as
+/// [`check_bce_grad`] checks it with the scale `1/37`, the clamp count the tape's.
+#[test]
+fn binary_cross_entropy_batch_mean() {
+    for_each_gpu(|gpu| {
+        let (batch, width) = (37usize, 12usize);
+        let n = batch * width;
+        let mut kit = kit(gpu, n);
+        let bce = BinaryCrossEntropy::new(gpu, &mut kit.cache).unwrap();
+        for input in [BinaryInput::Probabilities, BinaryInput::Logits] {
+            let form = (
+                input,
+                LossReduction::BatchMean {
+                    batch: batch as u32,
+                },
+            );
+            let what = format!("{form:?} of {n} values");
+            let pred = match input {
+                BinaryInput::Probabilities => probabilities(41, n),
+                BinaryInput::Logits => logits(41, n),
+            };
+            let target = targets(42, n);
+            let (value, count, grad) = gpu_bce(&mut kit, &bce, form, &pred, &target);
+            let (_, want_grad, clamped) = tape_bce::<f32>(form, &pred, &target);
+            check_bce_grad(
+                form,
+                (&pred, &target),
+                &grad,
+                &want_grad,
+                &format!("the gradient, {what}"),
+            );
+            assert_eq!(count, clamped as f32, "the clamp count, {what}");
+            let (want, bound) = bce_loss(form, &pred, &target);
+            assert_within(&[value], &[want], |_| bound, &format!("the loss, {what}"));
+        }
+    });
+}
+
+/// The GPU's KL divergence reduced by `reduction`: the loss, at word 1 between two
+/// sentinels, and the log-probabilities' gradient.
+fn gpu_kl(
+    kit: &mut Kit,
+    kl: &KlDivergence,
+    reduction: LossReduction,
+    log_probs: &[f32],
+    target: &[f32],
+) -> (f32, Vec<f32>) {
+    let (x, t) = (kit.upload(log_probs), kit.upload(target));
+    let grad = kit.upload(&vec![SENTINEL; log_probs.len()]);
+    let out = loss_buffer(kit);
+    let call = kl.call(
+        &mut kit.steps,
+        &mut kit.pool,
+        reduction,
+        log_probs.len() as u32,
+        &x,
+        &t,
+        &grad,
+        (&out, 1),
+    );
+    let mut step = kit.steps.begin();
+    kl.record(&mut step, &call);
+    let _ = step.finish();
+    let loss = read_loss(kit, &out);
+    let g = kit.read(&grad);
+    call.release(&mut kit.pool);
+    (loss, g)
+}
+
+/// What `Tape::kl_div` gives for `reduction` on a store of `T` from the same `f32` values,
+/// the values shaped `[batch, n / batch]` for the batch mean and `[n]` otherwise: the loss
+/// and the log-probabilities' gradient.
+fn tape_kl<T: Real>(reduction: LossReduction, log_probs: &[f32], target: &[f32]) -> (T, Vec<T>) {
+    let n = log_probs.len();
+    let dims = match reduction {
+        LossReduction::BatchMean { batch } => vec![batch as usize, n / batch as usize],
+        _ => vec![n],
+    };
+    let wide = |v: &[f32]| {
+        v.iter()
+            .map(|&x| T::from_f64(f64::from(x)))
+            .collect::<Vec<T>>()
+    };
+    let mut store = ParamStore::<T>::new_generic();
+    let id = store.add(Tensor::from_vec(wide(log_probs), &dims).unwrap());
+    let mut graph = Graph::<T>::new_generic();
+    let mut tape = graph.tape(&store.values);
+    let x = tape.param(id);
+    let t = tape.input(Tensor::from_vec(wide(target), &dims).unwrap().view());
+    let l = tape.kl_div(x, t, tape_reduction(reduction));
+    let value = tape.value(l).data()[0];
+    tape.backward(l, &mut store.grads);
+    drop(tape);
+    (value, store.grad(id).data().to_vec())
+}
+
+/// One value's exact loss `ℓ = t·(ln t − x)` (0 where `t` is ±0) and its stated bound
+/// `15u·|t·ln t| + 3u·|ℓ| + 2⁻¹²⁶·(1 + |t|)`, for finite values with `t` not negative.
+///
+/// `ln t` is the kernel's logarithm from the bits, binary cross-entropy's, within `13u` of
+/// `ln t` (derived at [`bce_term`]; it holds for subnormal `t`, whose exponent comes from
+/// the bits). The subtraction `ln t − x` rounds once (`u·|ln t − x|`, once `ln t`'s own error
+/// is carried through, `13u·|ln t|`), and the product once (`u·|ℓ|`); a subnormal `t` takes
+/// the product on `t·2³²` and scales back by 2⁻³², both exact, so the same single rounding.
+/// A compiler may reassociate the logarithm's last sum, `k·ln2_hi + b`, with the
+/// subtraction, as `k·ln2_hi + (b − x)`: `|b|` is at most `ln √2` and `|k·ln2_hi|` at most
+/// `2·|ln t|` where `k ≠ 0`, so `|b − x|` is at most `|ln t| + |x|` and `|x|` at most
+/// `|ln t| + |ln t − x|`, which adds `2u·|t·ln t| + u·|ℓ|`. A flushed `x` moves the loss by
+/// `|t|·2⁻¹²⁶` and a flushed result by 2⁻¹²⁶.
+fn kl_term(x: f32, t: f32) -> (f64, f64) {
+    if t == 0.0 {
+        return (0.0, 0.0);
+    }
+    let (x, t) = (f64::from(x), f64::from(t));
+    let l = t.ln();
+    let loss = t * (l - x);
+    (
+        loss,
+        15.0 * U * (t * l).abs() + 3.0 * U * loss.abs() + (1.0 + t.abs()) * FLOOR,
+    )
+}
+
+/// The exact loss of `reduction` on these values and its stated bound: the values' bounds
+/// summed, `(22 + chunks)·u·Σ|ℓ|` for the fixed tree, and for a mean the division by its
+/// divisor and `5u` of the mean for it.
+fn kl_loss(reduction: LossReduction, log_probs: &[f32], target: &[f32]) -> (f64, f64) {
+    let (mut sum, mut abs, mut bounds) = (0.0, 0.0, 0.0);
+    for (&x, &t) in log_probs.iter().zip(target) {
+        let (v, b) = kl_term(x, t);
+        sum += v;
+        abs += v.abs();
+        bounds += b;
+    }
+    let tree = depth(log_probs.len()) * U * abs;
+    match divisor(reduction, log_probs.len()) {
+        Some(d) => {
+            let mean = sum / d;
+            (
+                mean,
+                second((bounds + tree) / d + 5.0 * U * mean.abs()) + 3.0 * FLOOR,
+            )
+        }
+        None => (sum, second(bounds + tree) + 3.0 * FLOOR),
+    }
+}
+
+/// `n` log-probabilities: the logarithm of a value in `[10⁻⁶, 1)` from `seed`, every 17th
+/// five times further below 0 and every 23rd above 0, so some are not log-probabilities.
+fn kl_inputs(seed: u64, n: usize) -> Vec<f32> {
+    let mut x: Vec<f32> = (seeded_values(seed, n, 1e-6, 1.0).into_iter())
+        .map(f32::ln)
+        .collect();
+    for (i, v) in x.iter_mut().enumerate() {
+        if i % 17 == 2 {
+            *v *= 5.0;
+        } else if i % 23 == 4 {
+            *v = -*v;
+        }
+    }
+    x
+}
+
+/// `n` targets in `[0, 1)` from `seed`, every 5th exactly 0, every 13th 1, every 31st a
+/// subnormal and every 37th below 10⁻²⁰.
+fn kl_targets(seed: u64, n: usize) -> Vec<f32> {
+    let mut t = seeded_values(seed, n, 0.0, 1.0);
+    for (i, v) in t.iter_mut().enumerate() {
+        if i % 5 == 1 {
+            *v = 0.0;
+        } else if i % 13 == 3 {
+            *v = 1.0;
+        } else if i % 31 == 7 {
+            *v *= 1e-38;
+        } else if i % 37 == 9 {
+            *v *= 1e-20;
+        }
+    }
+    t
+}
+
+/// The reductions the KL divergence's twin test runs on `n` values: the mean, the sum and
+/// the batch mean over the largest batch up to 1,000 that divides `n`.
+fn kl_reductions(n: usize) -> [LossReduction; 3] {
+    let batch = (1..=n.min(1000))
+        .rev()
+        .find(|&b| n.is_multiple_of(b))
+        .unwrap_or(1) as u32;
+    [
+        LossReduction::Mean,
+        LossReduction::Sum,
+        LossReduction::BatchMean { batch },
+    ]
+}
+
+/// Each reduction against the tape on 1, 37, 4,097 and 100,000 values (and the batch mean
+/// on 2²⁴ + 1,000 values over 8 rows, more than one grid row of workgroups), no size a
+/// multiple of the workgroup: the gradient the `f32` tape's bits (a subnormal one possibly
+/// flushed), the loss within [`kl_loss`]'s bound of the exact loss, and a second run's bits
+/// the first's.
+#[test]
+fn kl_div_twin() {
+    for_each_gpu(|gpu| {
+        let mut runs: Vec<(usize, LossReduction)> = Vec::new();
+        for n in [1, 37, 4097, 100_000] {
+            runs.extend(kl_reductions(n).into_iter().map(|r| (n, r)));
+        }
+        runs.push(((1 << 24) + 1000, LossReduction::BatchMean { batch: 8 }));
+        for (k, &(n, reduction)) in runs.iter().enumerate() {
+            let mut kit = kit(gpu, n);
+            let kl = KlDivergence::new(gpu, &mut kit.cache).unwrap();
+            let what = format!("{reduction:?} of {n} values");
+            let x = kl_inputs(500 + k as u64, n);
+            let t = kl_targets(700 + k as u64, n);
+            let (value, grad) = gpu_kl(&mut kit, &kl, reduction, &x, &t);
+            let (_, want_grad) = tape_kl::<f32>(reduction, &x, &t);
+            assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+            let (want, bound) = kl_loss(reduction, &x, &t);
+            let worst = assert_within(&[value], &[want], |_| bound, &format!("the loss, {what}"));
+            println!("{what}: loss worst {:.3} of its bound", worst.ratio());
+            let (again, again_grad) = gpu_kl(&mut kit, &kl, reduction, &x, &t);
+            assert_exact(&[again], &[value], &format!("a second run, {what}"));
+            assert_exact(
+                &again_grad,
+                &grad,
+                &format!("a second run's gradient, {what}"),
+            );
+        }
+    });
+}
+
+/// Each value on its own (`n = 1`, so every reduction divides by 1) at the edges, against
+/// the tape: where the `f32` tape's loss is NaN or infinite the GPU's is the same, elsewhere
+/// within [`kl_term`]'s bound of the exact loss; the gradient the `f32` tape's bits.
+///
+/// Log-probabilities: ±0, a subnormal, −1, `ln ½`, −20, −88, −104, −1e30, 1, 3, ±`f32::MAX`,
+/// NaN and ±∞. Targets: ±0, the smallest subnormal, 10⁻⁴⁰, the smallest normal, 10⁻³⁰,
+/// ¼, ½, one ulp either side of 1, 1, 2 (where `t·(ln t − x)` overflows against −`f32::MAX`),
+/// −¼, NaN and ±∞.
+#[test]
+fn kl_div_edges_match_the_tape() {
+    let below = |x: f32| f32::from_bits(x.to_bits() - 1);
+    let above = |x: f32| f32::from_bits(x.to_bits() + 1);
+    let (inf, nan) = (f32::INFINITY, f32::NAN);
+    let inputs = [
+        0.0,
+        -0.0,
+        -1e-40,
+        -1.0,
+        0.5f32.ln(),
+        -20.0,
+        -88.0,
+        -104.0,
+        -1e30,
+        1.0,
+        3.0,
+        f32::MAX,
+        -f32::MAX,
+        nan,
+        inf,
+        -inf,
+    ];
+    let targets = [
+        0.0,
+        -0.0,
+        f32::from_bits(1),
+        1e-40,
+        f32::MIN_POSITIVE,
+        1e-30,
+        0.25,
+        0.5,
+        below(1.0),
+        1.0,
+        above(1.0),
+        2.0,
+        -0.25,
+        nan,
+        inf,
+        -inf,
+    ];
+    for_each_gpu(|gpu| {
+        let mut kit = kit(gpu, 64);
+        let kl = KlDivergence::new(gpu, &mut kit.cache).unwrap();
+        let mut worst: f64 = 0.0;
+        for reduction in [
+            LossReduction::Mean,
+            LossReduction::Sum,
+            LossReduction::BatchMean { batch: 1 },
+        ] {
+            for &x in &inputs {
+                for &t in &targets {
+                    let what = format!("{reduction:?} at {x:e}, target {t:e}");
+                    let (value, grad) = gpu_kl(&mut kit, &kl, reduction, &[x], &[t]);
+                    let (want, want_grad) = tape_kl::<f32>(reduction, &[x], &[t]);
+                    if want.is_finite() {
+                        let (exact, bound) = kl_term(x, t);
+                        let w = assert_within(&[value], &[exact], |_| second(bound), &what);
+                        worst = worst.max(w.ratio());
+                    } else {
+                        assert_exact(&[value], &[want], &format!("the loss, {what}"));
+                    }
+                    // -t·w with a subnormal t is subnormal, and a GPU may flush t itself
+                    // before the product, so there the gradient is held to FLOOR; every
+                    // other gradient is the tape's bits.
+                    let what = format!("the gradient, {what}");
+                    if want_grad[0].is_subnormal() {
+                        assert_within(&grad, &[f64::from(want_grad[0])], |_| FLOOR, &what);
+                    } else {
+                        assert_exact(&grad, &want_grad, &what);
+                    }
+                }
+            }
+        }
+        println!("edges: loss worst {worst:.3} of its bound");
+    });
+}
+
+/// A NaN or out-of-range value in a batch of 8,192: a NaN log-probability (where the target
+/// is 0 too), a NaN target, a negative target, an infinite target and a log-probability of
+/// +∞ give a NaN or infinite loss, which the finite flag catches, and leave every other
+/// value's gradient the clean run's bits.
+#[test]
+fn kl_div_non_finite_reaches_the_loss() {
+    for_each_gpu(|gpu| {
+        let n = 8192;
+        let mut kit = kit(gpu, n);
+        let kl = KlDivergence::new(gpu, &mut kit.cache).unwrap();
+        let flag = FiniteFlag::new(gpu, &mut kit.cache).unwrap();
+        let reduction = LossReduction::BatchMean { batch: 64 };
+        let x = kl_inputs(3, n);
+        let t = kl_targets(4, n);
+        // Value 5,001 has a target of 0.
+        assert_eq!(t[5001], 0.0);
+        let (_, clean) = gpu_kl(&mut kit, &kl, reduction, &x, &t);
+        for (name, at, on_input, value) in [
+            ("a NaN log-probability", 5000, true, f32::NAN),
+            ("a NaN log-probability against 0", 5001, true, f32::NAN),
+            ("a NaN target", 5000, false, f32::NAN),
+            ("a negative target", 5000, false, -0.5),
+            ("an infinite target", 5000, false, f32::INFINITY),
+            ("a log-probability of +inf", 5000, true, f32::INFINITY),
+        ] {
+            let (mut xs, mut ts) = (x.clone(), t.clone());
+            if on_input {
+                xs[at] = value;
+            } else {
+                ts[at] = value;
+            }
+            let (loss, grad) = gpu_kl(&mut kit, &kl, reduction, &xs, &ts);
+            assert!(!loss.is_finite(), "{name}: the loss is {loss}");
+            let rest: Vec<f32> = grad[..at].iter().chain(&grad[at + 1..]).copied().collect();
+            let want: Vec<f32> = clean[..at]
+                .iter()
+                .chain(&clean[at + 1..])
+                .copied()
+                .collect();
+            assert_exact(&rest, &want, &format!("{name}: the other values"));
+            let losses = kit.upload(&[loss]);
+            let flags = kit.zeros(1);
+            let check = flag.call(&mut kit.steps, &mut kit.pool, (&losses, 0), &[], &flags);
+            let mut step = kit.steps.begin();
+            flag.record(&mut step, &check);
+            let _ = step.finish();
+            assert_eq!(kit.read(&flags)[0].to_bits(), 1, "{name}: the finite flag");
+            check.release(&mut kit.pool);
+        }
+    });
+}
+
+/// The documented refusals of KL divergence: no values, buffers too short, a batch mean
+/// whose batch is 0 or does not divide the values, and an output that is a buffer the
+/// kernels read.
+#[test]
+fn kl_div_refusals() {
+    for_each_gpu(|gpu| {
+        let message = |f: &mut dyn FnMut()| {
+            let e = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).expect_err("refused");
+            e.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(|m| m.to_string()))
+                .unwrap_or_default()
+        };
+        let mut kit = kit(gpu, 64);
+        let kl = KlDivergence::new(gpu, &mut kit.cache).unwrap();
+        let [x, t, g, out] = [(); 4].map(|_| kit.zeros(16));
+        let one = kit.zeros(1);
+        let mut kl_div = |reduction: LossReduction,
+                          n: u32,
+                          x: &PooledBuffer,
+                          t: &PooledBuffer,
+                          g: &PooledBuffer,
+                          out: (&PooledBuffer, u32)| {
+            message(&mut || {
+                let _ = kl.call(&mut kit.steps, &mut kit.pool, reduction, n, x, t, g, out);
+            })
+        };
+        let mean = LossReduction::Mean;
+        assert!(kl_div(mean, 0, &x, &t, &g, (&out, 0)).contains("where the kernels take 1 to"));
+        assert!(kl_div(mean, 17, &x, &t, &g, (&out, 0)).contains("the log-probabilities needs 17"));
+        assert!(kl_div(mean, 16, &x, &one, &g, (&out, 0)).contains("the target needs 16 values"));
+        assert!(kl_div(mean, 16, &x, &t, &one, (&out, 0)).contains("the gradient needs 16 values"));
+        assert!(
+            kl_div(mean, 16, &x, &t, &g, (&out, 16)).contains("the loss output needs 17 values")
+        );
+        for batch in [0, 3, 32] {
+            let r = LossReduction::BatchMean { batch };
+            let text = format!("a batch of {batch} rows does not divide 16 values");
+            assert!(
+                kl_div(r, 16, &x, &t, &g, (&out, 0)).contains(&text),
+                "{batch}"
+            );
+        }
+        assert!(
+            kl_div(mean, 16, &x, &t, &t, (&out, 0))
+                .contains("the gradient and the target must be different")
+        );
+        assert!(
+            kl_div(mean, 16, &x, &t, &g, (&g, 0))
+                .contains("the gradient and the loss output must be different")
+        );
+        assert!(
+            kl_div(mean, 16, &x, &t, &g, (&x, 0))
+                .contains("the loss output and the log-probabilities must be different")
         );
     });
 }

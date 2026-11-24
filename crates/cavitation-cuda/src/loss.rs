@@ -1,10 +1,10 @@
 //! The training losses as this crate's own CUDA kernels, the twins of `cavitation_core`'s
 //! `Tape::softmax_cross_entropy`, `Tape::mse`, `Tape::nll`, `Tape::l1`, `Tape::huber` and
-//! `Tape::smooth_l1` with `Reduction::Mean`, and of `Tape::binary_cross_entropy` and
-//! `Tape::binary_cross_entropy_with_logits` with `Reduction::Mean` or `Reduction::Sum`: the
-//! loss, one `f32` written at a word offset of an output buffer (followed, for binary
-//! cross-entropy, by the count of clamped logarithms), and the gradient of that loss with
-//! respect to the input, overwriting it. The mean's sum runs in the channel sums' fixed tree
+//! `Tape::smooth_l1` with `Reduction::Mean`, and of `Tape::binary_cross_entropy`,
+//! `Tape::binary_cross_entropy_with_logits` and `Tape::kl_div` with `Reduction::Mean`,
+//! `Reduction::Sum` or `Reduction::BatchMean`: the loss, one `f32` written at a word offset
+//! of an output buffer (followed, for binary cross-entropy, by the count of clamped
+//! logarithms), and the gradient of that loss with respect to the input, overwriting it. The mean's sum runs in the channel sums' fixed tree
 //! (`reduce.cu`), so two runs give the same bits.
 
 use std::fmt;
@@ -58,6 +58,8 @@ struct Kernels<'c> {
     regression_terms: CuFunction,
     /// Binary cross-entropy's terms, clamp counts and gradients.
     bce_terms: CuFunction,
+    /// KL divergence's terms and gradients.
+    kl_terms: CuFunction,
 }
 
 impl<'c> Kernels<'c> {
@@ -74,6 +76,7 @@ impl<'c> Kernels<'c> {
             nll_rows: f("nll_rows")?,
             regression_terms: f("regression_terms")?,
             bce_terms: f("bce_terms")?,
+            kl_terms: f("kl_terms")?,
             module,
         })
     }
@@ -929,8 +932,8 @@ pub enum BinaryInput {
     Logits,
 }
 
-/// How [`BinaryCrossEntropy`] reduces its values' losses to one word, as the tape's
-/// `Reduction::Mean` and `Reduction::Sum`.
+/// How [`BinaryCrossEntropy`] and [`KlDivergence`] reduce their values' losses to one word,
+/// as the tape's `Reduction::Mean`, `Reduction::Sum` and `Reduction::BatchMean`.
 ///
 /// # Examples
 ///
@@ -938,6 +941,7 @@ pub enum BinaryInput {
 /// use cavitation_cuda::LossReduction;
 ///
 /// assert_ne!(LossReduction::Mean, LossReduction::Sum);
+/// assert_ne!(LossReduction::Mean, LossReduction::BatchMean { batch: 4 });
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LossReduction {
@@ -946,11 +950,42 @@ pub enum LossReduction {
     Mean,
     /// The sum; each gradient is scaled by 1.
     Sum,
+    /// The sum divided by the batch, the first dimension of the values; each gradient is
+    /// scaled by `1/batch` rounded to `f32`. The batch must be above 0 and divide the values.
+    BatchMean {
+        /// The rows of the values.
+        batch: u32,
+    },
+}
+
+impl LossReduction {
+    /// [`CudaError::Invalid`], naming `what`, for a batch mean whose batch is 0 or does not
+    /// divide `n` values.
+    fn check(self, what: &str, n: u32) -> Result<(), CudaError> {
+        match self {
+            LossReduction::BatchMean { batch } if batch == 0 || !n.is_multiple_of(batch) => {
+                Err(CudaError::Invalid(format!(
+                    "{what}: a batch of {batch} rows does not divide {n} values"
+                )))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Each gradient's scale and the sum's divisor (1 for the sum) over `n` values, for a
+    /// reduction [`check`](Self::check) accepted.
+    fn scale(self, n: u32) -> (f32, f32) {
+        match self {
+            LossReduction::Mean => (reciprocal(u64::from(n)), n as f32),
+            LossReduction::Sum => (1.0, 1.0),
+            LossReduction::BatchMean { batch } => (reciprocal(u64::from(batch)), batch as f32),
+        }
+    }
 }
 
 /// Binary cross-entropy on the card for one length and one form, as
 /// `Tape::binary_cross_entropy` and `Tape::binary_cross_entropy_with_logits` with
-/// `Reduction::Mean` or `Reduction::Sum` compute it: the loss (one word), then how many
+/// `Reduction::Mean`, `Reduction::Sum` or `Reduction::BatchMean` compute it: the loss (one word), then how many
 /// logarithms the tape would clamp and count in `Tape::clamped_logs` (one word, a whole
 /// number, 0 for logits), and the prediction's gradient. See [`BinaryInput`] for each form.
 ///
@@ -960,8 +995,8 @@ pub enum LossReduction {
 /// the CPU's are, the non-finite cases decided from the bits as the CPU's arithmetic gives
 /// them. Nothing is fused, the divisions are correctly rounded and nothing is flushed, so a
 /// probability's gradient is the CPU's bits everywhere. The losses' sum and the counts' sum
-/// are channel sums in `reduce.cu`'s fixed tree, the mean divided by `n` rounded to `f32`;
-/// the count is exact up to 2²⁴ clamps. The other bounds are the WGSL kernel's, with
+/// are channel sums in `reduce.cu`'s fixed tree, a mean divided by its divisor rounded to
+/// `f32`; the count is exact up to 2²⁴ clamps. The other bounds are the WGSL kernel's, with
 /// `u = 2⁻²⁴`, `chunks = ⌈n / 4096⌉` and the exact values of the same `f32` inputs; CUDA's
 /// `expf` is within 2 ulp, inside the `3 + 2|x|` they allow:
 ///
@@ -970,7 +1005,7 @@ pub enum LossReduction {
 /// - **A logit's loss:** within `u·(|z·t| + |a| + |ℓ|) + 10u·L + (6 + 4|z|)·u·e`, where
 ///   `a = max(z, 0) − z·t`, `e = e^(−|z|)`, `L = ln(1 + e)` and `ℓ = a + L`.
 /// - **The loss:** the values' bounds summed, plus `(22 + chunks)·u·Σ|ℓ|` for the sum, then
-///   for the mean divided by `n` and `5u` of itself for the division.
+///   for a mean divided by its divisor and `5u` of itself for the division.
 /// - **A logit's gradient:** within `w·(Δσ + u·|σ(z) − t|) + u·|g|` of `g = (σ(z) − t)·w`,
 ///   with `Δσ = 13u·σ(z)` for `z ≥ 0` and `(18 + 8|z|)·u·σ(z)` below.
 ///
@@ -1028,8 +1063,9 @@ impl<'c> BinaryCrossEntropy<'c> {
     ///
     /// # Errors
     ///
-    /// [`CudaError::Invalid`] if `n` is 0 or more than 2³¹; [`CudaError::Compile`] or
-    /// [`CudaError::Call`] if NVRTC or the driver refuses the kernels or the memory.
+    /// [`CudaError::Invalid`] if `n` is 0 or more than 2³¹, or a batch mean's batch is 0 or
+    /// does not divide `n`; [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the
+    /// driver refuses the kernels or the memory.
     ///
     /// # Examples
     ///
@@ -1049,6 +1085,7 @@ impl<'c> BinaryCrossEntropy<'c> {
     ) -> Result<BinaryCrossEntropy<'c>, CudaError> {
         let dims = ChannelDims::new(1, 1, n);
         dims.check("binary cross-entropy")?;
+        form.1.check("binary cross-entropy", n)?;
         let kernels = Kernels::new(cuda)?;
         Ok(BinaryCrossEntropy {
             n,
@@ -1144,10 +1181,7 @@ impl<'c> BinaryCrossEntropy<'c> {
             ],
         );
         let (input, reduction) = self.form;
-        let (w, divisor) = match reduction {
-            LossReduction::Mean => (reciprocal(len), n as f32),
-            LossReduction::Sum => (1.0, 1.0),
-        };
+        let (w, divisor) = reduction.scale(n);
         let k = &self.kernels;
         // SAFETY: bce_terms takes (const u32 *pred, const u32 *target, u32 *grad, u32 *terms,
         // float *clamps, u32 n, float w, u32 logits) and touches values below n, which the
@@ -1193,6 +1227,232 @@ impl<'c> BinaryCrossEntropy<'c> {
                 &self.partials,
                 (out, offset + 1),
                 1.0,
+            )
+        }
+    }
+}
+
+/// The KL divergence of a target distribution from log-probabilities on the card, for one
+/// length and one [`LossReduction`], as `Tape::kl_div` with `Reduction::Mean`,
+/// `Reduction::Sum` or `Reduction::BatchMean` computes it, in PyTorch's `kl_div`
+/// convention: the input `x` holds log-probabilities (for example a log-softmax's output)
+/// and the target `t` probabilities, and each value's loss is `t·(ln t − x)`, 0 where `t` is
+/// ±0 (`0·ln 0 = 0`). The output is the loss (one word); the log-probabilities' gradient is
+/// `−t·w`, +0 where `t` is ±0, with `w` the reduction's scale rounded to `f32` as the CPU's
+/// upstream gradient. `Loss::KlDiv` trains with the batch mean.
+///
+/// The kernel is `cavitation-gpu`'s WGSL one ported operation for operation: one thread per
+/// value writes its loss and gradient, `ln t` computed from the bits as binary
+/// cross-entropy's logarithm, the non-finite cases decided from the bits as the CPU's
+/// arithmetic gives them: NaN in either input gives a NaN loss (also where `t` is 0), a
+/// negative target a NaN loss, a target of +∞ a loss of +∞ (NaN for `x = +∞`), an infinite
+/// `x` an infinite loss. Nothing is fused and nothing is flushed, so the gradient is the
+/// CPU's bits everywhere. The losses' sum is a channel sum in `reduce.cu`'s fixed tree,
+/// divided by `n` for the mean and by the batch for the batch mean, rounded to `f32`. The
+/// loss's bound is the WGSL kernel's, with `u = 2⁻²⁴`, `chunks = ⌈n / 4096⌉` and the exact
+/// values of the same `f32` inputs:
+///
+/// - **A value's loss:** within `15u·|t·ln t| + 3u·|ℓ|` of `ℓ = t·(ln t − x)`, plus
+///   `2⁻¹²⁶·(1 + |t|)`.
+/// - **The loss:** the values' bounds summed, plus `(22 + chunks)·u·Σ|ℓ|` for the sum, then
+///   for a mean divided by its divisor and `5u` of itself for the division.
+///
+/// Two runs give the same bits.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_cuda::{Cuda, KlDivergence, LossReduction};
+///
+/// if let Some(cuda) = Cuda::new() {
+///     let kl = KlDivergence::new(&cuda, 2, LossReduction::BatchMean { batch: 1 }).unwrap();
+///     let (mut log_probs, mut target) = (cuda.buffer(8).unwrap(), cuda.buffer(8).unwrap());
+///     let (mut grad, mut out) = (cuda.buffer(8).unwrap(), cuda.buffer(4).unwrap());
+///     let half = 0.5f32.ln();
+///     log_probs.write(&[half, half]).unwrap();
+///     target.write(&[0.25f32, 0.75]).unwrap();
+///     kl.run(&log_probs, &target, &mut grad, (&mut out, 0)).unwrap();
+///     let (mut loss, mut g) = ([0.0f32; 1], [0.0f32; 2]);
+///     out.read(&mut loss).unwrap();
+///     grad.read(&mut g).unwrap();
+///     // 0.25 ln 0.5 + 0.75 ln 1.5, and the gradients -0.25 and -0.75.
+///     assert!((loss[0] - 0.130_812).abs() < 1e-5);
+///     assert_eq!(g, [-0.25, -0.75]);
+/// }
+/// ```
+pub struct KlDivergence<'c> {
+    /// The values.
+    n: u32,
+    /// How the loss reduces.
+    reduction: LossReduction,
+    /// The compiled kernels.
+    kernels: Kernels<'c>,
+    /// Each value's loss.
+    terms: DeviceBuffer<'c>,
+    /// One partial sum per chunk of 4,096 terms.
+    partials: DeviceBuffer<'c>,
+}
+
+impl fmt::Debug for KlDivergence<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KlDivergence")
+            .field("n", &self.n)
+            .field("reduction", &self.reduction)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'c> KlDivergence<'c> {
+    /// Compiles the kernels on `cuda`'s card for the loss of `n` values reduced by
+    /// `reduction`, and allocates each value's loss and their partial sums.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Invalid`] if `n` is 0 or more than 2³¹, or a batch mean's batch is 0 or
+    /// does not divide `n`; [`CudaError::Compile`] or [`CudaError::Call`] if NVRTC or the
+    /// driver refuses the kernels or the memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, KlDivergence, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     assert!(KlDivergence::new(&cuda, 4, LossReduction::Sum).is_ok());
+    ///     assert!(KlDivergence::new(&cuda, 0, LossReduction::Sum).is_err());
+    ///     assert!(KlDivergence::new(&cuda, 4, LossReduction::BatchMean { batch: 3 }).is_err());
+    /// }
+    /// ```
+    pub fn new(
+        cuda: &'c Cuda,
+        n: u32,
+        reduction: LossReduction,
+    ) -> Result<KlDivergence<'c>, CudaError> {
+        const WHAT: &str = "KL divergence";
+        let dims = ChannelDims::new(1, 1, n);
+        dims.check(WHAT)?;
+        reduction.check(WHAT, n)?;
+        let kernels = Kernels::new(cuda)?;
+        Ok(KlDivergence {
+            n,
+            reduction,
+            kernels,
+            terms: cuda.buffer(4 * n as usize)?,
+            partials: cuda.buffer(4 * dims.chunks() as usize)?,
+        })
+    }
+
+    /// The values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, KlDivergence, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     assert_eq!(KlDivergence::new(&cuda, 6, LossReduction::Mean).unwrap().len(), 6);
+    /// }
+    /// ```
+    pub fn len(&self) -> u32 {
+        self.n
+    }
+
+    /// Whether the loss takes no values: never, since [`new`](Self::new) refuses 0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, KlDivergence, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     assert!(!KlDivergence::new(&cuda, 6, LossReduction::Mean).unwrap().is_empty());
+    /// }
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// How the loss reduces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{Cuda, KlDivergence, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let reduction = LossReduction::BatchMean { batch: 3 };
+    ///     assert_eq!(KlDivergence::new(&cuda, 6, reduction).unwrap().reduction(), reduction);
+    /// }
+    /// ```
+    pub fn reduction(&self) -> LossReduction {
+        self.reduction
+    }
+
+    /// Writes the loss of `log_probs` against `target` (`n` `f32`s each) to word `out.1` of
+    /// `out.0`, and the log-probabilities' gradient to `grad` (`n` values). Nothing else of
+    /// `out` changes.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if a launch is refused.
+    ///
+    /// # Panics
+    ///
+    /// If a buffer is shorter than its values: the log-probabilities, the target and the
+    /// gradient `n`, and the output `out.1 + 1`.
+    ///
+    /// # Examples
+    ///
+    /// See [`KlDivergence`].
+    pub fn run(
+        &self,
+        log_probs: &DeviceBuffer<'_>,
+        target: &DeviceBuffer<'_>,
+        grad: &mut DeviceBuffer<'_>,
+        (out, offset): (&mut DeviceBuffer<'_>, u32),
+    ) -> Result<(), CudaError> {
+        const WHAT: &str = "KL divergence";
+        let n = self.n;
+        let len = u64::from(n);
+        check_buffers(
+            WHAT,
+            &[
+                (log_probs, "log-probabilities", len),
+                (target, "target", len),
+                (grad, "gradient", len),
+                (out, "loss output", u64::from(offset) + 1),
+            ],
+        );
+        let (w, divisor) = self.reduction.scale(n);
+        let k = &self.kernels;
+        // SAFETY: kl_terms takes (const u32 *log_probs, const u32 *target, u32 *grad, u32
+        // *terms, u32 n, float w) and touches values below n, which the buffers hold (checked
+        // above, and the terms are this loss's own); grad, borrowed mutably, is no input.
+        unsafe {
+            k.launch(
+                k.kl_terms,
+                n.div_ceil(BLOCK),
+                &[
+                    Arg::Buffer(log_probs),
+                    Arg::Buffer(target),
+                    Arg::Buffer(grad),
+                    Arg::Buffer(&self.terms),
+                    Arg::U32(n),
+                    Arg::F32(w),
+                ],
+            )?;
+        }
+        // SAFETY: sum_partials reads n terms from this loss's own buffer; the partial sums
+        // are its own too, sized for n, and out, borrowed mutably, holds word `offset`
+        // (checked above). A sum's division by 1 is exact.
+        unsafe {
+            k.mean(
+                k.sum_partials,
+                &[Arg::Buffer(&self.terms)],
+                ChannelDims::new(1, 1, n),
+                &self.partials,
+                (out, offset),
+                divisor,
             )
         }
     }

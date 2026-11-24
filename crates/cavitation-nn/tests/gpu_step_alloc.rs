@@ -1,6 +1,6 @@
 //! Counts host allocations and live host bytes across warm `GpuTrainer` epochs, on full,
-//! short, skipped and profiled steps, with cross-entropy and with binary cross-entropy of
-//! probabilities and of logits. wgpu allocates on the host for each encoder, pass,
+//! short, skipped and profiled steps, with cross-entropy, with binary cross-entropy of
+//! probabilities and of logits, and with KL divergence. wgpu allocates on the host for each encoder, pass,
 //! submission and poll, so a step is not free of allocations; but after warm-up, the live
 //! bytes must be the same at the start of every epoch of the same batches, or memory would
 //! grow, and each step must make the same number of allocations in every epoch, give or take
@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 use cavitation_core::{Conv2dGeom, ParamStore, Pool2dGeom, Rng, TensorView};
 use cavitation_gpu::Gpu;
 use cavitation_nn::{
-    BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, GpuTrainer, Health, Linear, Loss, MaxPool2d,
-    OnNonFinite, OptimizerConfig, Relu, Sequential, Sigmoid, TargetsView, Warning,
+    BatchNorm2d, BatchView, Conv2d, Dropout, Flatten, GpuTrainer, Health, Linear, LogSoftmax, Loss,
+    MaxPool2d, OnNonFinite, OptimizerConfig, Relu, Sequential, Sigmoid, TargetsView, Warning,
 };
 
 /// The number of allocations (including reallocations) made so far, from every thread.
@@ -154,7 +154,8 @@ struct Counts {
     live: Vec<isize>,
 }
 
-/// Trains the CNN (with a sigmoid after it for binary cross-entropy of probabilities) with
+/// Trains the CNN (with a sigmoid after it for binary cross-entropy of probabilities, a
+/// log-softmax for KL divergence) with
 /// `config` and `loss` at batch 6 on 22 rows (6, 6, 6 with a NaN and a short 4), every health
 /// check on and the NaN batch left out under `Skip`, profiling the batches in [`PROFILED`],
 /// for [`WARM_UP`] epochs, then counts [`COUNTED`] epochs.
@@ -163,6 +164,9 @@ fn count_epochs(gpu: &Gpu, config: &OptimizerConfig, loss: Loss) -> Counts {
     let mut net = cnn(&mut params);
     if loss == Loss::BinaryCrossEntropy {
         net = net.push(Sigmoid);
+    }
+    if loss == Loss::KlDiv {
+        net = net.push(LogSoftmax);
     }
     let on_values = loss != Loss::CrossEntropy;
     let mut batches: Vec<Data> = [6, 6, 6, 4]
@@ -227,7 +231,7 @@ fn count_epochs(gpu: &Gpu, config: &OptimizerConfig, loss: Loss) -> Counts {
 }
 
 /// Counts SGD with momentum and Adam with cross-entropy, and Adam with binary cross-entropy
-/// of probabilities and of logits, and fails if the live bytes at the start of a counted
+/// of probabilities and of logits and with KL divergence, and fails if the live bytes at the start of a counted
 /// epoch, or after the last, differ from the first counted epoch's, or if a step's
 /// allocations differ by more than one between counted epochs.
 fn main() -> ExitCode {
@@ -261,6 +265,7 @@ fn main() -> ExitCode {
             adam,
             Loss::BinaryCrossEntropyWithLogits,
         ),
+        ("adam, KL divergence", adam, Loss::KlDiv),
     ];
     let mut ok = true;
     for (name, config, loss) in &configs {

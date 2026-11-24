@@ -84,13 +84,12 @@ For a hand-written loop, `GpuTrainer` (and `CudaTrainer`) are the step-by-step t
 
 A GPU run is refused with `Error::Unsupported`, before any training, for what its trainer has no kernel for:
 
-- the loss `KlDiv`;
 - the optimisers `RmsProp` and `Adagrad`;
 - `OnNonFinite::Warn`;
 - hooks registered with `fit_with_hooks`, and `fit_controlled`;
 - layers of your own.
 
-The layers of the library, the other activations and losses, SGD, Adam and AdamW, the learning-rate schedules, validation, early stopping and the other health checks all train on every device. `Device::Auto` falls back to the CPU for a run a GPU cannot train, and says so in `History::device_note`.
+The layers of the library, the other activations, every loss, SGD, Adam and AdamW, the learning-rate schedules, validation, early stopping and the other health checks all train on every device. `Device::Auto` falls back to the CPU for a run a GPU cannot train, and says so in `History::device_note`.
 
 ## When a GPU is not worth it
 
