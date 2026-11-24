@@ -1763,8 +1763,16 @@ const KL_DIV: Shader = Shader {
         ",
         log_bits!(),
         "
-        // 2^-32, which undoes scaled().
-        const UNSCALE: f32 = 2.3283064365386963e-10;
+        // v times 2^-32, which undoes scaled(). A normal result is made by lowering the
+        // exponent bits, never by multiplying by a constant: a compiler may fold such a
+        // constant into scaled()'s own 2^-117 and get 2^-149, which a GPU flushes to 0.
+        fn unscaled(v: f32) -> u32 {
+            let b = bitcast<u32>(v);
+            let field = (b >> 23u) & 0xffu;
+            if (field == 0xffu) { return b; }
+            if (field > 32u) { return b - (32u << 23u); }
+            return bitcast<u32>(ldexp(v, -32));
+        }
 
         // t (ln t - x) for the bits of x and t, both not NaN.
         fn term(xb: u32, tb: u32) -> u32 {
@@ -1773,7 +1781,7 @@ const KL_DIV: Shader = Shader {
             if (tb == INF_BITS) { return select(INF_BITS, NAN_BITS, xb == INF_BITS); }
             if ((xb & MAGNITUDE) == INF_BITS) { return INF_BITS | ((xb ^ SIGN_BIT) & SIGN_BIT); }
             let d = ln_bits(tb) - bitcast<f32>(xb);
-            if ((tb >> 23u) == 0u) { return bitcast<u32>(scaled(tb) * d * UNSCALE); }
+            if ((tb >> 23u) == 0u) { return unscaled(scaled(tb) * d); }
             return bitcast<u32>(bitcast<f32>(tb) * d);
         }
 

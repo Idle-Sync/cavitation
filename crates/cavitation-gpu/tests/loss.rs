@@ -1930,7 +1930,15 @@ fn kl_div_edges_match_the_tape() {
                     } else {
                         assert_exact(&[value], &[want], &format!("the loss, {what}"));
                     }
-                    assert_exact(&grad, &want_grad, &format!("the gradient, {what}"));
+                    // -t·w with a subnormal t is subnormal, and a GPU may flush t itself
+                    // before the product, so there the gradient is held to FLOOR; every
+                    // other gradient is the tape's bits.
+                    let what = format!("the gradient, {what}");
+                    if want_grad[0].is_subnormal() {
+                        assert_within(&grad, &[f64::from(want_grad[0])], |_| FLOOR, &what);
+                    } else {
+                        assert_exact(&grad, &want_grad, &what);
+                    }
                 }
             }
         }
