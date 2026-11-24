@@ -1408,8 +1408,9 @@ fn binary_cross_entropy_twin() {
 /// probabilities, the kernel's term evaluated on the host bit for bit; the gradient as
 /// [`check_bce_grad`] checks it (probabilities the tape's bits, subnormals included); the
 /// clamp count the tape's. The values are the WGSL test's: 0, 1 and the clamp's threshold,
-/// subnormals, 2⁻⁶² and one ulp either side, values outside `[0, 1]`, NaN and ±∞; logits of
-/// ±0 to ±1e30, NaN and ±∞.
+/// subnormals, 2⁻⁶² and one ulp either side, values outside `[0, 1]` (±1e20 and ±2⁶⁴ and one ulp
+/// below it among them, where the CPU's `p·(1 − p)` starts to overflow), NaN and ±∞; logits
+/// of ±0 to ±1e30, NaN and ±∞.
 #[test]
 fn binary_cross_entropy_edges_match_the_tape() {
     let Some(cuda) = Cuda::new() else { return };
@@ -1417,6 +1418,8 @@ fn binary_cross_entropy_edges_match_the_tape() {
     let above = |x: f32| f32::from_bits(x.to_bits() + 1);
     let (inf, nan) = (f32::INFINITY, f32::NAN);
     let tiny = 2.0f32.powi(-62);
+    // From 2^64 on, the CPU's p (1 - p) overflows to -infinity.
+    let huge = 2.0f32.powi(64);
     let probabilities = [
         0.0,
         -0.0,
@@ -1438,6 +1441,12 @@ fn binary_cross_entropy_edges_match_the_tape() {
         1.5,
         -1e-3,
         -1e-30,
+        1e20,
+        -1e20,
+        below(huge),
+        huge,
+        -below(huge),
+        -huge,
         nan,
         inf,
         -inf,

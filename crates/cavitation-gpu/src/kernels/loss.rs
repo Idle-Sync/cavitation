@@ -1206,7 +1206,9 @@ impl RegressionCall {
 /// does not. A logarithm is clamped to −100 where the CPU's is: `p` of ±0 or of at most
 /// 26·2⁻¹⁴⁹ (`ln` −100.02; 27·2⁻¹⁴⁹ gives −99.98), and `1 − p` of 0. Where `|p| < 2⁻⁶²` the
 /// gradient's quotient is taken on `p` and `t` scaled by 2³² from their bits, the same
-/// quotient, since a GPU may flush a subnormal `p` to 0.
+/// quotient, since a GPU may flush a subnormal `p` to 0; where `|p·(1 − p)| ≥ 2⁶⁴` both sides
+/// of the quotient are scaled by 2⁻⁶⁴, since a division through the reciprocal of a
+/// denominator near the largest float flushes to 0.
 ///
 /// Logits: `max(z, 0) − z·t + ln(1 + e)` with `e = e^(−|z|)` and `ln(1 + e)` from the series
 /// of `2·atanh(e / (2 + e))`, as the cross-entropy's, and the gradient `σ(z) − t` with the
@@ -1230,6 +1232,10 @@ const BINARY: Shader = Shader {
         const SIGN_BIT: u32 = 0x80000000u;
         const MAGNITUDE: u32 = 0x7fffffffu;
         const ONE_BITS: u32 = 0x3f800000u;
+        // The magnitude bits of 2^64: from there on p (1 - p) rounds to -infinity in f32,
+        // since 1 - p rounds to -p and p^2 reaches 2^128; just below, p^2 rounds to a finite
+        // float.
+        const PRODUCT_OVERFLOWS: u32 = 0x5f800000u;
         const LN2_HI: f32 = 0.693145751953125;
         const LN2_LO: f32 = 1.4286068203094172e-6;
 
@@ -1304,6 +1310,10 @@ const BINARY: Shader = Shader {
             }
             if (pm == INF_BITS) {
                 grad[i] = NAN_BITS;
+            } else if (tm == INF_BITS && pm >= PRODUCT_OVERFLOWS) {
+                // p (1 - p) overflows to -infinity in f32 for |p| from 2^64, and
+                // infinity over infinity is NaN.
+                grad[i] = NAN_BITS;
             } else if (tm == INF_BITS) {
                 // -t times infinity over 1, or over p (1 - p), negative for p below 0 or
                 // above 1.
@@ -1319,7 +1329,15 @@ const BINARY: Shader = Shader {
                 let ps = scaled(pb);
                 grad[i] = bitcast<u32>((ps - scaled(tb)) / ps * r.w);
             } else {
-                grad[i] = bitcast<u32>((p - t) / (p * (1.0 - p)) * r.w);
+                // From |p (1 - p)| = 2^64 both sides of the quotient are scaled by 2^-64,
+                // exactly, so a division by the reciprocal does not flush to 0.
+                var num = p - t;
+                var den = p * (1.0 - p);
+                if ((bitcast<u32>(den) & MAGNITUDE) >= (191u << 23u)) {
+                    num = num * bitcast<f32>(63u << 23u);
+                    den = den * bitcast<f32>(63u << 23u);
+                }
+                grad[i] = bitcast<u32>(num / den * r.w);
             }
         }
 
@@ -1441,8 +1459,9 @@ pub enum LossReduction {
 /// `f32` for the mean. The count is exact up to 2²⁴ clamps. NaN in either input gives NaN for
 /// that value's loss and gradient, and the other non-finite cases are the CPU's, decided from
 /// the bits: a probability outside `[−0, 1]` or an infinite target gives a NaN loss (with the
-/// CPU's finite gradient, or an infinite one for an infinite target), an infinite logit or
-/// target gives the CPU's infinite or NaN loss. The finite flag tests the loss, so it catches
+/// CPU's finite gradient, or an infinite one for an infinite target, NaN where the CPU's
+/// `p·(1 − p)` overflows, from `|p| = 2⁶⁴`), an infinite logit or target gives the CPU's
+/// infinite or NaN loss. The finite flag tests the loss, so it catches
 /// each.
 ///
 /// The bounds, with `u = 2⁻²⁴`, `chunks = ⌈n / 4096⌉` and the exact values of the same `f32`

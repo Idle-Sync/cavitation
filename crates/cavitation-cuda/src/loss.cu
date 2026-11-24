@@ -228,6 +228,9 @@ extern "C" __global__ void regression_terms(const float *pred, const float *targ
 // The bits of 1.0 and of the magnitude.
 #define ONE_BITS 0x3f800000u
 #define MAGNITUDE 0x7fffffffu
+// The magnitude bits of 2^64: from there on p (1 - p) rounds to -infinity in f32, since 1 - p
+// rounds to -p and p^2 reaches 2^128; just below, p^2 rounds to a finite float.
+#define PRODUCT_OVERFLOWS 0x5f800000u
 
 // 2 atanh(y), from its series to y^15.
 __device__ float atanh2(float y) {
@@ -304,6 +307,10 @@ __device__ void bce_probabilities(u32 pb, u32 tb, float w, u32 *term, u32 *g, fl
     }
     if (pm == INF_BITS) {
         *g = NAN_BITS;
+    } else if (tm == INF_BITS && pm >= PRODUCT_OVERFLOWS) {
+        // p (1 - p) overflows to -infinity in f32 for |p| from 2^64, and infinity over
+        // infinity is NaN.
+        *g = NAN_BITS;
     } else if (tm == INF_BITS) {
         // -t times infinity over 1, or over p (1 - p), negative for p below 0 or above 1.
         bool negative = !p_clamped && !q_clamped && ((pb & SIGN_BIT) != 0u || pb > ONE_BITS);
@@ -316,6 +323,9 @@ __device__ void bce_probabilities(u32 pb, u32 tb, float w, u32 *term, u32 *g, fl
         float ps = scaled(pb);
         *g = __float_as_uint((ps - scaled(tb)) / ps * w);
     } else {
+        // The WGSL kernel scales both sides by 2^-64 from |p (1 - p)| = 2^64, for a division
+        // through the reciprocal; NVRTC divides correctly rounded, so the CPU's quotient needs
+        // no scaling here.
         *g = __float_as_uint((p - t) / (p * (1.0f - p)) * w);
     }
 }

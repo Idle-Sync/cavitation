@@ -1386,8 +1386,9 @@ fn binary_cross_entropy_twin() {
 ///
 /// Probabilities: ±0 and 1 (clamped), 26·2⁻¹⁴⁹ (clamped) and 27·2⁻¹⁴⁹ (not), other
 /// subnormals, 2⁻⁶² and one ulp either side (where the gradient's scaling starts), values
-/// near 0 and 1, and outside `[0, 1]` (a NaN loss with the CPU's finite gradient) and NaN or
-/// ±∞; against targets of ±0, 1, ¼, a subnormal, NaN and ±∞. Logits: ±0, a subnormal, ±1,
+/// near 0 and 1, and outside `[0, 1]` (a NaN loss with the CPU's finite gradient), among them
+/// ±1e20 and ±2⁶⁴ and one ulp below it (from 2⁶⁴ the CPU's `p·(1 − p)` overflows, so an
+/// infinite target gives a NaN gradient), and NaN or ±∞; against targets of ±0, 1, ¼, a subnormal, NaN and ±∞. Logits: ±0, a subnormal, ±1,
 /// ±20, ±88 and ±89 (where `e^(−|z|)` turns subnormal), ±100, ±104, ±1e30, NaN and ±∞; against
 /// targets of ±0, 1, ½, 2, NaN and ±∞.
 #[test]
@@ -1396,6 +1397,8 @@ fn binary_cross_entropy_edges_match_the_tape() {
     let above = |x: f32| f32::from_bits(x.to_bits() + 1);
     let (inf, nan) = (f32::INFINITY, f32::NAN);
     let tiny = 2.0f32.powi(-62);
+    // From 2^64 on, the CPU's p (1 - p) overflows to -infinity.
+    let huge = 2.0f32.powi(64);
     let probabilities = [
         0.0,
         -0.0,
@@ -1418,6 +1421,12 @@ fn binary_cross_entropy_edges_match_the_tape() {
         1.5,
         -1e-3,
         -1e-30,
+        1e20,
+        -1e20,
+        below(huge),
+        huge,
+        -below(huge),
+        -huge,
         nan,
         inf,
         -inf,
