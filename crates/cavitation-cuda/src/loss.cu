@@ -224,3 +224,156 @@ extern "C" __global__ void regression_terms(const float *pred, const float *targ
         }
     }
 }
+
+// The bits of 1.0 and of the magnitude.
+#define ONE_BITS 0x3f800000u
+#define MAGNITUDE 0x7fffffffu
+
+// 2 atanh(y), from its series to y^15.
+__device__ float atanh2(float y) {
+    float q = y * y;
+    float t = 1.0f / 15.0f;
+    t = 1.0f / 13.0f + q * t;
+    t = 1.0f / 11.0f + q * t;
+    t = 1.0f / 9.0f + q * t;
+    t = 1.0f / 7.0f + q * t;
+    t = 1.0f / 5.0f + q * t;
+    t = 1.0f / 3.0f + q * t;
+    t = 1.0f + q * t;
+    return 2.0f * y * t;
+}
+
+// ln x for the positive finite x whose bits are b, subnormals included: k ln 2 + 2 atanh(y)
+// with y = (f - 1) / (f + 1) for x = f 2^k, f within [sqrt(1/2), sqrt(2)], ln 2 split in two
+// so that k ln2_hi is exact.
+__device__ float ln_bits(u32 b) {
+    int e;
+    u32 m;
+    u32 field = b >> 23u;
+    if (field == 0u) {
+        u32 s = (u32)__clz(b) - 8u;
+        m = (b << s) & 0x7fffffu;
+        e = -126 - (int)s;
+    } else {
+        m = b & 0x7fffffu;
+        e = (int)field - 127;
+    }
+    float f = __uint_as_float(ONE_BITS | m);
+    if (f > 1.41421356f) {
+        f = 0.5f * f;
+        e = e + 1;
+    }
+    float k = (float)e;
+    return k * 0.693145751953125f + (k * 1.4286068203094172e-6f + atanh2((f - 1.0f) / (f + 1.0f)));
+}
+
+// The value whose bits are b times 2^32, exactly (infinite past the largest float).
+__device__ float scaled(u32 b) {
+    u32 sign = b & SIGN_BIT;
+    u32 field = (b >> 23u) & 0xffu;
+    if (field == 0u) {
+        float v = (float)(b & 0x7fffffu) * __uint_as_float(10u << 23u);
+        return __uint_as_float(__float_as_uint(v) | sign);
+    }
+    if (field >= 223u) {
+        return __uint_as_float(INF_BITS | sign);
+    }
+    return __uint_as_float(b + (32u << 23u));
+}
+
+// Binary cross-entropy of probabilities for one value: its loss, its clamp count (1.0 where
+// the CPU's tape counts a clamped logarithm) and its gradient times w. Each logarithm is
+// clamped to -100 where the CPU's is: p of +-0 or of at most 26 * 2^-149, and 1 - p of 0.
+// Where |p| < 2^-62 the gradient's quotient is taken on p and t scaled by 2^32.
+__device__ void bce_probabilities(u32 pb, u32 tb, float w, u32 *term, u32 *g, float *count) {
+    u32 pm = pb & MAGNITUDE;
+    u32 tm = tb & MAGNITUDE;
+    bool p_clamped = pm == 0u || pb <= 26u;
+    bool q_clamped = pb == ONE_BITS;
+    *count = (p_clamped && tm != 0u) || (q_clamped && tb != ONE_BITS) ? 1.0f : 0.0f;
+    float p = __uint_as_float(pb);
+    float t = __uint_as_float(tb);
+    // ln p or ln(1 - p) is NaN outside [-0, 1], and an infinite target meets a zero logarithm
+    // or two of one sign with weights of opposite signs.
+    if ((pb <= ONE_BITS || pb == SIGN_BIT) && tm != INF_BITS) {
+        float lp = p_clamped ? -100.0f : ln_bits(pb);
+        float lq = q_clamped ? -100.0f : ln_bits(__float_as_uint(1.0f - p));
+        *term = __float_as_uint(-(t * lp + (1.0f - t) * lq));
+    } else {
+        *term = NAN_BITS;
+    }
+    if (pm == INF_BITS) {
+        *g = NAN_BITS;
+    } else if (tm == INF_BITS) {
+        // -t times infinity over 1, or over p (1 - p), negative for p below 0 or above 1.
+        bool negative = !p_clamped && !q_clamped && ((pb & SIGN_BIT) != 0u || pb > ONE_BITS);
+        *g = INF_BITS | (((tb ^ SIGN_BIT) & SIGN_BIT) ^ (negative ? SIGN_BIT : 0u));
+    } else if (p_clamped) {
+        *g = __float_as_uint((1.0f - t) * w);
+    } else if (q_clamped) {
+        *g = __float_as_uint(-t * w);
+    } else if (pm < (65u << 23u)) {
+        float ps = scaled(pb);
+        *g = __float_as_uint((ps - scaled(tb)) / ps * w);
+    } else {
+        *g = __float_as_uint((p - t) / (p * (1.0f - p)) * w);
+    }
+}
+
+// Binary cross-entropy of logits for one value: max(z, 0) - z t + ln(1 + e) with
+// e = e^(-|z|) and ln(1 + e) from the series of 2 atanh(e / (2 + e)), and the gradient
+// (sigma(z) - t) w with the CPU's stable sigmoid on the same e. An infinite logit or target
+// takes the CPU's infinite or NaN loss and gradient from the bits.
+__device__ void bce_logits(u32 zb, u32 tb, float w, u32 *term, u32 *g) {
+    u32 zm = zb & MAGNITUDE;
+    u32 tm = tb & MAGNITUDE;
+    float t = __uint_as_float(tb);
+    if (zm == INF_BITS || tm == INF_BITS) {
+        // max(z, 0) - z t with an infinite z or t: infinity times 0 is NaN, as is infinity
+        // minus infinity.
+        if (zb == INF_BITS) {
+            *term = (tb & SIGN_BIT) != 0u && tm != 0u ? INF_BITS : NAN_BITS;
+        } else if (zm == INF_BITS) {
+            *term = tm == 0u ? NAN_BITS : (INF_BITS | (tb & SIGN_BIT));
+        } else {
+            *term = zm == 0u ? NAN_BITS : (INF_BITS | ((zb ^ tb ^ SIGN_BIT) & SIGN_BIT));
+        }
+        if (tm == INF_BITS) {
+            *g = INF_BITS | ((tb ^ SIGN_BIT) & SIGN_BIT);
+        } else {
+            *g = __float_as_uint(((zb == INF_BITS ? 1.0f : 0.0f) - t) * w);
+        }
+        return;
+    }
+    float z = __uint_as_float(zb);
+    float e = expf(-fabsf(z));
+    float positive = z > 0.0f ? z : 0.0f;
+    *term = __float_as_uint(positive - z * t + atanh2(e / (2.0f + e)));
+    float sigma = z >= 0.0f ? 1.0f / (1.0f + e) : e / (1.0f + e);
+    *g = __float_as_uint((sigma - t) * w);
+}
+
+// Binary cross-entropy, one thread per value: each value's loss into terms, the prediction's
+// gradient into grad (both as bits) and its clamp count into clamps. logits is 0 for
+// probabilities and 1 for logits. NaN in either input gives NaN for the loss and the gradient.
+extern "C" __global__ void bce_terms(const u32 *pred, const u32 *target, u32 *grad, u32 *terms,
+                                     float *clamps, u32 n, float w, u32 logits) {
+    u32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    u32 pb = pred[i];
+    u32 tb = target[i];
+    if ((pb & MAGNITUDE) > INF_BITS || (tb & MAGNITUDE) > INF_BITS) {
+        terms[i] = NAN_BITS;
+        grad[i] = NAN_BITS;
+        clamps[i] = 0.0f;
+        return;
+    }
+    if (logits == 0u) {
+        bce_probabilities(pb, tb, w, &terms[i], &grad[i], &clamps[i]);
+    } else {
+        clamps[i] = 0.0f;
+        bce_logits(pb, tb, w, &terms[i], &grad[i]);
+    }
+}

@@ -74,6 +74,12 @@
 //!   kernels: each row's or value's loss and gradient the CPU's bits, NaN and ±∞ included,
 //!   and the mean the fixed tree's (`tests/loss.rs`).
 //!
+//! - [`BinaryCrossEntropy`] with a [`BinaryInput`] and a [`LossReduction`]: binary
+//!   cross-entropy of probabilities or of logits with `Reduction::Mean` or `Reduction::Sum`,
+//!   ported from the WGSL kernel: a probability's gradient the CPU's bits, the loss and the
+//!   logits' gradient within the WGSL kernel's stated bounds, and the count of logarithms the
+//!   tape clamps (`tests/loss.rs`).
+//!
 //! - [`OptimizerKernel`] and [`OptimizerRule`]: SGD (with momentum and weight decay), Adam
 //!   and AdamW over a model's parameters in flat buffers, one launch per step, skipped when
 //!   the step's finite flag is set, as this crate's own kernels: the bits of the kernels'
@@ -155,7 +161,8 @@ pub use glu::{Glu, GluGate, GluOp};
 pub use health::{DeadRelu, FiniteFlag, SumSquares};
 pub use linear::{Linear, LinearShape};
 pub use loss::{
-    MeanSquaredError, NegativeLogLikelihood, Regression, RegressionLoss, SoftmaxCrossEntropy,
+    BinaryCrossEntropy, BinaryInput, LossReduction, MeanSquaredError, NegativeLogLikelihood,
+    Regression, RegressionLoss, SoftmaxCrossEntropy,
 };
 pub use module::{Arg, Kernel, MAX_KERNEL_ARGS, Module};
 pub use optimizer::{OptimizerKernel, OptimizerRule};

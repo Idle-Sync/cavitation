@@ -1,8 +1,10 @@
 //! The training losses as this crate's own CUDA kernels, the twins of `cavitation_core`'s
 //! `Tape::softmax_cross_entropy`, `Tape::mse`, `Tape::nll`, `Tape::l1`, `Tape::huber` and
-//! `Tape::smooth_l1` with `Reduction::Mean`: the loss, one `f32`
-//! written at a word offset of an output buffer, and the gradient of that loss with respect
-//! to the input, overwriting it. The mean's sum runs in the channel sums' fixed tree
+//! `Tape::smooth_l1` with `Reduction::Mean`, and of `Tape::binary_cross_entropy` and
+//! `Tape::binary_cross_entropy_with_logits` with `Reduction::Mean` or `Reduction::Sum`: the
+//! loss, one `f32` written at a word offset of an output buffer (followed, for binary
+//! cross-entropy, by the count of clamped logarithms), and the gradient of that loss with
+//! respect to the input, overwriting it. The mean's sum runs in the channel sums' fixed tree
 //! (`reduce.cu`), so two runs give the same bits.
 
 use std::fmt;
@@ -54,6 +56,8 @@ struct Kernels<'c> {
     nll_rows: CuFunction,
     /// The regression losses' terms and gradients.
     regression_terms: CuFunction,
+    /// Binary cross-entropy's terms, clamp counts and gradients.
+    bce_terms: CuFunction,
 }
 
 impl<'c> Kernels<'c> {
@@ -69,6 +73,7 @@ impl<'c> Kernels<'c> {
             mse_grad: f("mse_grad")?,
             nll_rows: f("nll_rows")?,
             regression_terms: f("regression_terms")?,
+            bce_terms: f("bce_terms")?,
             module,
         })
     }
@@ -895,6 +900,299 @@ impl<'c> RegressionLoss<'c> {
                 &self.partials,
                 (out, offset),
                 n as f32,
+            )
+        }
+    }
+}
+
+/// What [`BinaryCrossEntropy`] reads as its prediction.
+///
+/// - `Probabilities`: probabilities `p`, as `Tape::binary_cross_entropy`: the loss
+///   `−[t·ln p + (1 − t)·ln(1 − p)]` with each logarithm clamped to at least −100, and the
+///   gradient `(p − t) / (p·(1 − p))`, or only the unclamped term's derivative where a
+///   logarithm was clamped.
+/// - `Logits`: raw scores `z`, as `Tape::binary_cross_entropy_with_logits`: the loss
+///   `max(z, 0) − z·t + ln(1 + e^(−|z|))`, which never overflows, and the gradient `σ(z) − t`.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_cuda::BinaryInput;
+///
+/// assert_ne!(BinaryInput::Probabilities, BinaryInput::Logits);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryInput {
+    /// Probabilities, for example a sigmoid's output.
+    Probabilities,
+    /// Raw scores, the sigmoid fused into the loss.
+    Logits,
+}
+
+/// How [`BinaryCrossEntropy`] reduces its values' losses to one word, as the tape's
+/// `Reduction::Mean` and `Reduction::Sum`.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_cuda::LossReduction;
+///
+/// assert_ne!(LossReduction::Mean, LossReduction::Sum);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LossReduction {
+    /// The sum divided by the number of values; each gradient is scaled by `1/n` rounded to
+    /// `f32`, as the CPU's upstream gradient.
+    Mean,
+    /// The sum; each gradient is scaled by 1.
+    Sum,
+}
+
+/// Binary cross-entropy on the card for one length and one form, as
+/// `Tape::binary_cross_entropy` and `Tape::binary_cross_entropy_with_logits` with
+/// `Reduction::Mean` or `Reduction::Sum` compute it: the loss (one word), then how many
+/// logarithms the tape would clamp and count in `Tape::clamped_logs` (one word, a whole
+/// number, 0 for logits), and the prediction's gradient. See [`BinaryInput`] for each form.
+///
+/// The kernel is `cavitation-gpu`'s WGSL one ported operation for operation: one thread
+/// per value writes its loss, clamp count and gradient, the logarithms of probabilities
+/// computed from the bits as `k·ln 2 + 2·atanh((f − 1)/(f + 1))` and clamped to −100 where
+/// the CPU's are, the non-finite cases decided from the bits as the CPU's arithmetic gives
+/// them. Nothing is fused, the divisions are correctly rounded and nothing is flushed, so a
+/// probability's gradient is the CPU's bits everywhere. The losses' sum and the counts' sum
+/// are channel sums in `reduce.cu`'s fixed tree, the mean divided by `n` rounded to `f32`;
+/// the count is exact up to 2²⁴ clamps. The other bounds are the WGSL kernel's, with
+/// `u = 2⁻²⁴`, `chunks = ⌈n / 4096⌉` and the exact values of the same `f32` inputs; CUDA's
+/// `expf` is within 2 ulp, inside the `3 + 2|x|` they allow:
+///
+/// - **A probability's loss:** within `15u·(|t·ln p| + |(1 − t)·ln(1 − p)|)` of the CPU's
+///   expression on the same `p`, `fl(1 − p)` and `fl(1 − t)` evaluated exactly.
+/// - **A logit's loss:** within `u·(|z·t| + |a| + |ℓ|) + 10u·L + (6 + 4|z|)·u·e`, where
+///   `a = max(z, 0) − z·t`, `e = e^(−|z|)`, `L = ln(1 + e)` and `ℓ = a + L`.
+/// - **The loss:** the values' bounds summed, plus `(22 + chunks)·u·Σ|ℓ|` for the sum, then
+///   for the mean divided by `n` and `5u` of itself for the division.
+/// - **A logit's gradient:** within `w·(Δσ + u·|σ(z) − t|) + u·|g|` of `g = (σ(z) − t)·w`,
+///   with `Δσ = 13u·σ(z)` for `z ≥ 0` and `(18 + 8|z|)·u·σ(z)` below.
+///
+/// Each bound also carries `2⁻¹²⁶·(2 + |t|)` absolute per value for the results that may
+/// be subnormal, where an ulp is absolute. Two runs give the same bits.
+///
+/// # Examples
+///
+/// ```
+/// use cavitation_cuda::{BinaryCrossEntropy, BinaryInput, Cuda, LossReduction};
+///
+/// if let Some(cuda) = Cuda::new() {
+///     let form = (BinaryInput::Probabilities, LossReduction::Mean);
+///     let bce = BinaryCrossEntropy::new(&cuda, 2, form).unwrap();
+///     let (mut pred, mut target) = (cuda.buffer(8).unwrap(), cuda.buffer(8).unwrap());
+///     let (mut grad, mut out) = (cuda.buffer(8).unwrap(), cuda.buffer(8).unwrap());
+///     pred.write(&[0.5f32, 0.0]).unwrap();
+///     target.write(&[1.0f32, 1.0]).unwrap();
+///     bce.run(&pred, &target, &mut grad, (&mut out, 0)).unwrap();
+///     let (mut words, mut g) = ([0.0f32; 2], [0.0f32; 2]);
+///     out.read(&mut words).unwrap();
+///     grad.read(&mut g).unwrap();
+///     // (ln 2 + 100) / 2, one clamped logarithm, and the gradients -2 / 2 and 0 / 2.
+///     assert!((words[0] - 50.346_574).abs() < 1e-4);
+///     assert_eq!((words[1], g), (1.0, [-1.0, 0.0]));
+/// }
+/// ```
+pub struct BinaryCrossEntropy<'c> {
+    /// The values.
+    n: u32,
+    /// What the loss reads and how it reduces.
+    form: (BinaryInput, LossReduction),
+    /// The compiled kernels.
+    kernels: Kernels<'c>,
+    /// Each value's loss.
+    terms: DeviceBuffer<'c>,
+    /// Each value's clamp count.
+    clamps: DeviceBuffer<'c>,
+    /// One partial sum per chunk of 4,096 terms or counts.
+    partials: DeviceBuffer<'c>,
+}
+
+impl fmt::Debug for BinaryCrossEntropy<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BinaryCrossEntropy")
+            .field("n", &self.n)
+            .field("form", &self.form)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'c> BinaryCrossEntropy<'c> {
+    /// Compiles the kernels on `cuda`'s card for the loss `form` of `n` values, and
+    /// allocates each value's loss and clamp count and their partial sums.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Invalid`] if `n` is 0 or more than 2³¹; [`CudaError::Compile`] or
+    /// [`CudaError::Call`] if NVRTC or the driver refuses the kernels or the memory.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{BinaryCrossEntropy, BinaryInput, Cuda, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let form = (BinaryInput::Logits, LossReduction::Sum);
+    ///     assert!(BinaryCrossEntropy::new(&cuda, 4, form).is_ok());
+    ///     assert!(BinaryCrossEntropy::new(&cuda, 0, form).is_err());
+    /// }
+    /// ```
+    pub fn new(
+        cuda: &'c Cuda,
+        n: u32,
+        form: (BinaryInput, LossReduction),
+    ) -> Result<BinaryCrossEntropy<'c>, CudaError> {
+        let dims = ChannelDims::new(1, 1, n);
+        dims.check("binary cross-entropy")?;
+        let kernels = Kernels::new(cuda)?;
+        Ok(BinaryCrossEntropy {
+            n,
+            form,
+            kernels,
+            terms: cuda.buffer(4 * n as usize)?,
+            clamps: cuda.buffer(4 * n as usize)?,
+            partials: cuda.buffer(4 * dims.chunks() as usize)?,
+        })
+    }
+
+    /// The values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{BinaryCrossEntropy, BinaryInput, Cuda, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let form = (BinaryInput::Logits, LossReduction::Mean);
+    ///     assert_eq!(BinaryCrossEntropy::new(&cuda, 6, form).unwrap().len(), 6);
+    /// }
+    /// ```
+    pub fn len(&self) -> u32 {
+        self.n
+    }
+
+    /// Whether the loss takes no values: never, since [`new`](Self::new) refuses 0.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{BinaryCrossEntropy, BinaryInput, Cuda, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let form = (BinaryInput::Logits, LossReduction::Mean);
+    ///     assert!(!BinaryCrossEntropy::new(&cuda, 6, form).unwrap().is_empty());
+    /// }
+    /// ```
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+
+    /// What the loss reads and how it reduces.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use cavitation_cuda::{BinaryCrossEntropy, BinaryInput, Cuda, LossReduction};
+    ///
+    /// if let Some(cuda) = Cuda::new() {
+    ///     let form = (BinaryInput::Probabilities, LossReduction::Sum);
+    ///     assert_eq!(BinaryCrossEntropy::new(&cuda, 6, form).unwrap().form(), form);
+    /// }
+    /// ```
+    pub fn form(&self) -> (BinaryInput, LossReduction) {
+        self.form
+    }
+
+    /// Writes the loss of `pred` against `target` (`n` `f32`s each) to word `out.1` of
+    /// `out.0` and the clamp count to word `out.1 + 1`, and the prediction's gradient to
+    /// `grad` (`n` values). Nothing else of `out` changes.
+    ///
+    /// # Errors
+    ///
+    /// [`CudaError::Call`] if a launch is refused.
+    ///
+    /// # Panics
+    ///
+    /// If a buffer is shorter than its values: the prediction, the target and the gradient
+    /// `n`, and the output `out.1 + 2`.
+    ///
+    /// # Examples
+    ///
+    /// See [`BinaryCrossEntropy`].
+    pub fn run(
+        &self,
+        pred: &DeviceBuffer<'_>,
+        target: &DeviceBuffer<'_>,
+        grad: &mut DeviceBuffer<'_>,
+        (out, offset): (&mut DeviceBuffer<'_>, u32),
+    ) -> Result<(), CudaError> {
+        const WHAT: &str = "binary cross-entropy";
+        let n = self.n;
+        let len = u64::from(n);
+        check_buffers(
+            WHAT,
+            &[
+                (pred, "prediction", len),
+                (target, "target", len),
+                (grad, "gradient", len),
+                (out, "loss output", u64::from(offset) + 2),
+            ],
+        );
+        let (input, reduction) = self.form;
+        let (w, divisor) = match reduction {
+            LossReduction::Mean => (reciprocal(len), n as f32),
+            LossReduction::Sum => (1.0, 1.0),
+        };
+        let k = &self.kernels;
+        // SAFETY: bce_terms takes (const u32 *pred, const u32 *target, u32 *grad, u32 *terms,
+        // float *clamps, u32 n, float w, u32 logits) and touches values below n, which the
+        // buffers hold (checked above, and the terms and counts are this loss's own); grad,
+        // borrowed mutably, is no input.
+        unsafe {
+            k.launch(
+                k.bce_terms,
+                n.div_ceil(BLOCK),
+                &[
+                    Arg::Buffer(pred),
+                    Arg::Buffer(target),
+                    Arg::Buffer(grad),
+                    Arg::Buffer(&self.terms),
+                    Arg::Buffer(&self.clamps),
+                    Arg::U32(n),
+                    Arg::F32(w),
+                    Arg::U32(u32::from(input == BinaryInput::Logits)),
+                ],
+            )?;
+        }
+        let dims = ChannelDims::new(1, 1, n);
+        // SAFETY: sum_partials reads n terms from this loss's own buffer; the partial sums
+        // are its own too, sized for n, and out, borrowed mutably, holds word `offset`
+        // (checked above). A sum's division by 1 is exact.
+        unsafe {
+            k.mean(
+                k.sum_partials,
+                &[Arg::Buffer(&self.terms)],
+                dims,
+                &self.partials,
+                (out, offset),
+                divisor,
+            )?;
+        }
+        // SAFETY: as above for the counts, into word `offset + 1`, which out holds; the
+        // partial sums are taken up again only after the merge above, on the same stream.
+        unsafe {
+            k.mean(
+                k.sum_partials,
+                &[Arg::Buffer(&self.clamps)],
+                dims,
+                &self.partials,
+                (out, offset + 1),
+                1.0,
             )
         }
     }
