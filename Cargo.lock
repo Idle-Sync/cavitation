@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-cuda",
@@ -110,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation-bench"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-cuda",
@@ -122,14 +122,14 @@ dependencies = [
 
 [[package]]
 name = "cavitation-core"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "cavitation-cuda"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-nn",
@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation-datasets"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-nn",
@@ -145,7 +145,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation-gpu"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-nn",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation-inspect"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-nn",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation-ml"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-datasets",
@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "cavitation-nn"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "cavitation-core",
  "cavitation-cuda",
